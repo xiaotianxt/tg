@@ -133,7 +133,7 @@ pub fn decode_message(
         Some(id) => resolve_display_name(id),
         None => session_display_name.to_string(),
     };
-    let content = decode_content_by_type(msg_type, clean_content);
+    let content = decode_content_by_type(msg_type, clean_content, &resolve_display_name);
 
     DecodedMessage {
         msg_type: msg_type_enum,
@@ -213,9 +213,13 @@ fn extract_audio_meta(data: &[u8]) -> Option<String> {
     None
 }
 
-fn decode_content_by_type(msg_type: i32, content: &str) -> String {
+fn decode_content_by_type(
+    msg_type: i32,
+    content: &str,
+    resolve_display_name: &impl Fn(&str) -> String,
+) -> String {
     match msg_type {
-        49 => decode_link_content(content),
+        49 => decode_link_content(content, resolve_display_name),
         48 => decode_location_content(content),
         50 => decode_call_content(content),
         62 => decode_file_content(content),
@@ -225,7 +229,7 @@ fn decode_content_by_type(msg_type: i32, content: &str) -> String {
     }
 }
 
-fn decode_link_content(content: &str) -> String {
+fn decode_link_content(content: &str, resolve_display_name: &impl Fn(&str) -> String) -> String {
     if !content.trim_start().starts_with('<') {
         if content.len() > 200 {
             return format!("[链接] {}", &content[..200]);
@@ -251,7 +255,7 @@ fn decode_link_content(content: &str) -> String {
             let name = crate::media::extract_xml_tag(content, "title").unwrap_or_else(|| "未知文件".to_string());
             format!("[文件] {}", name)
         }
-        57 => decode_quote_content(content),
+        57 => decode_quote_content(content, resolve_display_name),
         51 => {
             let title = crate::media::extract_xml_tag(content, "title").unwrap_or_else(|| "聊天记录".to_string());
             format!("[引用: {}]", title)
@@ -269,10 +273,10 @@ fn decode_link_content(content: &str) -> String {
     }
 }
 
-fn decode_quote_content(content: &str) -> String {
+fn decode_quote_content(content: &str, resolve_display_name: &impl Fn(&str) -> String) -> String {
     let reply = crate::media::extract_xml_tag(content, "title").unwrap_or_default();
     let quoted = crate::media::extract_xml_tag(content, "refermsg")
-        .map(|refermsg| decode_refermsg_content(&refermsg))
+        .map(|refermsg| decode_refermsg_content(&refermsg, resolve_display_name))
         .unwrap_or_default();
 
     match (quoted.is_empty(), reply.is_empty()) {
@@ -283,24 +287,51 @@ fn decode_quote_content(content: &str) -> String {
     }
 }
 
-fn decode_refermsg_content(refermsg: &str) -> String {
+fn decode_refermsg_content(
+    refermsg: &str,
+    resolve_display_name: &impl Fn(&str) -> String,
+) -> String {
     let ref_type = crate::media::extract_xml_tag_int(refermsg, "type")
         .map(|n| n as i32)
         .unwrap_or(1);
     let ref_content = crate::media::extract_xml_tag(refermsg, "content").unwrap_or_default();
-    let (_, clean_content) = parse_sender_from_content(&ref_content);
+    let (content_sender, clean_content) = parse_sender_from_content(&ref_content);
 
-    if clean_content.is_empty() {
-        return format!("[{}]", MessageType::from(ref_type));
+    let body = if clean_content.is_empty() {
+        format!("[{}]", MessageType::from(ref_type))
+    } else {
+        match ref_type {
+            1 => clean_content.to_string(),
+            t if is_media_type(t) => decode_media_content(t, clean_content, &[]),
+            49 if clean_content.trim_start().starts_with('<') => decode_link_content(clean_content, resolve_display_name),
+            _ if clean_content.trim_start().starts_with('<') => format!("[{}]", MessageType::from(ref_type)),
+            _ => clean_content.to_string(),
+        }
+    };
+
+    match decode_refermsg_sender(refermsg, content_sender, resolve_display_name) {
+        Some(sender) => format!("{}: {}", sender, body),
+        None => body,
+    }
+}
+
+fn decode_refermsg_sender(
+    refermsg: &str,
+    content_sender: Option<&str>,
+    resolve_display_name: &impl Fn(&str) -> String,
+) -> Option<String> {
+    if let Some(name) = crate::media::extract_xml_tag(refermsg, "displayname") {
+        return Some(name);
     }
 
-    match ref_type {
-        1 => clean_content.to_string(),
-        t if is_media_type(t) => decode_media_content(t, clean_content, &[]),
-        49 if clean_content.trim_start().starts_with('<') => decode_link_content(clean_content),
-        _ if clean_content.trim_start().starts_with('<') => format!("[{}]", MessageType::from(ref_type)),
-        _ => clean_content.to_string(),
-    }
+    let sender_id = crate::media::extract_xml_tag(refermsg, "chatusr")
+        .or_else(|| content_sender.map(|id| id.to_string()))
+        .or_else(|| {
+            crate::media::extract_xml_tag(refermsg, "fromusr")
+                .filter(|id| !id.contains("@chatroom"))
+        })?;
+    let sender = resolve_display_name(&sender_id);
+    if sender.is_empty() { None } else { Some(sender) }
 }
 
 fn decode_location_content(content: &str) -> String {
@@ -499,16 +530,18 @@ mod tests {
 
     #[test]
     fn test_decode_quote_message() {
-        let xml = r#"<msg><appmsg><title>回复内容</title><type>57</type><refermsg><type>1</type><content>引用内容</content></refermsg></appmsg></msg>"#;
+        let xml = r#"<msg><appmsg><title>回复内容</title><type>57</type><refermsg><type>1</type><displayname>Bob</displayname><content>引用内容</content></refermsg></appmsg></msg>"#;
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
-        assert_eq!(d.content, "> 引用内容\n        回复内容");
+        assert_eq!(d.content, "> Bob: 引用内容\n        回复内容");
     }
 
     #[test]
     fn test_decode_quoted_group_image() {
-        let xml = r#"<msg><appmsg><title>回复图片</title><type>57</type><refermsg><type>3</type><content>tgid_abc:
+        let xml = r#"<msg><appmsg><title>回复图片</title><type>57</type><refermsg><type>3</type><chatusr>tgid_abc</chatusr><content>tgid_abc:
 &lt;msg&gt;&lt;img cdnthumbwidth="180" cdnthumbheight="153" length="38186" /&gt;&lt;/msg&gt;</content></refermsg></appmsg></msg>"#;
-        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
-        assert_eq!(d.content, "> [图片 180x153]\n        回复图片");
+        let d = decode_message(49, xml, "Alice", None, &[], |id| {
+            if id == "tgid_abc" { "Bob".into() } else { id.into() }
+        });
+        assert_eq!(d.content, "> Bob: [图片 180x153]\n        回复图片");
     }
 }
