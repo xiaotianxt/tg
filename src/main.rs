@@ -2,6 +2,7 @@ mod scanner;
 mod decrypt;
 mod db;
 mod message;
+mod media;
 mod export;
 
 use clap::{Parser, Subcommand};
@@ -99,6 +100,9 @@ enum Commands {
         /// Output directory
         #[arg(long, default_value = "exported")]
         output: PathBuf,
+        /// Directory to save decoded media files (images, stickers, videos)
+        #[arg(long)]
+        media_dir: Option<PathBuf>,
     },
 }
 
@@ -192,8 +196,8 @@ fn main() {
                 }
             }
         }
-        Commands::Export { session, decrypted_dir, format, output } => {
-            match export::export_messages(&decrypted_dir, &session, &format, &output) {
+        Commands::Export { session, decrypted_dir, format, output, media_dir } => {
+            match export::export_messages(&decrypted_dir, &session, &format, &output, media_dir.as_deref()) {
                 Ok(paths) => {
                     println!("Exported to:");
                     for (fmt, path) in paths {

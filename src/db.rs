@@ -273,15 +273,23 @@ pub fn read_messages(
             }
         }
 
+        // Load Name2Id mapping (sender_id → tgid)
+        let name2id: HashMap<i64, String> = match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
+            Ok(mut stmt) => stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        };
+
         let order_dir = if tail { "DESC" } else { "ASC" };
 
         // Query messages - collect eagerly to avoid borrow issues
         let sql = format!(
-            "SELECT local_type, create_time, message_content, WCDB_CT_message_content \
+            "SELECT local_type, create_time, message_content, WCDB_CT_message_content, real_sender_id \
              FROM {} WHERE create_time > 0{}{} ORDER BY create_time {}",
             table_name, search_clause, since_clause, order_dir
         );
-        let rows: Vec<(i64, i64, String, Option<i64>)> = match conn.prepare(&sql) {
+        let rows: Vec<(i64, i64, String, Option<i64>, String)> = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
                 // message_content can be TEXT or BLOB; read as String when possible
                 let content: String = match row.get::<_, Option<String>>(2) {
@@ -291,11 +299,14 @@ pub fn read_messages(
                         _ => String::new(),
                     },
                 };
+                let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                let sender_tgid = name2id.get(&sender_id).cloned().unwrap_or_default();
                 Ok((
                     row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
                     row.get::<_, Option<i64>>(1)?.unwrap_or(0),
                     content,
                     row.get::<_, Option<i64>>(3)?,
+                    sender_tgid,
                 ))
             }) {
                 Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
@@ -338,15 +349,24 @@ pub fn read_messages(
         println!("Showing {}-{} of {} messages\n", offset + 1, offset + messages.len(), total_count);
     }
 
-    for (local_type, create_time, content, wcdb_ct) in &messages {
+    for (local_type, create_time, content, wcdb_ct, sender_tgid) in &messages {
         let time_str = chrono::DateTime::from_timestamp(*create_time, 0)
             .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
 
+        // 1-on-1 chat: if the sender is not the chat partner, it's "me"
+        let sender_display = if sender_tgid.is_empty() {
+            display_name
+        } else if sender_tgid == &username {
+            display_name
+        } else {
+            "我"
+        };
+
         let decoded = message::decode_message(
             *local_type as i32,
             content,
-            display_name,
+            sender_display,
             *wcdb_ct,
             |id| resolve_sender_name(id, &contacts),
         );

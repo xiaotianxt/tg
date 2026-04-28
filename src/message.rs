@@ -1,3 +1,4 @@
+use crate::media;
 use std::fmt;
 
 /// Telegram消息类型枚举。
@@ -158,19 +159,17 @@ fn decode_media_content(msg_type: i32, raw_content: &str) -> String {
     let type_name: MessageType = msg_type.into();
     match msg_type {
         34 => {
-            // 语音：尝试提取时长
             let dur = extract_voice_duration(raw_content);
             format!("[语音{}]", dur)
         }
         47 => {
-            // 表情：尝试提取表情名
-            let name = extract_sticker_name(raw_content);
-            format!("[表情{}]", name)
+            media::parse_sticker_info(raw_content).display()
+        }
+        43 => {
+            media::parse_video_info(raw_content).display()
         }
         3 => {
-            // 图片：尝试提取缩略图路径
-            let img = extract_image_path(raw_content);
-            format!("[图片{}]", img)
+            media::parse_image_info(raw_content).display()
         }
         _ => format!("[{}]", type_name),
     }
@@ -191,13 +190,7 @@ fn decode_content_by_type(msg_type: i32, content: &str) -> String {
 
 /// 对 type 49（链接/卡片）解码。尝试解析 XML 提取标题、描述、URL。
 fn decode_link_content(content: &str) -> String {
-    // 几种常见子类型：
-    // 1. 链接（type=5）：<title>...</title> + <url>...</url>
-    // 2. 小程序（type=33）：<title>...</title> + <weappinfo>...</weappinfo>
-    // 3. 音乐（type=3）
-    // 4. 文件（type=6）
     if !content.trim_start().starts_with('<') {
-        // 不是 XML，直接返回原内容
         if content.len() > 200 {
             return format!("[链接] {}", &content[..200]);
         }
@@ -205,49 +198,38 @@ fn decode_link_content(content: &str) -> String {
     }
 
     let sub_type = extract_xml_tag_int(content, "type").unwrap_or(0);
-    let title = extract_xml_tag(content, "title").unwrap_or_default();
-    let desc = extract_xml_tag(content, "des").unwrap_or_default();
 
     match sub_type {
+        5 => {
+            media::parse_link_info(content)
+                .as_ref()
+                .map(media::LinkInfo::display)
+                .unwrap_or_else(|| "[链接]".to_string())
+        }
+        33 => {
+            media::parse_mini_program_info(content)
+                .as_ref()
+                .map(media::MiniProgramInfo::display)
+                .unwrap_or_else(|| "[小程序]".to_string())
+        }
         3 => {
             // 音乐分享
-            let title = if title.is_empty() { "未知歌曲".to_string() } else { title };
+            let title = extract_xml_tag(content, "title").unwrap_or_else(|| "未知歌曲".to_string());
             format!("[音乐] {}", title)
-        }
-        5 => {
-            // 链接
-            let url = extract_xml_tag(content, "url").unwrap_or_default();
-            let desc_part = if !desc.is_empty() { format!(" - {}", desc) } else { String::new() };
-            if url.len() > 100 {
-                format!("[链接] {}{}", title, desc_part)
-            } else if !url.is_empty() {
-                format!("[链接] {}{}\n  {}", title, desc_part, url)
-            } else {
-                format!("[链接] {}{}", title, desc_part)
-            }
         }
         6 => {
             // 文件
-            let name = if !title.is_empty() { title } else { "未知文件".to_string() };
+            let name = extract_xml_tag(content, "title").unwrap_or_else(|| "未知文件".to_string());
             format!("[文件] {}", name)
-        }
-        33 => {
-            // 小程序
-            let appname = extract_xml_tag(content, "appname").unwrap_or_default();
-            let title = if title.is_empty() { "小程序".to_string() } else { title };
-            if !appname.is_empty() {
-                format!("[小程序] {} - {}", title, appname)
-            } else {
-                format!("[小程序] {}", title)
-            }
         }
         51 => {
             // 引用/聊天记录
-            let title = if title.is_empty() { "聊天记录".to_string() } else { title };
+            let title = extract_xml_tag(content, "title").unwrap_or_else(|| "聊天记录".to_string());
             format!("[引用: {}]", title)
         }
         _ => {
-            // 其他子类型
+            let title = extract_xml_tag(content, "title").unwrap_or_default();
+            let desc = extract_xml_tag(content, "des").unwrap_or_default();
             let title = if !title.is_empty() { title } else { "未知卡片".to_string() };
             if !desc.is_empty() {
                 format!("[卡片] {} - {}", title, desc)
@@ -330,34 +312,6 @@ fn extract_voice_duration(content: &str) -> String {
         });
     match dur {
         Some(d) if d > 0 => format!(" {}秒", d),
-        _ => String::new(),
-    }
-}
-
-/// 提取表情包名称。
-fn extract_sticker_name(content: &str) -> String {
-    let name = extract_xml_tag(content, "productid")
-        .or_else(|| extract_xml_tag(content, "name"))
-        .or_else(|| {
-            // 尝试从 url 尾部提取文件名
-            let url = extract_xml_tag(content, "url").unwrap_or_default();
-            url.rsplit('/').next().and_then(|s| {
-                let s = s.split('?').next().unwrap_or(s);
-                if s.len() <= 40 { Some(s.to_string()) } else { None }
-            })
-        });
-    match name {
-        Some(n) if !n.is_empty() => format!(" {}", n),
-        _ => String::new(),
-    }
-}
-
-/// 提取图片消息中的缩略图路径片段。
-fn extract_image_path(content: &str) -> String {
-    let img = extract_xml_tag(content, "img")
-        .or_else(|| extract_xml_tag(content, "image"));
-    match img {
-        Some(p) if !p.is_empty() && p.len() < 60 => format!(" {}", p),
         _ => String::new(),
     }
 }

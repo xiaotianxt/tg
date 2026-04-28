@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::db;
+use crate::media;
 use crate::message;
 
 #[derive(serde::Serialize)]
@@ -15,6 +16,13 @@ struct ExportMessage {
     msg_type: i64,
     type_name: String,
     content: String,
+}
+
+/// Tracks a media message for later file export.
+struct MediaItem {
+    msg_type: i64,
+    raw_content: String,
+    seq: usize,
 }
 
 /// Find message database files
@@ -43,6 +51,7 @@ pub fn export_messages(
     session_query: &str,
     format: &str,
     output_dir: &Path,
+    media_dir: Option<&Path>,
 ) -> Result<Vec<(&'static str, PathBuf)>, String> {
     let (contact_db, _) = {
         let contact_db = decrypted_dir.join("contact/contact.db");
@@ -89,6 +98,8 @@ pub fn export_messages(
 
     let message_dbs = get_message_dbs(decrypted_dir);
     let mut all_messages: Vec<ExportMessage> = Vec::new();
+    let mut media_items: Vec<MediaItem> = Vec::new();
+    let mut seq: usize = 0;
     let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
 
     for db_path in &message_dbs {
