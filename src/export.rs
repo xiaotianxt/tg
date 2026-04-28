@@ -6,6 +6,7 @@ use std::process::Command;
 
 use crate::db;
 use crate::media;
+use crate::media_index::MediaIndex;
 use crate::message;
 use crate::parallel;
 
@@ -236,6 +237,7 @@ pub fn export_messages(
             log::warn!("Cannot derive media decryption keys: {}", e);
         }
         let media_keys = media_keys.ok();
+        let media_index = MediaIndex::load(&telegram_base, &username, &["Image", "Video"], jobs);
 
         let mut media_jobs = Vec::new();
         let mut next_index = 1usize;
@@ -255,7 +257,7 @@ pub fn export_messages(
                     _ => continue,
                 };
 
-                if let Some(src) = media::find_cached_media(&telegram_base, &username, cat_name, &identifier) {
+                if let Some(src) = media_index.find(cat_name, &identifier) {
                     media_jobs.push(MediaExportJob::Cached {
                         index: next_index,
                         src,
@@ -359,6 +361,7 @@ pub fn export_images(
 
     let telegram_base = media::find_telegram_base_path()
         .ok_or_else(|| "Telegram data directory not found".to_string())?;
+    let media_index = MediaIndex::load(&telegram_base, &username, &["Image"], config.jobs);
 
     let candidates: Vec<ImageCandidate> = messages
         .into_iter()
@@ -367,7 +370,7 @@ pub fn export_images(
             let identifier = image_identifier(&message);
             let source = identifier
                 .as_deref()
-                .and_then(|id| media::find_cached_media(&telegram_base, &username, "Image", id));
+                .and_then(|id| media_index.find("Image", id));
             ImageCandidate {
                 index: i + 1,
                 message,

@@ -3,6 +3,7 @@ mod decrypt;
 mod db;
 mod message;
 mod media;
+mod media_index;
 mod media_pb;
 mod media_decrypt;
 mod media_key;

@@ -256,52 +256,7 @@ pub fn find_telegram_base_path() -> Option<PathBuf> {
     None
 }
 
-// ===== MediaTemp cache search =====
-
-pub fn find_cached_media(
-    base_path: &Path,
-    session_tgid: &str,
-    category: &str,
-    identifier: &str,
-) -> Option<PathBuf> {
-    // Telegram 3.x: Message/MessageTemp/<session>/<category>/
-    let msg_temp = base_path.join("Message/MessageTemp");
-    if msg_temp.is_dir() {
-        let session_dir = msg_temp.join(session_tgid);
-        if session_dir.is_dir() {
-            let media_dir = session_dir.join(category);
-            if media_dir.is_dir() {
-                if let Some(found) = find_file_containing(&media_dir, identifier) {
-                    return Some(found);
-                }
-            }
-        }
-    }
-
-    // Telegram 4.x: msg/attach/<md5(sender)>/<YYYY-MM>/Img/
-    let msg_attach = base_path.join("msg/attach");
-    if msg_attach.is_dir() {
-        if let Ok(accounts) = fs::read_dir(&msg_attach) {
-            for account in accounts.flatten() {
-                if !account.path().is_dir() {
-                    continue;
-                }
-                if let Ok(months) = fs::read_dir(account.path()) {
-                    for month in months.flatten() {
-                        let img_dir = month.path().join("Img");
-                        if img_dir.is_dir() {
-                            if let Some(found) = find_file_containing(&img_dir, identifier) {
-                                return Some(found);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
+// ===== Sticker cache search =====
 
 pub fn find_cached_sticker(base_path: &Path, md5: &str) -> Option<PathBuf> {
     let md5 = md5.trim().to_lowercase();
@@ -325,49 +280,6 @@ pub fn find_cached_sticker(base_path: &Path, md5: &str) -> Option<PathBuf> {
     }
 
     find_file_named(&cache_dir, &md5)
-}
-
-fn find_file_containing(dir: &Path, substr: &str) -> Option<PathBuf> {
-    let lower = substr.to_lowercase();
-    let mut best: Option<PathBuf> = None;
-
-    fn walk(dir: &Path, lower: &str, best: &mut Option<PathBuf>) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    walk(&path, lower, best);
-                } else {
-                    let name = path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
-                    if name.to_lowercase().contains(lower) {
-                        let is_thm = name.contains(".pic_thm") || name.contains("thumb");
-                        match best {
-                            None => *best = Some(path.clone()),
-                            Some(ref current) => {
-                                let cur_thm = current.to_string_lossy().to_lowercase();
-                                if !is_thm && cur_thm.contains("thm") {
-                                    *best = Some(path.clone());
-                                } else if !is_thm && !cur_thm.contains("thm") {
-                                    if fs::metadata(&path).ok()
-                                        .zip(fs::metadata(current).ok())
-                                        .map(|(a, b)| a.len() > b.len())
-                                        .unwrap_or(false)
-                                    {
-                                        *best = Some(path.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    walk(dir, &lower, &mut best);
-    best
 }
 
 fn find_file_named(dir: &Path, target: &str) -> Option<PathBuf> {
