@@ -1,14 +1,20 @@
 class Tgreader < Formula
   desc "macOS Telegram 聊天记录读取 CLI 工具"
   homepage "https://github.com/xiaotianxt/tgreader"
-  url "https://github.com/xiaotianxt/tgreader.git",
-      tag:      "v0.1.0",
-      revision: "e75d2c0"
   license "MIT"
-  head "https://github.com/xiaotianxt/tgreader.git", branch: "main"
 
   depends_on "rust" => :build
   depends_on xcode: :build
+
+  head do
+    url "https://github.com/xiaotianxt/tgreader.git", branch: "main"
+  end
+
+  stable do
+    url "https://github.com/xiaotianxt/tgreader.git",
+        tag:      "v0.1.0",
+        revision: "ac27f67"
+  end
 
   def install
     system "cc", "-O2", "-o", "scanner_macos",
