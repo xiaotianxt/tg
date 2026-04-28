@@ -15,7 +15,7 @@ pub fn resolve_sender_name(sender_id: &str, contacts: &HashMap<String, Contact>)
 }
 
 /// Find decrypted databases.
-fn find_decrypted_dbs(decrypted_dir: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
+pub(crate) fn find_decrypted_dbs(decrypted_dir: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
     // Find contact.db
     let contact_db = decrypted_dir.join("contact/contact.db");
     let contact_db = if contact_db.exists() {
@@ -123,17 +123,6 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize) -> Result<Vec<(String, 
         let conn = match Connection::open(db_path) {
             Ok(c) => c,
             Err(_) => continue,
-        };
-
-        // Read Name2Id mapping
-        let _name2id: HashMap<i64, String> = match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
-            Ok(mut stmt) => match stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            }) {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                Err(_) => HashMap::new(),
-            },
-            Err(_) => HashMap::new(),
         };
 
         // Find all Msg_ tables
@@ -291,15 +280,21 @@ pub fn read_messages(
         );
         let rows: Vec<(i64, i64, String, Option<i64>, String)> = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
-                let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(3)?;
-                let content: String = read_message_content(row, 2, wcdb_ct);
+                // message_content can be TEXT or BLOB; read as String when possible
+                let content: String = match row.get::<_, Option<String>>(2) {
+                    Ok(Some(s)) => s,
+                    _ => match row.get::<_, Option<Vec<u8>>>(2) {
+                        Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
+                        _ => String::new(),
+                    },
+                };
                 let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
                 let sender_tgid = name2id.get(&sender_id).cloned().unwrap_or_default();
                 Ok((
                     row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
                     row.get::<_, Option<i64>>(1)?.unwrap_or(0),
                     content,
-                    wcdb_ct,
+                    row.get::<_, Option<i64>>(3)?,
                     sender_tgid,
                 ))
             }) {
@@ -348,6 +343,7 @@ pub fn read_messages(
             .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
 
+        // 1-on-1 chat: if the sender is not the chat partner, it's "me"
         let sender_display = if sender_tgid.is_empty() || sender_tgid == &username {
             display_name
         } else {
@@ -462,7 +458,7 @@ pub fn search_messages(
     Ok(total)
 }
 
-fn resolve_username(query: &str, contact_db: Option<&Path>) -> Result<String, String> {
+pub(crate) fn resolve_username(query: &str, contact_db: Option<&Path>) -> Result<String, String> {
     // If it looks like a tgid, use it directly
     if query.starts_with("tgid_") || query.starts_with("gh_") || query.contains("@chatroom") {
         return Ok(query.to_string());
@@ -512,25 +508,6 @@ fn resolve_username(query: &str, contact_db: Option<&Path>) -> Result<String, St
     }
     eprintln!("Using: {}", results[0].username);
     Ok(results[0].username.clone())
-}
-
-/// Read message content from a DB row, handling ZLIB decompression
-/// when WCDB_CT_message_content = 4.
-fn read_message_content(row: &rusqlite::Row, col: usize, wcdb_ct: Option<i64>) -> String {
-    if wcdb_ct == Some(4) {
-        if let Ok(b) = row.get::<_, Vec<u8>>(col) {
-            if let Some(s) = message::try_decompress(&b) {
-                return s;
-            }
-        }
-    }
-    match row.get::<_, Option<String>>(col) {
-        Ok(Some(s)) => s,
-        _ => match row.get::<_, Option<Vec<u8>>>(col) {
-            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-            _ => String::new(),
-        },
-    }
 }
 
 fn find_username_by_table(contacts: &HashMap<String, Contact>, table_name: &str) -> Option<String> {

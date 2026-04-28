@@ -341,7 +341,7 @@ pub fn decrypt_all(
         print!("Decrypt: {} ({:.1}MB) ... ", rel_path, size_mb);
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
-        match decrypt_database(full_path, &out_path, enc_key.map_or("", |v| v)) {
+        match decrypt_database(full_path, &out_path, enc_key.map_or("", |v| v.as_str())) {
             Ok(true) => {
                 // Verify with SQLite
                 match verify_sqlite(&out_path) {

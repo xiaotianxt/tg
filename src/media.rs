@@ -1,7 +1,3 @@
-use std::path::{Path, PathBuf};
-use std::fs;
-
-use crate::message;
 
 /// Parsed info about an image message (type 3).
 #[derive(Debug, Clone, Default)]
@@ -126,14 +122,8 @@ impl LinkInfo {
 #[derive(Debug, Clone, Default)]
 pub struct MiniProgramInfo {
     pub title: String,
-    #[allow(dead_code)]
-    pub description: String,
     pub app_name: String,
-    #[allow(dead_code)]
-    pub app_id: String,
     pub page_path: String,
-    #[allow(dead_code)]
-    pub username: String,
 }
 
 impl MiniProgramInfo {
@@ -158,229 +148,108 @@ impl MiniProgramInfo {
 }
 
 /// Parse image metadata from XML (type 3).
-pub fn parse_image_info(xml: &str) -> ImageInfo {
+pub(crate) fn parse_image_info(xml: &str) -> ImageInfo {
     let mut info = ImageInfo::default();
 
-    if let Some(v) = message::extract_xml_attr(xml, "aeskey") { info.aes_key = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "cdnthumburl") { info.cdn_thumb_url = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "cdnmidiurl") { info.cdn_midi_url = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "cdndisplaybackupurl") { info.cdn_big_url = v; }
+    if let Some(v) = extract_xml_attr(xml, "aeskey") { info.aes_key = v; }
+    if let Some(v) = extract_xml_attr(xml, "cdnthumburl") { info.cdn_thumb_url = v; }
+    if let Some(v) = extract_xml_attr(xml, "cdnmidiurl") { info.cdn_midi_url = v; }
+    if let Some(v) = extract_xml_attr(xml, "cdndisplaybackupurl") { info.cdn_big_url = v; }
 
-    if let Some(v) = message::extract_xml_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) { info.thumb_width = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) { info.thumb_height = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "rawlength").and_then(|s| s.parse().ok()) { info.raw_length = v; }
+    if let Some(v) = extract_xml_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) { info.thumb_width = v; }
+    if let Some(v) = extract_xml_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) { info.thumb_height = v; }
+    if let Some(v) = extract_xml_attr(xml, "rawlength").and_then(|s| s.parse().ok()) { info.raw_length = v; }
     if info.raw_length == 0 {
-        if let Some(v) = message::extract_xml_attr(xml, "cdnmidimagerawlength").and_then(|s| s.parse().ok()) { info.raw_length = v; }
+        if let Some(v) = extract_xml_attr(xml, "cdnmidimagerawlength").and_then(|s| s.parse().ok()) { info.raw_length = v; }
     }
 
     info
 }
 
 /// Parse video metadata from XML (type 43).
-pub fn parse_video_info(xml: &str) -> VideoInfo {
+pub(crate) fn parse_video_info(xml: &str) -> VideoInfo {
     let mut info = VideoInfo::default();
 
-    if let Some(v) = message::extract_xml_attr(xml, "aeskey") { info.aes_key = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "cdnvideourl") { info.cdn_video_url = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "cdnthumburl") { info.cdn_thumb_url = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) { info.thumb_width = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) { info.thumb_height = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "playlength").and_then(|s| s.parse().ok()) { info.play_length = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "rawvideolength").and_then(|s| s.parse().ok()) { info.raw_video_length = v; }
+    if let Some(v) = extract_xml_attr(xml, "aeskey") { info.aes_key = v; }
+    if let Some(v) = extract_xml_attr(xml, "cdnvideourl") { info.cdn_video_url = v; }
+    if let Some(v) = extract_xml_attr(xml, "cdnthumburl") { info.cdn_thumb_url = v; }
+    if let Some(v) = extract_xml_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) { info.thumb_width = v; }
+    if let Some(v) = extract_xml_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) { info.thumb_height = v; }
+    if let Some(v) = extract_xml_attr(xml, "playlength").and_then(|s| s.parse().ok()) { info.play_length = v; }
+    if let Some(v) = extract_xml_attr(xml, "rawvideolength").and_then(|s| s.parse().ok()) { info.raw_video_length = v; }
 
     info
 }
 
 /// Parse sticker metadata from XML (type 47).
-pub fn parse_sticker_info(xml: &str) -> StickerInfo {
+pub(crate) fn parse_sticker_info(xml: &str) -> StickerInfo {
     let mut info = StickerInfo::default();
 
-    if let Some(v) = message::extract_xml_attr(xml, "productid") { info.product_id = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "url") { info.url = v; }
-    if let Some(v) = message::extract_xml_tag(xml, "packname") { info.pack_name = v; }
-    if let Some(v) = message::extract_xml_attr(xml, "packurl") { info.pack_url = v; }
+    if let Some(v) = extract_xml_attr(xml, "productid") { info.product_id = v; }
+    if let Some(v) = extract_xml_attr(xml, "url") { info.url = v; }
+    if let Some(v) = extract_xml_tag(xml, "packname") { info.pack_name = v; }
+    if let Some(v) = extract_xml_attr(xml, "packurl") { info.pack_url = v; }
     info.has_emojibuf = xml.contains("<emojibuf>");
 
     info
 }
 
 /// Parse link info from XML (type 49, subtype 5).
-pub fn parse_link_info(xml: &str) -> Option<LinkInfo> {
+pub(crate) fn parse_link_info(xml: &str) -> Option<LinkInfo> {
     if !xml.contains("<type>5</type>") {
         return None;
     }
     Some(LinkInfo {
-        title: message::extract_xml_tag(xml, "title").unwrap_or_default(),
-        description: message::extract_xml_tag(xml, "des").unwrap_or_default(),
-        url: message::extract_xml_tag(xml, "url").unwrap_or_default(),
+        title: extract_xml_tag(xml, "title").unwrap_or_default(),
+        description: extract_xml_tag(xml, "des").unwrap_or_default(),
+        url: extract_xml_tag(xml, "url").unwrap_or_default(),
     })
 }
 
 /// Parse mini program info from XML (type 49, subtype 33).
-pub fn parse_mini_program_info(xml: &str) -> Option<MiniProgramInfo> {
+pub(crate) fn parse_mini_program_info(xml: &str) -> Option<MiniProgramInfo> {
     if !xml.contains("<type>33</type>") {
         return None;
     }
     Some(MiniProgramInfo {
-        title: message::extract_xml_tag(xml, "title").unwrap_or_default(),
-        description: message::extract_xml_tag(xml, "des").unwrap_or_default(),
-        app_name: message::extract_xml_tag(xml, "appname").unwrap_or_default(),
-        app_id: message::extract_xml_tag(xml, "appid").unwrap_or_default(),
-        page_path: message::extract_xml_tag(xml, "pagepath").unwrap_or_default(),
-        username: message::extract_xml_tag(xml, "username").unwrap_or_default(),
+        title: extract_xml_tag(xml, "title").unwrap_or_default(),
+        app_name: extract_xml_tag(xml, "appname").unwrap_or_default(),
+        page_path: extract_xml_tag(xml, "pagepath").unwrap_or_default(),
     })
 }
 
-/// Auto-detect Telegram data base path.
-pub fn find_telegram_base_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    // New path (Telegram 4.0.5+)
-    let new_base = PathBuf::from(&home)
-        .join("Library/Containers/com.telegram.xinTelegram/Data/Library/Application Support/com.telegram.xinTelegram");
-    if new_base.exists() {
-        if let Ok(entries) = fs::read_dir(&new_base) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    // May have versioned subdir with nested UUID
-                    if let Ok(sub_entries) = fs::read_dir(&path) {
-                        for sub_entry in sub_entries.flatten() {
-                            let sub_path = sub_entry.path();
-                            if sub_path.is_dir() {
-                                let candidate = sub_path.join("Message/MessageTemp");
-                                if candidate.is_dir() {
-                                    return Some(sub_path);
-                                }
-                            }
-                        }
-                    }
-                    // Direct UUID directory structure
-                    let candidate = path.join("Message/MessageTemp");
-                    if candidate.is_dir() {
-                        return Some(path);
-                    }
-                }
-            }
-        }
-    }
-    // Old path
-    let old_base = PathBuf::from(&home)
-        .join("Library/Containers/com.telegram.xinTelegram/Data/Documents/xtelegram_files");
-    if old_base.exists() {
-        if let Ok(entries) = fs::read_dir(&old_base) {
-            for entry in entries.flatten() {
-                let candidate = entry.path().join("Message/MessageTemp");
-                if candidate.is_dir() {
-                    return Some(entry.path());
-                }
-            }
-        }
-    }
-    None
+
+// ===== XML helpers =====
+
+/// Extract attribute value from a self-closing XML tag like `<tag attr="value" .../>`.
+pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
+    let pattern = format!(r#"{}=""#, attr);
+    let start = xml.find(&pattern)?;
+    let value_start = start + pattern.len();
+    if value_start >= xml.len() { return None; }
+    let rest = &xml[value_start..];
+    if !rest.starts_with('"') { return None; }
+    let rest = &rest[1..];
+    let end = rest.find('"')?;
+    let value = rest[..end].to_string();
+    if value.is_empty() { None } else { Some(value) }
 }
 
-/// Try to find a cached media file for a given session.
-/// Looks in MessageTemp/<session_tgid>/{Image,Video,File}/ for files
-/// matching the given identifier (aeskey, etc.).
-pub fn find_cached_media(
-    base_path: &Path,
-    session_tgid: &str,
-    category: &str, // "Image", "Video", "File"
-    identifier: &str,
-) -> Option<PathBuf> {
-    let msg_temp = base_path.join("Message/MessageTemp");
-    if !msg_temp.is_dir() {
-        return None;
-    }
-
-    let session_dir = msg_temp.join(session_tgid);
-    if !session_dir.is_dir() {
-        return None;
-    }
-
-    let media_dir = session_dir.join(category);
-    if !media_dir.is_dir() {
-        return None;
-    }
-
-    // Search recursively for files whose name contains the identifier
-    find_file_containing(&media_dir, identifier)
+/// Extract text content from `<tag>text</tag>`.
+pub(crate) fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)?;
+    let value_start = start + open.len();
+    if value_start >= xml.len() { return None; }
+    let rest = &xml[value_start..];
+    let value_end = rest.find(&close)?;
+    let value = rest[..value_end].trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
 }
 
-/// Recursively search a directory for a file whose name contains the given substring.
-fn find_file_containing(dir: &Path, substr: &str) -> Option<PathBuf> {
-    let lower = substr.to_lowercase();
-    let mut best: Option<PathBuf> = None;
-
-    fn walk(dir: &Path, lower: &str, best: &mut Option<PathBuf>) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    walk(&path, lower, best);
-                } else {
-                    let name = path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
-                    if name.to_lowercase().contains(lower) {
-                        // Prefer non-thumbnail (thm) files
-                        let is_thm = name.contains(".pic_thm") || name.contains("thumb");
-                        match best {
-                            None => *best = Some(path.clone()),
-                            Some(ref current) => {
-                                let cur_thm = current.to_string_lossy().to_lowercase();
-                                if !is_thm && cur_thm.contains("thm") {
-                                    *best = Some(path.clone());
-                                } else if !is_thm && !cur_thm.contains("thm") {
-                                    // Keep the larger file
-                                    if fs::metadata(&path).ok()
-                                        .zip(fs::metadata(current).ok())
-                                        .map(|(a, b)| a.len() > b.len())
-                                        .unwrap_or(false)
-                                    {
-                                        *best = Some(path.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    walk(dir, &lower, &mut best);
-    best
+/// Extract integer content from an XML tag.
+pub(crate) fn extract_xml_tag_int(xml: &str, tag: &str) -> Option<i64> {
+    let text = extract_xml_tag(xml, tag)?;
+    text.parse::<i64>().ok()
 }
-
-/// Copy a media file to the export directory.
-pub fn export_media_file(
-    src: &Path,
-    output_dir: &Path,
-    session_name: &str,
-    msg_type_name: &str,
-    index: usize,
-) -> Result<PathBuf, String> {
-    let ext = src.extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("bin");
-    let filename = format!("{}_{}_{:04}.{}", sanitize_filename(session_name), msg_type_name, index, ext);
-    let dest = output_dir.join(&filename);
-
-    fs::create_dir_all(output_dir)
-        .map_err(|e| format!("Cannot create media dir: {}", e))?;
-    fs::copy(src, &dest)
-        .map_err(|e| format!("Cannot copy media file: {}", e))?;
-
-    Ok(dest)
-}
-
-fn sanitize_filename(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect()
-}
-
-// XML helpers imported from message module to avoid duplication:
-//   message::extract_xml_attr  — <tag attr="value" .../>
-//   message::extract_xml_tag   — <tag>text</tag>

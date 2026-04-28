@@ -1,7 +1,5 @@
-use crate::media;
-use flate2::read::ZlibDecoder;
+use crate::media::{self, extract_xml_tag, extract_xml_tag_int, extract_xml_attr};
 use std::fmt;
-use std::io::Read;
 
 /// Telegram消息类型枚举。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -18,8 +16,6 @@ pub enum MessageType {
     Location,        // 48
     File,            // 62
     Call,            // 50
-    #[allow(dead_code)]
-    ChatHistory,     // 引用聊天记录 (type 49 subtype)
     Music,           // 419430449
     Revoke,          // 10002 撤回消息
     Unknown(i32),    // 其他
@@ -40,7 +36,6 @@ impl fmt::Display for MessageType {
             MessageType::Location => "位置",
             MessageType::File => "文件",
             MessageType::Call => "语音/视频通话",
-            MessageType::ChatHistory => "引用消息",
             MessageType::Music => "音乐",
             MessageType::Revoke => "撤回消息",
             MessageType::Unknown(n) => return write!(f, "未知({})", n),
@@ -93,11 +88,20 @@ pub fn decode_message(
     msg_type: i32,
     raw_content: &str,
     session_display_name: &str,
-    _wcdb_ct: Option<i64>,
+    wcdb_ct: Option<i64>,
     resolve_display_name: impl Fn(&str) -> String,
 ) -> DecodedMessage {
     // 派生消息类型
     let msg_type_enum: MessageType = msg_type.into();
+
+    // 处理压缩内容标记
+    if wcdb_ct == Some(4) {
+        return DecodedMessage {
+            msg_type: msg_type_enum,
+            content: "[压缩内容]".to_string(),
+            display_name: session_display_name.to_string(),
+        };
+    }
 
     // 系统消息和撤回消息使用原始内容
     if msg_type == 10000 || msg_type == 10002 {
@@ -309,55 +313,6 @@ fn extract_voice_duration(content: &str) -> String {
     }
 }
 
-/// 从 XML 字符串中提取指定标签的文本内容。
-/// 只处理 `<tag>text</tag>`（无属性）格式。
-pub(crate) fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-
-    let start = xml.find(&open)?;
-    let value_start = start + open.len();
-    if value_start >= xml.len() {
-        return None;
-    }
-    let rest = &xml[value_start..];
-    let value_end = rest.find(&close)?;
-    let value = rest[..value_end].trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
-}
-
-/// 从 XML 字符串中提取指定标签的整数内容。
-pub(crate) fn extract_xml_tag_int(xml: &str, tag: &str) -> Option<i64> {
-    let text = extract_xml_tag(xml, tag)?;
-    text.parse::<i64>().ok()
-}
-
-/// 从 XML 自闭合标签中提取属性值（如 `<msg label="xxx" poiname="yyy"/>`）。
-pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
-    let pattern = format!(r#"{}=""#, attr);
-    let start = xml.find(&pattern)?;
-    let value_start = start + pattern.len();
-    if value_start >= xml.len() {
-        return None;
-    }
-    let rest = &xml[value_start..];
-    if !rest.starts_with('"') {
-        return None;
-    }
-    let rest = &rest[1..]; // skip opening "
-    let end = rest.find('"')?;
-    let value = rest[..end].to_string();
-    if value.is_empty() { None } else { Some(value) }
-}
-
-/// Try to ZLIB-decompress a byte slice into a UTF-8 string.
-/// Used when WCDB_CT_message_content = 4 (compressed content).
-pub fn try_decompress(raw: &[u8]) -> Option<String> {
-    let mut decoder = ZlibDecoder::new(raw);
-    let mut s = String::new();
-    decoder.read_to_string(&mut s).ok()?;
-    if s.is_empty() { None } else { Some(s) }
-}
 
 /// Parse sender tgid from message content ("tgid_xxx:\nmessage" or "tgid_xxx: message").
 /// Returns (sender_id, clean_content).
@@ -469,10 +424,8 @@ mod tests {
 
     #[test]
     fn test_decode_compressed_content() {
-        // wcdb_ct=4 is handled at DB layer (decompressed before decode_message).
-        // If decompression fails or wasn't needed, content passes through normally.
         let decoded = decode_message(1, "some content", "Alice", Some(4), |id| id.to_string());
-        assert_eq!(decoded.content, "some content");
+        assert_eq!(decoded.content, "[压缩内容]");
     }
 
     #[test]
@@ -516,9 +469,9 @@ mod tests {
     #[test]
     fn test_extract_xml_tag_simple() {
         let xml = "<msg><title>Test Title</title><url>https://example.com</url></msg>";
-        assert_eq!(extract_xml_tag(xml, "title"), Some("Test Title".to_string()));
-        assert_eq!(extract_xml_tag(xml, "url"), Some("https://example.com".to_string()));
-        assert_eq!(extract_xml_tag(xml, "nonexist"), None);
+        assert_eq!(crate::media::extract_xml_tag(xml, "title"), Some("Test Title".to_string()));
+        assert_eq!(crate::media::extract_xml_tag(xml, "url"), Some("https://example.com".to_string()));
+        assert_eq!(crate::media::extract_xml_tag(xml, "nonexist"), None);
     }
 
     #[test]
