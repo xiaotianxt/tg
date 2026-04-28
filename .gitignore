@@ -12,3 +12,4 @@ all_keys.json
 *.kvdb
 *.kvdb-shm
 *.kvdb-wal
+.claude/worktrees/
