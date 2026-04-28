@@ -68,10 +68,20 @@ impl VideoInfo {
 /// Parsed info about a sticker message (type 47).
 #[derive(Debug, Clone, Default)]
 pub struct StickerInfo {
+    pub md5: String,
+    pub aes_key: String,
     pub product_id: String,
     pub url: String,
+    pub cdn_url: String,
+    pub encrypt_url: String,
+    pub extern_url: String,
+    pub extern_md5: String,
+    pub thumb_url: String,
     pub pack_name: String,
     pub pack_url: String,
+    pub len: u64,
+    pub width: u32,
+    pub height: u32,
     pub has_emojibuf: bool,
 }
 
@@ -177,10 +187,20 @@ pub(crate) fn parse_video_info(xml: &str) -> VideoInfo {
 
 pub(crate) fn parse_sticker_info(xml: &str) -> StickerInfo {
     let mut info = StickerInfo::default();
+    if let Some(v) = extract_xml_attr(xml, "md5") { info.md5 = v; }
+    if let Some(v) = extract_xml_attr(xml, "aeskey") { info.aes_key = v; }
     if let Some(v) = extract_xml_attr(xml, "productid") { info.product_id = v; }
     if let Some(v) = extract_xml_attr(xml, "url") { info.url = v; }
+    if let Some(v) = extract_xml_attr(xml, "cdnurl") { info.cdn_url = v; }
+    if let Some(v) = extract_xml_attr(xml, "encrypturl") { info.encrypt_url = v; }
+    if let Some(v) = extract_xml_attr(xml, "externurl") { info.extern_url = v; }
+    if let Some(v) = extract_xml_attr(xml, "externmd5") { info.extern_md5 = v; }
+    if let Some(v) = extract_xml_attr(xml, "thumburl") { info.thumb_url = v; }
     if let Some(v) = extract_xml_tag(xml, "packname") { info.pack_name = v; }
     if let Some(v) = extract_xml_attr(xml, "packurl") { info.pack_url = v; }
+    if let Some(v) = extract_xml_attr(xml, "len").and_then(|s| s.parse().ok()) { info.len = v; }
+    if let Some(v) = extract_xml_attr(xml, "width").and_then(|s| s.parse().ok()) { info.width = v; }
+    if let Some(v) = extract_xml_attr(xml, "height").and_then(|s| s.parse().ok()) { info.height = v; }
     info.has_emojibuf = xml.contains("<emojibuf>");
     info
 }
@@ -283,6 +303,30 @@ pub fn find_cached_media(
     None
 }
 
+pub fn find_cached_sticker(base_path: &Path, md5: &str) -> Option<PathBuf> {
+    let md5 = md5.trim().to_lowercase();
+    if md5.len() < 2 {
+        return None;
+    }
+
+    let cache_dir = base_path.join("cache");
+    if !cache_dir.is_dir() {
+        return None;
+    }
+
+    let prefix = &md5[..2];
+    if let Ok(months) = fs::read_dir(&cache_dir) {
+        for month in months.flatten() {
+            let candidate = month.path().join("Emoticon").join(prefix).join(&md5);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    find_file_named(&cache_dir, &md5)
+}
+
 fn find_file_containing(dir: &Path, substr: &str) -> Option<PathBuf> {
     let lower = substr.to_lowercase();
     let mut best: Option<PathBuf> = None;
@@ -326,6 +370,47 @@ fn find_file_containing(dir: &Path, substr: &str) -> Option<PathBuf> {
     best
 }
 
+fn find_file_named(dir: &Path, target: &str) -> Option<PathBuf> {
+    fn walk(dir: &Path, target: &str) -> Option<PathBuf> {
+        let entries = fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk(&path, target) {
+                    return Some(found);
+                }
+            } else {
+                let name = path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if name == target {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+
+    walk(dir, target)
+}
+
+pub fn decrypt_sticker_aes_cbc(data: &[u8], aes_key_hex: &str) -> Option<Vec<u8>> {
+    use aes::Aes128;
+    use cbc::Decryptor;
+    use cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+
+    let key = hex::decode(aes_key_hex).ok()?;
+    if key.len() != 16 || data.is_empty() || data.len() % 16 != 0 {
+        return None;
+    }
+
+    let mut buf = data.to_vec();
+    let cipher = Decryptor::<Aes128>::new_from_slices(&key, &key).ok()?;
+    let plaintext = cipher.decrypt_padded_mut::<Pkcs7>(&mut buf).ok()?;
+    Some(plaintext.to_vec())
+}
+
 pub fn export_media_file(
     src: &Path,
     output_dir: &Path,
@@ -356,16 +441,29 @@ fn sanitize_filename(s: &str) -> String {
 // ===== XML helpers (reused from message.rs) =====
 
 pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
-    let pattern = format!(r#"{}=""#, attr);
-    let start = xml.find(&pattern)?;
-    let value_start = start + pattern.len();
-    if value_start >= xml.len() { return None; }
-    let rest = &xml[value_start..];
-    if !rest.starts_with('"') { return None; }
-    let rest = &rest[1..];
-    let end = rest.find('"')?;
-    let value = rest[..end].to_string();
-    if value.is_empty() { None } else { Some(value) }
+    let pattern = format!("{}=\"", attr);
+    let mut search_from = 0;
+
+    while let Some(relative_start) = xml[search_from..].find(&pattern) {
+        let start = search_from + relative_start;
+        let has_attr_boundary = xml[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c == '<' || c.is_whitespace());
+        if !has_attr_boundary {
+            search_from = start + 1;
+            continue;
+        }
+
+        let value_start = start + pattern.len();
+        if value_start >= xml.len() { return None; }
+        let rest = &xml[value_start..];
+        let end = rest.find('"')?;
+        let value = decode_xml_entities(&rest[..end]);
+        return if value.is_empty() { None } else { Some(value) };
+    }
+
+    None
 }
 
 pub(crate) fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
@@ -376,11 +474,48 @@ pub(crate) fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     if value_start >= xml.len() { return None; }
     let rest = &xml[value_start..];
     let value_end = rest.find(&close)?;
-    let value = rest[..value_end].trim().to_string();
+    let value = decode_xml_entities(rest[..value_end].trim());
     if value.is_empty() { None } else { Some(value) }
 }
 
 pub(crate) fn extract_xml_tag_int(xml: &str, tag: &str) -> Option<i64> {
     let text = extract_xml_tag(xml, tag)?;
     text.parse::<i64>().ok()
+}
+
+fn decode_xml_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_xml_attr_exact_name_and_empty_value() {
+        let xml = r#"<emoji productid="" cdnurl="http://x.test/a?m=1&amp;n=2" externurl=""></emoji>"#;
+        assert_eq!(extract_xml_attr(xml, "productid"), None);
+        assert_eq!(extract_xml_attr(xml, "url"), None);
+        assert_eq!(
+            extract_xml_attr(xml, "cdnurl").as_deref(),
+            Some("http://x.test/a?m=1&n=2")
+        );
+    }
+
+    #[test]
+    fn test_parse_sticker_info_core_fields() {
+        let xml = r#"<emoji md5="abc123" len="4963" cdnurl="http://x.test/a.gif" encrypturl="http://x.test/e" aeskey="00112233445566778899aabbccddeeff" width="48" height="47"></emoji>"#;
+        let info = parse_sticker_info(xml);
+        assert_eq!(info.md5, "abc123");
+        assert_eq!(info.aes_key, "00112233445566778899aabbccddeeff");
+        assert_eq!(info.cdn_url, "http://x.test/a.gif");
+        assert_eq!(info.encrypt_url, "http://x.test/e");
+        assert_eq!(info.len, 4963);
+        assert_eq!(info.width, 48);
+        assert_eq!(info.height, 47);
+    }
 }

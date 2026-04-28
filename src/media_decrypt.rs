@@ -21,7 +21,9 @@
 //! aesCipherLen = if aesLen % 16 == 0 { aesLen + 16 } else { (aesLen + 15) / 16 * 16 }
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use crate::media_key::MediaKeys;
 
 /// Magic bytes for V2 .dat files.
@@ -38,14 +40,20 @@ pub fn detect_ext(data: &[u8]) -> &'static str {
         "png"
     } else if data.len() >= 2 && data[..2] == [0xFF, 0xD8] {
         "jpg"
-    } else if data.len() >= 4 && data[..4] == [0x52, 0x49, 0x46, 0x46] {
+    } else if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
         "webp"
-    } else if data.len() >= 4 && data[..4] == [0x00, 0x00, 0x00, 0x18] {
-        "mp4"  // ftypmp4
-    } else if data.len() >= 4 && data[..4] == [0x66, 0x74, 0x79, 0x70] {
-        "mp4"  // ftyp
-    } else if data.len() >= 4 && data[..4] == [0x47, 0x49, 0x46, 0x38] {
+    } else if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        match &data[8..12] {
+            b"avif" | b"avis" => "avif",
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1" | b"msf1" => "heic",
+            _ => "mp4",
+        }
+    } else if data.len() >= 4 && &data[..4] == b"GIF8" {
         "gif"
+    } else if data.len() >= 2 && data[..2] == [0x42, 0x4D] {
+        "bmp"
+    } else if data.len() >= 4 && &data[..4] == b"tggf" {
+        "tggf"
     } else {
         "bin"
     }
@@ -95,12 +103,110 @@ pub fn decrypt_v2_dat(src: &Path, dest: &Path, keys: &MediaKeys) -> Result<&'sta
     result.extend(xored.iter().map(|b| b ^ keys.xor_key));
 
     // Detect extension and write
-    let ext = detect_ext(&result[..plaintext_len.min(16)]);
+    let mut ext = detect_ext(&result[..plaintext_len.min(result.len())]);
+    let output = if ext == "tggf" {
+        let jpg = convert_tggf_to_jpg(&result)?;
+        ext = "jpg";
+        jpg
+    } else {
+        result
+    };
+
     let parent = dest.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent).map_err(|e| format!("Create dir {}: {}", parent.display(), e))?;
-    fs::write(dest, &result).map_err(|e| format!("Write {}: {}", dest.display(), e))?;
+    fs::write(dest, &output).map_err(|e| format!("Write {}: {}", dest.display(), e))?;
 
     Ok(ext)
+}
+
+pub fn convert_tggf_to_jpg(data: &[u8]) -> Result<Vec<u8>, String> {
+    let hevc = find_tggf_hevc_partition(data)
+        .ok_or_else(|| "tggf HEVC partition not found".to_string())?;
+
+    let ffmpeg = std::env::var("TGREADER_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
+    let mut child = Command::new(&ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "hevc",
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("run ffmpeg for tggf: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(hevc)
+            .map_err(|e| format!("write tggf HEVC to ffmpeg: {}", e))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("wait for ffmpeg: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg tggf decode failed: {}", stderr.trim()));
+    }
+    if detect_ext(&output.stdout) != "jpg" {
+        return Err("ffmpeg tggf output is not JPEG".to_string());
+    }
+
+    Ok(output.stdout)
+}
+
+fn find_tggf_hevc_partition(data: &[u8]) -> Option<&[u8]> {
+    if detect_ext(data) != "tggf" || data.len() < 8 {
+        return None;
+    }
+
+    let header_len = data[4] as usize;
+    let start_at = header_len.clamp(4, data.len());
+    let mut best: Option<(usize, usize)> = None;
+    let mut i = start_at;
+
+    while i + 3 < data.len() {
+        let is_start_code = data[i..].starts_with(&[0, 0, 0, 1]) || data[i..].starts_with(&[0, 0, 1]);
+        if is_start_code && i >= 4 {
+            let len = u32::from_be_bytes([data[i - 4], data[i - 3], data[i - 2], data[i - 1]]) as usize;
+            if len > 0 && i + len <= data.len() {
+                match best {
+                    Some((_, best_len)) if best_len >= len => {}
+                    _ => best = Some((i, len)),
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if let Some((offset, len)) = best {
+        Some(&data[offset..offset + len])
+    } else {
+        find_start_code(data, start_at).map(|offset| &data[offset..])
+    }
+}
+
+fn find_start_code(data: &[u8], start_at: usize) -> Option<usize> {
+    let mut i = start_at;
+    while i + 3 < data.len() {
+        if data[i..].starts_with(&[0, 0, 0, 1]) || data[i..].starts_with(&[0, 0, 1]) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn aes_ecb_decrypt(data: &[u8], key: &[u8; 16]) -> Vec<u8> {
@@ -148,6 +254,11 @@ mod tests {
     fn test_detect_ext() {
         assert_eq!(detect_ext(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00]), "jpg");
         assert_eq!(detect_ext(&[0x89, 0x50, 0x4E, 0x47, 0x0D]), "png");
+        assert_eq!(detect_ext(b"GIF89a"), "gif");
+        assert_eq!(detect_ext(b"RIFF\x00\x00\x00\x00WEBP"), "webp");
+        assert_eq!(detect_ext(b"\x00\x00\x00\x18ftypmp42"), "mp4");
+        assert_eq!(detect_ext(b"\x00\x00\x00\x18ftypavif"), "avif");
+        assert_eq!(detect_ext(b"tggf\x13\x00\x00\x00"), "tggf");
     }
 
     #[test]
@@ -156,5 +267,16 @@ mod tests {
         assert_eq!(pkcs7_unpad(b"no padding  "), b"no padding  "); // 0x20 != 16
         assert_eq!(pkcs7_unpad(b"hello\x01"), b"hello");
         assert_eq!(pkcs7_unpad(b""), b"");
+    }
+
+    #[test]
+    fn test_find_tggf_hevc_partition() {
+        let hevc = b"\x00\x00\x00\x01\x40\x01\x0c\x01";
+        let mut data = b"tggf\x08abc".to_vec();
+        data.extend_from_slice(&(hevc.len() as u32).to_be_bytes());
+        data.extend_from_slice(hevc);
+        data.extend_from_slice(b"tail");
+
+        assert_eq!(find_tggf_hevc_partition(&data), Some(&hevc[..]));
     }
 }

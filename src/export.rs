@@ -1,6 +1,8 @@
 use rusqlite::Connection;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::db;
 use crate::media;
@@ -211,6 +213,24 @@ pub fn export_messages(
                 }
             }
         }
+
+        for m in &all_messages {
+            if m.msg_type != 47 {
+                continue;
+            }
+
+            let index = exported + 1;
+            match export_sticker_message(m, &telegram_base, mdir, &username, index) {
+                Ok(path) => {
+                    println!("  Media #{}: {}", index, path.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
+                    exported += 1;
+                }
+                Err(e) => {
+                    eprintln!("  Sticker #{} export failed: {}", index, e);
+                }
+            }
+        }
+
         if exported > 0 {
             println!("Exported {} media files", exported);
         }
@@ -239,16 +259,29 @@ fn try_protobuf_identifier(data: &[u8]) -> Option<String> {
 
 /// Extract attribute value from XML-like string within content.
 fn extract_xml_attr_str(content: &str, attr: &str) -> Option<String> {
-    let pattern = format!(r#"{}=""#, attr);
-    let start = content.find(&pattern)?;
-    let value_start = start + pattern.len();
-    if value_start >= content.len() { return None; }
-    let rest = &content[value_start..];
-    if !rest.starts_with('"') { return None; }
-    let rest = &rest[1..];
-    let end = rest.find('"')?;
-    let value = rest[..end].to_string();
-    if value.is_empty() { None } else { Some(value) }
+    let pattern = format!("{}=\"", attr);
+    let mut search_from = 0;
+
+    while let Some(relative_start) = content[search_from..].find(&pattern) {
+        let start = search_from + relative_start;
+        let has_attr_boundary = content[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c == '<' || c.is_whitespace());
+        if !has_attr_boundary {
+            search_from = start + 1;
+            continue;
+        }
+
+        let value_start = start + pattern.len();
+        if value_start >= content.len() { return None; }
+        let rest = &content[value_start..];
+        let end = rest.find('"')?;
+        let value = rest[..end].to_string();
+        return if value.is_empty() { None } else { Some(value) };
+    }
+
+    None
 }
 
 fn export_txt(path: &Path, username: &str, display_name: &str, messages: &[ExportMessage]) -> Result<(), String> {
@@ -332,6 +365,149 @@ fn export_media_with_decrypt(
 
     // Plain copy for non-.dat files or when keys are unavailable
     media::export_media_file(src, output_dir, session_name, &format!("{}_{}", cat_name, msg_type), index)
+}
+
+fn export_sticker_message(
+    message: &ExportMessage,
+    telegram_base: &Path,
+    output_dir: &Path,
+    session_name: &str,
+    index: usize,
+) -> Result<PathBuf, String> {
+    let info = media::parse_sticker_info(&message.raw_content);
+    if info.md5.is_empty()
+        && info.url.is_empty()
+        && info.cdn_url.is_empty()
+        && info.encrypt_url.is_empty()
+        && info.extern_url.is_empty()
+        && info.thumb_url.is_empty()
+    {
+        return Err("no sticker md5 or URL in message XML".to_string());
+    }
+
+    if !info.md5.is_empty() {
+        if let Some(src) = media::find_cached_sticker(telegram_base, &info.md5) {
+            let data = std::fs::read(&src)
+                .map_err(|e| format!("Read cached sticker {}: {}", src.display(), e))?;
+            if let Some(path) = write_sticker_candidate(&data, &info, output_dir, session_name, index)? {
+                return Ok(path);
+            }
+        }
+    }
+
+    let mut tried_urls = HashSet::new();
+    for url in [&info.cdn_url, &info.extern_url, &info.url, &info.thumb_url] {
+        if url.is_empty() || !tried_urls.insert(url.clone()) {
+            continue;
+        }
+        match download_url(url) {
+            Ok(data) => {
+                if let Some(path) = write_sticker_candidate(&data, &info, output_dir, session_name, index)? {
+                    return Ok(path);
+                }
+            }
+            Err(e) => eprintln!("  Sticker download skipped: {}", e),
+        }
+    }
+
+    if !info.encrypt_url.is_empty() && tried_urls.insert(info.encrypt_url.clone()) {
+        let data = download_url(&info.encrypt_url)?;
+        if let Some(path) = write_sticker_candidate(&data, &info, output_dir, session_name, index)? {
+            return Ok(path);
+        }
+    }
+
+    let id = if info.md5.is_empty() { "unknown" } else { &info.md5 };
+    Err(format!("cannot decode sticker {}", id))
+}
+
+fn write_sticker_candidate(
+    data: &[u8],
+    info: &media::StickerInfo,
+    output_dir: &Path,
+    session_name: &str,
+    index: usize,
+) -> Result<Option<PathBuf>, String> {
+    let ext = crate::media_decrypt::detect_ext(data);
+    if ext == "tggf" {
+        let jpg = crate::media_decrypt::convert_tggf_to_jpg(data)?;
+        return write_sticker_bytes(&jpg, "jpg", output_dir, session_name, index).map(Some);
+    }
+    if ext != "bin" {
+        return write_sticker_bytes(data, ext, output_dir, session_name, index).map(Some);
+    }
+
+    if !info.aes_key.is_empty() {
+        if let Some(decoded) = media::decrypt_sticker_aes_cbc(data, &info.aes_key) {
+            let ext = crate::media_decrypt::detect_ext(&decoded);
+            if ext == "tggf" {
+                let jpg = crate::media_decrypt::convert_tggf_to_jpg(&decoded)?;
+                return write_sticker_bytes(&jpg, "jpg", output_dir, session_name, index).map(Some);
+            }
+            if ext != "bin" {
+                return write_sticker_bytes(&decoded, ext, output_dir, session_name, index).map(Some);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn write_sticker_bytes(
+    data: &[u8],
+    ext: &str,
+    output_dir: &Path,
+    session_name: &str,
+    index: usize,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(output_dir)
+        .map_err(|e| format!("Cannot create media dir: {}", e))?;
+
+    let filename = format!(
+        "{}_Sticker_47_{:04}.{}",
+        sanitize_filename(session_name),
+        index,
+        ext
+    );
+    let dest = output_dir.join(filename);
+    std::fs::write(&dest, data)
+        .map_err(|e| format!("Write sticker {}: {}", dest.display(), e))?;
+    Ok(dest)
+}
+
+fn download_url(url: &str) -> Result<Vec<u8>, String> {
+    let url = url.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!("unsupported URL: {}", url));
+    }
+
+    let output = Command::new("curl")
+        .args([
+            "--fail",
+            "--location",
+            "--max-time",
+            "20",
+            "--max-filesize",
+            "52428800",
+            "--retry",
+            "2",
+            "--compressed",
+            "--silent",
+            "--show-error",
+            url,
+        ])
+        .output()
+        .map_err(|e| format!("run curl: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("curl failed for {}: {}", url, stderr.trim()));
+    }
+    if output.stdout.is_empty() {
+        return Err(format!("empty response from {}", url));
+    }
+
+    Ok(output.stdout)
 }
 
 fn sanitize_filename(s: &str) -> String {
