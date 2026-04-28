@@ -1,10 +1,8 @@
-use md5::{Md5, Digest};
 use rusqlite::Connection;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::db;
-use crate::media;
 use crate::message;
 
 #[derive(serde::Serialize)]
@@ -18,70 +16,18 @@ struct ExportMessage {
     content: String,
 }
 
-/// Tracks a media message for later file export.
-struct MediaItem {
-    msg_type: i64,
-    raw_content: String,
-    seq: usize,
-}
-
-/// Find message database files
-fn get_message_dbs(decrypted_dir: &Path) -> Vec<PathBuf> {
-    let msg_dir = decrypted_dir.join("message");
-    let mut dbs = Vec::new();
-    if msg_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&msg_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = path.file_name()
-                    .and_then(|n| n.to_str()).unwrap_or("");
-                if name.starts_with("message_") && name.ends_with(".db") && !name.contains("fts") {
-                    dbs.push(path);
-                }
-            }
-        }
-    }
-    dbs.sort();
-    dbs
-}
-
 /// Export messages for a session.
 pub fn export_messages(
     decrypted_dir: &Path,
     session_query: &str,
     format: &str,
     output_dir: &Path,
-    media_dir: Option<&Path>,
 ) -> Result<Vec<(&'static str, PathBuf)>, String> {
-    let (contact_db, _) = {
-        let contact_db = decrypted_dir.join("contact/contact.db");
-        let contact_db = if contact_db.exists() { Some(contact_db) }
-            else { None };
-        let msg_dbs = get_message_dbs(decrypted_dir);
-        (contact_db, msg_dbs)
-    };
+    let (contact_db, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
+    let contact_db_path = contact_db.as_deref();
 
     // Resolve session username
-    let contact_db_path = contact_db.as_deref();
-    let username = if session_query.starts_with("tgid_") || session_query.starts_with("gh_") || session_query.contains("@chatroom") {
-        session_query.to_string()
-    } else if let Some(db_path) = contact_db_path {
-        let contacts = db::load_contacts(db_path).map_err(|e| format!("Load contacts: {}", e))?;
-        if let Some(c) = contacts.get(session_query) {
-            c.username.clone()
-        } else {
-            // Fuzzy search
-            let results: Vec<_> = contacts.values()
-                .filter(|c| c.display.contains(session_query) || c.nick_name.contains(session_query))
-                .collect();
-            if results.is_empty() {
-                return Err(format!("No contact found matching '{}'", session_query));
-            }
-            results[0].username.clone()
-        }
-    } else {
-        session_query.to_string()
-    };
+    let username = db::resolve_username(session_query, contact_db_path)?;
 
     // Load contacts for display name
     let contacts = contact_db_path
@@ -92,14 +38,8 @@ pub fn export_messages(
         .unwrap_or(&username);
 
     // Table name
-    let mut hasher = Md5::new();
-    hasher.update(username.as_bytes());
-    let table_name = format!("Msg_{:x}", hasher.finalize());
-
-    let message_dbs = get_message_dbs(decrypted_dir);
+    let table_name = db::msg_table_name(&username);
     let mut all_messages: Vec<ExportMessage> = Vec::new();
-    let mut media_items: Vec<MediaItem> = Vec::new();
-    let mut seq: usize = 0;
     let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
 
     for db_path in &message_dbs {
