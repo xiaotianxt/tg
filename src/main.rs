@@ -115,7 +115,7 @@ fn main() {
 
     match cli.command {
         Commands::Keys { scanner, timeout } => {
-            let scanner_path = scanner.unwrap_or_else(|| PathBuf::from("./scanner_macos"));
+            let scanner_path = scanner.unwrap_or_else(scanner::default_scanner_path);
             match scanner::extract_keys(&scanner_path, timeout) {
                 Ok(path) => println!("Keys saved to: {}", path),
                 Err(e) => {
@@ -214,4 +214,3 @@ fn main() {
         }
     }
 }
-

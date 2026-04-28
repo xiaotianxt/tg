@@ -27,6 +27,62 @@ fn is_root() -> bool {
         .unwrap_or(false)
 }
 
+pub fn default_scanner_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let installed = dir.join("scanner_macos");
+            if installed.exists() {
+                return installed;
+            }
+        }
+    }
+
+    PathBuf::from("./scanner_macos")
+}
+
+fn real_home_dir() -> Option<PathBuf> {
+    if is_root() {
+        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            if !sudo_user.is_empty() && sudo_user != "root" {
+                return Some(PathBuf::from("/Users").join(sudo_user));
+            }
+        }
+    }
+
+    std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+fn find_db_storage_dir() -> Option<PathBuf> {
+    let home = real_home_dir()?;
+    let xtelegram_base = home.join("Library/Containers/com.telegram.xinTelegram/Data/Documents/xtelegram_files");
+    if !xtelegram_base.is_dir() {
+        return None;
+    }
+
+    for entry in std::fs::read_dir(&xtelegram_base).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let direct = path.join("db_storage");
+        if direct.is_dir() {
+            return Some(direct);
+        }
+
+        if let Ok(sub_entries) = std::fs::read_dir(&path) {
+            for sub_entry in sub_entries.flatten() {
+                let nested = sub_entry.path().join("db_storage");
+                if nested.is_dir() {
+                    return Some(nested);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Extract DB encryption keys from Telegram process memory.
 /// Runs the C scanner binary, wrapping with sudo if not already root.
 pub fn extract_keys(scanner_path: &Path, _timeout_secs: u64) -> Result<String, String> {
@@ -55,6 +111,9 @@ pub fn extract_keys(scanner_path: &Path, _timeout_secs: u64) -> Result<String, S
         Command::new(scanner_str.as_ref())
     };
     cmd.arg(format!("{}", pid));
+    if let Some(db_storage) = find_db_storage_dir() {
+        cmd.arg(db_storage);
+    }
 
     let output = cmd
         .output()
