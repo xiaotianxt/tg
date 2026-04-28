@@ -15,6 +15,7 @@ pub enum MessageType {
     Location,        // 48
     File,            // 62
     Call,            // 50
+    #[allow(dead_code)]
     ChatHistory,     // 引用聊天记录 (type 49 subtype)
     Music,           // 419430449
     Revoke,          // 10002 撤回消息
