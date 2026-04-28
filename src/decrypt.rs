@@ -9,6 +9,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::parallel;
+
 type Aes256CbcDec = Decryptor<Aes256>;
 
 const PAGE_SZ: usize = 4096;
@@ -47,6 +49,34 @@ pub struct DecryptConfig {
     pub since: Option<i64>,
     /// If true, suppress progress output.
     pub quiet: bool,
+    /// Number of parallel database jobs. 0 means auto.
+    pub jobs: usize,
+}
+
+struct DecryptTask {
+    rel_path: String,
+    full_path: PathBuf,
+    out_path: PathBuf,
+    enc_key: String,
+    size: u64,
+}
+
+enum DecryptOutcome {
+    Success {
+        file_stats: DecryptFileStats,
+        tables: Vec<String>,
+    },
+    VerifyFailed(String),
+    Failed(String),
+}
+
+enum DecryptPlanItem {
+    Skipped {
+        rel_path: String,
+        reason: &'static str,
+        counts_as_failed: bool,
+    },
+    Task(usize),
 }
 
 /// Derive the HMAC key from the encryption key and salt.
@@ -469,18 +499,14 @@ pub fn decrypt_all(
         log::info!("Found {} database files", db_files.len());
     }
 
-    let mut stats = DecryptStats {
-        success: 0,
-        failed: 0,
-        skipped: 0,
-        total: db_files.len(),
-    };
+    let mut plan = Vec::with_capacity(db_files.len());
+    let mut tasks = Vec::new();
 
-    for (rel_path, full_path, size) in &db_files {
+    for (rel_path, full_path, size) in db_files {
         // Look up key for this database
         let enc_key = keys.get(rel_path.as_str()).or_else(|| {
             // Also try without directory prefix
-            let basename = Path::new(rel_path)
+            let basename = Path::new(&rel_path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
@@ -489,33 +515,32 @@ pub fn decrypt_all(
                 .and_then(|k| keys.get(k))
         });
 
-        let enc_key = match enc_key {
-            Some(k) => k.get("enc_key"),
+        let enc_key = match enc_key.and_then(|k| k.get("enc_key")) {
+            Some(enc_key) => enc_key.clone(),
             None => {
-                if !config.quiet {
-                    log::info!("SKIP: {} (no key)", rel_path);
-                }
-                stats.failed += 1;
+                plan.push(DecryptPlanItem::Skipped {
+                    rel_path,
+                    reason: "no key",
+                    counts_as_failed: true,
+                });
                 continue;
             }
         };
 
-        let out_path = output_dir.join(rel_path);
+        let out_path = output_dir.join(&rel_path);
 
         // --since filter: skip source files not modified since the requested time
         if let Some(since_ts) = config.since {
-            if let Ok(meta) = fs::metadata(full_path) {
+            if let Ok(meta) = fs::metadata(&full_path) {
                 if let Ok(mtime) = meta.modified() {
                     if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
                         let mtime_ts = duration.as_secs() as i64;
                         if mtime_ts < since_ts {
-                            if !config.quiet {
-                                log::info!(
-                                    "SKIP: {} (not modified since requested time)",
-                                    rel_path
-                                );
-                            }
-                            stats.skipped += 1;
+                            plan.push(DecryptPlanItem::Skipped {
+                                rel_path,
+                                reason: "not modified since requested time",
+                                counts_as_failed: false,
+                            });
                             continue;
                         }
                     }
@@ -525,15 +550,16 @@ pub fn decrypt_all(
 
         // --incremental filter: skip if decrypted file is already up to date
         if config.incremental {
-            if let Ok(src_meta) = fs::metadata(full_path) {
+            if let Ok(src_meta) = fs::metadata(&full_path) {
                 if let Ok(src_mtime) = src_meta.modified() {
                     if let Ok(dec_meta) = fs::metadata(&out_path) {
                         if let Ok(dec_mtime) = dec_meta.modified() {
                             if dec_mtime >= src_mtime {
-                                if !config.quiet {
-                                    log::info!("SKIP: {} (up to date)", rel_path);
-                                }
-                                stats.skipped += 1;
+                                plan.push(DecryptPlanItem::Skipped {
+                                    rel_path,
+                                    reason: "up to date",
+                                    counts_as_failed: false,
+                                });
                                 continue;
                             }
                         }
@@ -542,24 +568,69 @@ pub fn decrypt_all(
             }
         }
 
-        let size_mb = *size as f64 / (1024.0 * 1024.0);
-        if !config.quiet {
-            log::info!("Decrypt: {} ({:.1}MB)", rel_path, size_mb);
-        }
-
-        match decrypt_database(
+        let task_index = tasks.len();
+        tasks.push(DecryptTask {
+            rel_path,
             full_path,
-            &out_path,
-            enc_key.map_or("", |v| v.as_str()),
+            out_path,
+            enc_key,
+            size,
+        });
+        plan.push(DecryptPlanItem::Task(task_index));
+    }
+
+    let jobs = parallel::job_count(config.jobs, 4);
+    let completed = parallel::map_ordered(tasks, jobs, |task| {
+        let outcome = match decrypt_database(
+            &task.full_path,
+            &task.out_path,
+            &task.enc_key,
             config.incremental,
         ) {
-            Ok(file_stats) => {
-                // Verify with SQLite
-                match verify_sqlite(&out_path) {
-                    Ok(tables) => {
-                        let table_list: Vec<&str> =
-                            tables.iter().take(5).map(|s| s.as_str()).collect();
+            Ok(file_stats) => match verify_sqlite(&task.out_path) {
+                Ok(tables) => DecryptOutcome::Success { file_stats, tables },
+                Err(e) => DecryptOutcome::VerifyFailed(format!("SQLite verify failed: {}", e)),
+            },
+            Err(e) => DecryptOutcome::Failed(format!("FAILED: {}", e)),
+        };
+        (task, outcome)
+    });
+
+    let mut stats = DecryptStats {
+        success: 0,
+        failed: 0,
+        skipped: 0,
+        total: plan.len(),
+    };
+
+    for item in plan {
+        match item {
+            DecryptPlanItem::Skipped {
+                rel_path,
+                reason,
+                counts_as_failed,
+            } => {
+                if !config.quiet {
+                    log::info!("SKIP: {} ({})", rel_path, reason);
+                }
+                if counts_as_failed {
+                    stats.failed += 1;
+                } else {
+                    stats.skipped += 1;
+                }
+            }
+            DecryptPlanItem::Task(task_index) => {
+                let (task, outcome) = &completed[task_index];
+                if !config.quiet {
+                    let size_mb = task.size as f64 / (1024.0 * 1024.0);
+                    log::info!("Decrypt: {} ({:.1}MB)", task.rel_path, size_mb);
+                }
+
+                match outcome {
+                    DecryptOutcome::Success { file_stats, tables } => {
                         if !config.quiet {
+                            let table_list: Vec<&str> =
+                                tables.iter().take(5).map(|s| s.as_str()).collect();
                             let mut message = if file_stats.reused_pages > 0 {
                                 format!(
                                     "OK! Pages: {}/{} decrypted, {} reused. Tables: {}",
@@ -578,19 +649,19 @@ pub fn decrypt_all(
                         }
                         stats.success += 1;
                     }
-                    Err(e) => {
+                    DecryptOutcome::VerifyFailed(message) => {
                         if !config.quiet {
-                            log::warn!("SQLite verify failed: {}", e);
+                            log::warn!("{}", message);
+                        }
+                        stats.failed += 1;
+                    }
+                    DecryptOutcome::Failed(message) => {
+                        if !config.quiet {
+                            log::error!("{}", message);
                         }
                         stats.failed += 1;
                     }
                 }
-            }
-            Err(e) => {
-                if !config.quiet {
-                    log::error!("FAILED: {}", e);
-                }
-                stats.failed += 1;
             }
         }
     }
