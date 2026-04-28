@@ -1,4 +1,5 @@
 //! Telegram 4.x V2 .dat media file decryption.
+#![allow(dead_code)]
 //!
 //! # V2 file format (15-byte header)
 //!

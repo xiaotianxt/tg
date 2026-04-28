@@ -17,6 +17,7 @@ pub struct MediaKeys {
     /// XOR byte for the tail section.
     pub xor_key: u8,
     /// The raw code from kvcomm filename.
+    #[allow(dead_code)]
     pub code: u64,
 }
 

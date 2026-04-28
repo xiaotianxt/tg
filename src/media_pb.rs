@@ -1,4 +1,5 @@
 //! Protobuf decoding for Telegram 4.x `packed_info_data` column.
+#![allow(dead_code)]
 
 pub mod wire {
     //! Minimal protobuf wire format decoder.
@@ -291,6 +292,7 @@ fn parse_file_meta(data: &[u8]) -> Option<FileMeta> {
 // Media file path resolution
 // ============================================================================
 
+#[allow(dead_code)]
 /// Time-based image path: `msg/attach/{md5(username)}/{YYYY-MM}/Img/{local_id}_{timestamp}_W.dat`
 pub fn image_path_by_time(username: &str, timestamp: i64, local_id: i64) -> String {
     let dir1 = md5_hex(username);
