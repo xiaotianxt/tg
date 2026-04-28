@@ -251,6 +251,7 @@ fn decode_link_content(content: &str) -> String {
             let name = crate::media::extract_xml_tag(content, "title").unwrap_or_else(|| "未知文件".to_string());
             format!("[文件] {}", name)
         }
+        57 => decode_quote_content(content),
         51 => {
             let title = crate::media::extract_xml_tag(content, "title").unwrap_or_else(|| "聊天记录".to_string());
             format!("[引用: {}]", title)
@@ -265,6 +266,38 @@ fn decode_link_content(content: &str) -> String {
                 format!("[卡片] {}", title)
             }
         }
+    }
+}
+
+fn decode_quote_content(content: &str) -> String {
+    let reply = crate::media::extract_xml_tag(content, "title").unwrap_or_default();
+    let quoted = crate::media::extract_xml_tag(content, "refermsg")
+        .map(|refermsg| decode_refermsg_content(&refermsg))
+        .unwrap_or_default();
+
+    match (quoted.is_empty(), reply.is_empty()) {
+        (false, false) => format!("> {}\n        {}", quoted, reply),
+        (false, true) => format!("> {}", quoted),
+        (true, false) => reply,
+        (true, true) => "[引用]".to_string(),
+    }
+}
+
+fn decode_refermsg_content(refermsg: &str) -> String {
+    let ref_type = crate::media::extract_xml_tag_int(refermsg, "type")
+        .map(|n| n as i32)
+        .unwrap_or(1);
+    let ref_content = crate::media::extract_xml_tag(refermsg, "content").unwrap_or_default();
+
+    if ref_content.is_empty() {
+        return format!("[{}]", MessageType::from(ref_type));
+    }
+
+    match ref_type {
+        1 => ref_content,
+        49 if ref_content.trim_start().starts_with('<') => decode_link_content(&ref_content),
+        _ if ref_content.trim_start().starts_with('<') => format!("[{}]", MessageType::from(ref_type)),
+        _ => ref_content,
     }
 }
 
@@ -460,5 +493,12 @@ mod tests {
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
         assert!(d.content.contains("链接"));
         assert!(d.content.contains("标题"));
+    }
+
+    #[test]
+    fn test_decode_quote_message() {
+        let xml = r#"<msg><appmsg><title>回复内容</title><type>57</type><refermsg><type>1</type><content>引用内容</content></refermsg></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "> 引用内容\n        回复内容");
     }
 }
