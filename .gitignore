@@ -1,0 +1,14 @@
+/target
+all_keys.json
+/decrypted
+/export
+/scanner_macos
+*.db
+*.db-shm
+*.db-wal
+*.db-first.material
+*.db-incremental.material
+*.db-last.material
+*.kvdb
+*.kvdb-shm
+*.kvdb-wal
