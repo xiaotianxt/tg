@@ -16,9 +16,6 @@ pub struct MediaKeys {
     pub aes_key: [u8; 16],
     /// XOR byte for the tail section.
     pub xor_key: u8,
-    /// The raw code from kvcomm filename.
-    #[allow(dead_code)]
-    pub code: u64,
 }
 
 /// Derive media decryption keys for the current Telegram account.
@@ -33,7 +30,7 @@ pub fn find_media_keys(telegram_base: &Path) -> Result<MediaKeys, String> {
     let xor_key = (code & 0xff) as u8;
     let aes_key = derive_aes_key(code, &clean_tgid);
 
-    Ok(MediaKeys { aes_key, xor_key, code })
+    Ok(MediaKeys { aes_key, xor_key })
 }
 
 /// Derive the 16-byte AES key as ASCII bytes.

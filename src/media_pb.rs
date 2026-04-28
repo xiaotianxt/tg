@@ -1,5 +1,4 @@
 //! Protobuf decoding for Telegram 4.x `packed_info_data` column.
-#![allow(dead_code)]
 
 pub mod wire {
     //! Minimal protobuf wire format decoder.
@@ -156,19 +155,6 @@ pub fn parse_img(data: &[u8]) -> Option<PackedInfoDataImg> {
     if r.filename.is_empty() { None } else { Some(r) }
 }
 
-/// Extract filename from packed_info_data (try both formats).
-pub fn extract_filename(data: &[u8]) -> Option<String> {
-    if let Some(v2) = parse_img2(data) {
-        if let Some(img) = v2.image { if !img.filename.is_empty() { return Some(img.filename); } }
-        if let Some(vid) = v2.video { if !vid.filename.is_empty() { return Some(vid.filename); } }
-        if let Some(f) = v2.file { if !f.filename.is_empty() { return Some(f.filename); } }
-    }
-    if let Some(v1) = parse_img(data) {
-        if !v1.filename.is_empty() { return Some(v1.filename); }
-    }
-    None
-}
-
 // ===== Display helpers =====
 
 pub fn display_image(meta: &ImageMeta) -> String {
@@ -197,14 +183,6 @@ pub fn display_video(meta: &VideoMeta) -> String {
         String::new()
     };
     format!("[视频{}{}]", dims, name)
-}
-
-pub fn display_audio(meta: &AudioMeta) -> String {
-    if !meta.audio_text.is_empty() {
-        format!("[语音] {}", meta.audio_text)
-    } else {
-        "[语音]".to_string()
-    }
 }
 
 // ===== Internal parsers =====
@@ -288,51 +266,6 @@ fn parse_file_meta(data: &[u8]) -> Option<FileMeta> {
     Some(r)
 }
 
-// ============================================================================
-// Media file path resolution
-// ============================================================================
-
-#[allow(dead_code)]
-/// Time-based image path: `msg/attach/{md5(username)}/{YYYY-MM}/Img/{local_id}_{timestamp}_W.dat`
-pub fn image_path_by_time(username: &str, timestamp: i64, local_id: i64) -> String {
-    let dir1 = md5_hex(username);
-    let ts = chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|t| t.format("%Y-%m").to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    format!("msg/attach/{}/{}/Img/{}_{}_W.dat", dir1, ts, local_id, timestamp)
-}
-
-/// Thumbnail path: `..._{timestamp}_t.dat`
-pub fn image_thumb_path_by_time(username: &str, timestamp: i64, local_id: i64) -> String {
-    let dir1 = md5_hex(username);
-    let ts = chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|t| t.format("%Y-%m").to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    format!("msg/attach/{}/{}/Img/{}_{}_t.dat", dir1, ts, local_id, timestamp)
-}
-
-/// Video path from packed_info_data: `msg/video/{YYYY-MM}/{filename}.mp4`
-pub fn video_path_by_time(filename: &str, timestamp: i64) -> String {
-    let ts = chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|t| t.format("%Y-%m").to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    format!("msg/video/{}/{}.mp4", ts, filename)
-}
-
-/// File path from packed_info_data: `msg/file/{YYYY-MM}/{filename}`
-pub fn file_path_by_time(filename: &str, timestamp: i64) -> String {
-    let ts = chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|t| t.format("%Y-%m").to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    format!("msg/file/{}/{}", ts, filename)
-}
-
-fn md5_hex(s: &str) -> String {
-    use md5::{Md5, Digest};
-    let hash = Md5::digest(s.as_bytes());
-    format!("{:x}", hash)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,11 +301,5 @@ mod tests {
         assert_eq!(parsed.filename, "pic.png");
     }
 
-    #[test]
-    fn test_image_path() {
-        let p = image_path_by_time("tgid_test", 1700000000, 123);
-        assert!(p.contains("msg/attach/"));
-        assert!(p.ends_with("_W.dat"));
-    }
 }
 

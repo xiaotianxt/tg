@@ -1,5 +1,4 @@
 //! Telegram 4.x V2 .dat media file decryption.
-#![allow(dead_code)]
 //!
 //! # V2 file format (15-byte header)
 //!
@@ -132,16 +131,6 @@ fn pkcs7_unpad(data: &[u8]) -> &[u8] {
         }
     }
     &data[..data.len() - pad_len]
-}
-
-/// Quick validation: decrypt the first AES block of a _t.dat file and check for image magic.
-pub fn validate_key(data: &[u8], keys: &MediaKeys) -> bool {
-    if data.len() < 31 {
-        return false;
-    }
-    let encrypted = &data[15..31]; // first 16-byte AES block
-    let decrypted = aes_ecb_decrypt(encrypted, &keys.aes_key);
-    decrypted.len() >= 2 && decrypted[0] == 0xFF && decrypted[1] == 0xD8
 }
 
 #[cfg(test)]
