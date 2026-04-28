@@ -1,53 +1,36 @@
 # tgreader
 
-macOS Telegram聊天记录读取 CLI 工具。直接从本机加密数据库中解密并读取Telegram聊天记录，无需手机备份。
+macOS 本地Telegram聊天记录读取 CLI。它用于在本机提取、解密、查询和导出Telegram聊天记录，无需手机备份。
 
-## 快速开始
+## 能做什么
 
-```bash
-# 一键安装
-brew install xiaotianxt/tgreader/tgreader
+- 从正在运行的Telegram进程中提取数据库密钥
+- 增量解密本地Telegram数据库到 `decrypted/`
+- 列出会话，按联系人、群名、tgid 读取消息
+- 按关键词或时间范围搜索聊天记录
+- 导出 `txt`、`csv`、`json`
+- 可选导出本地缓存中的图片、视频和表情
+- 全程本地运行，不上传聊天数据
 
-# 1. 从Telegram进程内存中提取数据库密钥（需 sudo）
-sudo tgreader keys
-
-# 2. 解密所有数据库
-tgreader decrypt          # 默认静默增量刷新，已解密且未变化的库会跳过
-tgreader decrypt --full   # 强制全量重解
-
-# 3. 查看聊天列表
-tgreader sessions
-
-# 4. 读取聊天记录
-tgreader messages "联系人名称"
-
-# 5. 导出聊天记录
-tgreader export "联系人名称" --format txt
-```
+面向 AI/自动化助手的能力说明见 [SKILL.md](SKILL.md)。
 
 ## 安装
 
-### 前置要求
-- macOS（支持Telegram 4.x）
-- SIP 需部分关闭或Telegram重新签名（用于 `task_for_pid`）
-
-### 方式一：Homebrew 安装
+### Homebrew
 
 ```bash
 brew install xiaotianxt/tgreader/tgreader
 ```
 
-安装完成后，`tgreader` 命令即可全局使用。如需从最新源码安装（开发版）：
+安装开发版：
 
 ```bash
 brew install --HEAD xiaotianxt/tgreader/tgreader
 ```
 
-### 方式二：从源码安装
+### 源码安装
 
-前置要求：
-- [Rust](https://rustup.rs/) 工具链
-- Xcode Command Line Tools（`xcode-select --install`）
+需要 Rust 工具链和 Xcode Command Line Tools。
 
 ```bash
 git clone https://github.com/xiaotianxt/tgreader.git
@@ -55,171 +38,128 @@ cd tgreader
 make install
 ```
 
-或用一键安装脚本（会自动配置 Claude Code skill）：
+安装到用户目录：
+
+```bash
+make install-local
+```
+
+一键安装脚本：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xiaotianxt/tgreader/main/scripts/install.sh | bash
 ```
 
-### 方式三：Claude Code Skill
+## 快速开始
 
-安装后，在 Claude Code 中可使用 `/tgreader` 加载技能，AI 即可理解并使用 tgreader：
+先确保Telegram正在运行。
 
 ```bash
-# 安装脚本会自动配置 skill，或在 Claude Code 中直接输入：
-/tgreader
+sudo tgreader keys
+tgreader decrypt
+tgreader sessions
+tgreader messages "联系人或群名" --limit 50
 ```
 
-skill 配置位于 `~/.claude/settings.json`，也可手动加载项目中的 `.claude/settings.json`。
+`keys` 需要读取Telegram进程内存，所以可能需要 sudo、部分关闭 SIP，或对Telegram重新签名以允许 `task_for_pid`。
 
-## 使用流程
+## 常用命令
 
-### 1. 提取密钥
-
-确保Telegram正在运行，执行：
+提取密钥：
 
 ```bash
 sudo tgreader keys
 ```
 
-这会扫描Telegram进程内存，自动匹配数据库文件的加密密钥，生成 `all_keys.json`。
-
-### 2. 解密数据库
+解密数据库：
 
 ```bash
 tgreader decrypt
+tgreader decrypt --full
+tgreader decrypt --since 1h --verbose
 ```
 
-自动检测Telegram数据库目录，使用提取的密钥静默增量解密 `.db` 文件。解密后的文件存放在 `decrypted/` 目录；已解密且未变化的库会跳过，变化过的库会按页复用未变化内容，并在旁边维护 `*.db.tgreader-pages` 页缓存。如需强制全量重解，使用 `--full`；如需查看进度，使用 `--verbose`。
-
-`sessions`、`messages`、`search`、`export` 会在读取 `decrypted/` 前自动静默刷新一次缓存；如果当前没有可用的 `all_keys.json` 或无法访问Telegram数据库，会继续读取已有的解密缓存。
-
-### 3. 查看会话
+查看会话：
 
 ```bash
 tgreader sessions
+tgreader sessions --top 50
 ```
 
-按消息数排序显示所有聊天会话，包含会话名称、消息数和时间范围。
-
-### 4. 读取消息
+读取消息：
 
 ```bash
-# 按昵称/备注搜索联系人
 tgreader messages "张三"
-
-# 指定消息数量
-tgreader messages "张三" --limit 20
-
-# 分页查询
-tgreader messages "张三" --limit 10 --offset 100
-
-# 关键词搜索
-tgreader messages "张三" --search "项目讨论"
+tgreader messages "张三" --limit 100
+tgreader messages "张三" --since today
+tgreader messages "张三" --since yesterday
+tgreader messages "张三" --search "项目"
+tgreader messages "张三" --head --limit 20
+tgreader messages "张三" --tail --limit 20
+tgreader messages "张三" --offset 100 --limit 50
 ```
 
-### 5. 全局搜索
+全局搜索：
 
 ```bash
 tgreader search "关键词"
+tgreader search "关键词" --limit 50
 ```
 
-跨所有会话搜索消息内容。
-
-### 6. 导出
+导出聊天：
 
 ```bash
-# 导出为文本
 tgreader export "张三" --format txt
-
-# 导出为 CSV（Excel 兼容）
-tgreader export "张三" --format csv
-
-# 导出为 JSON
-tgreader export "张三" --format json
-
-# 导出全部格式
-tgreader export "张三"
+tgreader export "张三" --format csv --output exported
+tgreader export "张三" --format json --output exported
 ```
 
-## 命令参考
-
-| 命令       | 功能                         |
-|-----------|------------------------------|
-| `keys`    | 从内存提取数据库密钥（需 sudo） |
-| `decrypt` | 静默增量解密加密数据库（`--full` 强制全量，`--verbose` 显示进度） |
-| `sessions`| 按消息数排序列出所有会话       |
-| `messages`| 分页读取指定会话消息           |
-| `search`  | 跨会话全文搜索                |
-| `export`  | 导出聊天记录到文件             |
-
-## 技术原理
-
-Telegram macOS 版使用 **SQLCipher 4** 加密 SQLite 数据库，存储在：
-
-```
-~/Library/Containers/com.telegram.xinTelegram/Data/.../db_storage/
-```
-
-tgreader 的工作流程：
-
-1. **内存扫描** — 通过 Mach VM API（`task_for_pid` + `mach_vm_read`）扫描Telegram进程内存，查找 WCDB 格式的密钥（`x'<64位十六进制密钥><32位十六进制盐>'`）
-2. **密钥匹配** — 将扫描到的密钥与数据库文件的盐值交叉匹配
-3. **数据库解密** — 逐页 AES-256-CBC 解密，HMAC-SHA512 验证完整性
-4. **数据读取** — 读取联系人表（`contact.db`）和消息表（`message_*.db`），将 tgid 解析为联系人昵称
-
-### 加密参数
-
-| 参数             | 值                           |
-|-----------------|------------------------------|
-| 加密算法         | AES-256-CBC                  |
-| 页面大小         | 4096 字节                    |
-| 保留区大小       | 80 字节（16 IV + 64 HMAC）   |
-| HMAC 算法        | HMAC-SHA512                  |
-| 密钥派生         | PBKDF2-HMAC-SHA512，2 轮迭代 |
-| 格式             | WCDB（Telegram Custom Database）|
-
-## 项目结构
-
-```
-tgreader/
-├── src/
-│   ├── main.rs       # CLI 入口（clap）
-│   ├── scanner.rs    # 密钥提取子进程调用
-│   ├── decrypt.rs    # SQLCipher 4 解密
-│   ├── db.rs         # 数据库读取与查询
-│   └── export.rs     # 消息导出（TXT/CSV/JSON）
-├── vendor/
-│   └── find_all_keys_macos.c  # Mach VM 内存扫描器
-├── .github/
-│   └── workflows/
-│       ├── ci.yml             # CI（build + test）
-│       └── release.yml        # 发布预编译二进制
-├── CLAUDE.md         # AI 辅助开发文档
-└── Cargo.toml
-```
-
-## AI Native
-
-本项目设计为 AI Native——配合 Claude Code 等 AI 编程助手使用体验最佳：
-
-- **`CLAUDE.md`** 包含完整的项目上下文，AI 可直接理解架构并辅助开发
-- 所有错误信息清晰可读，AI 能准确诊断问题
-- 命令输出结构化，便于 AI 解析和处理
+导出聊天并尝试导出本地缓存媒体：
 
 ```bash
-# 在 Claude Code 中直接提问：
-# "帮我读一下张三今天的聊天记录"
-# "搜索关于项目讨论的消息"
-# "把所有聊天导出为 JSON"
+tgreader export "张三" --format json --output exported --media-dir exported/media
 ```
 
-## 隐私说明
+媒体导出依赖Telegram本地缓存；缓存不存在时会跳过对应文件。
 
-- 所有操作在本地完成，不上传任何数据
-- 导出的聊天记录仅保存在你指定的目录
-- 数据库密钥仅存在于生成的 `all_keys.json` 中
-- 建议使用后将 `all_keys.json` 和 `decrypted/` 目录安全删除
+## 时间过滤
+
+`--since` 支持：
+
+- 日期：`2026-04-28`
+- 日期时间：`2026-04-28 09:30:00`
+- 相对时间：`5min`、`1h`、`2d`、`1w`
+- 命名时间：`today`、`yesterday`
+
+## 读取缓存
+
+`sessions`、`messages`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。
+
+## 开发
+
+```bash
+make build
+cargo test
+cargo build
+```
+
+项目入口是 `src/main.rs`。主要模块：
+
+- `src/scanner.rs`：调用密钥扫描器
+- `src/decrypt.rs`：数据库解密
+- `src/db.rs`：会话、联系人和消息查询
+- `src/message.rs`：消息类型解析
+- `src/media*.rs`：媒体元信息、缓存查找和解密
+- `src/export.rs`：导出
+- `vendor/find_all_keys_macos.c`：macOS Telegram进程扫描器
+
+## 隐私
+
+- `all_keys.json` 包含数据库密钥
+- `decrypted/` 包含解密后的数据库
+- `exported/` 或自定义导出目录包含聊天内容和媒体
+
+这些文件都应视为敏感数据。使用后可按需删除。
 
 ## License
 
