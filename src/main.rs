@@ -79,6 +79,9 @@ enum Commands {
         /// Show the latest N messages (newest appears last; uses --limit for count)
         #[arg(long)]
         tail: bool,
+        /// Show earliest messages instead of the default latest messages
+        #[arg(long, conflicts_with = "tail")]
+        head: bool,
     },
     /// Search across all sessions
     Search {
@@ -165,7 +168,7 @@ fn main() {
                 }
             }
         }
-        Commands::Messages { session, decrypted_dir, limit, offset, search, since, tail } => {
+        Commands::Messages { session, decrypted_dir, limit, offset, search, since, tail, head } => {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -173,7 +176,8 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            match db::read_messages(&decrypted_dir, &session, limit, offset, search.as_deref(), since_ts, tail) {
+            let use_tail = tail || (!head && offset == 0);
+            match db::read_messages(&decrypted_dir, &session, limit, offset, search.as_deref(), since_ts, use_tail) {
                 Ok(msg_count) => {
                     if msg_count == 0 {
                         println!("No messages found for '{}'. Use 'sessions' to list available sessions.", session);
