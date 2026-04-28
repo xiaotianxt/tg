@@ -22,7 +22,16 @@ const SQLITE_HDR: &[u8] = b"SQLite format 3\0";
 pub struct DecryptStats {
     pub success: usize,
     pub failed: usize,
+    pub skipped: usize,
     pub total: usize,
+}
+
+/// Configuration for decryption behavior.
+pub struct DecryptConfig {
+    /// If true, only decrypt files whose source mtime is newer than the decrypted file's mtime.
+    pub incremental: bool,
+    /// If set, only decrypt source files modified after this Unix timestamp.
+    pub since: Option<i64>,
 }
 
 /// Derive the HMAC key from the encryption key and salt.
@@ -264,6 +273,7 @@ pub fn decrypt_all(
     keys_path: &Path,
     output_dir: &Path,
     db_dir: Option<&Path>,
+    config: &DecryptConfig,
 ) -> Result<DecryptStats, String> {
     // Load keys
     let keys_json = fs::read_to_string(keys_path)
@@ -285,7 +295,7 @@ pub fn decrypt_all(
     let db_files = collect_db_files(&db_storage);
     println!("Found {} database files\n", db_files.len());
 
-    let mut stats = DecryptStats { success: 0, failed: 0, total: db_files.len() };
+    let mut stats = DecryptStats { success: 0, failed: 0, skipped: 0, total: db_files.len() };
 
     for (rel_path, full_path, size) in &db_files {
         // Look up key for this database
@@ -309,6 +319,40 @@ pub fn decrypt_all(
         };
 
         let out_path = output_dir.join(rel_path);
+
+        // --since filter: skip source files not modified since the requested time
+        if let Some(since_ts) = config.since {
+            if let Ok(meta) = fs::metadata(full_path) {
+                if let Ok(mtime) = meta.modified() {
+                    if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                        let mtime_ts = duration.as_secs() as i64;
+                        if mtime_ts < since_ts {
+                            println!("SKIP: {} (not modified since requested time)", rel_path);
+                            stats.skipped += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // --incremental filter: skip if decrypted file is already up to date
+        if config.incremental {
+            if let Ok(src_meta) = fs::metadata(full_path) {
+                if let Ok(src_mtime) = src_meta.modified() {
+                    if let Ok(dec_meta) = fs::metadata(&out_path) {
+                        if let Ok(dec_mtime) = dec_meta.modified() {
+                            if dec_mtime >= src_mtime {
+                                println!("SKIP: {} (up to date)", rel_path);
+                                stats.skipped += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let size_mb = *size as f64 / (1024.0 * 1024.0);
         print!("Decrypt: {} ({:.1}MB) ... ", rel_path, size_mb);
         std::io::Write::flush(&mut std::io::stdout()).ok();

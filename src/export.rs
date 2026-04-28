@@ -4,23 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::db;
-
-/// Message type names (must match db.rs)
-const MSG_TYPES: &[(i64, &str)] = &[
-    (1, "文本"), (3, "图片"), (34, "语音"), (42, "名片"),
-    (43, "视频"), (47, "表情"), (48, "位置"),
-    (49, "链接/文件/小程序"), (50, "语音/视频通话"),
-    (51, "系统消息"), (10000, "系统提示"), (10002, "撤回消息"),
-];
-
-const MEDIA_TYPES: &[i64] = &[3, 34, 43, 47];
-
-fn msg_type_name(t: i64) -> &'static str {
-    for (code, name) in MSG_TYPES {
-        if *code == t { return name; }
-    }
-    "未知"
-}
+use crate::message;
 
 #[derive(serde::Serialize)]
 struct ExportMessage {
@@ -147,34 +131,21 @@ pub fn export_messages(
                 .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_default();
 
-            // Resolve sender from content when possible
-            let sender = if local_type == 10000 || local_type == 10002 {
-                "系统".to_string()
-            } else {
-                let (sender_id, _) = crate::db::parse_sender_from_content(&content);
-                match sender_id {
-                    Some(id) => crate::db::resolve_sender_name(id, &contacts),
-                    None => display_name.to_string(),
-                }
-            };
-
-            let display_content = if MEDIA_TYPES.contains(&local_type) {
-                format!("[{}]", msg_type_name(local_type))
-            } else if content.is_empty() && local_type != 1 {
-                format!("[{}]", msg_type_name(local_type))
-            } else if wcdb_ct == Some(4) {
-                "[压缩内容]".to_string()
-            } else {
-                content
-            };
+            let decoded = message::decode_message(
+                local_type as i32,
+                &content,
+                display_name,
+                wcdb_ct,
+                |id| crate::db::resolve_sender_name(id, &contacts),
+            );
 
             all_messages.push(ExportMessage {
                 time: time_str,
                 timestamp: create_time,
-                sender,
+                sender: decoded.display_name,
                 msg_type: local_type,
-                type_name: msg_type_name(local_type).to_string(),
-                content: display_content,
+                type_name: decoded.msg_type.to_string(),
+                content: decoded.content,
             });
         }
     }

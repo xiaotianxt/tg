@@ -4,46 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs;
 
-const MSG_TYPES: &[(i64, &str)] = &[
-    (1, "文本"), (3, "图片"), (34, "语音"), (42, "名片"),
-    (43, "视频"), (47, "表情"), (48, "位置"),
-    (49, "链接/文件/小程序"), (50, "语音/视频通话"),
-    (51, "系统消息"), (10000, "系统提示"), (10002, "撤回消息"),
-];
-
-fn msg_type_name(t: i64) -> &'static str {
-    for (code, name) in MSG_TYPES {
-        if *code == t { return name; }
-    }
-    "未知"
-}
-
-fn is_media_type(t: i64) -> bool {
-    matches!(t, 3 | 34 | 43 | 47)
-}
-
-/// Parse sender tgid from message content ("tgid_xxx:\nmessage" or "tgid_xxx: message").
-/// Returns (sender_id, clean_content).
-pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
-    // Look for first colon that follows an alphanumeric ID pattern
-    for (i, c) in content.char_indices() {
-        if c != ':' { continue; }
-        if i == 0 { break; }
-        let prefix = &content[..i];
-        // Check if prefix looks like a Telegram ID
-        let is_id = prefix.starts_with("tgid_")
-            || prefix.starts_with("gh_")
-            || prefix.contains('@')
-            || prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-        if is_id && prefix.len() >= 3 {
-            let after = &content[i + 1..];
-            let after = after.trim_start_matches(|c| c == ' ' || c == '\n');
-            return (Some(prefix), after);
-        }
-        break; // first colon doesn't match, stop
-    }
-    (None, content)
-}
+use crate::message;
 
 /// Resolve a sender ID to a display name from contacts.
 pub fn resolve_sender_name(sender_id: &str, contacts: &HashMap<String, Contact>) -> String {
@@ -263,6 +224,8 @@ pub fn read_messages(
     limit: usize,
     offset: usize,
     search_query: Option<&str>,
+    since: Option<i64>,
+    tail: bool,
 ) -> Result<usize, String> {
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
 
@@ -295,19 +258,28 @@ pub fn read_messages(
             .map(|q| format!(" AND message_content LIKE '%{}'", q.replace('\'', "''")))
             .unwrap_or_default();
 
+        let since_clause = since
+            .map(|ts| format!(" AND create_time >= {}", ts))
+            .unwrap_or_default();
+
         // Get total count for this DB
-        let count_sql = format!("SELECT COUNT(*) FROM {} WHERE create_time > 0{}", table_name, search_clause);
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE create_time > 0{}{}",
+            table_name, search_clause, since_clause
+        );
         if let Ok(mut stmt) = conn.prepare(&count_sql) {
             if let Ok(cnt) = stmt.query_row([], |row| row.get::<_, i64>(0)) {
                 total_count += cnt as usize;
             }
         }
 
+        let order_dir = if tail { "DESC" } else { "ASC" };
+
         // Query messages - collect eagerly to avoid borrow issues
         let sql = format!(
             "SELECT local_type, create_time, message_content, WCDB_CT_message_content \
-             FROM {} WHERE create_time > 0{} ORDER BY create_time ASC",
-            table_name, search_clause
+             FROM {} WHERE create_time > 0{}{} ORDER BY create_time {}",
+            table_name, search_clause, since_clause, order_dir
         );
         let rows: Vec<(i64, i64, String, Option<i64>)> = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
@@ -334,8 +306,18 @@ pub fn read_messages(
         all_messages.extend(rows);
     }
 
-    all_messages.sort_by(|a, b| a.1.cmp(&b.1));
-    let messages: Vec<_> = all_messages.iter().skip(offset).take(limit).collect();
+    if tail {
+        // Query returned DESC, take `limit` latest and reverse for chronological display
+        all_messages.truncate(limit);
+        all_messages.reverse();
+    } else {
+        all_messages.sort_by(|a, b| a.1.cmp(&b.1));
+    }
+    let messages: Vec<_> = if tail {
+        all_messages.iter().collect()
+    } else {
+        all_messages.iter().skip(offset).take(limit).collect()
+    };
 
     if messages.is_empty() {
         if let Some(q) = search_query {
@@ -350,32 +332,26 @@ pub fn read_messages(
     if let Some(q) = search_query {
         println!("Search: '{}'", q);
     }
-    println!("Showing {}-{} of {} messages\n", offset + 1, offset + messages.len(), total_count);
+    if tail {
+        println!("Showing latest {} of {} messages\n", messages.len(), total_count);
+    } else {
+        println!("Showing {}-{} of {} messages\n", offset + 1, offset + messages.len(), total_count);
+    }
 
     for (local_type, create_time, content, wcdb_ct) in &messages {
         let time_str = chrono::DateTime::from_timestamp(*create_time, 0)
             .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
 
-        let (sender, display_content) = if *local_type == 10000 || *local_type == 10002 {
-            ("系统".to_string(), content.clone())
-        } else if is_media_type(*local_type) {
-            (display_name.to_string(), format!("[{}]", msg_type_name(*local_type)))
-        } else if content.is_empty() && *local_type != 1 {
-            (display_name.to_string(), format!("[{}]", msg_type_name(*local_type)))
-        } else if *wcdb_ct == Some(4) {
-            (display_name.to_string(), "[压缩内容]".to_string())
-        } else {
-            // Try to extract sender tgid and clean content
-            let (sender_id, clean) = parse_sender_from_content(content);
-            let sender = match sender_id {
-                Some(id) => resolve_sender_name(id, &contacts),
-                None => display_name.to_string(),
-            };
-            (sender, clean.to_string())
-        };
+        let decoded = message::decode_message(
+            *local_type as i32,
+            content,
+            display_name,
+            *wcdb_ct,
+            |id| resolve_sender_name(id, &contacts),
+        );
 
-        println!("[{}] {}: {}", time_str, sender, display_content);
+        println!("[{}] {}: {}", time_str, decoded.display_name, decoded.content);
     }
 
     println!("\n--- End of messages ---");
