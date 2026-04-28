@@ -135,6 +135,17 @@ tgreader export "张三" --format json --output exported --media-dir exported/me
 
 `sessions`、`messages`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。
 
+## 日志
+
+聊天记录、会话表格、搜索结果等命令结果写到 stdout。运行状态、警告和错误写到 stderr 日志。
+
+默认日志等级是 `info`。可以用 `TGREADER_LOG` 或 `RUST_LOG` 调整：
+
+```bash
+TGREADER_LOG=warn tgreader decrypt
+TGREADER_LOG=debug tgreader messages "张三"
+```
+
 ## 开发
 
 ```bash

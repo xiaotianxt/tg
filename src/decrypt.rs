@@ -459,14 +459,14 @@ pub fn decrypt_all(
     };
 
     if !config.quiet {
-        println!("DB storage directory: {}", db_storage.display());
-        println!("Loaded {} database keys", keys.len());
+        log::info!("DB storage directory: {}", db_storage.display());
+        log::info!("Loaded {} database keys", keys.len());
     }
 
     // Collect all .db files
     let db_files = collect_db_files(&db_storage);
     if !config.quiet {
-        println!("Found {} database files\n", db_files.len());
+        log::info!("Found {} database files", db_files.len());
     }
 
     let mut stats = DecryptStats {
@@ -493,7 +493,7 @@ pub fn decrypt_all(
             Some(k) => k.get("enc_key"),
             None => {
                 if !config.quiet {
-                    println!("SKIP: {} (no key)", rel_path);
+                    log::info!("SKIP: {} (no key)", rel_path);
                 }
                 stats.failed += 1;
                 continue;
@@ -510,7 +510,10 @@ pub fn decrypt_all(
                         let mtime_ts = duration.as_secs() as i64;
                         if mtime_ts < since_ts {
                             if !config.quiet {
-                                println!("SKIP: {} (not modified since requested time)", rel_path);
+                                log::info!(
+                                    "SKIP: {} (not modified since requested time)",
+                                    rel_path
+                                );
                             }
                             stats.skipped += 1;
                             continue;
@@ -528,7 +531,7 @@ pub fn decrypt_all(
                         if let Ok(dec_mtime) = dec_meta.modified() {
                             if dec_mtime >= src_mtime {
                                 if !config.quiet {
-                                    println!("SKIP: {} (up to date)", rel_path);
+                                    log::info!("SKIP: {} (up to date)", rel_path);
                                 }
                                 stats.skipped += 1;
                                 continue;
@@ -541,8 +544,7 @@ pub fn decrypt_all(
 
         let size_mb = *size as f64 / (1024.0 * 1024.0);
         if !config.quiet {
-            print!("Decrypt: {} ({:.1}MB) ... ", rel_path, size_mb);
-            std::io::Write::flush(&mut std::io::stdout()).ok();
+            log::info!("Decrypt: {} ({:.1}MB)", rel_path, size_mb);
         }
 
         match decrypt_database(
@@ -558,27 +560,27 @@ pub fn decrypt_all(
                         let table_list: Vec<&str> =
                             tables.iter().take(5).map(|s| s.as_str()).collect();
                         if !config.quiet {
-                            if file_stats.reused_pages > 0 {
-                                println!(
+                            let mut message = if file_stats.reused_pages > 0 {
+                                format!(
                                     "OK! Pages: {}/{} decrypted, {} reused. Tables: {}",
                                     file_stats.decrypted_pages,
                                     file_stats.total_pages,
                                     file_stats.reused_pages,
                                     table_list.join(", "),
-                                );
+                                )
                             } else {
-                                println!("OK! Tables: {}", table_list.join(", "));
-                            }
+                                format!("OK! Tables: {}", table_list.join(", "))
+                            };
                             if tables.len() > 5 {
-                                print!(" ... {} total", tables.len());
+                                message.push_str(&format!(" ... {} total", tables.len()));
                             }
-                            println!();
+                            log::info!("{}", message);
                         }
                         stats.success += 1;
                     }
                     Err(e) => {
                         if !config.quiet {
-                            println!("WARN: SQLite verify failed: {}", e);
+                            log::warn!("SQLite verify failed: {}", e);
                         }
                         stats.failed += 1;
                     }
@@ -586,7 +588,7 @@ pub fn decrypt_all(
             }
             Err(e) => {
                 if !config.quiet {
-                    println!("FAILED: {}", e);
+                    log::error!("FAILED: {}", e);
                 }
                 stats.failed += 1;
             }

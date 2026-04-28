@@ -164,12 +164,15 @@ pub fn export_messages(
         }
     }
 
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+
     // Export media files if requested
     if let Some(mdir) = media_dir {
         let telegram_base = match media::find_telegram_base_path() {
             Some(p) => p,
             None => {
-                eprintln!("Warning: Telegram data directory not found, media export skipped");
+                log::warn!("Telegram data directory not found, media export skipped");
                 return Ok(results);
             }
         };
@@ -177,7 +180,7 @@ pub fn export_messages(
         // Derive media decryption keys (V2 .dat)
         let media_keys = crate::media_key::find_media_keys(&telegram_base);
         if let Err(ref e) = media_keys {
-            eprintln!("Warning: cannot derive media decryption keys: {}", e);
+            log::warn!("Cannot derive media decryption keys: {}", e);
         }
         let media_keys = media_keys.ok();
 
@@ -203,11 +206,15 @@ pub fn export_messages(
                     let result = export_media_with_decrypt(&src, mdir, &username, cat_name, m.msg_type, index, media_keys.as_ref());
                     match result {
                         Ok(path) => {
-                            println!("  Media #{}: {}", index, path.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
+                            out.line(format_args!(
+                                "  Media #{}: {}",
+                                index,
+                                path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                            ))?;
                             exported += 1;
                         }
                         Err(e) => {
-                            eprintln!("  Media #{} export failed: {}", index, e);
+                            log::warn!("  Media #{} export failed: {}", index, e);
                         }
                     }
                 }
@@ -222,21 +229,31 @@ pub fn export_messages(
             let index = exported + 1;
             match export_sticker_message(m, &telegram_base, mdir, &username, index) {
                 Ok(path) => {
-                    println!("  Media #{}: {}", index, path.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
+                    out.line(format_args!(
+                        "  Media #{}: {}",
+                        index,
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                    ))?;
                     exported += 1;
                 }
                 Err(e) => {
-                    eprintln!("  Sticker #{} export failed: {}", index, e);
+                    log::warn!("  Sticker #{} export failed: {}", index, e);
                 }
             }
         }
 
         if exported > 0 {
-            println!("Exported {} media files", exported);
+            out.line(format_args!("Exported {} media files", exported))?;
         }
     }
 
-    println!("Exported {} messages for {} ({})", all_messages.len(), display_name, username);
+    out.line(format_args!(
+        "Exported {} messages for {} ({})",
+        all_messages.len(),
+        display_name,
+        username
+    ))?;
+    out.flush()?;
     Ok(results)
 }
 
@@ -406,7 +423,7 @@ fn export_sticker_message(
                     return Ok(path);
                 }
             }
-            Err(e) => eprintln!("  Sticker download skipped: {}", e),
+            Err(e) => log::warn!("  Sticker download skipped: {}", e),
         }
     }
 

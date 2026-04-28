@@ -34,3 +34,4 @@ tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
 zstd = "0.13"
+log = "0.4"

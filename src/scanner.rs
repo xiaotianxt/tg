@@ -94,12 +94,12 @@ pub fn extract_keys(scanner_path: &Path, _timeout_secs: u64) -> Result<String, S
     }
 
     let pid = find_telegram_pid().map_err(|e| format!("Cannot find Telegram process: {}", e))?;
-    println!("Telegram PID: {}", pid);
+    log::info!("Telegram PID: {}", pid);
 
     let needs_sudo = !is_root();
     if needs_sudo {
-        println!("Running key scanner (requires sudo)...");
-        println!("You may be prompted for your password.\n");
+        log::info!("Running key scanner (requires sudo)...");
+        log::info!("You may be prompted for your password.");
     }
 
     let scanner_str = scanner_path.to_string_lossy();
@@ -123,7 +123,7 @@ pub fn extract_keys(scanner_path: &Path, _timeout_secs: u64) -> Result<String, S
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     if !stderr.is_empty() {
-        eprintln!("[stderr] {}", stderr);
+        log::warn!("[stderr] {}", stderr.trim_end());
     }
 
     if !output.status.success() {
@@ -134,14 +134,14 @@ pub fn extract_keys(scanner_path: &Path, _timeout_secs: u64) -> Result<String, S
         ));
     }
 
-    println!("{}", stdout);
+    log::info!("{}", stdout.trim_end());
 
     let keys_path = PathBuf::from("all_keys.json");
     if keys_path.exists() {
         let content = std::fs::read_to_string(&keys_path)
             .map_err(|e| format!("Cannot read keys file: {}", e))?;
         let key_count = content.matches("\"enc_key\"").count();
-        println!("\nFound {} database keys.", key_count);
+        log::info!("Found {} database keys.", key_count);
         Ok(keys_path.to_string_lossy().to_string())
     } else {
         Err("all_keys.json not found. Key extraction may have failed.".to_string())

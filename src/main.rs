@@ -7,10 +7,19 @@ mod media_pb;
 mod media_decrypt;
 mod media_key;
 mod export;
+mod logger;
+mod output;
 mod time;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+fn print_output(args: std::fmt::Arguments<'_>) {
+    if let Err(e) = output::stdout_line(args) {
+        log::error!("Error: {}", e);
+        std::process::exit(1);
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "tgreader", version, about = "Read Telegram messages from local databases")]
@@ -134,15 +143,16 @@ fn refresh_decrypted_cache(decrypted_dir: &std::path::Path) {
 }
 
 fn main() {
+    logger::init();
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Keys { scanner, timeout } => {
             let scanner_path = scanner.unwrap_or_else(scanner::default_scanner_path);
             match scanner::extract_keys(&scanner_path, timeout) {
-                Ok(path) => println!("Keys saved to: {}", path),
+                Ok(path) => print_output(format_args!("Keys saved to: {}", path)),
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    log::error!("Error: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -151,7 +161,7 @@ fn main() {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
-                    eprintln!("Error parsing --since: {}", e);
+                    log::error!("Error parsing --since: {}", e);
                     std::process::exit(1);
                 }
             };
@@ -164,16 +174,16 @@ fn main() {
                 Ok(stats) => {
                     if verbose {
                         if stats.skipped > 0 {
-                            println!("Decryption complete: {} succeeded, {} failed, {} skipped, {} total",
+                            log::info!("Decryption complete: {} succeeded, {} failed, {} skipped, {} total",
                                 stats.success, stats.failed, stats.skipped, stats.total);
                         } else {
-                            println!("Decryption complete: {} succeeded, {} failed, {} total",
+                            log::info!("Decryption complete: {} succeeded, {} failed, {} total",
                                 stats.success, stats.failed, stats.total);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    log::error!("Error: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -183,11 +193,11 @@ fn main() {
             match db::list_sessions(&decrypted_dir, top) {
                 Ok(sessions) => {
                     if sessions.is_empty() {
-                        println!("No sessions found. Try running 'decrypt' first.");
+                        print_output(format_args!("No sessions found. Try running 'decrypt' first."));
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    log::error!("Error: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -196,7 +206,7 @@ fn main() {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
-                    eprintln!("Error parsing --since: {}", e);
+                    log::error!("Error parsing --since: {}", e);
                     std::process::exit(1);
                 }
             };
@@ -206,11 +216,14 @@ fn main() {
             match db::read_messages(&decrypted_dir, &session, limit, offset, search.as_deref(), since_ts, use_tail) {
                 Ok(msg_count) => {
                     if msg_count == 0 {
-                        println!("No messages found for '{}'. Use 'sessions' to list available sessions.", session);
+                        print_output(format_args!(
+                            "No messages found for '{}'. Use 'sessions' to list available sessions.",
+                            session
+                        ));
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    log::error!("Error: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -220,11 +233,11 @@ fn main() {
             match db::search_messages(&decrypted_dir, &query, limit) {
                 Ok(count) => {
                     if count == 0 {
-                        println!("No messages found for '{}'.", query);
+                        print_output(format_args!("No messages found for '{}'.", query));
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    log::error!("Error: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -233,13 +246,13 @@ fn main() {
             refresh_decrypted_cache(&decrypted_dir);
             match export::export_messages(&decrypted_dir, &session, &format, &output, media_dir.as_deref()) {
                 Ok(paths) => {
-                    println!("Exported to:");
+                    print_output(format_args!("Exported to:"));
                     for (fmt, path) in paths {
-                        println!("  [{}] {}", fmt, path.display());
+                        print_output(format_args!("  [{}] {}", fmt, path.display()));
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    log::error!("Error: {}", e);
                     std::process::exit(1);
                 }
             }

@@ -169,9 +169,21 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize) -> Result<Vec<(String, 
     let mut sorted: Vec<_> = sessions.into_iter().collect();
     sorted.sort_by(|a, b| b.1.count.cmp(&a.1.count));
 
-    // Print header
-    println!("{:<4} {:<8} {:<46} {:<22} Username", "Rank", "Count", "Time Range", "Display Name");
-    println!("{}", "-".repeat(120));
+    if sorted.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+
+    out.line(format_args!(
+        "{:<4} {:<8} {:<46} {:<22} Username",
+        "Rank",
+        "Count",
+        "Time Range",
+        "Display Name"
+    ))?;
+    out.line(format_args!("{}", "-".repeat(120)))?;
 
     let mut result = Vec::new();
 
@@ -196,13 +208,21 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize) -> Result<Vec<(String, 
             _ => String::new(),
         };
 
-        println!("{:<4} {:<8} {:<46} {:<22} {}",
-            i + 1, info.count, time_range, display, username);
+        out.line(format_args!(
+            "{:<4} {:<8} {:<46} {:<22} {}",
+            i + 1,
+            info.count,
+            time_range,
+            display,
+            username
+        ))?;
 
         result.push((username.clone(), info.count, time_range, display.to_string()));
     }
 
-    println!("\nTotal: {} sessions", sorted.len());
+    out.blank_line()?;
+    out.line(format_args!("Total: {} sessions", sorted.len()))?;
+    out.flush()?;
     Ok(result)
 }
 
@@ -337,31 +357,47 @@ pub fn read_messages(
     };
 
     if messages.is_empty() {
-        if let Some(q) = search_query {
-            println!("No messages found matching '{}' for {}", q, display_name);
-        } else {
-            println!("No messages found for {} ({})", display_name, username);
-        }
         return Ok(0);
     }
 
-    println!("\nChat with: {} ({})", display_name, username);
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+
+    out.line(format_args!("Chat with: {} ({})", display_name, username))?;
     if let Some(q) = search_query {
-        println!("Search: '{}'", q);
+        out.line(format_args!("Search: '{}'", q))?;
     }
     if tail {
         if limit.is_some() {
-            println!("Showing latest {} of {} messages\n", messages.len(), total_count);
+            out.line(format_args!(
+                "Showing latest {} of {} messages",
+                messages.len(),
+                total_count
+            ))?;
         } else {
-            println!("Showing {} of {} messages\n", messages.len(), total_count);
+            out.line(format_args!(
+                "Showing {} of {} messages",
+                messages.len(),
+                total_count
+            ))?;
         }
     } else {
         if limit.is_some() || offset > 0 {
-            println!("Showing {}-{} of {} messages\n", offset + 1, offset + messages.len(), total_count);
+            out.line(format_args!(
+                "Showing {}-{} of {} messages",
+                offset + 1,
+                offset + messages.len(),
+                total_count
+            ))?;
         } else {
-            println!("Showing {} of {} messages\n", messages.len(), total_count);
+            out.line(format_args!(
+                "Showing {} of {} messages",
+                messages.len(),
+                total_count
+            ))?;
         }
     }
+    out.blank_line()?;
 
     for (local_type, create_time, content, wcdb_ct, sender_tgid, packed_info) in &messages {
         let time_str = chrono::DateTime::from_timestamp(*create_time, 0)
@@ -384,10 +420,15 @@ pub fn read_messages(
             |id| resolve_sender_name(id, &contacts),
         );
 
-        println!("[{}] {}: {}", time_str, decoded.display_name, decoded.content);
+        out.line(format_args!(
+            "[{}] {}: {}",
+            time_str, decoded.display_name, decoded.content
+        ))?;
     }
 
-    println!("\n--- End of messages ---");
+    out.blank_line()?;
+    out.line(format_args!("--- End of messages ---"))?;
+    out.flush()?;
     Ok(total_count)
 }
 
@@ -458,7 +499,18 @@ pub fn search_messages(
     let total = results.len();
     let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
 
-    println!("Search results for '{}': {} matches\n", query, total);
+    if total == 0 {
+        return Ok(0);
+    }
+
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+
+    out.line(format_args!(
+        "Search results for '{}': {} matches",
+        query, total
+    ))?;
+    out.blank_line()?;
 
     for (i, (_, create_time, content, table_name)) in results.iter().enumerate().take(limit) {
         let time_str = chrono::DateTime::from_timestamp(*create_time, 0)
@@ -474,13 +526,20 @@ pub fn search_messages(
             content.clone()
         };
 
-        println!("[{}] {} | {}: {}", i + 1, time_str, display, display_content);
+        out.line(format_args!(
+            "[{}] {} | {}: {}",
+            i + 1,
+            time_str,
+            display,
+            display_content
+        ))?;
     }
 
     if total > limit {
-        println!("... and {} more results", total - limit);
+        out.line(format_args!("... and {} more results", total - limit))?;
     }
 
+    out.flush()?;
     Ok(total)
 }
 
@@ -527,7 +586,7 @@ fn resolve_username_with_context(
     let candidates = contact_match_candidates(&contacts, query, message_dbs);
     if let Some(best) = candidates.first() {
         if candidates.len() > 1 || best.score < EXACT_MATCH_SCORE {
-            eprintln!(
+            log::info!(
                 "Matched '{}' to {} ({}){}",
                 query,
                 best.contact.display,
@@ -538,9 +597,9 @@ fn resolve_username_with_context(
             );
         }
         if candidates.len() > 1 {
-            eprintln!("Other matches:");
+            log::info!("Other matches:");
             for candidate in candidates.iter().skip(1).take(4) {
-                eprintln!(
+                log::info!(
                     "  {} (nick: {}, remark: {}, alias: {}){}",
                     candidate.contact.username,
                     candidate.contact.nick_name,

@@ -9,14 +9,25 @@ use std::fs;
 use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes128;
 
+#[path = "../logger.rs"]
+mod logger;
+
 fn main() {
+    logger::init();
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: try_decrypt <path_to.dat>");
+        log::error!("Usage: try_decrypt <path_to.dat>");
         std::process::exit(1);
     }
     let dat_path = &args[1];
-    let data = fs::read(dat_path).expect("read file");
+    let data = match fs::read(dat_path) {
+        Ok(data) => data,
+        Err(e) => {
+            log::error!("Cannot read {}: {}", dat_path, e);
+            std::process::exit(1);
+        }
+    };
 
     // Parse V2 header
     let magic = &data[..6];
@@ -26,10 +37,16 @@ fn main() {
 
     let aes_cipher_len = if aes_len % 16 == 0 { aes_len + 16 } else { (aes_len + 15) / 16 * 16 };
 
-    println!("File: {} ({} bytes)", dat_path, data.len());
-    println!("Magic: {:02x?}", magic);
-    println!("AES len: {}, XOR len: {}, flag: {}, AES cipher: {}", aes_len, xor_len, flag, aes_cipher_len);
-    println!("First encrypted block: {:02x?}", &data[15..31]);
+    log::info!("File: {} ({} bytes)", dat_path, data.len());
+    log::info!("Magic: {:02x?}", magic);
+    log::info!(
+        "AES len: {}, XOR len: {}, flag: {}, AES cipher: {}",
+        aes_len,
+        xor_len,
+        flag,
+        aes_cipher_len
+    );
+    log::info!("First encrypted block: {:02x?}", &data[15..31]);
 
     // Try to derive keys from kvcomm
     let home = std::env::var("HOME").unwrap_or_default();
@@ -50,9 +67,9 @@ fn main() {
                     let aes_key = aes_key_str.as_bytes();
                     let xor_key = (code & 0xff) as u8;
 
-                    println!("\nTrying: code={}, tgid={}", code, tgid);
-                    println!("  AES key (ASCII): {}", aes_key_str);
-                    println!("  XOR key: {:#04x}", xor_key);
+                    log::info!("Trying: code={}, tgid={}", code, tgid);
+                    log::info!("  AES key (ASCII): {}", aes_key_str);
+                    log::info!("  XOR key: {:#04x}", xor_key);
 
                     // Validate: decrypt first block
                     let cipher = Aes128::new_from_slice(aes_key).unwrap();
@@ -60,7 +77,7 @@ fn main() {
                     cipher.decrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(&mut block));
                     let is_jpeg = block[0] == 0xFF && block[1] == 0xD8;
                     let is_png = block[0] == 0x89 && block[1] == 0x50 && block[2] == 0x4E && block[3] == 0x47;
-                    println!("  Validate: {:02x?} JPEG={} PNG={}", &block[..4], is_jpeg, is_png);
+                    log::info!("  Validate: {:02x?} JPEG={} PNG={}", &block[..4], is_jpeg, is_png);
 
                     if is_jpeg || is_png {
                         // Full decrypt
@@ -94,13 +111,13 @@ fn main() {
 
                         let out_name = format!("/tmp/decrypted_{}.{}", name.replace(|c: char| !c.is_alphanumeric(), "_"), ext);
                         fs::write(&out_name, &decrypted).ok();
-                        println!("  Saved: {} ({} bytes, {})", out_name, decrypted.len(), ext);
+                        log::info!("  Saved: {} ({} bytes, {})", out_name, decrypted.len(), ext);
                     }
                 }
             }
         }
     } else {
-        eprintln!("kvcomm dir not found at {}", kvcomm);
+        log::error!("kvcomm dir not found at {}", kvcomm);
     }
 }
 

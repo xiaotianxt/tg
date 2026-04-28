@@ -101,7 +101,7 @@ pub fn decode_message(
     if msg_type == 10000 || msg_type == 10002 {
         return DecodedMessage {
             msg_type: msg_type_enum,
-            content: raw_content.to_string(),
+            content: decode_system_content(raw_content, msg_type_enum),
             display_name: "系统".to_string(),
         };
     }
@@ -227,6 +227,29 @@ fn decode_content_by_type(
         436207665 | 536870918 => format!("[{}]", MessageType::from(msg_type)),
         _ => content.to_string(),
     }
+}
+
+fn decode_system_content(content: &str, msg_type: MessageType) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return format!("[{}]", msg_type);
+    }
+
+    let sysmsg_type = crate::media::extract_xml_attr(trimmed, "type").unwrap_or_default();
+    if sysmsg_type == "revokemsg" || matches!(msg_type, MessageType::Revoke) {
+        if let Some(revoke_content) = crate::media::extract_xml_tag(trimmed, "content") {
+            return format!("[撤回] {}", revoke_content);
+        }
+        return "[撤回]".to_string();
+    }
+
+    if trimmed.starts_with('<') {
+        if let Some(text) = crate::media::extract_xml_tag(trimmed, "content") {
+            return text;
+        }
+    }
+
+    content.to_string()
 }
 
 fn decode_link_content(content: &str, resolve_display_name: &impl Fn(&str) -> String) -> String {
@@ -470,6 +493,14 @@ mod tests {
     fn test_decode_system_message() {
         let d = decode_message(10000, "提示", "Alice", None, &[], |id| id.to_string());
         assert_eq!(d.content, "提示");
+        assert_eq!(d.display_name, "系统");
+    }
+
+    #[test]
+    fn test_decode_revoke_system_message() {
+        let xml = r#"<?xml version="1.0"?><sysmsg type="revokemsg"><revokemsg><content>&quot;俞腾飞 22&quot; 撤回了一条消息</content><revoketime>0</revoketime></revokemsg></sysmsg>"#;
+        let d = decode_message(10000, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, r#"[撤回] "俞腾飞 22" 撤回了一条消息"#);
         assert_eq!(d.display_name, "系统");
     }
 

@@ -1094,6 +1094,7 @@ dependencies = [
  "flate2",
  "hex",
  "hmac",
+ "log",
  "md-5",
  "pbkdf2",
  "rusqlite",
