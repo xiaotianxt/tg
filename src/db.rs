@@ -40,7 +40,7 @@ pub(crate) fn find_decrypted_dbs(decrypted_dir: &Path) -> (Option<PathBuf>, Vec<
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("db") {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if name.starts_with("message_") && !name.contains("fts") {
+                    if is_message_db_name(name) {
                         message_dbs.push(path);
                     }
                 }
@@ -50,6 +50,17 @@ pub(crate) fn find_decrypted_dbs(decrypted_dir: &Path) -> (Option<PathBuf>, Vec<
     message_dbs.sort();
 
     (contact_db, message_dbs)
+}
+
+fn is_message_db_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix("message_")
+        .and_then(|s| s.strip_suffix(".db"))
+    else {
+        return false;
+    };
+
+    !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Contact info.
@@ -70,6 +81,7 @@ struct SessionInfo {
 
 type MessageRow = (i64, i64, String, Option<i64>, String, Vec<u8>);
 type SearchRow = (i64, i64, String, String);
+const SESSION_TIME_BOUNDARY_ROWS: usize = 128;
 
 pub(crate) fn load_contacts(contact_db: &Path) -> Result<HashMap<String, Contact>, String> {
     let conn =
@@ -113,6 +125,68 @@ pub(crate) fn msg_table_name(username: &str) -> String {
     hasher.update(username.as_bytes());
     let hash = hasher.finalize();
     format!("Msg_{:x}", hash)
+}
+
+fn quote_identifier(name: &str) -> String {
+    let mut quoted = String::with_capacity(name.len() + 2);
+    quoted.push('"');
+    for ch in name.chars() {
+        if ch == '"' {
+            quoted.push('"');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn session_stats_for_table(conn: &Connection, table_name: &str) -> Option<SessionInfo> {
+    let table = quote_identifier(table_name);
+    let fast_sql = format!(
+        "SELECT \
+            (SELECT COUNT(*) FROM {table}), \
+            (SELECT MIN(create_time) FROM (SELECT create_time FROM {table} WHERE create_time > 0 ORDER BY sort_seq ASC LIMIT {SESSION_TIME_BOUNDARY_ROWS})), \
+            (SELECT MAX(create_time) FROM (SELECT create_time FROM {table} WHERE create_time > 0 ORDER BY sort_seq DESC LIMIT {SESSION_TIME_BOUNDARY_ROWS}))"
+    );
+
+    // Telegram message tables have a SORTSEQ index. These boundary lookups avoid
+    // full-table MIN/MAX(create_time) scans on large chats while tolerating
+    // small same-second ordering differences near each edge.
+    if let Ok((count, earliest, latest)) = conn.query_row(&fast_sql, [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+        ))
+    }) {
+        if count > 0 && (earliest.is_some() || latest.is_some()) {
+            return Some(SessionInfo {
+                count,
+                earliest,
+                latest,
+            });
+        }
+        return None;
+    }
+
+    let exact_sql = format!(
+        "SELECT COUNT(*), MIN(create_time), MAX(create_time) FROM {} WHERE create_time > 0",
+        table
+    );
+    let (count, earliest, latest) = conn
+        .query_row(&exact_sql, [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .ok()?;
+    (count > 0).then_some(SessionInfo {
+        count,
+        earliest,
+        latest,
+    })
 }
 
 /// List all sessions/messages with counts.
@@ -162,33 +236,20 @@ pub fn list_sessions(
         };
 
         for table_name in &tables {
-            let sql = format!(
-                "SELECT COUNT(*), MIN(create_time), MAX(create_time) FROM {} WHERE create_time > 0",
-                table_name
-            );
-            let stats: Vec<(i64, Option<i64>, Option<i64>)> = match conn.prepare(&sql) {
-                Ok(mut q) => match q.query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                    ))
-                }) {
-                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                    Err(_) => vec![],
-                },
-                Err(_) => vec![],
-            };
-            if let Some((cnt, earliest, latest)) = stats.into_iter().next() {
-                if cnt > 0 {
-                    let info = sessions.entry(table_name.clone()).or_default();
-                    info.count += cnt;
-                    if earliest.is_none_or(|e| info.earliest.is_none_or(|ie| e < ie)) {
-                        info.earliest = earliest;
-                    }
-                    if latest.is_none_or(|l| info.latest.is_none_or(|il| l > il)) {
-                        info.latest = latest;
-                    }
+            if let Some(table_info) = session_stats_for_table(&conn, table_name) {
+                let info = sessions.entry(table_name.clone()).or_default();
+                info.count += table_info.count;
+                if table_info
+                    .earliest
+                    .is_none_or(|e| info.earliest.is_none_or(|ie| e < ie))
+                {
+                    info.earliest = table_info.earliest;
+                }
+                if table_info
+                    .latest
+                    .is_none_or(|l| info.latest.is_none_or(|il| l > il))
+                {
+                    info.latest = table_info.latest;
                 }
             }
         }
@@ -1088,6 +1149,69 @@ mod tests {
 
         drop(conn);
         (dir, path)
+    }
+
+    #[test]
+    fn filters_only_numbered_message_dbs() {
+        assert!(is_message_db_name("message_0.db"));
+        assert!(is_message_db_name("message_12.db"));
+        assert!(!is_message_db_name("message_fts.db"));
+        assert!(!is_message_db_name("message_resource.db"));
+        assert!(!is_message_db_name("biz_message_0.db"));
+    }
+
+    #[test]
+    fn session_stats_uses_sort_seq_boundaries() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE Msg_test (
+                local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sort_seq INTEGER,
+                create_time INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX Msg_test_SORTSEQ ON Msg_test(sort_seq)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO Msg_test (sort_seq, create_time) VALUES
+             (10, 1001), (11, 1000), (20, 2000), (21, 1999)",
+            [],
+        )
+        .unwrap();
+
+        let stats = session_stats_for_table(&conn, "Msg_test").unwrap();
+
+        assert_eq!(stats.count, 4);
+        assert_eq!(stats.earliest, Some(1000));
+        assert_eq!(stats.latest, Some(2000));
+    }
+
+    #[test]
+    fn session_stats_falls_back_without_sort_seq() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE Msg_test (
+                local_type INTEGER,
+                create_time INTEGER,
+                message_content TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO Msg_test (local_type, create_time, message_content) VALUES
+             (1, 2000, 'newer'), (1, 1000, 'older')",
+            [],
+        )
+        .unwrap();
+
+        let stats = session_stats_for_table(&conn, "Msg_test").unwrap();
+
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.earliest, Some(1000));
+        assert_eq!(stats.latest, Some(2000));
     }
 
     #[test]
