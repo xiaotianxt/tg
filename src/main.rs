@@ -8,6 +8,7 @@ mod media_decrypt;
 mod media_key;
 mod export;
 mod time;
+mod parallel;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -53,6 +54,9 @@ enum Commands {
         /// Show decrypt progress and summary
         #[arg(long)]
         verbose: bool,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
     },
     /// List all chat sessions/conversations
     Sessions {
@@ -62,6 +66,9 @@ enum Commands {
         /// Number of top sessions to show
         #[arg(long, default_value_t = 30)]
         top: usize,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
     },
     /// Read messages from a specific session
     Messages {
@@ -88,6 +95,9 @@ enum Commands {
         /// Show earliest messages instead of the default latest messages
         #[arg(long, conflicts_with = "tail")]
         head: bool,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
     },
     /// Search across all sessions
     Search {
@@ -99,6 +109,9 @@ enum Commands {
         /// Number of results
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
     },
     /// Export messages to file
     Export {
@@ -116,14 +129,18 @@ enum Commands {
         /// Directory to save decoded media files (images, stickers, videos)
         #[arg(long)]
         media_dir: Option<PathBuf>,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
     },
 }
 
-fn refresh_decrypted_cache(decrypted_dir: &std::path::Path) {
+fn refresh_decrypted_cache(decrypted_dir: &std::path::Path, jobs: usize) {
     let config = decrypt::DecryptConfig {
         incremental: true,
         since: None,
         quiet: true,
+        jobs,
     };
     let _ = decrypt::decrypt_all(
         std::path::Path::new("all_keys.json"),
@@ -147,7 +164,7 @@ fn main() {
                 }
             }
         }
-        Commands::Decrypt { keys, output, db_dir, incremental: _, full, since, verbose } => {
+        Commands::Decrypt { keys, output, db_dir, incremental: _, full, since, verbose, jobs } => {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -159,6 +176,7 @@ fn main() {
                 incremental: !full,
                 since: since_ts,
                 quiet: !verbose,
+                jobs,
             };
             match decrypt::decrypt_all(&keys, &output, db_dir.as_deref(), &config) {
                 Ok(stats) => {
@@ -178,9 +196,9 @@ fn main() {
                 }
             }
         }
-        Commands::Sessions { decrypted_dir, top } => {
-            refresh_decrypted_cache(&decrypted_dir);
-            match db::list_sessions(&decrypted_dir, top) {
+        Commands::Sessions { decrypted_dir, top, jobs } => {
+            refresh_decrypted_cache(&decrypted_dir, jobs);
+            match db::list_sessions(&decrypted_dir, top, jobs) {
                 Ok(sessions) => {
                     if sessions.is_empty() {
                         println!("No sessions found. Try running 'decrypt' first.");
@@ -192,7 +210,7 @@ fn main() {
                 }
             }
         }
-        Commands::Messages { session, decrypted_dir, limit, offset, search, since, tail, head } => {
+        Commands::Messages { session, decrypted_dir, limit, offset, search, since, tail, head, jobs } => {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -202,8 +220,8 @@ fn main() {
             };
             let limit = limit.or_else(|| since_ts.is_none().then_some(50));
             let use_tail = tail || (!head && offset == 0);
-            refresh_decrypted_cache(&decrypted_dir);
-            match db::read_messages(&decrypted_dir, &session, limit, offset, search.as_deref(), since_ts, use_tail) {
+            refresh_decrypted_cache(&decrypted_dir, jobs);
+            match db::read_messages(&decrypted_dir, &session, limit, offset, search.as_deref(), since_ts, use_tail, jobs) {
                 Ok(msg_count) => {
                     if msg_count == 0 {
                         println!("No messages found for '{}'. Use 'sessions' to list available sessions.", session);
@@ -215,9 +233,9 @@ fn main() {
                 }
             }
         }
-        Commands::Search { query, decrypted_dir, limit } => {
-            refresh_decrypted_cache(&decrypted_dir);
-            match db::search_messages(&decrypted_dir, &query, limit) {
+        Commands::Search { query, decrypted_dir, limit, jobs } => {
+            refresh_decrypted_cache(&decrypted_dir, jobs);
+            match db::search_messages(&decrypted_dir, &query, limit, jobs) {
                 Ok(count) => {
                     if count == 0 {
                         println!("No messages found for '{}'.", query);
@@ -229,9 +247,9 @@ fn main() {
                 }
             }
         }
-        Commands::Export { session, decrypted_dir, format, output, media_dir } => {
-            refresh_decrypted_cache(&decrypted_dir);
-            match export::export_messages(&decrypted_dir, &session, &format, &output, media_dir.as_deref()) {
+        Commands::Export { session, decrypted_dir, format, output, media_dir, jobs } => {
+            refresh_decrypted_cache(&decrypted_dir, jobs);
+            match export::export_messages(&decrypted_dir, &session, &format, &output, media_dir.as_deref(), jobs) {
                 Ok(paths) => {
                     println!("Exported to:");
                     for (fmt, path) in paths {

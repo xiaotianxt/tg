@@ -7,8 +7,9 @@ use std::process::Command;
 use crate::db;
 use crate::media;
 use crate::message;
+use crate::parallel;
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct ExportMessage {
     time: String,
     timestamp: i64,
@@ -23,6 +24,25 @@ struct ExportMessage {
     packed_info: Vec<u8>,
 }
 
+enum MediaExportJob {
+    Cached {
+        index: usize,
+        src: PathBuf,
+        category: &'static str,
+        msg_type: i64,
+    },
+    Sticker {
+        index: usize,
+        message: ExportMessage,
+    },
+}
+
+struct MediaExportResult {
+    index: usize,
+    is_sticker: bool,
+    result: Result<PathBuf, String>,
+}
+
 /// Export messages for a session.
 pub fn export_messages(
     decrypted_dir: &Path,
@@ -30,12 +50,13 @@ pub fn export_messages(
     format: &str,
     output_dir: &Path,
     media_dir: Option<&Path>,
+    jobs: usize,
 ) -> Result<Vec<(&'static str, PathBuf)>, String> {
     let (contact_db, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
     let contact_db_path = contact_db.as_deref();
 
     // Resolve session username
-    let username = db::resolve_username_for_messages(session_query, contact_db_path, &message_dbs)?;
+    let username = db::resolve_username_for_messages(session_query, contact_db_path, &message_dbs, jobs)?;
 
     // Load contacts for display name
     let contacts = contact_db_path
@@ -47,13 +68,14 @@ pub fn export_messages(
 
     // Table name
     let table_name = db::msg_table_name(&username);
-    let mut all_messages: Vec<ExportMessage> = Vec::new();
     let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
 
-    for db_path in &message_dbs {
-        let conn = match Connection::open(db_path) {
+    let db_jobs = parallel::job_count(jobs, 8);
+    let per_db_messages = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
+        let mut messages = Vec::new();
+        let conn = match Connection::open(&db_path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(_) => return messages,
         };
 
         let sql = format!(
@@ -107,7 +129,7 @@ pub fn export_messages(
                 |id| crate::db::resolve_sender_name(id, &contacts),
             );
 
-            all_messages.push(ExportMessage {
+            messages.push(ExportMessage {
                 time: time_str,
                 timestamp: create_time,
                 sender: decoded.display_name,
@@ -118,6 +140,12 @@ pub fn export_messages(
                 packed_info,
             });
         }
+        messages
+    });
+
+    let mut all_messages: Vec<ExportMessage> = Vec::new();
+    for messages in per_db_messages {
+        all_messages.extend(messages);
     }
 
     all_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
@@ -181,7 +209,8 @@ pub fn export_messages(
         }
         let media_keys = media_keys.ok();
 
-        let mut exported = 0;
+        let mut media_jobs = Vec::new();
+        let mut next_index = 1usize;
         let category_map = [("Image", 3), ("Video", 43)];
 
         for (cat_name, local_type) in &category_map {
@@ -199,17 +228,13 @@ pub fn export_messages(
                 };
 
                 if let Some(src) = media::find_cached_media(&telegram_base, &username, cat_name, &identifier) {
-                    let index = exported + 1;
-                    let result = export_media_with_decrypt(&src, mdir, &username, cat_name, m.msg_type, index, media_keys.as_ref());
-                    match result {
-                        Ok(path) => {
-                            println!("  Media #{}: {}", index, path.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
-                            exported += 1;
-                        }
-                        Err(e) => {
-                            eprintln!("  Media #{} export failed: {}", index, e);
-                        }
-                    }
+                    media_jobs.push(MediaExportJob::Cached {
+                        index: next_index,
+                        src,
+                        category: cat_name,
+                        msg_type: m.msg_type,
+                    });
+                    next_index += 1;
                 }
             }
         }
@@ -219,14 +244,46 @@ pub fn export_messages(
                 continue;
             }
 
-            let index = exported + 1;
-            match export_sticker_message(m, &telegram_base, mdir, &username, index) {
+            if !has_sticker_export_source(m) {
+                continue;
+            }
+
+            media_jobs.push(MediaExportJob::Sticker {
+                index: next_index,
+                message: m.clone(),
+            });
+            next_index += 1;
+        }
+
+        let media_job_count = parallel::job_count(jobs, 4);
+        let media_results = parallel::map_ordered(media_jobs, media_job_count, |job| {
+            match job {
+                MediaExportJob::Cached { index, src, category, msg_type } => MediaExportResult {
+                    index,
+                    is_sticker: false,
+                    result: export_media_with_decrypt(&src, mdir, &username, category, msg_type, index, media_keys.as_ref()),
+                },
+                MediaExportJob::Sticker { index, message } => MediaExportResult {
+                    index,
+                    is_sticker: true,
+                    result: export_sticker_message(&message, &telegram_base, mdir, &username, index),
+                },
+            }
+        });
+
+        let mut exported = 0;
+        for media_result in media_results {
+            match media_result.result {
                 Ok(path) => {
-                    println!("  Media #{}: {}", index, path.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
+                    println!("  Media #{}: {}", media_result.index, path.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
                     exported += 1;
                 }
                 Err(e) => {
-                    eprintln!("  Sticker #{} export failed: {}", index, e);
+                    if media_result.is_sticker {
+                        eprintln!("  Sticker #{} export failed: {}", media_result.index, e);
+                    } else {
+                        eprintln!("  Media #{} export failed: {}", media_result.index, e);
+                    }
                 }
             }
         }
@@ -419,6 +476,16 @@ fn export_sticker_message(
 
     let id = if info.md5.is_empty() { "unknown" } else { &info.md5 };
     Err(format!("cannot decode sticker {}", id))
+}
+
+fn has_sticker_export_source(message: &ExportMessage) -> bool {
+    let info = media::parse_sticker_info(&message.raw_content);
+    !info.md5.is_empty()
+        || !info.url.is_empty()
+        || !info.cdn_url.is_empty()
+        || !info.encrypt_url.is_empty()
+        || !info.extern_url.is_empty()
+        || !info.thumb_url.is_empty()
 }
 
 fn write_sticker_candidate(

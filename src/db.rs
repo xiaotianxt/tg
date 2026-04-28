@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::fs;
 
 use crate::message;
+use crate::parallel;
 
 /// Resolve a sender ID to a display name from contacts.
 pub fn resolve_sender_name(sender_id: &str, contacts: &HashMap<String, Contact>) -> String {
@@ -59,6 +60,16 @@ pub(crate) struct Contact {
     pub display: String,
 }
 
+#[derive(Default)]
+struct SessionInfo {
+    count: i64,
+    earliest: Option<i64>,
+    latest: Option<i64>,
+}
+
+type MessageRow = (i64, i64, String, Option<i64>, String, Vec<u8>);
+type SearchRow = (i64, i64, String, String);
+
 pub(crate) fn load_contacts(contact_db: &Path) -> Result<HashMap<String, Contact>, String> {
     let conn = Connection::open(contact_db)
         .map_err(|e| format!("Cannot open contact DB: {}", e))?;
@@ -89,7 +100,7 @@ pub(crate) fn msg_table_name(username: &str) -> String {
 }
 
 /// List all sessions/messages with counts.
-pub fn list_sessions(decrypted_dir: &Path, top_n: usize) -> Result<Vec<(String, i64, String, String)>, String> {
+pub fn list_sessions(decrypted_dir: &Path, top_n: usize, jobs: usize) -> Result<Vec<(String, i64, String, String)>, String> {
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
 
     // Load contacts
@@ -97,14 +108,6 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize) -> Result<Vec<(String, 
         Some(path) => load_contacts(path).unwrap_or_default(),
         None => HashMap::new(),
     };
-
-    // Enumerate all Msg_ tables across message DBs
-    #[derive(Default)]
-    struct SessionInfo {
-        count: i64,
-        earliest: Option<i64>,
-        latest: Option<i64>,
-    }
 
     // Map: table_name -> SessionInfo
     // Also track: table_name -> contact username
@@ -117,12 +120,12 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize) -> Result<Vec<(String, 
         table_to_username.entry(display_table).or_insert_with(|| username.clone());
     }
 
-    let mut sessions: HashMap<String, SessionInfo> = HashMap::new();
-
-    for db_path in &message_dbs {
-        let conn = match Connection::open(db_path) {
+    let db_jobs = parallel::job_count(jobs, 8);
+    let per_db_sessions = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
+        let mut sessions: HashMap<String, SessionInfo> = HashMap::new();
+        let conn = match Connection::open(&db_path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(_) => return sessions,
         };
 
         // Find all Msg_ tables
@@ -161,6 +164,21 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize) -> Result<Vec<(String, 
                         info.latest = latest;
                     }
                 }
+            }
+        }
+        sessions
+    });
+
+    let mut sessions: HashMap<String, SessionInfo> = HashMap::new();
+    for db_sessions in per_db_sessions {
+        for (table_name, db_info) in db_sessions {
+            let info = sessions.entry(table_name).or_default();
+            info.count += db_info.count;
+            if db_info.earliest.is_none_or(|e| info.earliest.is_none_or(|ie| e < ie)) {
+                info.earliest = db_info.earliest;
+            }
+            if db_info.latest.is_none_or(|l| info.latest.is_none_or(|il| l > il)) {
+                info.latest = db_info.latest;
             }
         }
     }
@@ -215,10 +233,11 @@ pub fn read_messages(
     search_query: Option<&str>,
     since: Option<i64>,
     tail: bool,
+    jobs: usize,
 ) -> Result<usize, String> {
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
 
-    let username = resolve_username_for_messages(session_query, contact_db.as_deref(), &message_dbs)?;
+    let username = resolve_username_for_messages(session_query, contact_db.as_deref(), &message_dbs, jobs)?;
     let table_name = msg_table_name(&username);
     let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
 
@@ -230,26 +249,26 @@ pub fn read_messages(
         .map(|c| c.display.as_str())
         .unwrap_or(&username);
 
-    let mut all_messages = Vec::new();
-    let mut total_count: usize = 0;
+    let search_clause = search_query
+        .map(|q| format!(" AND message_content LIKE '%{}'", q.replace('\'', "''")))
+        .unwrap_or_default();
 
-    for db_path in &message_dbs {
-        let conn = match Connection::open(db_path) {
+    let since_clause = since
+        .map(|ts| format!(" AND create_time >= {}", ts))
+        .unwrap_or_default();
+
+    let db_jobs = parallel::job_count(jobs, 8);
+    let per_db_messages = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
+        let mut total_count = 0usize;
+        let mut rows: Vec<MessageRow> = Vec::new();
+        let conn = match Connection::open(&db_path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(_) => return (total_count, rows),
         };
 
         // Check if table exists quickly
         let table_exists = conn.prepare(&format!("SELECT 1 FROM {} LIMIT 1", table_name)).is_ok();
-        if !table_exists { continue; }
-
-        let search_clause = search_query
-            .map(|q| format!(" AND message_content LIKE '%{}'", q.replace('\'', "''")))
-            .unwrap_or_default();
-
-        let since_clause = since
-            .map(|ts| format!(" AND create_time >= {}", ts))
-            .unwrap_or_default();
+        if !table_exists { return (total_count, rows); }
 
         // Get total count for this DB
         let count_sql = format!(
@@ -282,7 +301,7 @@ pub fn read_messages(
             order_dir,
             if tail { limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default() } else { String::new() }
         );
-        let rows: Vec<(i64, i64, String, Option<i64>, String, Vec<u8>)> = match conn.prepare(&sql) {
+        rows = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
                 let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(3)?;
                 let content: String = if wcdb_ct == Some(4) {
@@ -315,6 +334,13 @@ pub fn read_messages(
             },
             Err(_) => vec![],
         };
+        (total_count, rows)
+    });
+
+    let mut all_messages = Vec::new();
+    let mut total_count: usize = 0;
+    for (db_count, rows) in per_db_messages {
+        total_count += db_count;
         all_messages.extend(rows);
     }
 
@@ -396,18 +422,20 @@ pub fn search_messages(
     decrypted_dir: &Path,
     query: &str,
     limit: usize,
+    jobs: usize,
 ) -> Result<usize, String> {
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
     let contacts = contact_db.as_ref()
         .and_then(|p| load_contacts(p).ok())
         .unwrap_or_default();
 
-    let mut results = Vec::new();
-
-    for db_path in &message_dbs {
-        let conn = match Connection::open(db_path) {
+    let escaped = query.replace('\'', "''");
+    let db_jobs = parallel::job_count(jobs, 8);
+    let per_db_results = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
+        let mut results: Vec<SearchRow> = Vec::new();
+        let conn = match Connection::open(&db_path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(_) => return results,
         };
 
         // Find Msg_ tables - collect eagerly
@@ -421,7 +449,6 @@ pub fn search_messages(
             Err(_) => vec![],
         };
 
-        let escaped = query.replace('\'', "''");
         for table_name in &tables {
             let sql = format!(
                 "SELECT local_type, create_time, message_content \
@@ -429,7 +456,7 @@ pub fn search_messages(
                  ORDER BY create_time ASC LIMIT 50",
                 table_name, escaped
             );
-            let rows: Vec<(i64, i64, String, String)> = match conn.prepare(&sql) {
+            let rows: Vec<SearchRow> = match conn.prepare(&sql) {
                 Ok(mut q) => match q.query_map([], |row| {
                     let content: String = match row.get::<_, Option<String>>(2) {
                         Ok(Some(s)) => s,
@@ -452,6 +479,12 @@ pub fn search_messages(
             };
             results.extend(rows);
         }
+        results
+    });
+
+    let mut results = Vec::new();
+    for rows in per_db_results {
+        results.extend(rows);
     }
 
     results.sort_by(|a, b| a.1.cmp(&b.1));
@@ -488,19 +521,21 @@ pub(crate) fn resolve_username_for_messages(
     query: &str,
     contact_db: Option<&Path>,
     message_dbs: &[PathBuf],
+    jobs: usize,
 ) -> Result<String, String> {
-    resolve_username_with_context(query, contact_db, Some(message_dbs))
+    resolve_username_with_context(query, contact_db, Some(message_dbs), jobs)
 }
 
 #[allow(dead_code)]
 pub(crate) fn resolve_username(query: &str, contact_db: Option<&Path>) -> Result<String, String> {
-    resolve_username_with_context(query, contact_db, None)
+    resolve_username_with_context(query, contact_db, None, 1)
 }
 
 fn resolve_username_with_context(
     query: &str,
     contact_db: Option<&Path>,
     message_dbs: Option<&[PathBuf]>,
+    jobs: usize,
 ) -> Result<String, String> {
     let query = query.trim();
     if query.is_empty() {
@@ -524,7 +559,7 @@ fn resolve_username_with_context(
         return Ok(c.username.clone());
     }
 
-    let candidates = contact_match_candidates(&contacts, query, message_dbs);
+    let candidates = contact_match_candidates(&contacts, query, message_dbs, jobs);
     if let Some(best) = candidates.first() {
         if candidates.len() > 1 || best.score < EXACT_MATCH_SCORE {
             eprintln!(
@@ -581,6 +616,7 @@ fn contact_match_candidates<'a>(
     contacts: &'a HashMap<String, Contact>,
     query: &str,
     message_dbs: Option<&[PathBuf]>,
+    jobs: usize,
 ) -> Vec<ContactMatch<'a>> {
     let mut candidates: Vec<_> = contacts.values()
         .filter_map(|contact| {
@@ -601,7 +637,7 @@ fn contact_match_candidates<'a>(
     }
 
     if let Some(message_dbs) = message_dbs {
-        let latest_by_username = latest_message_times_for_candidates(message_dbs, &candidates);
+        let latest_by_username = latest_message_times_for_candidates(message_dbs, &candidates, jobs);
         for candidate in &mut candidates {
             candidate.latest_message_time = latest_by_username.get(&candidate.contact.username).copied();
         }
@@ -763,6 +799,7 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
 fn latest_message_times_for_candidates(
     message_dbs: &[PathBuf],
     candidates: &[ContactMatch<'_>],
+    jobs: usize,
 ) -> HashMap<String, i64> {
     let table_to_username: HashMap<String, String> = candidates.iter()
         .map(|candidate| {
@@ -774,10 +811,12 @@ fn latest_message_times_for_candidates(
         .collect();
     let mut latest_by_username: HashMap<String, i64> = HashMap::new();
 
-    for db_path in message_dbs {
-        let conn = match Connection::open(db_path) {
+    let db_jobs = parallel::job_count(jobs, 8);
+    let per_db_latest = parallel::map_ordered(message_dbs.to_vec(), db_jobs, |db_path| {
+        let mut latest_by_username: HashMap<String, i64> = HashMap::new();
+        let conn = match Connection::open(&db_path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(_) => return latest_by_username,
         };
 
         let tables: Vec<String> = match conn.prepare(
@@ -806,6 +845,16 @@ fn latest_message_times_for_candidates(
                     }
                 }
             };
+        }
+        latest_by_username
+    });
+
+    for db_latest in per_db_latest {
+        for (username, ts) in db_latest {
+            let entry = latest_by_username.entry(username).or_insert(ts);
+            if ts > *entry {
+                *entry = ts;
+            }
         }
     }
 
@@ -905,7 +954,7 @@ mod tests {
             ("tgid_active", 2, 2000),
         ]);
 
-        let username = resolve_username_for_messages("田雨坤", Some(&contact_db), &[message_db]).unwrap();
+        let username = resolve_username_for_messages("田雨坤", Some(&contact_db), &[message_db], 1).unwrap();
 
         assert_eq!(username, "tgid_active");
     }
@@ -922,7 +971,7 @@ mod tests {
             ("tgid_meilidou", 100, 2000),
         ]);
 
-        let username = resolve_username_for_messages("豆", Some(&contact_db), &[message_db]).unwrap();
+        let username = resolve_username_for_messages("豆", Some(&contact_db), &[message_db], 1).unwrap();
 
         assert_eq!(username, "tgid_meilidou");
     }
@@ -938,7 +987,7 @@ mod tests {
             ("tgid_alias", 1, 2000),
         ]);
 
-        let username = resolve_username_for_messages("Linux", Some(&contact_db), &[message_db]).unwrap();
+        let username = resolve_username_for_messages("Linux", Some(&contact_db), &[message_db], 1).unwrap();
 
         assert_eq!(username, "tgid_remark");
     }
@@ -954,7 +1003,7 @@ mod tests {
             ("linux_2026@chatroom", 1, 2000),
         ]);
 
-        let username = resolve_username_for_messages("Linux 2026", Some(&contact_db), &[message_db]).unwrap();
+        let username = resolve_username_for_messages("Linux 2026", Some(&contact_db), &[message_db], 1).unwrap();
 
         assert_eq!(username, "linux_2026@chatroom");
     }
