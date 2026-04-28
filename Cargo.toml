@@ -1,6 +1,6 @@
 [package]
 name = "tgreader"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 description = "macOS Telegram 聊天记录读取 CLI 工具"
 authors = ["xiaotianxt"]
