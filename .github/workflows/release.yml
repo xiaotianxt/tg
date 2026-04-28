@@ -6,18 +6,14 @@ on:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          - os: macos-latest
-            arch: arm64
-          - os: macos-13
-            arch: amd64
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Verify arm64 runner
+        run: test "$(uname -m)" = "arm64"
 
       - name: Build scanner
         run: cc -O2 -o scanner_macos vendor/find_all_keys_macos.c -framework Foundation
@@ -30,13 +26,13 @@ jobs:
           mkdir -p archive
           cp target/release/tgreader scanner_macos archive/
           cd archive
-          tar czf ../tgreader-${{ github.ref_name }}-darwin-${{ matrix.arch }}.tar.gz \
+          tar czf ../tgreader-${{ github.ref_name }}-darwin-arm64.tar.gz \
             tgreader scanner_macos
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tgreader-${{ github.ref_name }}-darwin-${{ matrix.arch }}
-          path: tgreader-${{ github.ref_name }}-darwin-${{ matrix.arch }}.tar.gz
+          name: tgreader-${{ github.ref_name }}-darwin-arm64
+          path: tgreader-${{ github.ref_name }}-darwin-arm64.tar.gz
 
   release:
     needs: build
