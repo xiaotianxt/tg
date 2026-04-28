@@ -28,3 +28,4 @@ hex = "0.4"
 cipher = "0.4"
 tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
+flate2 = "1"

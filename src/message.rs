@@ -1,5 +1,7 @@
 use crate::media;
+use flate2::read::ZlibDecoder;
 use std::fmt;
+use std::io::Read;
 
 /// Telegram消息类型枚举。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,20 +93,11 @@ pub fn decode_message(
     msg_type: i32,
     raw_content: &str,
     session_display_name: &str,
-    wcdb_ct: Option<i64>,
+    _wcdb_ct: Option<i64>,
     resolve_display_name: impl Fn(&str) -> String,
 ) -> DecodedMessage {
     // 派生消息类型
     let msg_type_enum: MessageType = msg_type.into();
-
-    // 处理压缩内容标记
-    if wcdb_ct == Some(4) {
-        return DecodedMessage {
-            msg_type: msg_type_enum,
-            content: "[压缩内容]".to_string(),
-            display_name: session_display_name.to_string(),
-        };
-    }
 
     // 系统消息和撤回消息使用原始内容
     if msg_type == 10000 || msg_type == 10002 {
@@ -357,6 +350,15 @@ fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
+/// Try to ZLIB-decompress a byte slice into a UTF-8 string.
+/// Used when WCDB_CT_message_content = 4 (compressed content).
+pub fn try_decompress(raw: &[u8]) -> Option<String> {
+    let mut decoder = ZlibDecoder::new(raw);
+    let mut s = String::new();
+    decoder.read_to_string(&mut s).ok()?;
+    if s.is_empty() { None } else { Some(s) }
+}
+
 /// Parse sender tgid from message content ("tgid_xxx:\nmessage" or "tgid_xxx: message").
 /// Returns (sender_id, clean_content).
 pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
@@ -467,8 +469,10 @@ mod tests {
 
     #[test]
     fn test_decode_compressed_content() {
+        // wcdb_ct=4 is handled at DB layer (decompressed before decode_message).
+        // If decompression fails or wasn't needed, content passes through normally.
         let decoded = decode_message(1, "some content", "Alice", Some(4), |id| id.to_string());
-        assert_eq!(decoded.content, "[压缩内容]");
+        assert_eq!(decoded.content, "some content");
     }
 
     #[test]

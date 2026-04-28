@@ -291,21 +291,15 @@ pub fn read_messages(
         );
         let rows: Vec<(i64, i64, String, Option<i64>, String)> = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
-                // message_content can be TEXT or BLOB; read as String when possible
-                let content: String = match row.get::<_, Option<String>>(2) {
-                    Ok(Some(s)) => s,
-                    _ => match row.get::<_, Option<Vec<u8>>>(2) {
-                        Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                        _ => String::new(),
-                    },
-                };
+                let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(3)?;
+                let content: String = read_message_content(row, 2, wcdb_ct);
                 let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
                 let sender_tgid = name2id.get(&sender_id).cloned().unwrap_or_default();
                 Ok((
                     row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
                     row.get::<_, Option<i64>>(1)?.unwrap_or(0),
                     content,
-                    row.get::<_, Option<i64>>(3)?,
+                    wcdb_ct,
                     sender_tgid,
                 ))
             }) {
@@ -521,6 +515,25 @@ fn resolve_username(query: &str, contact_db: Option<&Path>) -> Result<String, St
     }
     eprintln!("Using: {}", results[0].username);
     Ok(results[0].username.clone())
+}
+
+/// Read message content from a DB row, handling ZLIB decompression
+/// when WCDB_CT_message_content = 4.
+fn read_message_content(row: &rusqlite::Row, col: usize, wcdb_ct: Option<i64>) -> String {
+    if wcdb_ct == Some(4) {
+        if let Ok(b) = row.get::<_, Vec<u8>>(col) {
+            if let Some(s) = message::try_decompress(&b) {
+                return s;
+            }
+        }
+    }
+    match row.get::<_, Option<String>>(col) {
+        Ok(Some(s)) => s,
+        _ => match row.get::<_, Option<Vec<u8>>>(col) {
+            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
+            _ => String::new(),
+        },
+    }
 }
 
 fn find_username_by_table(contacts: &HashMap<String, Contact>, table_name: &str) -> Option<String> {
