@@ -50,50 +50,34 @@ fn decrypt_page(enc_key: &[u8], page_data: &[u8], pgno: u32) -> Option<Vec<u8>> 
         return None;
     }
 
-    // Extract IV from reserve area (last 80 bytes, first 16)
     let iv = &page_data[PAGE_SZ - RESERVE_SZ .. PAGE_SZ - RESERVE_SZ + IV_SZ];
 
+    // Page 1 has 16-byte salt prefix; all pages encrypt up to the reserve area
+    let payload_start = if pgno == 1 { SALT_SZ } else { 0 };
+    let encrypted = &page_data[payload_start .. PAGE_SZ - RESERVE_SZ];
+
+    let mut buf = encrypted.to_vec();
+    buf.resize(encrypted.len() + 16, 0);
+
+    let key_arr = GenericArray::from_slice(enc_key);
+    let iv_arr = GenericArray::from_slice(iv);
+    let decryptor = Aes256CbcDec::new(key_arr, iv_arr);
+    decryptor.decrypt_padded_mut::<NoPadding>(&mut buf).ok()?;
+
+    let mut page = Vec::with_capacity(PAGE_SZ);
     if pgno == 1 {
-        // Page 1: first 16 bytes are salt, skip them
-        let encrypted = &page_data[SALT_SZ .. PAGE_SZ - RESERVE_SZ];
-        let mut buf = encrypted.to_vec();
-        buf.resize(encrypted.len() + 16, 0); // room for padding
-
-        let key_arr = GenericArray::from_slice(enc_key);
-        let iv_arr = GenericArray::from_slice(iv);
-        let decryptor = Aes256CbcDec::new(key_arr, iv_arr);
-        match decryptor.decrypt_padded_mut::<NoPadding>(&mut buf) {
-            Ok(decrypted) => {
-                let mut page = Vec::with_capacity(PAGE_SZ);
-                page.extend_from_slice(SQLITE_HDR);
-                page.extend_from_slice(&decrypted[..encrypted.len()]);
-
-                // Fill rest with zeros up to reserve
-                page.resize(PAGE_SZ - RESERVE_SZ, 0);
-                page.extend_from_slice(&page_data[PAGE_SZ - RESERVE_SZ..]);
-                Some(page)
-            }
-            Err(_) => None,
-        }
-    } else {
-        // Other pages: full encrypted content
-        let encrypted = &page_data[.. PAGE_SZ - RESERVE_SZ];
-        let mut buf = encrypted.to_vec();
-        buf.resize(encrypted.len() + 16, 0);
-
-        let key_arr = GenericArray::from_slice(enc_key);
-        let iv_arr = GenericArray::from_slice(iv);
-        let decryptor = Aes256CbcDec::new(key_arr, iv_arr);
-        match decryptor.decrypt_padded_mut::<NoPadding>(&mut buf) {
-            Ok(decrypted) => {
-                let mut page = Vec::with_capacity(PAGE_SZ);
-                page.extend_from_slice(&decrypted[..encrypted.len()]);
-                page.resize(PAGE_SZ, 0);
-                Some(page)
-            }
-            Err(_) => None,
-        }
+        page.extend_from_slice(SQLITE_HDR);
     }
+    page.extend_from_slice(&buf[..encrypted.len()]);
+
+    if pgno == 1 {
+        page.resize(PAGE_SZ - RESERVE_SZ, 0);
+        page.extend_from_slice(&page_data[PAGE_SZ - RESERVE_SZ..]);
+    } else {
+        page.resize(PAGE_SZ, 0);
+    }
+
+    Some(page)
 }
 
 /// Verify page 1 HMAC and return the decryption key if valid.
@@ -146,7 +130,7 @@ fn decrypt_database(db_path: &Path, out_path: &Path, enc_key_hex: &str) -> Resul
         return Err("Page 1 HMAC verification failed".to_string());
     }
 
-    let total_pages = (file_size as usize + PAGE_SZ - 1) / PAGE_SZ;
+    let total_pages = (file_size as usize).div_ceil(PAGE_SZ);
 
     // Ensure output directory exists
     if let Some(parent) = out_path.parent() {
@@ -357,7 +341,7 @@ pub fn decrypt_all(
         print!("Decrypt: {} ({:.1}MB) ... ", rel_path, size_mb);
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
-        match decrypt_database(full_path, &out_path, enc_key.as_deref().map_or("", |v| v)) {
+        match decrypt_database(full_path, &out_path, enc_key.map_or("", |v| v)) {
             Ok(true) => {
                 // Verify with SQLite
                 match verify_sqlite(&out_path) {

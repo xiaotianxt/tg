@@ -1,4 +1,3 @@
-use md5::{Md5, Digest};
 use rusqlite::Connection;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,14 +17,12 @@ struct ExportMessage {
     content: String,
 }
 
-/// Tracks a media message for later file export.
 struct MediaItem {
     msg_type: i64,
     raw_content: String,
     seq: usize,
 }
 
-/// Find message database files
 fn get_message_dbs(decrypted_dir: &Path) -> Vec<PathBuf> {
     let msg_dir = decrypted_dir.join("message");
     let mut dbs = Vec::new();
@@ -45,7 +42,6 @@ fn get_message_dbs(decrypted_dir: &Path) -> Vec<PathBuf> {
     dbs
 }
 
-/// Export messages for a session.
 pub fn export_messages(
     decrypted_dir: &Path,
     session_query: &str,
@@ -61,40 +57,22 @@ pub fn export_messages(
         (contact_db, msg_dbs)
     };
 
-    // Resolve session username
     let contact_db_path = contact_db.as_deref();
-    let username = if session_query.starts_with("tgid_") || session_query.starts_with("gh_") || session_query.contains("@chatroom") {
-        session_query.to_string()
-    } else if let Some(db_path) = contact_db_path {
-        let contacts = db::load_contacts(db_path).map_err(|e| format!("Load contacts: {}", e))?;
-        if let Some(c) = contacts.get(session_query) {
-            c.username.clone()
-        } else {
-            // Fuzzy search
-            let results: Vec<_> = contacts.values()
-                .filter(|c| c.display.contains(session_query) || c.nick_name.contains(session_query))
-                .collect();
-            if results.is_empty() {
-                return Err(format!("No contact found matching '{}'", session_query));
-            }
-            results[0].username.clone()
-        }
-    } else {
-        session_query.to_string()
-    };
-
-    // Load contacts for display name
     let contacts = contact_db_path
         .and_then(|p| db::load_contacts(p).ok())
         .unwrap_or_default();
+
+    let username = match contact_db_path.and_then(|_| resolve_session(session_query, &contacts)) {
+        Some(u) => u,
+        None if session_query.starts_with("tgid_") || session_query.starts_with("gh_") || session_query.contains("@chatroom") => session_query.to_string(),
+        _ => return Err(format!("No contact found matching '{}'", session_query)),
+    };
+
     let display_name = contacts.get(&username)
         .map(|c| c.display.as_str())
         .unwrap_or(&username);
 
-    // Table name
-    let mut hasher = Md5::new();
-    hasher.update(username.as_bytes());
-    let table_name = format!("Msg_{:x}", hasher.finalize());
+    let table_name = db::msg_table_name(&username);
 
     let message_dbs = get_message_dbs(decrypted_dir);
     let mut all_messages: Vec<ExportMessage> = Vec::new();
@@ -154,7 +132,7 @@ pub fn export_messages(
                 &content,
                 display_name,
                 wcdb_ct,
-                |id| crate::db::resolve_sender_name(id, &contacts),
+                |id| db::resolve_sender_name(id, &contacts),
             );
 
             all_messages.push(ExportMessage {
@@ -166,7 +144,6 @@ pub fn export_messages(
                 content: decoded.content,
             });
 
-            // Track media messages for file export
             if media_dir.is_some() && matches!(local_type, 3 | 43 | 47) && !content.is_empty() {
                 media_items.push(MediaItem {
                     msg_type: local_type,
@@ -183,7 +160,6 @@ pub fn export_messages(
         return Err(format!("No messages found for '{}'", username));
     }
 
-    // Create output directory
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("Cannot create output dir: {}", e))?;
 
@@ -206,7 +182,6 @@ pub fn export_messages(
             results.push(("json", path));
         }
         _ => {
-            // Default: export all formats
             let path_txt = output_dir.join("chat.txt");
             export_txt(&path_txt, &username, display_name, &all_messages)?;
             results.push(("txt", path_txt));
@@ -221,7 +196,6 @@ pub fn export_messages(
         }
     }
 
-    // Export media files
     if let Some(mdir) = media_dir {
         let count = export_session_media(mdir, &username, &media_items)?;
         if count > 0 {
@@ -231,6 +205,16 @@ pub fn export_messages(
 
     println!("Exported {} messages for {} ({})", all_messages.len(), display_name, username);
     Ok(results)
+}
+
+fn resolve_session(query: &str, contacts: &std::collections::HashMap<String, db::Contact>) -> Option<String> {
+    if let Some(c) = contacts.get(query) {
+        return Some(c.username.clone());
+    }
+    let results: Vec<_> = contacts.values()
+        .filter(|c| c.display.contains(query) || c.nick_name.contains(query))
+        .collect();
+    results.first().map(|c| c.username.clone())
 }
 
 fn export_txt(path: &Path, username: &str, display_name: &str, messages: &[ExportMessage]) -> Result<(), String> {
@@ -255,12 +239,10 @@ fn export_csv(path: &Path, messages: &[ExportMessage]) -> Result<(), String> {
     let mut f = std::fs::File::create(path)
         .map_err(|e| format!("Cannot create {}: {}", path.display(), e))?;
 
-    // Write BOM for Excel compatibility
     f.write_all(&[0xEF, 0xBB, 0xBF]).ok();
     writeln!(f, "时间,发送者,类型,内容").ok();
 
     for m in messages {
-        // Escape CSV fields
         let time = escape_csv(&m.time);
         let sender = escape_csv(&m.sender);
         let type_name = escape_csv(&m.type_name);
@@ -287,9 +269,6 @@ fn escape_csv(s: &str) -> String {
     }
 }
 
-/// Export media files for a session.
-/// Scans Telegram's local cache for images, stickers, and videos matching the
-/// parsed message metadata and copies them to the output directory.
 fn export_session_media(
     output_dir: &Path,
     session_tgid: &str,
@@ -308,13 +287,11 @@ fn export_session_media(
         let (category, identifier, type_name) = match item.msg_type {
             3 => {
                 let info = media::parse_image_info(&item.raw_content);
-                let id = info.aes_key.clone();
-                (if id.is_empty() { "Image" } else { "Image" }, id, "image")
+                ("Image", info.aes_key.clone(), "image")
             }
             43 => {
                 let info = media::parse_video_info(&item.raw_content);
-                let id = info.aes_key.clone();
-                ("Video", id, "video")
+                ("Video", info.aes_key.clone(), "video")
             }
             47 => {
                 let info = media::parse_sticker_info(&item.raw_content);

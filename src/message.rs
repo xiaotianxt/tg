@@ -311,7 +311,7 @@ fn extract_voice_duration(content: &str) -> String {
 
 /// 从 XML 字符串中提取指定标签的文本内容。
 /// 只处理 `<tag>text</tag>`（无属性）格式。
-fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
 
@@ -327,13 +327,13 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
 }
 
 /// 从 XML 字符串中提取指定标签的整数内容。
-fn extract_xml_tag_int(xml: &str, tag: &str) -> Option<i64> {
+pub(crate) fn extract_xml_tag_int(xml: &str, tag: &str) -> Option<i64> {
     let text = extract_xml_tag(xml, tag)?;
     text.parse::<i64>().ok()
 }
 
 /// 从 XML 自闭合标签中提取属性值（如 `<msg label="xxx" poiname="yyy"/>`）。
-fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
+pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
     let pattern = format!(r#"{}=""#, attr);
     let start = xml.find(&pattern)?;
     let value_start = start + pattern.len();
@@ -377,7 +377,7 @@ pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
             || prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
         if is_id && prefix.len() >= 3 {
             let after = &content[i + 1..];
-            let after = after.trim_start_matches(|c| c == ' ' || c == '\n');
+            let after = after.trim_start_matches([' ', '\n']);
             return (Some(prefix), after);
         }
         break; // first colon doesn't match, stop
