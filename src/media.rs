@@ -34,6 +34,7 @@ impl ImageInfo {
         format!("[图片{}{}]", dims, size)
     }
 
+    #[allow(dead_code)]
     pub fn possible_cache_keys(&self) -> Vec<String> {
         let mut keys = Vec::new();
         if !self.aes_key.is_empty() { keys.push(self.aes_key.clone()); }
@@ -70,6 +71,7 @@ impl VideoInfo {
         format!("[视频{}{}]", dur, dims)
     }
 
+    #[allow(dead_code)]
     pub fn possible_cache_keys(&self) -> Vec<String> {
         let mut keys = Vec::new();
         if !self.aes_key.is_empty() { keys.push(self.aes_key.clone()); }
@@ -134,10 +136,13 @@ impl LinkInfo {
 #[derive(Debug, Clone, Default)]
 pub struct MiniProgramInfo {
     pub title: String,
+    #[allow(dead_code)]
     pub description: String,
     pub app_name: String,
+    #[allow(dead_code)]
     pub app_id: String,
     pub page_path: String,
+    #[allow(dead_code)]
     pub username: String,
 }
 

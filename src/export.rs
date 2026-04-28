@@ -138,6 +138,7 @@ pub fn export_messages(
         };
 
         for (local_type, create_time, content, wcdb_ct) in rows {
+            seq += 1;
             let time_str = chrono::DateTime::from_timestamp(create_time, 0)
                 .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_default();
@@ -158,6 +159,15 @@ pub fn export_messages(
                 type_name: decoded.msg_type.to_string(),
                 content: decoded.content,
             });
+
+            // Track media messages for file export
+            if media_dir.is_some() && matches!(local_type, 3 | 43 | 47) && !content.is_empty() {
+                media_items.push(MediaItem {
+                    msg_type: local_type,
+                    raw_content: content,
+                    seq,
+                });
+            }
         }
     }
 
@@ -202,6 +212,14 @@ pub fn export_messages(
             let path_json = output_dir.join("chat.json");
             export_json(&path_json, &all_messages)?;
             results.push(("json", path_json));
+        }
+    }
+
+    // Export media files
+    if let Some(mdir) = media_dir {
+        let count = export_session_media(mdir, &username, &media_items)?;
+        if count > 0 {
+            println!("Exported {} media files to {}", count, mdir.display());
         }
     }
 
@@ -261,4 +279,61 @@ fn escape_csv(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Export media files for a session.
+/// Scans Telegram's local cache for images, stickers, and videos matching the
+/// parsed message metadata and copies them to the output directory.
+fn export_session_media(
+    output_dir: &Path,
+    session_tgid: &str,
+    items: &[MediaItem],
+) -> Result<usize, String> {
+    let telegram_base = match media::find_telegram_base_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("Warning: Telegram data directory not found, media export skipped");
+            return Ok(0);
+        }
+    };
+
+    let mut exported = 0;
+    for item in items {
+        let (category, identifier, type_name) = match item.msg_type {
+            3 => {
+                let info = media::parse_image_info(&item.raw_content);
+                let id = info.aes_key.clone();
+                (if id.is_empty() { "Image" } else { "Image" }, id, "image")
+            }
+            43 => {
+                let info = media::parse_video_info(&item.raw_content);
+                let id = info.aes_key.clone();
+                ("Video", id, "video")
+            }
+            47 => {
+                let info = media::parse_sticker_info(&item.raw_content);
+                let id = if !info.product_id.is_empty() { info.product_id.clone() } else { info.url.clone() };
+                ("Image", id, "sticker")
+            }
+            _ => continue,
+        };
+
+        if identifier.is_empty() {
+            continue;
+        }
+
+        if let Some(src) = media::find_cached_media(&telegram_base, session_tgid, category, &identifier) {
+            match media::export_media_file(&src, output_dir, session_tgid, type_name, item.seq) {
+                Ok(path) => {
+                    println!("  Media #{}: {}", item.seq, path.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
+                    exported += 1;
+                }
+                Err(e) => {
+                    eprintln!("  Media #{} export failed: {}", item.seq, e);
+                }
+            }
+        }
+    }
+
+    Ok(exported)
 }
