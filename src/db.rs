@@ -81,7 +81,7 @@ pub(crate) fn load_contacts(contact_db: &Path) -> Result<HashMap<String, Contact
     Ok(contacts)
 }
 
-fn msg_table_name(username: &str) -> String {
+pub(crate) fn msg_table_name(username: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(username.as_bytes());
     let hash = hasher.finalize();
@@ -165,10 +165,10 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize) -> Result<Vec<(String, 
                 if cnt > 0 {
                     let info = sessions.entry(table_name.clone()).or_default();
                     info.count += cnt;
-                    if earliest.map_or(true, |e| info.earliest.map_or(true, |ie| e < ie)) {
+                    if earliest.is_none_or(|e| info.earliest.is_none_or(|ie| e < ie)) {
                         info.earliest = earliest;
                     }
-                    if latest.map_or(true, |l| info.latest.map_or(true, |il| l > il)) {
+                    if latest.is_none_or(|l| info.latest.is_none_or(|il| l > il)) {
                         info.latest = latest;
                     }
                 }
@@ -181,7 +181,7 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize) -> Result<Vec<(String, 
     sorted.sort_by(|a, b| b.1.count.cmp(&a.1.count));
 
     // Print header
-    println!("{:<4} {:<8} {:<46} {:<22} {}", "Rank", "Count", "Time Range", "Display Name", "Username");
+    println!("{:<4} {:<8} {:<46} {:<22} Username", "Rank", "Count", "Time Range", "Display Name");
     println!("{}", "-".repeat(120));
 
     let mut result = Vec::new();
@@ -354,10 +354,7 @@ pub fn read_messages(
             .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
 
-        // 1-on-1 chat: if the sender is not the chat partner, it's "me"
-        let sender_display = if sender_tgid.is_empty() {
-            display_name
-        } else if sender_tgid == &username {
+        let sender_display = if sender_tgid.is_empty() || sender_tgid == &username {
             display_name
         } else {
             "我"
@@ -524,7 +521,7 @@ fn resolve_username(query: &str, contact_db: Option<&Path>) -> Result<String, St
 }
 
 fn find_username_by_table(contacts: &HashMap<String, Contact>, table_name: &str) -> Option<String> {
-    for (username, _) in contacts {
+    for username in contacts.keys() {
         if msg_table_name(username) == table_name {
             return Some(format!("{} ({})", contacts.get(username)?.display, username));
         }

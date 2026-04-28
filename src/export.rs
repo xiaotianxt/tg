@@ -1,4 +1,3 @@
-use md5::{Md5, Digest};
 use rusqlite::Connection;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,14 +17,12 @@ struct ExportMessage {
     content: String,
 }
 
-/// Tracks a media message for later file export.
 struct MediaItem {
     msg_type: i64,
     raw_content: String,
     seq: usize,
 }
 
-/// Find message database files
 fn get_message_dbs(decrypted_dir: &Path) -> Vec<PathBuf> {
     let msg_dir = decrypted_dir.join("message");
     let mut dbs = Vec::new();
@@ -45,7 +42,6 @@ fn get_message_dbs(decrypted_dir: &Path) -> Vec<PathBuf> {
     dbs
 }
 
-/// Export messages for a session.
 pub fn export_messages(
     decrypted_dir: &Path,
     session_query: &str,
@@ -61,40 +57,22 @@ pub fn export_messages(
         (contact_db, msg_dbs)
     };
 
-    // Resolve session username
     let contact_db_path = contact_db.as_deref();
-    let username = if session_query.starts_with("tgid_") || session_query.starts_with("gh_") || session_query.contains("@chatroom") {
-        session_query.to_string()
-    } else if let Some(db_path) = contact_db_path {
-        let contacts = db::load_contacts(db_path).map_err(|e| format!("Load contacts: {}", e))?;
-        if let Some(c) = contacts.get(session_query) {
-            c.username.clone()
-        } else {
-            // Fuzzy search
-            let results: Vec<_> = contacts.values()
-                .filter(|c| c.display.contains(session_query) || c.nick_name.contains(session_query))
-                .collect();
-            if results.is_empty() {
-                return Err(format!("No contact found matching '{}'", session_query));
-            }
-            results[0].username.clone()
-        }
-    } else {
-        session_query.to_string()
-    };
-
-    // Load contacts for display name
     let contacts = contact_db_path
         .and_then(|p| db::load_contacts(p).ok())
         .unwrap_or_default();
+
+    let username = match contact_db_path.and_then(|_| resolve_session(session_query, &contacts)) {
+        Some(u) => u,
+        None if session_query.starts_with("tgid_") || session_query.starts_with("gh_") || session_query.contains("@chatroom") => session_query.to_string(),
+        _ => return Err(format!("No contact found matching '{}'", session_query)),
+    };
+
     let display_name = contacts.get(&username)
         .map(|c| c.display.as_str())
         .unwrap_or(&username);
 
-    // Table name
-    let mut hasher = Md5::new();
-    hasher.update(username.as_bytes());
-    let table_name = format!("Msg_{:x}", hasher.finalize());
+    let table_name = db::msg_table_name(&username);
 
     let message_dbs = get_message_dbs(decrypted_dir);
     let mut all_messages: Vec<ExportMessage> = Vec::new();
@@ -116,7 +94,6 @@ pub fn export_messages(
 
         let rows: Vec<(i64, i64, String, Option<i64>)> = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
-                // message_content can be TEXT or BLOB; read as String when possible
                 let content: String = match row.get::<_, Option<String>>(2) {
                     Ok(Some(s)) => s,
                     _ => match row.get::<_, Option<Vec<u8>>>(2) {
@@ -138,6 +115,7 @@ pub fn export_messages(
         };
 
         for (local_type, create_time, content, wcdb_ct) in rows {
+            seq += 1;
             let time_str = chrono::DateTime::from_timestamp(create_time, 0)
                 .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_default();
@@ -147,7 +125,7 @@ pub fn export_messages(
                 &content,
                 display_name,
                 wcdb_ct,
-                |id| crate::db::resolve_sender_name(id, &contacts),
+                |id| db::resolve_sender_name(id, &contacts),
             );
 
             all_messages.push(ExportMessage {
@@ -158,6 +136,14 @@ pub fn export_messages(
                 type_name: decoded.msg_type.to_string(),
                 content: decoded.content,
             });
+
+            if media_dir.is_some() && matches!(local_type, 3 | 43 | 47) && !content.is_empty() {
+                media_items.push(MediaItem {
+                    msg_type: local_type,
+                    raw_content: content,
+                    seq,
+                });
+            }
         }
     }
 
@@ -167,7 +153,6 @@ pub fn export_messages(
         return Err(format!("No messages found for '{}'", username));
     }
 
-    // Create output directory
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("Cannot create output dir: {}", e))?;
 
@@ -190,7 +175,6 @@ pub fn export_messages(
             results.push(("json", path));
         }
         _ => {
-            // Default: export all formats
             let path_txt = output_dir.join("chat.txt");
             export_txt(&path_txt, &username, display_name, &all_messages)?;
             results.push(("txt", path_txt));
@@ -205,8 +189,25 @@ pub fn export_messages(
         }
     }
 
+    if let Some(mdir) = media_dir {
+        let count = export_session_media(mdir, &username, &media_items)?;
+        if count > 0 {
+            println!("Exported {} media files to {}", count, mdir.display());
+        }
+    }
+
     println!("Exported {} messages for {} ({})", all_messages.len(), display_name, username);
     Ok(results)
+}
+
+fn resolve_session(query: &str, contacts: &std::collections::HashMap<String, db::Contact>) -> Option<String> {
+    if let Some(c) = contacts.get(query) {
+        return Some(c.username.clone());
+    }
+    let results: Vec<_> = contacts.values()
+        .filter(|c| c.display.contains(query) || c.nick_name.contains(query))
+        .collect();
+    results.first().map(|c| c.username.clone())
 }
 
 fn export_txt(path: &Path, username: &str, display_name: &str, messages: &[ExportMessage]) -> Result<(), String> {
@@ -231,12 +232,10 @@ fn export_csv(path: &Path, messages: &[ExportMessage]) -> Result<(), String> {
     let mut f = std::fs::File::create(path)
         .map_err(|e| format!("Cannot create {}: {}", path.display(), e))?;
 
-    // Write BOM for Excel compatibility
     f.write_all(&[0xEF, 0xBB, 0xBF]).ok();
     writeln!(f, "时间,发送者,类型,内容").ok();
 
     for m in messages {
-        // Escape CSV fields
         let time = escape_csv(&m.time);
         let sender = escape_csv(&m.sender);
         let type_name = escape_csv(&m.type_name);
@@ -261,4 +260,56 @@ fn escape_csv(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+fn export_session_media(
+    output_dir: &Path,
+    session_tgid: &str,
+    items: &[MediaItem],
+) -> Result<usize, String> {
+    let telegram_base = match media::find_telegram_base_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("Warning: Telegram data directory not found, media export skipped");
+            return Ok(0);
+        }
+    };
+
+    let mut exported = 0;
+    for item in items {
+        let (category, identifier, type_name) = match item.msg_type {
+            3 => {
+                let info = media::parse_image_info(&item.raw_content);
+                ("Image", info.aes_key.clone(), "image")
+            }
+            43 => {
+                let info = media::parse_video_info(&item.raw_content);
+                ("Video", info.aes_key.clone(), "video")
+            }
+            47 => {
+                let info = media::parse_sticker_info(&item.raw_content);
+                let id = if !info.product_id.is_empty() { info.product_id.clone() } else { info.url.clone() };
+                ("Image", id, "sticker")
+            }
+            _ => continue,
+        };
+
+        if identifier.is_empty() {
+            continue;
+        }
+
+        if let Some(src) = media::find_cached_media(&telegram_base, session_tgid, category, &identifier) {
+            match media::export_media_file(&src, output_dir, session_tgid, type_name, item.seq) {
+                Ok(path) => {
+                    println!("  Media #{}: {}", item.seq, path.file_name().and_then(|n| n.to_str()).unwrap_or("?"));
+                    exported += 1;
+                }
+                Err(e) => {
+                    eprintln!("  Media #{} export failed: {}", item.seq, e);
+                }
+            }
+        }
+    }
+
+    Ok(exported)
 }

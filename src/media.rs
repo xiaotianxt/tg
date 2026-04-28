@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::fs;
 
+use crate::message;
+
 /// Parsed info about an image message (type 3).
 #[derive(Debug, Clone, Default)]
 pub struct ImageInfo {
@@ -34,11 +36,6 @@ impl ImageInfo {
         format!("[图片{}{}]", dims, size)
     }
 
-    pub fn possible_cache_keys(&self) -> Vec<String> {
-        let mut keys = Vec::new();
-        if !self.aes_key.is_empty() { keys.push(self.aes_key.clone()); }
-        keys
-    }
 }
 
 /// Parsed info about a video message (type 43).
@@ -70,11 +67,6 @@ impl VideoInfo {
         format!("[视频{}{}]", dur, dims)
     }
 
-    pub fn possible_cache_keys(&self) -> Vec<String> {
-        let mut keys = Vec::new();
-        if !self.aes_key.is_empty() { keys.push(self.aes_key.clone()); }
-        keys
-    }
 }
 
 /// Parsed info about a sticker message (type 47).
@@ -134,10 +126,13 @@ impl LinkInfo {
 #[derive(Debug, Clone, Default)]
 pub struct MiniProgramInfo {
     pub title: String,
+    #[allow(dead_code)]
     pub description: String,
     pub app_name: String,
+    #[allow(dead_code)]
     pub app_id: String,
     pub page_path: String,
+    #[allow(dead_code)]
     pub username: String,
 }
 
@@ -166,16 +161,16 @@ impl MiniProgramInfo {
 pub fn parse_image_info(xml: &str) -> ImageInfo {
     let mut info = ImageInfo::default();
 
-    if let Some(v) = extract_attr(xml, "aeskey") { info.aes_key = v; }
-    if let Some(v) = extract_attr(xml, "cdnthumburl") { info.cdn_thumb_url = v; }
-    if let Some(v) = extract_attr(xml, "cdnmidiurl") { info.cdn_midi_url = v; }
-    if let Some(v) = extract_attr(xml, "cdndisplaybackupurl") { info.cdn_big_url = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "aeskey") { info.aes_key = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "cdnthumburl") { info.cdn_thumb_url = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "cdnmidiurl") { info.cdn_midi_url = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "cdndisplaybackupurl") { info.cdn_big_url = v; }
 
-    if let Some(v) = extract_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) { info.thumb_width = v; }
-    if let Some(v) = extract_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) { info.thumb_height = v; }
-    if let Some(v) = extract_attr(xml, "rawlength").and_then(|s| s.parse().ok()) { info.raw_length = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) { info.thumb_width = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) { info.thumb_height = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "rawlength").and_then(|s| s.parse().ok()) { info.raw_length = v; }
     if info.raw_length == 0 {
-        if let Some(v) = extract_attr(xml, "cdnmidimagerawlength").and_then(|s| s.parse().ok()) { info.raw_length = v; }
+        if let Some(v) = message::extract_xml_attr(xml, "cdnmidimagerawlength").and_then(|s| s.parse().ok()) { info.raw_length = v; }
     }
 
     info
@@ -185,13 +180,13 @@ pub fn parse_image_info(xml: &str) -> ImageInfo {
 pub fn parse_video_info(xml: &str) -> VideoInfo {
     let mut info = VideoInfo::default();
 
-    if let Some(v) = extract_attr(xml, "aeskey") { info.aes_key = v; }
-    if let Some(v) = extract_attr(xml, "cdnvideourl") { info.cdn_video_url = v; }
-    if let Some(v) = extract_attr(xml, "cdnthumburl") { info.cdn_thumb_url = v; }
-    if let Some(v) = extract_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) { info.thumb_width = v; }
-    if let Some(v) = extract_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) { info.thumb_height = v; }
-    if let Some(v) = extract_attr(xml, "playlength").and_then(|s| s.parse().ok()) { info.play_length = v; }
-    if let Some(v) = extract_attr(xml, "rawvideolength").and_then(|s| s.parse().ok()) { info.raw_video_length = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "aeskey") { info.aes_key = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "cdnvideourl") { info.cdn_video_url = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "cdnthumburl") { info.cdn_thumb_url = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) { info.thumb_width = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) { info.thumb_height = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "playlength").and_then(|s| s.parse().ok()) { info.play_length = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "rawvideolength").and_then(|s| s.parse().ok()) { info.raw_video_length = v; }
 
     info
 }
@@ -200,10 +195,10 @@ pub fn parse_video_info(xml: &str) -> VideoInfo {
 pub fn parse_sticker_info(xml: &str) -> StickerInfo {
     let mut info = StickerInfo::default();
 
-    if let Some(v) = extract_attr(xml, "productid") { info.product_id = v; }
-    if let Some(v) = extract_attr(xml, "url") { info.url = v; }
-    if let Some(v) = extract_tag(xml, "packname") { info.pack_name = v; }
-    if let Some(v) = extract_attr(xml, "packurl") { info.pack_url = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "productid") { info.product_id = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "url") { info.url = v; }
+    if let Some(v) = message::extract_xml_tag(xml, "packname") { info.pack_name = v; }
+    if let Some(v) = message::extract_xml_attr(xml, "packurl") { info.pack_url = v; }
     info.has_emojibuf = xml.contains("<emojibuf>");
 
     info
@@ -215,9 +210,9 @@ pub fn parse_link_info(xml: &str) -> Option<LinkInfo> {
         return None;
     }
     Some(LinkInfo {
-        title: extract_tag(xml, "title").unwrap_or_default(),
-        description: extract_tag(xml, "des").unwrap_or_default(),
-        url: extract_tag(xml, "url").unwrap_or_default(),
+        title: message::extract_xml_tag(xml, "title").unwrap_or_default(),
+        description: message::extract_xml_tag(xml, "des").unwrap_or_default(),
+        url: message::extract_xml_tag(xml, "url").unwrap_or_default(),
     })
 }
 
@@ -227,12 +222,12 @@ pub fn parse_mini_program_info(xml: &str) -> Option<MiniProgramInfo> {
         return None;
     }
     Some(MiniProgramInfo {
-        title: extract_tag(xml, "title").unwrap_or_default(),
-        description: extract_tag(xml, "des").unwrap_or_default(),
-        app_name: extract_tag(xml, "appname").unwrap_or_default(),
-        app_id: extract_tag(xml, "appid").unwrap_or_default(),
-        page_path: extract_tag(xml, "pagepath").unwrap_or_default(),
-        username: extract_tag(xml, "username").unwrap_or_default(),
+        title: message::extract_xml_tag(xml, "title").unwrap_or_default(),
+        description: message::extract_xml_tag(xml, "des").unwrap_or_default(),
+        app_name: message::extract_xml_tag(xml, "appname").unwrap_or_default(),
+        app_id: message::extract_xml_tag(xml, "appid").unwrap_or_default(),
+        page_path: message::extract_xml_tag(xml, "pagepath").unwrap_or_default(),
+        username: message::extract_xml_tag(xml, "username").unwrap_or_default(),
     })
 }
 
@@ -386,31 +381,6 @@ fn sanitize_filename(s: &str) -> String {
         .collect()
 }
 
-// ===== XML helpers (reused from message.rs) =====
-
-/// Extract attribute value from a self-closing XML tag like `<tag attr="value" .../>`.
-fn extract_attr(xml: &str, attr: &str) -> Option<String> {
-    let pattern = format!(r#"{}=""#, attr);
-    let start = xml.find(&pattern)?;
-    let value_start = start + pattern.len();
-    if value_start >= xml.len() { return None; }
-    let rest = &xml[value_start..];
-    if !rest.starts_with('"') { return None; }
-    let rest = &rest[1..];
-    let end = rest.find('"')?;
-    let value = rest[..end].to_string();
-    if value.is_empty() { None } else { Some(value) }
-}
-
-/// Extract text content from `<tag>text</tag>`.
-fn extract_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    let start = xml.find(&open)?;
-    let value_start = start + open.len();
-    if value_start >= xml.len() { return None; }
-    let rest = &xml[value_start..];
-    let value_end = rest.find(&close)?;
-    let value = rest[..value_end].trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
-}
+// XML helpers imported from message module to avoid duplication:
+//   message::extract_xml_attr  — <tag attr="value" .../>
+//   message::extract_xml_tag   — <tag>text</tag>
