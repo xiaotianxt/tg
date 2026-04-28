@@ -1,15 +1,16 @@
-use md5::{Md5, Digest};
+use md5::{Digest, Md5};
 use rusqlite::Connection;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::message;
 use crate::parallel;
 
 /// Resolve a sender ID to a display name from contacts.
 pub fn resolve_sender_name(sender_id: &str, contacts: &HashMap<String, Contact>) -> String {
-    contacts.get(sender_id)
+    contacts
+        .get(sender_id)
         .map(|c| c.display.as_str())
         .unwrap_or(sender_id)
         .to_string()
@@ -23,7 +24,8 @@ pub(crate) fn find_decrypted_dbs(decrypted_dir: &Path) -> (Option<PathBuf>, Vec<
         Some(contact_db)
     } else {
         // Try alternative location
-        let alt = decrypted_dir.parent()
+        let alt = decrypted_dir
+            .parent()
             .map(|p| p.join("decrypted/contact/contact.db"))
             .filter(|p| p.exists());
         alt
@@ -37,8 +39,7 @@ pub(crate) fn find_decrypted_dbs(decrypted_dir: &Path) -> (Option<PathBuf>, Vec<
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("db") {
-                    let name = path.file_name()
-                        .and_then(|n| n.to_str()).unwrap_or("");
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     if name.starts_with("message_") && !name.contains("fts") {
                         message_dbs.push(path);
                     }
@@ -71,23 +72,38 @@ type MessageRow = (i64, i64, String, Option<i64>, String, Vec<u8>);
 type SearchRow = (i64, i64, String, String);
 
 pub(crate) fn load_contacts(contact_db: &Path) -> Result<HashMap<String, Contact>, String> {
-    let conn = Connection::open(contact_db)
-        .map_err(|e| format!("Cannot open contact DB: {}", e))?;
+    let conn =
+        Connection::open(contact_db).map_err(|e| format!("Cannot open contact DB: {}", e))?;
 
-    let mut stmt = conn.prepare(
-        "SELECT username, nick_name, remark, alias FROM contact"
-    ).map_err(|e| format!("Contact query error: {}", e))?;
+    let mut stmt = conn
+        .prepare("SELECT username, nick_name, remark, alias FROM contact")
+        .map_err(|e| format!("Contact query error: {}", e))?;
 
-    let contacts: HashMap<String, Contact> = stmt.query_map([], |row| {
-        let username: String = row.get(0)?;
-        let nick_name: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
-        let remark: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
-        let alias: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
-        let display = if !remark.is_empty() { remark.clone() } else { nick_name.clone() };
-        Ok((username.clone(), Contact { username, nick_name, remark, alias, display }))
-    }).map_err(|e| format!("Contact read error: {}", e))?
-    .filter_map(|r| r.ok())
-    .collect();
+    let contacts: HashMap<String, Contact> = stmt
+        .query_map([], |row| {
+            let username: String = row.get(0)?;
+            let nick_name: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+            let remark: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+            let alias: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+            let display = if !remark.is_empty() {
+                remark.clone()
+            } else {
+                nick_name.clone()
+            };
+            Ok((
+                username.clone(),
+                Contact {
+                    username,
+                    nick_name,
+                    remark,
+                    alias,
+                    display,
+                },
+            ))
+        })
+        .map_err(|e| format!("Contact read error: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
 
     Ok(contacts)
 }
@@ -100,7 +116,11 @@ pub(crate) fn msg_table_name(username: &str) -> String {
 }
 
 /// List all sessions/messages with counts.
-pub fn list_sessions(decrypted_dir: &Path, top_n: usize, jobs: usize) -> Result<Vec<(String, i64, String, String)>, String> {
+pub fn list_sessions(
+    decrypted_dir: &Path,
+    top_n: usize,
+    jobs: usize,
+) -> Result<Vec<(String, i64, String, String)>, String> {
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
 
     // Load contacts
@@ -117,7 +137,9 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize, jobs: usize) -> Result<
         table_to_username.insert(table, username.clone());
         // Also store by display name
         let display_table = msg_table_name(&contact.display);
-        table_to_username.entry(display_table).or_insert_with(|| username.clone());
+        table_to_username
+            .entry(display_table)
+            .or_insert_with(|| username.clone());
     }
 
     let db_jobs = parallel::job_count(jobs, 8);
@@ -129,9 +151,9 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize, jobs: usize) -> Result<
         };
 
         // Find all Msg_ tables
-        let tables: Vec<String> = match conn.prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
-        ) {
+        let tables: Vec<String> = match conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
+        {
             Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
                 Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
                 Err(_) => vec![],
@@ -146,7 +168,11 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize, jobs: usize) -> Result<
             );
             let stats: Vec<(i64, Option<i64>, Option<i64>)> = match conn.prepare(&sql) {
                 Ok(mut q) => match q.query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?))
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
                 }) {
                     Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
                     Err(_) => vec![],
@@ -174,10 +200,16 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize, jobs: usize) -> Result<
         for (table_name, db_info) in db_sessions {
             let info = sessions.entry(table_name).or_default();
             info.count += db_info.count;
-            if db_info.earliest.is_none_or(|e| info.earliest.is_none_or(|ie| e < ie)) {
+            if db_info
+                .earliest
+                .is_none_or(|e| info.earliest.is_none_or(|ie| e < ie))
+            {
                 info.earliest = db_info.earliest;
             }
-            if db_info.latest.is_none_or(|l| info.latest.is_none_or(|il| l > il)) {
+            if db_info
+                .latest
+                .is_none_or(|l| info.latest.is_none_or(|il| l > il))
+            {
                 info.latest = db_info.latest;
             }
         }
@@ -196,20 +228,19 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize, jobs: usize) -> Result<
 
     out.line(format_args!(
         "{:<4} {:<8} {:<46} {:<22} Username",
-        "Rank",
-        "Count",
-        "Time Range",
-        "Display Name"
+        "Rank", "Count", "Time Range", "Display Name"
     ))?;
     out.line(format_args!("{}", "-".repeat(120)))?;
 
     let mut result = Vec::new();
 
     for (i, (table, info)) in sorted.iter().enumerate().take(top_n) {
-        let username = table_to_username.get(table)
+        let username = table_to_username
+            .get(table)
             .cloned()
             .unwrap_or_else(|| table.clone());
-        let display = contacts.get(&username)
+        let display = contacts
+            .get(&username)
             .map(|c| c.display.as_str())
             .unwrap_or("(?))");
 
@@ -235,7 +266,12 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize, jobs: usize) -> Result<
             username
         ))?;
 
-        result.push((username.clone(), info.count, time_range, display.to_string()));
+        result.push((
+            username.clone(),
+            info.count,
+            time_range,
+            display.to_string(),
+        ));
     }
 
     out.blank_line()?;
@@ -257,15 +293,18 @@ pub fn read_messages(
 ) -> Result<usize, String> {
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
 
-    let username = resolve_username_for_messages(session_query, contact_db.as_deref(), &message_dbs, jobs)?;
+    let username =
+        resolve_username_for_messages(session_query, contact_db.as_deref(), &message_dbs, jobs)?;
     let table_name = msg_table_name(&username);
     let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
 
-    let contacts = contact_db.as_ref()
+    let contacts = contact_db
+        .as_ref()
         .and_then(|p| load_contacts(p).ok())
         .unwrap_or_default();
 
-    let display_name = contacts.get(&username)
+    let display_name = contacts
+        .get(&username)
         .map(|c| c.display.as_str())
         .unwrap_or(&username);
 
@@ -287,8 +326,12 @@ pub fn read_messages(
         };
 
         // Check if table exists quickly
-        let table_exists = conn.prepare(&format!("SELECT 1 FROM {} LIMIT 1", table_name)).is_ok();
-        if !table_exists { return (total_count, rows); }
+        let table_exists = conn
+            .prepare(&format!("SELECT 1 FROM {} LIMIT 1", table_name))
+            .is_ok();
+        if !table_exists {
+            return (total_count, rows);
+        }
 
         // Get total count for this DB
         let count_sql = format!(
@@ -302,12 +345,17 @@ pub fn read_messages(
         }
 
         // Load Name2Id mapping (sender_id → tgid)
-        let name2id: HashMap<i64, String> = match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
-            Ok(mut stmt) => stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default(),
-            Err(_) => HashMap::new(),
-        };
+        let name2id: HashMap<i64, String> =
+            match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
+                Ok(mut stmt) => stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .ok()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default(),
+                Err(_) => HashMap::new(),
+            };
 
         let order_dir = if tail { "DESC" } else { "ASC" };
 
@@ -327,7 +375,9 @@ pub fn read_messages(
                 let content: String = if wcdb_ct == Some(4) {
                     if let Ok(b) = row.get::<_, Vec<u8>>(2) {
                         message::try_decompress(&b).unwrap_or_default()
-                    } else { String::new() }
+                    } else {
+                        String::new()
+                    }
                 } else {
                     match row.get::<_, Option<String>>(2) {
                         Ok(Some(s)) => s,
@@ -427,7 +477,11 @@ pub fn read_messages(
 
     for (local_type, create_time, content, wcdb_ct, sender_tgid, packed_info) in &messages {
         let time_str = chrono::DateTime::from_timestamp(*create_time, 0)
-            .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
+            .map(|t| {
+                t.with_timezone(&cst_offset)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
             .unwrap_or_default();
 
         // 1-on-1 chat: if the sender is not the chat partner, it's "me"
@@ -466,7 +520,8 @@ pub fn search_messages(
     jobs: usize,
 ) -> Result<usize, String> {
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
-    let contacts = contact_db.as_ref()
+    let contacts = contact_db
+        .as_ref()
         .and_then(|p| load_contacts(p).ok())
         .unwrap_or_default();
 
@@ -480,9 +535,9 @@ pub fn search_messages(
         };
 
         // Find Msg_ tables - collect eagerly
-        let tables: Vec<String> = match conn.prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
-        ) {
+        let tables: Vec<String> = match conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
+        {
             Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
                 Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
                 Err(_) => vec![],
@@ -547,11 +602,15 @@ pub fn search_messages(
 
     for (i, (_, create_time, content, table_name)) in results.iter().enumerate().take(limit) {
         let time_str = chrono::DateTime::from_timestamp(*create_time, 0)
-            .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
+            .map(|t| {
+                t.with_timezone(&cst_offset)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
             .unwrap_or_default();
 
-        let display = find_username_by_table(&contacts, table_name)
-            .unwrap_or_else(|| "(?)".to_string());
+        let display =
+            find_username_by_table(&contacts, table_name).unwrap_or_else(|| "(?)".to_string());
 
         let display_content = if content.len() > 100 {
             format!("{}...", &content[..100])
@@ -640,7 +699,8 @@ fn resolve_username_with_context(
                     candidate.contact.nick_name,
                     candidate.contact.remark,
                     candidate.contact.alias,
-                    candidate.latest_message_time
+                    candidate
+                        .latest_message_time
                         .map(|ts| format!(" - latest {}", format_match_time(ts)))
                         .unwrap_or_default()
                 );
@@ -677,7 +737,8 @@ fn contact_match_candidates<'a>(
     message_dbs: Option<&[PathBuf]>,
     jobs: usize,
 ) -> Vec<ContactMatch<'a>> {
-    let mut candidates: Vec<_> = contacts.values()
+    let mut candidates: Vec<_> = contacts
+        .values()
         .filter_map(|contact| {
             let (score, field_priority, distance, field_len) = best_contact_score(contact, query)?;
             Some(ContactMatch {
@@ -691,21 +752,28 @@ fn contact_match_candidates<'a>(
         })
         .collect();
 
-    if candidates.iter().any(|candidate| candidate.score >= DIRECT_MATCH_SCORE_FLOOR) {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.score >= DIRECT_MATCH_SCORE_FLOOR)
+    {
         candidates.retain(|candidate| candidate.score >= DIRECT_MATCH_SCORE_FLOOR);
     }
 
     if let Some(message_dbs) = message_dbs {
-        let latest_by_username = latest_message_times_for_candidates(message_dbs, &candidates, jobs);
+        let latest_by_username =
+            latest_message_times_for_candidates(message_dbs, &candidates, jobs);
         for candidate in &mut candidates {
-            candidate.latest_message_time = latest_by_username.get(&candidate.contact.username).copied();
+            candidate.latest_message_time =
+                latest_by_username.get(&candidate.contact.username).copied();
         }
     }
 
     candidates.sort_by(|a, b| {
         let a_latest = a.latest_message_time.unwrap_or(0);
         let b_latest = b.latest_message_time.unwrap_or(0);
-        b.latest_message_time.is_some().cmp(&a.latest_message_time.is_some())
+        b.latest_message_time
+            .is_some()
+            .cmp(&a.latest_message_time.is_some())
             .then_with(|| a.field_priority.cmp(&b.field_priority))
             .then_with(|| b.score.cmp(&a.score))
             .then_with(|| b_latest.cmp(&a_latest))
@@ -724,7 +792,8 @@ fn best_contact_score(contact: &Contact, query: &str) -> Option<(i64, usize, usi
     }
     let query_tokens = tokenize_match_text(query);
 
-    contact_match_fields(contact).iter()
+    contact_match_fields(contact)
+        .iter()
         .filter_map(|(priority, field)| {
             field_score(field, query, &normalized_query, &query_tokens)
                 .map(|(score, distance, field_len)| (score, *priority, distance, field_len))
@@ -776,7 +845,11 @@ fn field_score(
     if normalized_field.contains(normalized_query) {
         return Some((NORMALIZED_CONTAINS_MATCH_SCORE, 0, field_len));
     }
-    if query_tokens.len() > 1 && query_tokens.iter().all(|token| normalized_field.contains(token)) {
+    if query_tokens.len() > 1
+        && query_tokens
+            .iter()
+            .all(|token| normalized_field.contains(token))
+    {
         return Some((TOKEN_MATCH_SCORE, 0, field_len));
     }
 
@@ -860,7 +933,8 @@ fn latest_message_times_for_candidates(
     candidates: &[ContactMatch<'_>],
     jobs: usize,
 ) -> HashMap<String, i64> {
-    let table_to_username: HashMap<String, String> = candidates.iter()
+    let table_to_username: HashMap<String, String> = candidates
+        .iter()
         .map(|candidate| {
             (
                 msg_table_name(&candidate.contact.username),
@@ -878,9 +952,9 @@ fn latest_message_times_for_candidates(
             Err(_) => return latest_by_username,
         };
 
-        let tables: Vec<String> = match conn.prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
-        ) {
+        let tables: Vec<String> = match conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
+        {
             Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
                 Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
                 Err(_) => vec![],
@@ -893,7 +967,10 @@ fn latest_message_times_for_candidates(
                 Some(username) => username,
                 None => continue,
             };
-            let sql = format!("SELECT MAX(create_time) FROM {} WHERE create_time > 0", table_name);
+            let sql = format!(
+                "SELECT MAX(create_time) FROM {} WHERE create_time > 0",
+                table_name
+            );
             if let Ok(mut stmt) = conn.prepare(&sql) {
                 if let Ok(ts) = stmt.query_row([], |row| row.get::<_, Option<i64>>(0)) {
                     if let Some(ts) = ts {
@@ -923,14 +1000,22 @@ fn latest_message_times_for_candidates(
 fn format_match_time(timestamp: i64) -> String {
     let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
     chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
+        .map(|t| {
+            t.with_timezone(&cst_offset)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
         .unwrap_or_else(|| timestamp.to_string())
 }
 
 fn find_username_by_table(contacts: &HashMap<String, Contact>, table_name: &str) -> Option<String> {
     for username in contacts.keys() {
         if msg_table_name(username) == table_name {
-            return Some(format!("{} ({})", contacts.get(username)?.display, username));
+            return Some(format!(
+                "{} ({})",
+                contacts.get(username)?.display,
+                username
+            ));
         }
     }
     None
@@ -954,13 +1039,15 @@ mod tests {
                 alias TEXT
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         for (username, nick_name, remark, alias) in rows {
             conn.execute(
                 "INSERT INTO contact (username, nick_name, remark, alias) VALUES (?1, ?2, ?3, ?4)",
                 params![username, nick_name, remark, alias],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         drop(conn);
@@ -984,7 +1071,8 @@ mod tests {
                     table_name
                 ),
                 [],
-            ).unwrap();
+            )
+            .unwrap();
 
             for i in 0..*count {
                 let create_time = latest_time - (*count - i - 1) as i64;
@@ -1008,12 +1096,11 @@ mod tests {
             ("tgid_old", "田雨坤", "", ""),
             ("tgid_active", "田雨坤", "", ""),
         ]);
-        let (_message_dir, message_db) = create_message_db(&[
-            ("tgid_old", 190, 1000),
-            ("tgid_active", 2, 2000),
-        ]);
+        let (_message_dir, message_db) =
+            create_message_db(&[("tgid_old", 190, 1000), ("tgid_active", 2, 2000)]);
 
-        let username = resolve_username_for_messages("田雨坤", Some(&contact_db), &[message_db], 1).unwrap();
+        let username =
+            resolve_username_for_messages("田雨坤", Some(&contact_db), &[message_db], 1).unwrap();
 
         assert_eq!(username, "tgid_active");
     }
@@ -1025,12 +1112,11 @@ mod tests {
             ("tgid_doubao", "豆宝", "", ""),
             ("tgid_meilidou", "美丽豆", "", ""),
         ]);
-        let (_message_dir, message_db) = create_message_db(&[
-            ("tgid_doubao", 17, 1000),
-            ("tgid_meilidou", 100, 2000),
-        ]);
+        let (_message_dir, message_db) =
+            create_message_db(&[("tgid_doubao", 17, 1000), ("tgid_meilidou", 100, 2000)]);
 
-        let username = resolve_username_for_messages("豆", Some(&contact_db), &[message_db], 1).unwrap();
+        let username =
+            resolve_username_for_messages("豆", Some(&contact_db), &[message_db], 1).unwrap();
 
         assert_eq!(username, "tgid_meilidou");
     }
@@ -1041,12 +1127,11 @@ mod tests {
             ("tgid_remark", "Someone", "Linux", ""),
             ("tgid_alias", "Someone Else", "", "Linux"),
         ]);
-        let (_message_dir, message_db) = create_message_db(&[
-            ("tgid_remark", 1, 1000),
-            ("tgid_alias", 1, 2000),
-        ]);
+        let (_message_dir, message_db) =
+            create_message_db(&[("tgid_remark", 1, 1000), ("tgid_alias", 1, 2000)]);
 
-        let username = resolve_username_for_messages("Linux", Some(&contact_db), &[message_db], 1).unwrap();
+        let username =
+            resolve_username_for_messages("Linux", Some(&contact_db), &[message_db], 1).unwrap();
 
         assert_eq!(username, "tgid_remark");
     }
@@ -1062,7 +1147,9 @@ mod tests {
             ("linux_2026@chatroom", 1, 2000),
         ]);
 
-        let username = resolve_username_for_messages("Linux 2026", Some(&contact_db), &[message_db], 1).unwrap();
+        let username =
+            resolve_username_for_messages("Linux 2026", Some(&contact_db), &[message_db], 1)
+                .unwrap();
 
         assert_eq!(username, "linux_2026@chatroom");
     }

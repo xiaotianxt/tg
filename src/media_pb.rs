@@ -26,7 +26,9 @@ pub mod wire {
 
     pub fn skip_field(data: &[u8], pos: &mut usize, wire: u8) -> Option<()> {
         match wire {
-            WIRE_VARINT => { decode_varint(data, pos)?; }
+            WIRE_VARINT => {
+                decode_varint(data, pos)?;
+            }
             WIRE_LEN => {
                 let len = decode_varint(data, pos)? as usize;
                 *pos = pos.checked_add(len)?;
@@ -51,7 +53,11 @@ pub mod wire {
         decode_varint(data, pos).map(|v| v as u32)
     }
 
-    pub fn decode_submessage<T>(data: &[u8], pos: &mut usize, mut f: impl FnMut(&[u8]) -> Option<T>) -> Option<T> {
+    pub fn decode_submessage<T>(
+        data: &[u8],
+        pos: &mut usize,
+        mut f: impl FnMut(&[u8]) -> Option<T>,
+    ) -> Option<T> {
         let len = decode_varint(data, pos)? as usize;
         let sub = data.get(*pos..pos.checked_add(len)?)?;
         *pos += len;
@@ -116,22 +122,39 @@ pub fn parse_img2(data: &[u8]) -> Option<PackedInfoDataImg2> {
         let tag = decode_varint(data, &mut pos)?;
         let (field, w) = tag_field(tag);
         match (field, w) {
-            (1, 0) => { r.field1 = decode_int32(data, &mut pos)?; }
-            (2, 0) => { r.field2 = decode_int32(data, &mut pos)?; }
-            (3, 2) => { r.image = decode_submessage(data, &mut pos, parse_image_meta); }
-            (4, 2) => { r.video = decode_submessage(data, &mut pos, parse_video_meta); }
-            (5, 2) => { r.audio = decode_submessage(data, &mut pos, parse_audio_meta); }
-            (7, 2) => { r.file = decode_submessage(data, &mut pos, parse_file_meta); }
+            (1, 0) => {
+                r.field1 = decode_int32(data, &mut pos)?;
+            }
+            (2, 0) => {
+                r.field2 = decode_int32(data, &mut pos)?;
+            }
+            (3, 2) => {
+                r.image = decode_submessage(data, &mut pos, parse_image_meta);
+            }
+            (4, 2) => {
+                r.video = decode_submessage(data, &mut pos, parse_video_meta);
+            }
+            (5, 2) => {
+                r.audio = decode_submessage(data, &mut pos, parse_audio_meta);
+            }
+            (7, 2) => {
+                r.file = decode_submessage(data, &mut pos, parse_file_meta);
+            }
             (9, 2) => {
                 let len = decode_varint(data, &mut pos)? as usize;
                 pos += len;
             }
-            _ => { skip_field(data, &mut pos, w)?; }
+            _ => {
+                skip_field(data, &mut pos, w)?;
+            }
         }
     }
-    if r.field1 == 0 && r.field2 == 0
-        && r.image.is_none() && r.video.is_none()
-        && r.audio.is_none() && r.file.is_none()
+    if r.field1 == 0
+        && r.field2 == 0
+        && r.image.is_none()
+        && r.video.is_none()
+        && r.audio.is_none()
+        && r.file.is_none()
     {
         return None;
     }
@@ -146,13 +169,25 @@ pub fn parse_img(data: &[u8]) -> Option<PackedInfoDataImg> {
         let tag = decode_varint(data, &mut pos)?;
         let (field, w) = tag_field(tag);
         match (field, w) {
-            (1, 0) => { r.field1 = decode_int32(data, &mut pos)?; }
-            (2, 0) => { r.field2 = decode_int32(data, &mut pos)?; }
-            (3, 2) => { r.filename = decode_string(data, &mut pos)?; }
-            _ => { skip_field(data, &mut pos, w)?; }
+            (1, 0) => {
+                r.field1 = decode_int32(data, &mut pos)?;
+            }
+            (2, 0) => {
+                r.field2 = decode_int32(data, &mut pos)?;
+            }
+            (3, 2) => {
+                r.filename = decode_string(data, &mut pos)?;
+            }
+            _ => {
+                skip_field(data, &mut pos, w)?;
+            }
         }
     }
-    if r.filename.is_empty() { None } else { Some(r) }
+    if r.filename.is_empty() {
+        None
+    } else {
+        Some(r)
+    }
 }
 
 // ===== Display helpers =====
@@ -195,10 +230,18 @@ fn parse_image_meta(data: &[u8]) -> Option<ImageMeta> {
         let tag = decode_varint(data, &mut pos)?;
         let (field, w) = tag_field(tag);
         match (field, w) {
-            (1, 0) => { r.height = decode_int32(data, &mut pos)?; }
-            (2, 0) => { r.width = decode_int32(data, &mut pos)?; }
-            (4, 2) => { r.filename = decode_string(data, &mut pos)?; }
-            _ => { skip_field(data, &mut pos, w)?; }
+            (1, 0) => {
+                r.height = decode_int32(data, &mut pos)?;
+            }
+            (2, 0) => {
+                r.width = decode_int32(data, &mut pos)?;
+            }
+            (4, 2) => {
+                r.filename = decode_string(data, &mut pos)?;
+            }
+            _ => {
+                skip_field(data, &mut pos, w)?;
+            }
         }
     }
     Some(r)
@@ -212,10 +255,18 @@ fn parse_video_meta(data: &[u8]) -> Option<VideoMeta> {
         let tag = decode_varint(data, &mut pos)?;
         let (field, w) = tag_field(tag);
         match (field, w) {
-            (4, 0) => { r.height = decode_int32(data, &mut pos)?; }
-            (5, 0) => { r.width = decode_int32(data, &mut pos)?; }
-            (8, 2) => { r.filename = decode_string(data, &mut pos)?; }
-            _ => { skip_field(data, &mut pos, w)?; }
+            (4, 0) => {
+                r.height = decode_int32(data, &mut pos)?;
+            }
+            (5, 0) => {
+                r.width = decode_int32(data, &mut pos)?;
+            }
+            (8, 2) => {
+                r.filename = decode_string(data, &mut pos)?;
+            }
+            _ => {
+                skip_field(data, &mut pos, w)?;
+            }
         }
     }
     Some(r)
@@ -229,9 +280,15 @@ fn parse_audio_meta(data: &[u8]) -> Option<AudioMeta> {
         let tag = decode_varint(data, &mut pos)?;
         let (field, w) = tag_field(tag);
         match (field, w) {
-            (1, 0) => { decode_uint32(data, &mut pos)?; }
-            (2, 2) => { r.audio_text = decode_string(data, &mut pos)?; }
-            _ => { skip_field(data, &mut pos, w)?; }
+            (1, 0) => {
+                decode_uint32(data, &mut pos)?;
+            }
+            (2, 2) => {
+                r.audio_text = decode_string(data, &mut pos)?;
+            }
+            _ => {
+                skip_field(data, &mut pos, w)?;
+            }
         }
     }
     Some(r)
@@ -260,7 +317,9 @@ fn parse_file_meta(data: &[u8]) -> Option<FileMeta> {
                     Some(())
                 });
             }
-            _ => { skip_field(data, &mut pos, w)?; }
+            _ => {
+                skip_field(data, &mut pos, w)?;
+            }
         }
     }
     Some(r)
@@ -273,11 +332,10 @@ mod tests {
     #[test]
     fn test_parse_img2() {
         let mut buf = Vec::new();
-        buf.push(8); buf.push(1);
+        buf.push(8);
+        buf.push(1);
         let img = [
-            8, 0xb8, 0x08,
-            16, 0x80, 0x0f,
-            34, 8, 116, 101, 115, 116, 46, 106, 112, 103,
+            8, 0xb8, 0x08, 16, 0x80, 0x0f, 34, 8, 116, 101, 115, 116, 46, 106, 112, 103,
         ];
         buf.push(26);
         buf.push(img.len() as u8);
@@ -293,13 +351,8 @@ mod tests {
 
     #[test]
     fn test_parse_img_older() {
-        let buf = &[
-            8, 1, 16, 0, 26, 7,
-            112, 105, 99, 46, 112, 110, 103,
-        ];
+        let buf = &[8, 1, 16, 0, 26, 7, 112, 105, 99, 46, 112, 110, 103];
         let parsed = parse_img(buf).unwrap();
         assert_eq!(parsed.filename, "pic.png");
     }
-
 }
-

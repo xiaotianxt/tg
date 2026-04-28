@@ -5,9 +5,9 @@
 //!   xorKey = code & 0xff
 //!   aesKey = md5("{code}{cleanTgid}").hex_lower()[0..16] as ASCII bytes
 
-use std::path::{Path, PathBuf};
+use md5::{Digest, Md5};
 use std::fs;
-use md5::{Md5, Digest};
+use std::path::{Path, PathBuf};
 
 const KVCOMM_REL: &str = "Documents/app_data/net/kvcomm";
 
@@ -70,7 +70,10 @@ fn extract_clean_tgid(base: &Path) -> Result<String, String> {
         return Ok(dir_name.to_string());
     }
 
-    Err(format!("Cannot determine clean tgid from path: {}", base.display()))
+    Err(format!(
+        "Cannot determine clean tgid from path: {}",
+        base.display()
+    ))
 }
 
 fn find_kvcomm_dir() -> Result<PathBuf, String> {
@@ -82,13 +85,15 @@ fn find_kvcomm_dir() -> Result<PathBuf, String> {
     if candidate.is_dir() {
         return Ok(candidate);
     }
-    Err(format!("kvcomm directory not found at {}", candidate.display()))
+    Err(format!(
+        "kvcomm directory not found at {}",
+        candidate.display()
+    ))
 }
 
 /// Find the `key_<code>_*.statistic` file and extract the code.
 fn find_code_in_kvcomm(kvcomm_dir: &Path) -> Result<u64, String> {
-    let entries = fs::read_dir(kvcomm_dir)
-        .map_err(|e| format!("Cannot read kvcomm dir: {}", e))?;
+    let entries = fs::read_dir(kvcomm_dir).map_err(|e| format!("Cannot read kvcomm dir: {}", e))?;
 
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -98,7 +103,10 @@ fn find_code_in_kvcomm(kvcomm_dir: &Path) -> Result<u64, String> {
         }
     }
 
-    Err(format!("No key_<code>_*.statistic file found in {}", kvcomm_dir.display()))
+    Err(format!(
+        "No key_<code>_*.statistic file found in {}",
+        kvcomm_dir.display()
+    ))
 }
 
 /// Try to extract the numeric code from a filename like `key_1020215821_4066646301_1_..._input.statistic`.
@@ -117,7 +125,12 @@ mod tests {
 
     #[test]
     fn test_extract_code() {
-        assert_eq!(try_extract_code("key_1020215821_4066646301_1_1777357465_1581567597_3600_input.statistic"), Some(1020215821));
+        assert_eq!(
+            try_extract_code(
+                "key_1020215821_4066646301_1_1777357465_1581567597_3600_input.statistic"
+            ),
+            Some(1020215821)
+        );
         assert_eq!(try_extract_code("key_reportnow_1020215821_..."), None); // non-numeric after key_
         assert_eq!(try_extract_code("config.ini"), None);
         assert_eq!(try_extract_code("monitordata_1020215821_20571"), None);

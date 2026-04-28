@@ -20,11 +20,11 @@
 //!
 //! aesCipherLen = if aesLen % 16 == 0 { aesLen + 16 } else { (aesLen + 15) / 16 * 16 }
 
+use crate::media_key::MediaKeys;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use crate::media_key::MediaKeys;
 
 /// Magic bytes for V2 .dat files.
 pub const V2_MAGIC: [u8; 6] = [0x07, 0x08, 0x56, 0x32, 0x08, 0x07];
@@ -65,7 +65,10 @@ pub fn detect_ext(data: &[u8]) -> &'static str {
 pub fn decrypt_v2_dat(src: &Path, dest: &Path, keys: &MediaKeys) -> Result<&'static str, String> {
     let data = fs::read(src).map_err(|e| format!("Read {}: {}", src.display(), e))?;
     if data.len() < 15 {
-        return Err(format!("File too small for V2 header: {} bytes", data.len()));
+        return Err(format!(
+            "File too small for V2 header: {} bytes",
+            data.len()
+        ));
     }
     if !is_v2_dat(&data) {
         return Err(format!("Not a V2 .dat file: {}", src.display()));
@@ -81,7 +84,11 @@ pub fn decrypt_v2_dat(src: &Path, dest: &Path, keys: &MediaKeys) -> Result<&'sta
     };
 
     if 15 + aes_cipher_len > data.len() {
-        return Err(format!("AES cipher len {} exceeds file ({} bytes)", aes_cipher_len, data.len()));
+        return Err(format!(
+            "AES cipher len {} exceeds file ({} bytes)",
+            aes_cipher_len,
+            data.len()
+        ));
     }
 
     // AES-128-ECB decrypt
@@ -178,9 +185,11 @@ fn find_tggf_hevc_partition(data: &[u8]) -> Option<&[u8]> {
     let mut i = start_at;
 
     while i + 3 < data.len() {
-        let is_start_code = data[i..].starts_with(&[0, 0, 0, 1]) || data[i..].starts_with(&[0, 0, 1]);
+        let is_start_code =
+            data[i..].starts_with(&[0, 0, 0, 1]) || data[i..].starts_with(&[0, 0, 1]);
         if is_start_code && i >= 4 {
-            let len = u32::from_be_bytes([data[i - 4], data[i - 3], data[i - 2], data[i - 1]]) as usize;
+            let len =
+                u32::from_be_bytes([data[i - 4], data[i - 3], data[i - 2], data[i - 1]]) as usize;
             if len > 0 && i + len <= data.len() {
                 match best {
                     Some((_, best_len)) if best_len >= len => {}

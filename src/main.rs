@@ -1,17 +1,17 @@
-mod scanner;
-mod decrypt;
 mod db;
-mod message;
-mod media;
-mod media_index;
-mod media_pb;
-mod media_decrypt;
-mod media_key;
+mod decrypt;
 mod export;
 mod logger;
+mod media;
+mod media_decrypt;
+mod media_index;
+mod media_key;
+mod media_pb;
+mod message;
 mod output;
-mod time;
 mod parallel;
+mod scanner;
+mod time;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -24,7 +24,11 @@ fn print_output(args: std::fmt::Arguments<'_>) {
 }
 
 #[derive(Parser)]
-#[command(name = "tgreader", version, about = "Read Telegram messages from local databases")]
+#[command(
+    name = "tgreader",
+    version,
+    about = "Read Telegram messages from local databases"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -204,7 +208,16 @@ fn main() {
                 }
             }
         }
-        Commands::Decrypt { keys, output, db_dir, incremental: _, full, since, verbose, jobs } => {
+        Commands::Decrypt {
+            keys,
+            output,
+            db_dir,
+            incremental: _,
+            full,
+            since,
+            verbose,
+            jobs,
+        } => {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -225,8 +238,12 @@ fn main() {
                             log::info!("Decryption complete: {} succeeded, {} failed, {} skipped, {} total",
                                 stats.success, stats.failed, stats.skipped, stats.total);
                         } else {
-                            log::info!("Decryption complete: {} succeeded, {} failed, {} total",
-                                stats.success, stats.failed, stats.total);
+                            log::info!(
+                                "Decryption complete: {} succeeded, {} failed, {} total",
+                                stats.success,
+                                stats.failed,
+                                stats.total
+                            );
                         }
                     }
                 }
@@ -236,12 +253,18 @@ fn main() {
                 }
             }
         }
-        Commands::Sessions { decrypted_dir, top, jobs } => {
+        Commands::Sessions {
+            decrypted_dir,
+            top,
+            jobs,
+        } => {
             refresh_decrypted_cache(&decrypted_dir, jobs);
             match db::list_sessions(&decrypted_dir, top, jobs) {
                 Ok(sessions) => {
                     if sessions.is_empty() {
-                        print_output(format_args!("No sessions found. Try running 'decrypt' first."));
+                        print_output(format_args!(
+                            "No sessions found. Try running 'decrypt' first."
+                        ));
                     }
                 }
                 Err(e) => {
@@ -250,7 +273,17 @@ fn main() {
                 }
             }
         }
-        Commands::Messages { session, decrypted_dir, limit, offset, search, since, tail, head, jobs } => {
+        Commands::Messages {
+            session,
+            decrypted_dir,
+            limit,
+            offset,
+            search,
+            since,
+            tail,
+            head,
+            jobs,
+        } => {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -261,7 +294,16 @@ fn main() {
             let limit = limit.or_else(|| since_ts.is_none().then_some(50));
             let use_tail = tail || (!head && offset == 0);
             refresh_decrypted_cache(&decrypted_dir, jobs);
-            match db::read_messages(&decrypted_dir, &session, limit, offset, search.as_deref(), since_ts, use_tail, jobs) {
+            match db::read_messages(
+                &decrypted_dir,
+                &session,
+                limit,
+                offset,
+                search.as_deref(),
+                since_ts,
+                use_tail,
+                jobs,
+            ) {
                 Ok(msg_count) => {
                     if msg_count == 0 {
                         print_output(format_args!(
@@ -276,7 +318,12 @@ fn main() {
                 }
             }
         }
-        Commands::Search { query, decrypted_dir, limit, jobs } => {
+        Commands::Search {
+            query,
+            decrypted_dir,
+            limit,
+            jobs,
+        } => {
             refresh_decrypted_cache(&decrypted_dir, jobs);
             match db::search_messages(&decrypted_dir, &query, limit, jobs) {
                 Ok(count) => {
@@ -290,9 +337,23 @@ fn main() {
                 }
             }
         }
-        Commands::Export { session, decrypted_dir, format, output, media_dir, jobs } => {
+        Commands::Export {
+            session,
+            decrypted_dir,
+            format,
+            output,
+            media_dir,
+            jobs,
+        } => {
             refresh_decrypted_cache(&decrypted_dir, jobs);
-            match export::export_messages(&decrypted_dir, &session, &format, &output, media_dir.as_deref(), jobs) {
+            match export::export_messages(
+                &decrypted_dir,
+                &session,
+                &format,
+                &output,
+                media_dir.as_deref(),
+                jobs,
+            ) {
                 Ok(paths) => {
                     print_output(format_args!("Exported to:"));
                     for (fmt, path) in paths {
@@ -305,7 +366,17 @@ fn main() {
                 }
             }
         }
-        Commands::Image { session, decrypted_dir, output, list, all, index, limit, since, jobs } => {
+        Commands::Image {
+            session,
+            decrypted_dir,
+            output,
+            list,
+            all,
+            index,
+            limit,
+            since,
+            jobs,
+        } => {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {

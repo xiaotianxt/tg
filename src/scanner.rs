@@ -13,13 +13,17 @@ fn find_telegram_pid() -> Result<i32, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let pid = stdout.trim().parse::<i32>()
+    let pid = stdout
+        .trim()
+        .parse::<i32>()
         .map_err(|e| format!("Invalid PID: {}", e))?;
     Ok(pid)
 }
 
 fn is_root() -> bool {
-    Command::new("id").arg("-u").output()
+    Command::new("id")
+        .arg("-u")
+        .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse::<u32>().ok())
@@ -54,7 +58,8 @@ fn real_home_dir() -> Option<PathBuf> {
 
 fn find_db_storage_dir() -> Option<PathBuf> {
     let home = real_home_dir()?;
-    let xtelegram_base = home.join("Library/Containers/com.telegram.xinTelegram/Data/Documents/xtelegram_files");
+    let xtelegram_base =
+        home.join("Library/Containers/com.telegram.xinTelegram/Data/Documents/xtelegram_files");
     if !xtelegram_base.is_dir() {
         return None;
     }

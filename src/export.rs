@@ -82,13 +82,15 @@ pub fn export_messages(
     let contact_db_path = contact_db.as_deref();
 
     // Resolve session username
-    let username = db::resolve_username_for_messages(session_query, contact_db_path, &message_dbs, jobs)?;
+    let username =
+        db::resolve_username_for_messages(session_query, contact_db_path, &message_dbs, jobs)?;
 
     // Load contacts for display name
     let contacts = contact_db_path
         .and_then(|p| db::load_contacts(p).ok())
         .unwrap_or_default();
-    let display_name = contacts.get(&username)
+    let display_name = contacts
+        .get(&username)
         .map(|c| c.display.as_str())
         .unwrap_or(&username);
 
@@ -116,7 +118,9 @@ pub fn export_messages(
                 let content: String = if wcdb_ct == Some(4) {
                     if let Ok(b) = row.get::<_, Vec<u8>>(2) {
                         message::try_decompress(&b).unwrap_or_default()
-                    } else { String::new() }
+                    } else {
+                        String::new()
+                    }
                 } else {
                     match row.get::<_, Option<String>>(2) {
                         Ok(Some(s)) => s,
@@ -143,7 +147,11 @@ pub fn export_messages(
 
         for (local_type, create_time, content, wcdb_ct, packed_info) in rows {
             let time_str = chrono::DateTime::from_timestamp(create_time, 0)
-                .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
+                .map(|t| {
+                    t.with_timezone(&cst_offset)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
                 .unwrap_or_default();
 
             let decoded = message::decode_message(
@@ -181,8 +189,7 @@ pub fn export_messages(
     }
 
     // Create output directory
-    std::fs::create_dir_all(output_dir)
-        .map_err(|e| format!("Cannot create output dir: {}", e))?;
+    std::fs::create_dir_all(output_dir).map_err(|e| format!("Cannot create output dir: {}", e))?;
 
     let mut results = Vec::new();
 
@@ -286,19 +293,30 @@ pub fn export_messages(
         }
 
         let media_job_count = parallel::job_count(jobs, 4);
-        let media_results = parallel::map_ordered(media_jobs, media_job_count, |job| {
-            match job {
-                MediaExportJob::Cached { index, src, category, msg_type } => MediaExportResult {
+        let media_results = parallel::map_ordered(media_jobs, media_job_count, |job| match job {
+            MediaExportJob::Cached {
+                index,
+                src,
+                category,
+                msg_type,
+            } => MediaExportResult {
+                index,
+                is_sticker: false,
+                result: export_media_with_decrypt(
+                    &src,
+                    mdir,
+                    &username,
+                    category,
+                    msg_type,
                     index,
-                    is_sticker: false,
-                    result: export_media_with_decrypt(&src, mdir, &username, category, msg_type, index, media_keys.as_ref()),
-                },
-                MediaExportJob::Sticker { index, message } => MediaExportResult {
-                    index,
-                    is_sticker: true,
-                    result: export_sticker_message(&message, &telegram_base, mdir, &username, index),
-                },
-            }
+                    media_keys.as_ref(),
+                ),
+            },
+            MediaExportJob::Sticker { index, message } => MediaExportResult {
+                index,
+                is_sticker: true,
+                result: export_sticker_message(&message, &telegram_base, mdir, &username, index),
+            },
         });
 
         let mut exported = 0;
@@ -353,8 +371,13 @@ pub fn export_images(
     }
 
     let scan_limit = config.limit.max(config.index.unwrap_or(1));
-    let (username, messages) =
-        load_image_messages(decrypted_dir, session_query, config.since, scan_limit, config.jobs)?;
+    let (username, messages) = load_image_messages(
+        decrypted_dir,
+        session_query,
+        config.since,
+        scan_limit,
+        config.jobs,
+    )?;
     if messages.is_empty() {
         return Err(format!("No image messages found for '{}'", username));
     }
@@ -386,9 +409,7 @@ pub fn export_images(
     if config.list {
         out.line(format_args!(
             "{:<5} {:<19} {:<8} Source",
-            "Index",
-            "Time",
-            "Status"
+            "Index", "Time", "Status"
         ))?;
         out.line(format_args!("{}", "-".repeat(100)))?;
         for candidate in &candidates {
@@ -405,10 +426,7 @@ pub fn export_images(
                 .unwrap_or_else(|| "(no identifier)".to_string());
             out.line(format_args!(
                 "{:<5} {:<19} {:<8} {}",
-                candidate.index,
-                candidate.message.time,
-                status,
-                source
+                candidate.index, candidate.message.time, status, source
             ))?;
         }
         out.flush()?;
@@ -422,15 +440,27 @@ pub fn export_images(
             .take(config.limit)
             .collect::<Vec<_>>()
     } else if let Some(index) = config.index {
-        let Some(candidate) = candidates.into_iter().find(|candidate| candidate.index == index) else {
-            return Err(format!("Image index {} is outside the scanned window", index));
+        let Some(candidate) = candidates
+            .into_iter()
+            .find(|candidate| candidate.index == index)
+        else {
+            return Err(format!(
+                "Image index {} is outside the scanned window",
+                index
+            ));
         };
         if candidate.source.is_none() {
-            return Err(format!("Image #{} is not available in local Telegram cache", index));
+            return Err(format!(
+                "Image #{} is not available in local Telegram cache",
+                index
+            ));
         }
         vec![candidate]
     } else {
-        let Some(candidate) = candidates.into_iter().find(|candidate| candidate.source.is_some()) else {
+        let Some(candidate) = candidates
+            .into_iter()
+            .find(|candidate| candidate.source.is_some())
+        else {
             return Err(format!(
                 "No locally cached images found in the latest {} image messages",
                 config.limit
@@ -464,23 +494,26 @@ pub fn export_images(
         })
         .collect::<Vec<_>>();
     let image_job_count = parallel::job_count(config.jobs, 4);
-    let image_results = parallel::map_ordered(image_jobs, image_job_count, |job| {
-        match job {
-            MediaExportJob::Cached { index, src, category, msg_type } => MediaExportResult {
+    let image_results = parallel::map_ordered(image_jobs, image_job_count, |job| match job {
+        MediaExportJob::Cached {
+            index,
+            src,
+            category,
+            msg_type,
+        } => MediaExportResult {
+            index,
+            is_sticker: false,
+            result: export_media_with_decrypt(
+                &src,
+                config.output_dir,
+                &username,
+                category,
+                msg_type,
                 index,
-                is_sticker: false,
-                result: export_media_with_decrypt(
-                    &src,
-                    config.output_dir,
-                    &username,
-                    category,
-                    msg_type,
-                    index,
-                    media_keys.as_ref(),
-                ),
-            },
-            MediaExportJob::Sticker { .. } => unreachable!("image command only exports images"),
-        }
+                media_keys.as_ref(),
+            ),
+        },
+        MediaExportJob::Sticker { .. } => unreachable!("image command only exports images"),
     });
 
     let mut paths = Vec::new();
@@ -510,8 +543,12 @@ fn load_image_messages(
     jobs: usize,
 ) -> Result<(String, Vec<ImageMessage>), String> {
     let (contact_db, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
-    let username =
-        db::resolve_username_for_messages(session_query, contact_db.as_deref(), &message_dbs, jobs)?;
+    let username = db::resolve_username_for_messages(
+        session_query,
+        contact_db.as_deref(),
+        &message_dbs,
+        jobs,
+    )?;
     let table_name = db::msg_table_name(&username);
     let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
     let since_clause = since
@@ -551,7 +588,11 @@ fn load_image_messages(
                     }
                 };
                 let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default();
-                Ok((row.get::<_, Option<i64>>(0)?.unwrap_or(0), content, packed_info))
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    content,
+                    packed_info,
+                ))
             }) {
                 Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
                 Err(_) => vec![],
@@ -561,7 +602,11 @@ fn load_image_messages(
 
         for (timestamp, raw_content, packed_info) in rows {
             let time = chrono::DateTime::from_timestamp(timestamp, 0)
-                .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
+                .map(|t| {
+                    t.with_timezone(&cst_offset)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
                 .unwrap_or_else(|| timestamp.to_string());
             messages.push(ImageMessage {
                 time,
@@ -591,17 +636,25 @@ fn image_identifier(message: &ImageMessage) -> Option<String> {
 
 /// Try to extract media cache identifier from packed_info protobuf.
 fn try_protobuf_identifier(data: &[u8]) -> Option<String> {
-    if data.is_empty() { return None; }
+    if data.is_empty() {
+        return None;
+    }
     if let Some(v2) = crate::media_pb::parse_img2(data) {
         if let Some(img) = v2.image {
-            if !img.filename.is_empty() { return Some(img.filename); }
+            if !img.filename.is_empty() {
+                return Some(img.filename);
+            }
         }
         if let Some(vid) = v2.video {
-            if !vid.filename.is_empty() { return Some(vid.filename); }
+            if !vid.filename.is_empty() {
+                return Some(vid.filename);
+            }
         }
     }
     if let Some(v1) = crate::media_pb::parse_img(data) {
-        if !v1.filename.is_empty() { return Some(v1.filename); }
+        if !v1.filename.is_empty() {
+            return Some(v1.filename);
+        }
     }
     None
 }
@@ -623,7 +676,9 @@ fn extract_xml_attr_str(content: &str, attr: &str) -> Option<String> {
         }
 
         let value_start = start + pattern.len();
-        if value_start >= content.len() { return None; }
+        if value_start >= content.len() {
+            return None;
+        }
         let rest = &content[value_start..];
         let end = rest.find('"')?;
         let value = rest[..end].to_string();
@@ -633,14 +688,24 @@ fn extract_xml_attr_str(content: &str, attr: &str) -> Option<String> {
     None
 }
 
-fn export_txt(path: &Path, username: &str, display_name: &str, messages: &[ExportMessage]) -> Result<(), String> {
+fn export_txt(
+    path: &Path,
+    username: &str,
+    display_name: &str,
+    messages: &[ExportMessage],
+) -> Result<(), String> {
     let mut f = std::fs::File::create(path)
         .map_err(|e| format!("Cannot create {}: {}", path.display(), e))?;
 
     writeln!(f, "Telegram聊天记录: {} ({})", display_name, username).ok();
     writeln!(f, "总消息数: {}", messages.len()).ok();
-    writeln!(f, "时间范围: {} ~ {}", messages.first().map(|m| &m.time).unwrap_or(&"".to_string()),
-        messages.last().map(|m| &m.time).unwrap_or(&"".to_string())).ok();
+    writeln!(
+        f,
+        "时间范围: {} ~ {}",
+        messages.first().map(|m| &m.time).unwrap_or(&"".to_string()),
+        messages.last().map(|m| &m.time).unwrap_or(&"".to_string())
+    )
+    .ok();
     writeln!(f, "{}", "=".repeat(60)).ok();
     writeln!(f).ok();
 
@@ -674,8 +739,7 @@ fn export_csv(path: &Path, messages: &[ExportMessage]) -> Result<(), String> {
 fn export_json(path: &Path, messages: &[ExportMessage]) -> Result<(), String> {
     let json = serde_json::to_string_pretty(messages)
         .map_err(|e| format!("JSON serialization error: {}", e))?;
-    std::fs::write(path, json)
-        .map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
+    std::fs::write(path, json).map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
     Ok(())
 }
 
@@ -713,7 +777,13 @@ fn export_media_with_decrypt(
     }
 
     // Plain copy for non-.dat files or when keys are unavailable
-    media::export_media_file(src, output_dir, session_name, &format!("{}_{}", cat_name, msg_type), index)
+    media::export_media_file(
+        src,
+        output_dir,
+        session_name,
+        &format!("{}_{}", cat_name, msg_type),
+        index,
+    )
 }
 
 fn export_sticker_message(
@@ -738,7 +808,9 @@ fn export_sticker_message(
         if let Some(src) = media::find_cached_sticker(telegram_base, &info.md5) {
             let data = std::fs::read(&src)
                 .map_err(|e| format!("Read cached sticker {}: {}", src.display(), e))?;
-            if let Some(path) = write_sticker_candidate(&data, &info, output_dir, session_name, index)? {
+            if let Some(path) =
+                write_sticker_candidate(&data, &info, output_dir, session_name, index)?
+            {
                 return Ok(path);
             }
         }
@@ -751,7 +823,9 @@ fn export_sticker_message(
         }
         match download_url(url) {
             Ok(data) => {
-                if let Some(path) = write_sticker_candidate(&data, &info, output_dir, session_name, index)? {
+                if let Some(path) =
+                    write_sticker_candidate(&data, &info, output_dir, session_name, index)?
+                {
                     return Ok(path);
                 }
             }
@@ -761,12 +835,17 @@ fn export_sticker_message(
 
     if !info.encrypt_url.is_empty() && tried_urls.insert(info.encrypt_url.clone()) {
         let data = download_url(&info.encrypt_url)?;
-        if let Some(path) = write_sticker_candidate(&data, &info, output_dir, session_name, index)? {
+        if let Some(path) = write_sticker_candidate(&data, &info, output_dir, session_name, index)?
+        {
             return Ok(path);
         }
     }
 
-    let id = if info.md5.is_empty() { "unknown" } else { &info.md5 };
+    let id = if info.md5.is_empty() {
+        "unknown"
+    } else {
+        &info.md5
+    };
     Err(format!("cannot decode sticker {}", id))
 }
 
@@ -804,7 +883,8 @@ fn write_sticker_candidate(
                 return write_sticker_bytes(&jpg, "jpg", output_dir, session_name, index).map(Some);
             }
             if ext != "bin" {
-                return write_sticker_bytes(&decoded, ext, output_dir, session_name, index).map(Some);
+                return write_sticker_bytes(&decoded, ext, output_dir, session_name, index)
+                    .map(Some);
             }
         }
     }
@@ -819,8 +899,7 @@ fn write_sticker_bytes(
     session_name: &str,
     index: usize,
 ) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(output_dir)
-        .map_err(|e| format!("Cannot create media dir: {}", e))?;
+    std::fs::create_dir_all(output_dir).map_err(|e| format!("Cannot create media dir: {}", e))?;
 
     let filename = format!(
         "{}_Sticker_47_{:04}.{}",
@@ -829,8 +908,7 @@ fn write_sticker_bytes(
         ext
     );
     let dest = output_dir.join(filename);
-    std::fs::write(&dest, data)
-        .map_err(|e| format!("Write sticker {}: {}", dest.display(), e))?;
+    std::fs::write(&dest, data).map_err(|e| format!("Write sticker {}: {}", dest.display(), e))?;
     Ok(dest)
 }
 
@@ -871,7 +949,13 @@ fn download_url(url: &str) -> Result<Vec<u8>, String> {
 
 fn sanitize_filename(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 

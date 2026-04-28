@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Parsed info about an image message (type 3) from XML.
 #[derive(Debug, Clone, Default)]
@@ -90,7 +90,11 @@ impl StickerInfo {
         let name = if !self.pack_name.is_empty() {
             format!(" {}", self.pack_name)
         } else if !self.product_id.is_empty() {
-            let short = self.product_id.rsplit('.').next().unwrap_or(&self.product_id);
+            let short = self
+                .product_id
+                .rsplit('.')
+                .next()
+                .unwrap_or(&self.product_id);
             if short.len() <= 30 {
                 format!(" {}", short)
             } else {
@@ -118,8 +122,12 @@ pub struct LinkInfo {
 impl LinkInfo {
     pub fn display(&self) -> String {
         let mut parts = vec!["[链接]".to_string()];
-        if !self.title.is_empty() { parts.push(self.title.clone()); }
-        if !self.description.is_empty() { parts.push(format!("- {}", self.description)); }
+        if !self.title.is_empty() {
+            parts.push(self.title.clone());
+        }
+        if !self.description.is_empty() {
+            parts.push(format!("- {}", self.description));
+        }
         if !self.url.is_empty() && self.url.len() < 120 {
             parts.push(format!("\n  {}", self.url));
         }
@@ -160,47 +168,106 @@ impl MiniProgramInfo {
 
 pub(crate) fn parse_image_info(xml: &str) -> ImageInfo {
     let mut info = ImageInfo::default();
-    if let Some(v) = extract_xml_attr(xml, "aeskey") { info.aes_key = v; }
-    if let Some(v) = extract_xml_attr(xml, "cdnthumburl") { info.cdn_thumb_url = v; }
-    if let Some(v) = extract_xml_attr(xml, "cdnmidiurl") { info.cdn_midi_url = v; }
-    if let Some(v) = extract_xml_attr(xml, "cdndisplaybackupurl") { info.cdn_big_url = v; }
-    if let Some(v) = extract_xml_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) { info.thumb_width = v; }
-    if let Some(v) = extract_xml_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) { info.thumb_height = v; }
-    if let Some(v) = extract_xml_attr(xml, "rawlength").and_then(|s| s.parse().ok()) { info.raw_length = v; }
+    if let Some(v) = extract_xml_attr(xml, "aeskey") {
+        info.aes_key = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "cdnthumburl") {
+        info.cdn_thumb_url = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "cdnmidiurl") {
+        info.cdn_midi_url = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "cdndisplaybackupurl") {
+        info.cdn_big_url = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) {
+        info.thumb_width = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) {
+        info.thumb_height = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "rawlength").and_then(|s| s.parse().ok()) {
+        info.raw_length = v;
+    }
     if info.raw_length == 0 {
-        if let Some(v) = extract_xml_attr(xml, "cdnmidimagerawlength").and_then(|s| s.parse().ok()) { info.raw_length = v; }
+        if let Some(v) = extract_xml_attr(xml, "cdnmidimagerawlength").and_then(|s| s.parse().ok())
+        {
+            info.raw_length = v;
+        }
     }
     info
 }
 
 pub(crate) fn parse_video_info(xml: &str) -> VideoInfo {
     let mut info = VideoInfo::default();
-    if let Some(v) = extract_xml_attr(xml, "aeskey") { info.aes_key = v; }
-    if let Some(v) = extract_xml_attr(xml, "cdnvideourl") { info.cdn_video_url = v; }
-    if let Some(v) = extract_xml_attr(xml, "cdnthumburl") { info.cdn_thumb_url = v; }
-    if let Some(v) = extract_xml_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) { info.thumb_width = v; }
-    if let Some(v) = extract_xml_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) { info.thumb_height = v; }
-    if let Some(v) = extract_xml_attr(xml, "playlength").and_then(|s| s.parse().ok()) { info.play_length = v; }
-    if let Some(v) = extract_xml_attr(xml, "rawvideolength").and_then(|s| s.parse().ok()) { info.raw_video_length = v; }
+    if let Some(v) = extract_xml_attr(xml, "aeskey") {
+        info.aes_key = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "cdnvideourl") {
+        info.cdn_video_url = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "cdnthumburl") {
+        info.cdn_thumb_url = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) {
+        info.thumb_width = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) {
+        info.thumb_height = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "playlength").and_then(|s| s.parse().ok()) {
+        info.play_length = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "rawvideolength").and_then(|s| s.parse().ok()) {
+        info.raw_video_length = v;
+    }
     info
 }
 
 pub(crate) fn parse_sticker_info(xml: &str) -> StickerInfo {
     let mut info = StickerInfo::default();
-    if let Some(v) = extract_xml_attr(xml, "md5") { info.md5 = v; }
-    if let Some(v) = extract_xml_attr(xml, "aeskey") { info.aes_key = v; }
-    if let Some(v) = extract_xml_attr(xml, "productid") { info.product_id = v; }
-    if let Some(v) = extract_xml_attr(xml, "url") { info.url = v; }
-    if let Some(v) = extract_xml_attr(xml, "cdnurl") { info.cdn_url = v; }
-    if let Some(v) = extract_xml_attr(xml, "encrypturl") { info.encrypt_url = v; }
-    if let Some(v) = extract_xml_attr(xml, "externurl") { info.extern_url = v; }
-    if let Some(v) = extract_xml_attr(xml, "externmd5") { info.extern_md5 = v; }
-    if let Some(v) = extract_xml_attr(xml, "thumburl") { info.thumb_url = v; }
-    if let Some(v) = extract_xml_tag(xml, "packname") { info.pack_name = v; }
-    if let Some(v) = extract_xml_attr(xml, "packurl") { info.pack_url = v; }
-    if let Some(v) = extract_xml_attr(xml, "len").and_then(|s| s.parse().ok()) { info.len = v; }
-    if let Some(v) = extract_xml_attr(xml, "width").and_then(|s| s.parse().ok()) { info.width = v; }
-    if let Some(v) = extract_xml_attr(xml, "height").and_then(|s| s.parse().ok()) { info.height = v; }
+    if let Some(v) = extract_xml_attr(xml, "md5") {
+        info.md5 = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "aeskey") {
+        info.aes_key = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "productid") {
+        info.product_id = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "url") {
+        info.url = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "cdnurl") {
+        info.cdn_url = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "encrypturl") {
+        info.encrypt_url = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "externurl") {
+        info.extern_url = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "externmd5") {
+        info.extern_md5 = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "thumburl") {
+        info.thumb_url = v;
+    }
+    if let Some(v) = extract_xml_tag(xml, "packname") {
+        info.pack_name = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "packurl") {
+        info.pack_url = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "len").and_then(|s| s.parse().ok()) {
+        info.len = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "width").and_then(|s| s.parse().ok()) {
+        info.width = v;
+    }
+    if let Some(v) = extract_xml_attr(xml, "height").and_then(|s| s.parse().ok()) {
+        info.height = v;
+    }
     info.has_emojibuf = xml.contains("<emojibuf>");
     info
 }
@@ -292,7 +359,8 @@ fn find_file_named(dir: &Path, target: &str) -> Option<PathBuf> {
                     return Some(found);
                 }
             } else {
-                let name = path.file_name()
+                let name = path
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("")
                     .to_lowercase();
@@ -330,23 +398,31 @@ pub fn export_media_file(
     msg_type_name: &str,
     index: usize,
 ) -> Result<PathBuf, String> {
-    let ext = src.extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("bin");
-    let filename = format!("{}_{}_{:04}.{}", sanitize_filename(session_name), msg_type_name, index, ext);
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+    let filename = format!(
+        "{}_{}_{:04}.{}",
+        sanitize_filename(session_name),
+        msg_type_name,
+        index,
+        ext
+    );
     let dest = output_dir.join(&filename);
 
-    fs::create_dir_all(output_dir)
-        .map_err(|e| format!("Cannot create media dir: {}", e))?;
-    fs::copy(src, &dest)
-        .map_err(|e| format!("Cannot copy media file: {}", e))?;
+    fs::create_dir_all(output_dir).map_err(|e| format!("Cannot create media dir: {}", e))?;
+    fs::copy(src, &dest).map_err(|e| format!("Cannot copy media file: {}", e))?;
 
     Ok(dest)
 }
 
 fn sanitize_filename(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -368,7 +444,9 @@ pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
         }
 
         let value_start = start + pattern.len();
-        if value_start >= xml.len() { return None; }
+        if value_start >= xml.len() {
+            return None;
+        }
         let rest = &xml[value_start..];
         let end = rest.find('"')?;
         let value = decode_xml_entities(&rest[..end]);
@@ -383,11 +461,17 @@ pub(crate) fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     let close = format!("</{}>", tag);
     let start = xml.find(&open)?;
     let value_start = start + open.len();
-    if value_start >= xml.len() { return None; }
+    if value_start >= xml.len() {
+        return None;
+    }
     let rest = &xml[value_start..];
     let value_end = rest.find(&close)?;
     let value = decode_xml_entities(rest[..value_end].trim());
-    if value.is_empty() { None } else { Some(value) }
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 pub(crate) fn extract_xml_tag_int(xml: &str, tag: &str) -> Option<i64> {
@@ -409,7 +493,8 @@ mod tests {
 
     #[test]
     fn test_extract_xml_attr_exact_name_and_empty_value() {
-        let xml = r#"<emoji productid="" cdnurl="http://x.test/a?m=1&amp;n=2" externurl=""></emoji>"#;
+        let xml =
+            r#"<emoji productid="" cdnurl="http://x.test/a?m=1&amp;n=2" externurl=""></emoji>"#;
         assert_eq!(extract_xml_attr(xml, "productid"), None);
         assert_eq!(extract_xml_attr(xml, "url"), None);
         assert_eq!(

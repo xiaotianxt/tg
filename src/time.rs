@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
 
 /// Parse a time expression into a Unix timestamp.
 ///
@@ -32,7 +32,8 @@ pub fn parse_relative_time(s: &str) -> Result<i64, String> {
             return Ok(start.and_utc().timestamp());
         }
         "yesterday" => {
-            let yesterday = (now - Duration::try_days(1).unwrap_or(Duration::hours(24))).date_naive();
+            let yesterday =
+                (now - Duration::try_days(1).unwrap_or(Duration::hours(24))).date_naive();
             let start = yesterday.and_hms_opt(0, 0, 0).unwrap();
             return Ok(start.and_utc().timestamp());
         }
@@ -41,7 +42,8 @@ pub fn parse_relative_time(s: &str) -> Result<i64, String> {
 
     // Try "min" suffix (e.g. "5min")
     if let Some(num_str) = s.strip_suffix("min") {
-        let minutes: i64 = num_str.parse()
+        let minutes: i64 = num_str
+            .parse()
             .map_err(|_| format!("Invalid number in '{}'", s))?;
         return Ok(now.timestamp() - minutes * 60);
     }

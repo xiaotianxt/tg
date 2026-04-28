@@ -7,21 +7,21 @@ use std::io::Read;
 /// Telegram消息类型枚举。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MessageType {
-    Text,            // 1
-    Image,           // 3
-    Voice,           // 34
-    Sticker,         // 47
-    Video,           // 43
-    Link,            // 49 — 链接/文件/小程序/音乐
-    System,          // 10000
-    RedEnvelope,     // 436207665
-    Transfer,        // 536870918
-    Location,        // 48
-    File,            // 62
-    Call,            // 50
-    Music,           // 419430449
-    Revoke,          // 10002 撤回消息
-    Unknown(i32),    // 其他
+    Text,         // 1
+    Image,        // 3
+    Voice,        // 34
+    Sticker,      // 47
+    Video,        // 43
+    Link,         // 49 — 链接/文件/小程序/音乐
+    System,       // 10000
+    RedEnvelope,  // 436207665
+    Transfer,     // 536870918
+    Location,     // 48
+    File,         // 62
+    Call,         // 50
+    Music,        // 419430449
+    Revoke,       // 10002 撤回消息
+    Unknown(i32), // 其他
 }
 
 impl fmt::Display for MessageType {
@@ -177,7 +177,9 @@ fn decode_media_content(msg_type: i32, raw_content: &str, packed_info: &[u8]) ->
 }
 
 fn extract_image_display(data: &[u8]) -> Option<String> {
-    if data.is_empty() { return None; }
+    if data.is_empty() {
+        return None;
+    }
     if let Some(v2) = media_pb::parse_img2(data) {
         if let Some(img) = v2.image {
             return Some(media_pb::display_image(&img));
@@ -192,7 +194,9 @@ fn extract_image_display(data: &[u8]) -> Option<String> {
 }
 
 fn extract_video_display(data: &[u8]) -> Option<String> {
-    if data.is_empty() { return None; }
+    if data.is_empty() {
+        return None;
+    }
     if let Some(v2) = media_pb::parse_img2(data) {
         if let Some(vid) = v2.video {
             return Some(media_pb::display_video(&vid));
@@ -202,7 +206,9 @@ fn extract_video_display(data: &[u8]) -> Option<String> {
 }
 
 fn extract_audio_meta(data: &[u8]) -> Option<String> {
-    if data.is_empty() { return None; }
+    if data.is_empty() {
+        return None;
+    }
     if let Some(v2) = media_pb::parse_img2(data) {
         if let Some(audio) = v2.audio {
             if !audio.audio_text.is_empty() {
@@ -271,22 +277,29 @@ fn decode_link_content(content: &str, resolve_display_name: &impl Fn(&str) -> St
             .map(media::MiniProgramInfo::display)
             .unwrap_or_else(|| "[小程序]".to_string()),
         3 => {
-            let title = crate::media::extract_xml_tag(content, "title").unwrap_or_else(|| "未知歌曲".to_string());
+            let title = crate::media::extract_xml_tag(content, "title")
+                .unwrap_or_else(|| "未知歌曲".to_string());
             format!("[音乐] {}", title)
         }
         6 => {
-            let name = crate::media::extract_xml_tag(content, "title").unwrap_or_else(|| "未知文件".to_string());
+            let name = crate::media::extract_xml_tag(content, "title")
+                .unwrap_or_else(|| "未知文件".to_string());
             format!("[文件] {}", name)
         }
         57 => decode_quote_content(content, resolve_display_name),
         51 => {
-            let title = crate::media::extract_xml_tag(content, "title").unwrap_or_else(|| "聊天记录".to_string());
+            let title = crate::media::extract_xml_tag(content, "title")
+                .unwrap_or_else(|| "聊天记录".to_string());
             format!("[引用: {}]", title)
         }
         _ => {
             let title = crate::media::extract_xml_tag(content, "title").unwrap_or_default();
             let desc = crate::media::extract_xml_tag(content, "des").unwrap_or_default();
-            let title = if !title.is_empty() { title } else { "未知卡片".to_string() };
+            let title = if !title.is_empty() {
+                title
+            } else {
+                "未知卡片".to_string()
+            };
             if !desc.is_empty() {
                 format!("[卡片] {} - {}", title, desc)
             } else {
@@ -326,8 +339,12 @@ fn decode_refermsg_content(
         match ref_type {
             1 => clean_content.to_string(),
             t if is_media_type(t) => decode_media_content(t, clean_content, &[]),
-            49 if clean_content.trim_start().starts_with('<') => decode_link_content(clean_content, resolve_display_name),
-            _ if clean_content.trim_start().starts_with('<') => format!("[{}]", MessageType::from(ref_type)),
+            49 if clean_content.trim_start().starts_with('<') => {
+                decode_link_content(clean_content, resolve_display_name)
+            }
+            _ if clean_content.trim_start().starts_with('<') => {
+                format!("[{}]", MessageType::from(ref_type))
+            }
             _ => clean_content.to_string(),
         }
     };
@@ -354,7 +371,11 @@ fn decode_refermsg_sender(
                 .filter(|id| !id.contains("@chatroom"))
         })?;
     let sender = resolve_display_name(&sender_id);
-    if sender.is_empty() { None } else { Some(sender) }
+    if sender.is_empty() {
+        None
+    } else {
+        Some(sender)
+    }
 }
 
 fn decode_location_content(content: &str) -> String {
@@ -365,13 +386,18 @@ fn decode_location_content(content: &str) -> String {
         .or_else(|| crate::media::extract_xml_tag(content, "label"));
     let poiname = crate::media::extract_xml_attr(content, "poiname")
         .or_else(|| crate::media::extract_xml_tag(content, "poiname"));
-    let location_name = poiname.as_deref().or(label.as_deref()).unwrap_or("未知位置");
+    let location_name = poiname
+        .as_deref()
+        .or(label.as_deref())
+        .unwrap_or("未知位置");
     format!("[位置] {}", location_name)
 }
 
 fn decode_call_content(content: &str) -> String {
     if let Some(dur_secs) = crate::media::extract_xml_tag_int(content, "duration").or_else(|| {
-        content.split_whitespace().find_map(|w| w.parse::<i64>().ok())
+        content
+            .split_whitespace()
+            .find_map(|w| w.parse::<i64>().ok())
     }) {
         let mins = dur_secs / 60;
         let secs = dur_secs % 60;
@@ -410,7 +436,8 @@ fn extract_voice_duration(content: &str) -> String {
     let dur = crate::media::extract_xml_tag_int(content, "voicelength")
         .or_else(|| crate::media::extract_xml_tag_int(content, "duration"))
         .or_else(|| {
-            content.split(|c: char| !c.is_ascii_digit())
+            content
+                .split(|c: char| !c.is_ascii_digit())
                 .find_map(|s| s.parse::<i64>().ok())
         });
     match dur {
@@ -424,38 +451,58 @@ fn extract_voice_duration(content: &str) -> String {
 /// Tries ZSTD first (Telegram 4.x), then ZLIB (older), then falls back to raw UTF-8.
 pub fn try_decompress(raw: &[u8]) -> Option<String> {
     if let Ok(s) = try_zstd(raw) {
-        if !s.is_empty() { return Some(s); }
+        if !s.is_empty() {
+            return Some(s);
+        }
     }
     if let Ok(s) = try_zlib(raw) {
-        if !s.is_empty() { return Some(s); }
+        if !s.is_empty() {
+            return Some(s);
+        }
     }
-    String::from_utf8(raw.to_vec()).ok().filter(|s| !s.is_empty())
+    String::from_utf8(raw.to_vec())
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 fn try_zstd(data: &[u8]) -> Result<String, ()> {
     let mut d = zstd::Decoder::new(data).map_err(|_| ())?;
     let mut s = String::new();
     d.read_to_string(&mut s).map_err(|_| ())?;
-    if s.is_empty() { Err(()) } else { Ok(s) }
+    if s.is_empty() {
+        Err(())
+    } else {
+        Ok(s)
+    }
 }
 
 fn try_zlib(data: &[u8]) -> Result<String, ()> {
     let mut d = ZlibDecoder::new(data);
     let mut s = String::new();
     d.read_to_string(&mut s).map_err(|_| ())?;
-    if s.is_empty() { Err(()) } else { Ok(s) }
+    if s.is_empty() {
+        Err(())
+    } else {
+        Ok(s)
+    }
 }
 
 /// Parse sender tgid from message content.
 pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
     for (i, c) in content.char_indices() {
-        if c != ':' { continue; }
-        if i == 0 { break; }
+        if c != ':' {
+            continue;
+        }
+        if i == 0 {
+            break;
+        }
         let prefix = &content[..i];
         let is_id = prefix.starts_with("tgid_")
             || prefix.starts_with("gh_")
             || prefix.contains('@')
-            || prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            || prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
         if is_id && prefix.len() >= 3 {
             let after = &content[i + 1..];
             let after = after.trim_start_matches([' ', '\n']);
@@ -513,8 +560,11 @@ mod tests {
     #[test]
     fn test_decode_image_with_packed_info() {
         let mut packed = Vec::new();
-        packed.push(8); packed.push(1);
-        let img = [8, 0xb8, 0x08, 16, 0x80, 0x0f, 34, 8, 116, 101, 115, 116, 46, 106, 112, 103];
+        packed.push(8);
+        packed.push(1);
+        let img = [
+            8, 0xb8, 0x08, 16, 0x80, 0x0f, 34, 8, 116, 101, 115, 116, 46, 106, 112, 103,
+        ];
         packed.push(26);
         packed.push(img.len() as u8);
         packed.extend_from_slice(&img);
@@ -527,7 +577,11 @@ mod tests {
     #[test]
     fn test_decode_group_chat_sender() {
         let d = decode_message(1, "tgid_abc:\nHello", "Group", None, &[], |id| {
-            if id == "tgid_abc" { "Bob".into() } else { id.into() }
+            if id == "tgid_abc" {
+                "Bob".into()
+            } else {
+                id.into()
+            }
         });
         assert_eq!(d.content, "Hello");
         assert_eq!(d.display_name, "Bob");
@@ -536,7 +590,11 @@ mod tests {
     #[test]
     fn test_decode_media_group_chat_sender() {
         let d = decode_message(3, "tgid_abc:\n", "Group", None, &[], |id| {
-            if id == "tgid_abc" { "Bob".into() } else { id.into() }
+            if id == "tgid_abc" {
+                "Bob".into()
+            } else {
+                id.into()
+            }
         });
         assert_eq!(d.display_name, "Bob");
     }
@@ -571,7 +629,11 @@ mod tests {
         let xml = r#"<msg><appmsg><title>回复图片</title><type>57</type><refermsg><type>3</type><chatusr>tgid_abc</chatusr><content>tgid_abc:
 &lt;msg&gt;&lt;img cdnthumbwidth="180" cdnthumbheight="153" length="38186" /&gt;&lt;/msg&gt;</content></refermsg></appmsg></msg>"#;
         let d = decode_message(49, xml, "Alice", None, &[], |id| {
-            if id == "tgid_abc" { "Bob".into() } else { id.into() }
+            if id == "tgid_abc" {
+                "Bob".into()
+            } else {
+                id.into()
+            }
         });
         assert_eq!(d.content, "> Bob: [图片 180x153]\n        回复图片");
     }

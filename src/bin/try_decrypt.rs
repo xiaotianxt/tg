@@ -5,9 +5,9 @@
 //!
 //! Derives the AES key from Telegram kvcomm files, decrypts, and writes to /tmp/.
 
-use std::fs;
 use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes128;
+use std::fs;
 
 #[path = "../logger.rs"]
 mod logger;
@@ -35,7 +35,11 @@ fn main() {
     let xor_len = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
     let flag = data[14];
 
-    let aes_cipher_len = if aes_len % 16 == 0 { aes_len + 16 } else { (aes_len + 15) / 16 * 16 };
+    let aes_cipher_len = if aes_len % 16 == 0 {
+        aes_len + 16
+    } else {
+        (aes_len + 15) / 16 * 16
+    };
 
     log::info!("File: {} ({} bytes)", dat_path, data.len());
     log::info!("Magic: {:02x?}", magic);
@@ -50,7 +54,10 @@ fn main() {
 
     // Try to derive keys from kvcomm
     let home = std::env::var("HOME").unwrap_or_default();
-    let kvcomm = format!("{}/Library/Containers/com.telegram.xinTelegram/Data/Documents/app_data/net/kvcomm", home);
+    let kvcomm = format!(
+        "{}/Library/Containers/com.telegram.xinTelegram/Data/Documents/app_data/net/kvcomm",
+        home
+    );
     let kvcomm_path = std::path::Path::new(&kvcomm);
 
     if kvcomm_path.is_dir() {
@@ -74,17 +81,28 @@ fn main() {
                     // Validate: decrypt first block
                     let cipher = Aes128::new_from_slice(aes_key).unwrap();
                     let mut block = data[15..31].to_vec();
-                    cipher.decrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(&mut block));
+                    cipher.decrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
+                        &mut block,
+                    ));
                     let is_jpeg = block[0] == 0xFF && block[1] == 0xD8;
-                    let is_png = block[0] == 0x89 && block[1] == 0x50 && block[2] == 0x4E && block[3] == 0x47;
-                    log::info!("  Validate: {:02x?} JPEG={} PNG={}", &block[..4], is_jpeg, is_png);
+                    let is_png = block[0] == 0x89
+                        && block[1] == 0x50
+                        && block[2] == 0x4E
+                        && block[3] == 0x47;
+                    log::info!(
+                        "  Validate: {:02x?} JPEG={} PNG={}",
+                        &block[..4],
+                        is_jpeg,
+                        is_png
+                    );
 
                     if is_jpeg || is_png {
                         // Full decrypt
                         let encrypted = &data[15..15 + aes_cipher_len];
                         let mut decrypted = encrypted.to_vec();
                         for chunk in decrypted.chunks_exact_mut(16) {
-                            let mut b = aes::cipher::generic_array::GenericArray::from_mut_slice(chunk);
+                            let mut b =
+                                aes::cipher::generic_array::GenericArray::from_mut_slice(chunk);
                             cipher.decrypt_block(&mut b);
                         }
                         // PKCS7 unpad
@@ -105,11 +123,20 @@ fn main() {
                         decrypted.extend(xored.iter().map(|b| b ^ xor_key));
 
                         // Detect extension
-                        let ext = if decrypted.len() >= 4 && decrypted[..4] == [0x89, 0x50, 0x4E, 0x47] { "png" }
-                            else if decrypted.len() >= 2 && decrypted[..2] == [0xFF, 0xD8] { "jpg" }
-                            else { "bin" };
+                        let ext =
+                            if decrypted.len() >= 4 && decrypted[..4] == [0x89, 0x50, 0x4E, 0x47] {
+                                "png"
+                            } else if decrypted.len() >= 2 && decrypted[..2] == [0xFF, 0xD8] {
+                                "jpg"
+                            } else {
+                                "bin"
+                            };
 
-                        let out_name = format!("/tmp/decrypted_{}.{}", name.replace(|c: char| !c.is_alphanumeric(), "_"), ext);
+                        let out_name = format!(
+                            "/tmp/decrypted_{}.{}",
+                            name.replace(|c: char| !c.is_alphanumeric(), "_"),
+                            ext
+                        );
                         fs::write(&out_name, &decrypted).ok();
                         log::info!("  Saved: {} ({} bytes, {})", out_name, decrypted.len(), ext);
                     }
@@ -122,14 +149,16 @@ fn main() {
 }
 
 fn extract_code(filename: &str) -> Option<u64> {
-    if !filename.starts_with("key_") { return None; }
+    if !filename.starts_with("key_") {
+        return None;
+    }
     let rest = filename.strip_prefix("key_")?;
     let end = rest.find('_')?;
     rest[..end].parse::<u64>().ok()
 }
 
 fn derive_key(code: u64, tgid: &str) -> String {
-    use md5::{Md5, Digest};
+    use md5::{Digest, Md5};
     let mut hasher = Md5::new();
     hasher.update(code.to_string().as_bytes());
     hasher.update(tgid.as_bytes());
