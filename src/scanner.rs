@@ -1,8 +1,34 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+fn find_telegram_pid() -> Result<i32, String> {
+    let output = Command::new("pgrep")
+        .arg("-x")
+        .arg("Telegram")
+        .output()
+        .map_err(|e| format!("Failed to run pgrep: {}", e))?;
+
+    if !output.status.success() {
+        return Err("Telegram is not running.".to_string());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pid = stdout.trim().parse::<i32>()
+        .map_err(|e| format!("Invalid PID: {}", e))?;
+    Ok(pid)
+}
+
+fn is_root() -> bool {
+    Command::new("id").arg("-u").output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(|uid| uid == 0)
+        .unwrap_or(false)
+}
+
 /// Extract DB encryption keys from Telegram process memory.
-/// Runs the C scanner binary with sudo, parses its output.
+/// Runs the C scanner binary, wrapping with sudo if not already root.
 pub fn extract_keys(scanner_path: &Path, _timeout_secs: u64) -> Result<String, String> {
     if !scanner_path.exists() {
         return Err(format!(
@@ -11,18 +37,26 @@ pub fn extract_keys(scanner_path: &Path, _timeout_secs: u64) -> Result<String, S
         ));
     }
 
-    // Find Telegram PID first
     let pid = find_telegram_pid().map_err(|e| format!("Cannot find Telegram process: {}", e))?;
     println!("Telegram PID: {}", pid);
 
-    // Run the C scanner with sudo
-    println!("Running key scanner (requires sudo)...");
-    println!("You may be prompted for your password.\n");
+    let needs_sudo = !is_root();
+    if needs_sudo {
+        println!("Running key scanner (requires sudo)...");
+        println!("You may be prompted for your password.\n");
+    }
 
-    let output = Command::new("sudo")
-        .arg(scanner_path)
-        .arg(format!("{}", pid))
-        .arg("/dev/null") // redirect stderr
+    let scanner_str = scanner_path.to_string_lossy();
+    let mut cmd = if needs_sudo {
+        let mut c = Command::new("sudo");
+        c.arg(scanner_str.as_ref());
+        c
+    } else {
+        Command::new(scanner_str.as_ref())
+    };
+    cmd.arg(format!("{}", pid));
+
+    let output = cmd
         .output()
         .map_err(|e| format!("Failed to run scanner: {}", e))?;
 
@@ -41,13 +75,10 @@ pub fn extract_keys(scanner_path: &Path, _timeout_secs: u64) -> Result<String, S
         ));
     }
 
-    // Print scanner output
     println!("{}", stdout);
 
-    // Check for all_keys.json
     let keys_path = PathBuf::from("all_keys.json");
     if keys_path.exists() {
-        // Count keys
         let content = std::fs::read_to_string(&keys_path)
             .map_err(|e| format!("Cannot read keys file: {}", e))?;
         let key_count = content.matches("\"enc_key\"").count();
@@ -56,21 +87,4 @@ pub fn extract_keys(scanner_path: &Path, _timeout_secs: u64) -> Result<String, S
     } else {
         Err("all_keys.json not found. Key extraction may have failed.".to_string())
     }
-}
-
-fn find_telegram_pid() -> Result<i32, String> {
-    let output = Command::new("pgrep")
-        .arg("-x")
-        .arg("Telegram")
-        .output()
-        .map_err(|e| format!("Failed to run pgrep: {}", e))?;
-
-    if !output.status.success() {
-        return Err("Telegram is not running.".to_string());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let pid = stdout.trim().parse::<i32>()
-        .map_err(|e| format!("Invalid PID: {}", e))?;
-    Ok(pid)
 }
