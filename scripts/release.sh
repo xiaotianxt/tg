@@ -106,6 +106,16 @@ log "fetching origin/main and tags"
 git fetch origin main --tags
 
 HEAD_SHA="$(git rev-parse HEAD)"
+if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+  TAG_SHA="$(git rev-list -n 1 "$TAG")"
+  [[ "$TAG_SHA" == "$HEAD_SHA" ]] || die "local tag ${TAG} points to ${TAG_SHA}, not HEAD ${HEAD_SHA}; bump Cargo.toml version before releasing"
+fi
+
+REMOTE_TAG_SHA="$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}')"
+if [[ -n "$REMOTE_TAG_SHA" ]]; then
+  [[ "$REMOTE_TAG_SHA" == "$HEAD_SHA" ]] || die "remote tag ${TAG} points to ${REMOTE_TAG_SHA}, not HEAD ${HEAD_SHA}; bump Cargo.toml version before releasing"
+fi
+
 ORIGIN_MAIN_SHA="$(git rev-parse origin/main)"
 if [[ "$HEAD_SHA" != "$ORIGIN_MAIN_SHA" ]]; then
   if git merge-base --is-ancestor origin/main HEAD; then
@@ -122,17 +132,13 @@ if [[ "$RUN_TESTS" -eq 1 ]]; then
 fi
 
 if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-  TAG_SHA="$(git rev-list -n 1 "$TAG")"
-  [[ "$TAG_SHA" == "$HEAD_SHA" ]] || die "local tag ${TAG} points to ${TAG_SHA}, not HEAD ${HEAD_SHA}"
   log "local tag ${TAG} already exists"
 else
   log "creating tag ${TAG}"
   git tag "$TAG"
 fi
 
-REMOTE_TAG_SHA="$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}')"
 if [[ -n "$REMOTE_TAG_SHA" ]]; then
-  [[ "$REMOTE_TAG_SHA" == "$HEAD_SHA" ]] || die "remote tag ${TAG} points to ${REMOTE_TAG_SHA}, not HEAD ${HEAD_SHA}"
   log "remote tag ${TAG} already exists"
 else
   log "pushing tag ${TAG}"
