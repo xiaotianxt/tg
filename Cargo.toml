@@ -2,7 +2,12 @@
 name = "tgreader"
 version = "0.1.0"
 edition = "2021"
-description = "A CLI tool to read Telegram messages from local databases"
+description = "macOS Telegram 聊天记录读取 CLI 工具"
+authors = ["xiaotianxt"]
+repository = "https://github.com/xiaotianxt/tgreader"
+license = "MIT"
+keywords = ["telegram", "telegram", "chat", "decrypt", "sqlcipher"]
+categories = ["command-line-utilities", "database"]
 
 [[bin]]
 name = "tgreader"
