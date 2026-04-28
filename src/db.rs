@@ -274,28 +274,36 @@ pub fn read_messages(
 
         // Query messages - collect eagerly to avoid borrow issues
         let sql = format!(
-            "SELECT local_type, create_time, message_content, WCDB_CT_message_content, real_sender_id \
+            "SELECT local_type, create_time, message_content, WCDB_CT_message_content, real_sender_id, packed_info_data \
              FROM {} WHERE create_time > 0{}{} ORDER BY create_time {}",
             table_name, search_clause, since_clause, order_dir
         );
-        let rows: Vec<(i64, i64, String, Option<i64>, String)> = match conn.prepare(&sql) {
+        let rows: Vec<(i64, i64, String, Option<i64>, String, Vec<u8>)> = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
-                // message_content can be TEXT or BLOB; read as String when possible
-                let content: String = match row.get::<_, Option<String>>(2) {
-                    Ok(Some(s)) => s,
-                    _ => match row.get::<_, Option<Vec<u8>>>(2) {
-                        Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                        _ => String::new(),
-                    },
+                let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(3)?;
+                let content: String = if wcdb_ct == Some(4) {
+                    if let Ok(b) = row.get::<_, Vec<u8>>(2) {
+                        message::try_decompress(&b).unwrap_or_default()
+                    } else { String::new() }
+                } else {
+                    match row.get::<_, Option<String>>(2) {
+                        Ok(Some(s)) => s,
+                        _ => match row.get::<_, Option<Vec<u8>>>(2) {
+                            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
+                            _ => String::new(),
+                        },
+                    }
                 };
                 let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
                 let sender_tgid = name2id.get(&sender_id).cloned().unwrap_or_default();
+                let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
                 Ok((
                     row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
                     row.get::<_, Option<i64>>(1)?.unwrap_or(0),
                     content,
-                    row.get::<_, Option<i64>>(3)?,
+                    wcdb_ct,
                     sender_tgid,
+                    packed_info,
                 ))
             }) {
                 Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
@@ -338,7 +346,7 @@ pub fn read_messages(
         println!("Showing {}-{} of {} messages\n", offset + 1, offset + messages.len(), total_count);
     }
 
-    for (local_type, create_time, content, wcdb_ct, sender_tgid) in &messages {
+    for (local_type, create_time, content, wcdb_ct, sender_tgid, packed_info) in &messages {
         let time_str = chrono::DateTime::from_timestamp(*create_time, 0)
             .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
@@ -355,6 +363,7 @@ pub fn read_messages(
             content,
             sender_display,
             *wcdb_ct,
+            packed_info,
             |id| resolve_sender_name(id, &contacts),
         );
 
