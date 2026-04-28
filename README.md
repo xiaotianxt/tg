@@ -32,7 +32,33 @@ tgreader export "联系人名称" --format txt
 - Xcode Command Line Tools（`xcode-select --install`）
 - SIP 需部分关闭或Telegram重新签名（用于 `task_for_pid`）
 
-### 从源码安装
+### 方式一：一键安装脚本（推荐）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xiaotianxt/tgreader/main/scripts/install.sh | bash
+```
+
+安装完成后，`tgreader` 命令即可全局使用。
+
+### 方式二：Homebrew
+
+```bash
+brew install xiaotianxt/tgreader/tgreader
+```
+
+或直接从 Formula 安装：
+
+```bash
+brew install https://raw.githubusercontent.com/xiaotianxt/tgreader/main/Formula/tgreader.rb
+```
+
+如需从最新源码安装（开发版）：
+
+```bash
+brew install --HEAD xiaotianxt/tgreader/tgreader
+```
+
+### 方式三：从源码安装
 
 ```bash
 git clone https://github.com/xiaotianxt/tgreader.git
@@ -40,7 +66,16 @@ cd tgreader
 make install
 ```
 
-安装完成后，`tgreader` 命令即可全局使用。
+### 方式四：Claude Code Skill
+
+安装后，在 Claude Code 中可使用 `/tgreader` 加载技能，AI 即可理解并使用 tgreader：
+
+```bash
+# 安装脚本会自动配置 skill，或在 Claude Code 中直接输入：
+/tgreader
+```
+
+skill 配置位于 `~/.claude/settings.json`，也可手动加载项目中的 `.claude/settings.json`。
 
 ## 使用流程
 

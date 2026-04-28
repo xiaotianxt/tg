@@ -4,7 +4,6 @@ class Tgreader < Formula
   license "MIT"
 
   depends_on "rust" => :build
-  depends_on xcode: :build
 
   head do
     url "https://github.com/xiaotianxt/tgreader.git", branch: "main"
