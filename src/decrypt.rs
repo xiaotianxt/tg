@@ -146,7 +146,7 @@ fn decrypt_database(db_path: &Path, out_path: &Path, enc_key_hex: &str) -> Resul
         return Err("Page 1 HMAC verification failed".to_string());
     }
 
-    let total_pages = (file_size as usize + PAGE_SZ - 1) / PAGE_SZ;
+    let total_pages = (file_size as usize).div_ceil(PAGE_SZ);
 
     // Ensure output directory exists
     if let Some(parent) = out_path.parent() {
@@ -357,7 +357,7 @@ pub fn decrypt_all(
         print!("Decrypt: {} ({:.1}MB) ... ", rel_path, size_mb);
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
-        match decrypt_database(full_path, &out_path, enc_key.as_deref().map_or("", |v| v)) {
+        match decrypt_database(full_path, &out_path, enc_key.map_or("", |v| v.as_str())) {
             Ok(true) => {
                 // Verify with SQLite
                 match verify_sqlite(&out_path) {

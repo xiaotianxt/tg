@@ -1,4 +1,4 @@
-use crate::media;
+use crate::media::{self, extract_xml_tag, extract_xml_tag_int, extract_xml_attr};
 use std::fmt;
 
 /// Telegram消息类型枚举。
@@ -16,8 +16,6 @@ pub enum MessageType {
     Location,        // 48
     File,            // 62
     Call,            // 50
-    #[allow(dead_code)]
-    ChatHistory,     // 引用聊天记录 (type 49 subtype)
     Music,           // 419430449
     Revoke,          // 10002 撤回消息
     Unknown(i32),    // 其他
@@ -38,7 +36,6 @@ impl fmt::Display for MessageType {
             MessageType::Location => "位置",
             MessageType::File => "文件",
             MessageType::Call => "语音/视频通话",
-            MessageType::ChatHistory => "引用消息",
             MessageType::Music => "音乐",
             MessageType::Revoke => "撤回消息",
             MessageType::Unknown(n) => return write!(f, "未知({})", n),
@@ -316,46 +313,6 @@ fn extract_voice_duration(content: &str) -> String {
     }
 }
 
-/// 从 XML 字符串中提取指定标签的文本内容。
-/// 只处理 `<tag>text</tag>`（无属性）格式。
-fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-
-    let start = xml.find(&open)?;
-    let value_start = start + open.len();
-    if value_start >= xml.len() {
-        return None;
-    }
-    let rest = &xml[value_start..];
-    let value_end = rest.find(&close)?;
-    let value = rest[..value_end].trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
-}
-
-/// 从 XML 字符串中提取指定标签的整数内容。
-fn extract_xml_tag_int(xml: &str, tag: &str) -> Option<i64> {
-    let text = extract_xml_tag(xml, tag)?;
-    text.parse::<i64>().ok()
-}
-
-/// 从 XML 自闭合标签中提取属性值（如 `<msg label="xxx" poiname="yyy"/>`）。
-fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
-    let pattern = format!(r#"{}=""#, attr);
-    let start = xml.find(&pattern)?;
-    let value_start = start + pattern.len();
-    if value_start >= xml.len() {
-        return None;
-    }
-    let rest = &xml[value_start..];
-    if !rest.starts_with('"') {
-        return None;
-    }
-    let rest = &rest[1..]; // skip opening "
-    let end = rest.find('"')?;
-    let value = rest[..end].to_string();
-    if value.is_empty() { None } else { Some(value) }
-}
 
 /// Parse sender tgid from message content ("tgid_xxx:\nmessage" or "tgid_xxx: message").
 /// Returns (sender_id, clean_content).
@@ -375,7 +332,7 @@ pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
             || prefix.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
         if is_id && prefix.len() >= 3 {
             let after = &content[i + 1..];
-            let after = after.trim_start_matches(|c| c == ' ' || c == '\n');
+            let after = after.trim_start_matches([' ', '\n']);
             return (Some(prefix), after);
         }
         break; // first colon doesn't match, stop
@@ -512,9 +469,9 @@ mod tests {
     #[test]
     fn test_extract_xml_tag_simple() {
         let xml = "<msg><title>Test Title</title><url>https://example.com</url></msg>";
-        assert_eq!(extract_xml_tag(xml, "title"), Some("Test Title".to_string()));
-        assert_eq!(extract_xml_tag(xml, "url"), Some("https://example.com".to_string()));
-        assert_eq!(extract_xml_tag(xml, "nonexist"), None);
+        assert_eq!(crate::media::extract_xml_tag(xml, "title"), Some("Test Title".to_string()));
+        assert_eq!(crate::media::extract_xml_tag(xml, "url"), Some("https://example.com".to_string()));
+        assert_eq!(crate::media::extract_xml_tag(xml, "nonexist"), None);
     }
 
     #[test]
