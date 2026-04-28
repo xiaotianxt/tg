@@ -288,16 +288,18 @@ fn decode_refermsg_content(refermsg: &str) -> String {
         .map(|n| n as i32)
         .unwrap_or(1);
     let ref_content = crate::media::extract_xml_tag(refermsg, "content").unwrap_or_default();
+    let (_, clean_content) = parse_sender_from_content(&ref_content);
 
-    if ref_content.is_empty() {
+    if clean_content.is_empty() {
         return format!("[{}]", MessageType::from(ref_type));
     }
 
     match ref_type {
-        1 => ref_content,
-        49 if ref_content.trim_start().starts_with('<') => decode_link_content(&ref_content),
-        _ if ref_content.trim_start().starts_with('<') => format!("[{}]", MessageType::from(ref_type)),
-        _ => ref_content,
+        1 => clean_content.to_string(),
+        t if is_media_type(t) => decode_media_content(t, clean_content, &[]),
+        49 if clean_content.trim_start().starts_with('<') => decode_link_content(clean_content),
+        _ if clean_content.trim_start().starts_with('<') => format!("[{}]", MessageType::from(ref_type)),
+        _ => clean_content.to_string(),
     }
 }
 
@@ -500,5 +502,13 @@ mod tests {
         let xml = r#"<msg><appmsg><title>回复内容</title><type>57</type><refermsg><type>1</type><content>引用内容</content></refermsg></appmsg></msg>"#;
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
         assert_eq!(d.content, "> 引用内容\n        回复内容");
+    }
+
+    #[test]
+    fn test_decode_quoted_group_image() {
+        let xml = r#"<msg><appmsg><title>回复图片</title><type>57</type><refermsg><type>3</type><content>tgid_abc:
+&lt;msg&gt;&lt;img cdnthumbwidth="180" cdnthumbheight="153" length="38186" /&gt;&lt;/msg&gt;</content></refermsg></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "> [图片 180x153]\n        回复图片");
     }
 }
