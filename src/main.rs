@@ -41,12 +41,18 @@ enum Commands {
         /// Path to Telegram db_storage directory (auto-detected if not provided)
         #[arg(long)]
         db_dir: Option<PathBuf>,
-        /// Incremental mode: only decrypt files that have changed since last decrypt
-        #[arg(short, long)]
+        /// Incremental mode is the default; kept for compatibility with old scripts
+        #[arg(short, long, hide = true)]
         incremental: bool,
+        /// Force decrypting every database even when cached outputs are up to date
+        #[arg(long)]
+        full: bool,
         /// Only decrypt databases modified after this time (ISO 8601 or relative: 5min, 1h, today)
         #[arg(long)]
         since: Option<String>,
+        /// Show decrypt progress and summary
+        #[arg(long)]
+        verbose: bool,
     },
     /// List all chat sessions/conversations
     Sessions {
@@ -113,6 +119,20 @@ enum Commands {
     },
 }
 
+fn refresh_decrypted_cache(decrypted_dir: &std::path::Path) {
+    let config = decrypt::DecryptConfig {
+        incremental: true,
+        since: None,
+        quiet: true,
+    };
+    let _ = decrypt::decrypt_all(
+        std::path::Path::new("all_keys.json"),
+        decrypted_dir,
+        None,
+        &config,
+    );
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -127,7 +147,7 @@ fn main() {
                 }
             }
         }
-        Commands::Decrypt { keys, output, db_dir, incremental, since } => {
+        Commands::Decrypt { keys, output, db_dir, incremental: _, full, since, verbose } => {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -136,17 +156,20 @@ fn main() {
                 }
             };
             let config = decrypt::DecryptConfig {
-                incremental,
+                incremental: !full,
                 since: since_ts,
+                quiet: !verbose,
             };
             match decrypt::decrypt_all(&keys, &output, db_dir.as_deref(), &config) {
                 Ok(stats) => {
-                    if stats.skipped > 0 {
-                        println!("Decryption complete: {} succeeded, {} failed, {} skipped, {} total",
-                            stats.success, stats.failed, stats.skipped, stats.total);
-                    } else {
-                        println!("Decryption complete: {} succeeded, {} failed, {} total",
-                            stats.success, stats.failed, stats.total);
+                    if verbose {
+                        if stats.skipped > 0 {
+                            println!("Decryption complete: {} succeeded, {} failed, {} skipped, {} total",
+                                stats.success, stats.failed, stats.skipped, stats.total);
+                        } else {
+                            println!("Decryption complete: {} succeeded, {} failed, {} total",
+                                stats.success, stats.failed, stats.total);
+                        }
                     }
                 }
                 Err(e) => {
@@ -156,6 +179,7 @@ fn main() {
             }
         }
         Commands::Sessions { decrypted_dir, top } => {
+            refresh_decrypted_cache(&decrypted_dir);
             match db::list_sessions(&decrypted_dir, top) {
                 Ok(sessions) => {
                     if sessions.is_empty() {
@@ -177,6 +201,7 @@ fn main() {
                 }
             };
             let use_tail = tail || (!head && offset == 0);
+            refresh_decrypted_cache(&decrypted_dir);
             match db::read_messages(&decrypted_dir, &session, limit, offset, search.as_deref(), since_ts, use_tail) {
                 Ok(msg_count) => {
                     if msg_count == 0 {
@@ -190,6 +215,7 @@ fn main() {
             }
         }
         Commands::Search { query, decrypted_dir, limit } => {
+            refresh_decrypted_cache(&decrypted_dir);
             match db::search_messages(&decrypted_dir, &query, limit) {
                 Ok(count) => {
                     if count == 0 {
@@ -203,6 +229,7 @@ fn main() {
             }
         }
         Commands::Export { session, decrypted_dir, format, output, media_dir } => {
+            refresh_decrypted_cache(&decrypted_dir);
             match export::export_messages(&decrypted_dir, &session, &format, &output, media_dir.as_deref()) {
                 Ok(paths) => {
                     println!("Exported to:");

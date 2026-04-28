@@ -1,13 +1,13 @@
 use aes::Aes256;
 use cbc::Decryptor;
-use cipher::{KeyIvInit, block_padding::NoPadding, BlockDecryptMut, generic_array::GenericArray};
+use cipher::{block_padding::NoPadding, generic_array::GenericArray, BlockDecryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha512;
 use std::collections::HashMap;
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::fs;
 
 type Aes256CbcDec = Decryptor<Aes256>;
 
@@ -17,6 +17,9 @@ const IV_SZ: usize = 16;
 const HMAC_SZ: usize = 64;
 const RESERVE_SZ: usize = IV_SZ + HMAC_SZ; // 80
 const KEY_SZ: usize = 32;
+const PAGE_FINGERPRINT_SZ: usize = 16;
+const IO_BUF_SZ: usize = 1024 * 1024;
+const PAGE_CACHE_MAGIC: &[u8; 8] = b"TGRPG001";
 const SQLITE_HDR: &[u8] = b"SQLite format 3\0";
 
 pub struct DecryptStats {
@@ -26,12 +29,24 @@ pub struct DecryptStats {
     pub total: usize,
 }
 
+struct DecryptFileStats {
+    total_pages: usize,
+    decrypted_pages: usize,
+    reused_pages: usize,
+}
+
+struct PageCache {
+    fingerprints: Vec<[u8; PAGE_FINGERPRINT_SZ]>,
+}
+
 /// Configuration for decryption behavior.
 pub struct DecryptConfig {
     /// If true, only decrypt files whose source mtime is newer than the decrypted file's mtime.
     pub incremental: bool,
     /// If set, only decrypt source files modified after this Unix timestamp.
     pub since: Option<i64>,
+    /// If true, suppress progress output.
+    pub quiet: bool,
 }
 
 /// Derive the HMAC key from the encryption key and salt.
@@ -43,41 +58,36 @@ fn derive_mac_key(enc_key: &[u8], salt: &[u8]) -> Vec<u8> {
     mac_key
 }
 
-/// Verify and decrypt a single page.
-/// Returns decrypted 4096-byte page.
-fn decrypt_page(enc_key: &[u8], page_data: &[u8], pgno: u32) -> Option<Vec<u8>> {
-    if page_data.len() < PAGE_SZ {
+/// Verify and decrypt a single page into `out`.
+fn decrypt_page_into(enc_key: &[u8], page_data: &[u8], pgno: u32, out: &mut [u8]) -> Option<()> {
+    if page_data.len() < PAGE_SZ || out.len() != PAGE_SZ {
         return None;
     }
 
-    let iv = &page_data[PAGE_SZ - RESERVE_SZ .. PAGE_SZ - RESERVE_SZ + IV_SZ];
+    let iv = &page_data[PAGE_SZ - RESERVE_SZ..PAGE_SZ - RESERVE_SZ + IV_SZ];
 
     // Page 1 has 16-byte salt prefix; all pages encrypt up to the reserve area
     let payload_start = if pgno == 1 { SALT_SZ } else { 0 };
-    let encrypted = &page_data[payload_start .. PAGE_SZ - RESERVE_SZ];
+    let encrypted = &page_data[payload_start..PAGE_SZ - RESERVE_SZ];
 
-    let mut buf = encrypted.to_vec();
-    buf.resize(encrypted.len() + 16, 0);
+    out[payload_start..PAGE_SZ - RESERVE_SZ].copy_from_slice(encrypted);
 
     let key_arr = GenericArray::from_slice(enc_key);
     let iv_arr = GenericArray::from_slice(iv);
     let decryptor = Aes256CbcDec::new(key_arr, iv_arr);
-    decryptor.decrypt_padded_mut::<NoPadding>(&mut buf).ok()?;
-
-    let mut page = Vec::with_capacity(PAGE_SZ);
-    if pgno == 1 {
-        page.extend_from_slice(SQLITE_HDR);
-    }
-    page.extend_from_slice(&buf[..encrypted.len()]);
+    decryptor
+        .decrypt_padded_mut::<NoPadding>(&mut out[payload_start..PAGE_SZ - RESERVE_SZ])
+        .ok()?;
 
     if pgno == 1 {
-        page.resize(PAGE_SZ - RESERVE_SZ, 0);
-        page.extend_from_slice(&page_data[PAGE_SZ - RESERVE_SZ..]);
+        out[..SQLITE_HDR.len()].copy_from_slice(SQLITE_HDR);
+        out[PAGE_SZ - RESERVE_SZ..PAGE_SZ]
+            .copy_from_slice(&page_data[PAGE_SZ - RESERVE_SZ..PAGE_SZ]);
     } else {
-        page.resize(PAGE_SZ, 0);
+        out[PAGE_SZ - RESERVE_SZ..PAGE_SZ].fill(0);
     }
 
-    Some(page)
+    Some(())
 }
 
 /// Verify page 1 HMAC and return the decryption key if valid.
@@ -89,8 +99,8 @@ fn verify_and_decrypt_page1(enc_key: &[u8], page1: &[u8]) -> bool {
     let salt = &page1[..SALT_SZ];
     let mac_key = derive_mac_key(enc_key, salt);
 
-    let hmac_data = &page1[SALT_SZ .. PAGE_SZ - RESERVE_SZ + IV_SZ];
-    let stored_hmac = &page1[PAGE_SZ - HMAC_SZ .. PAGE_SZ];
+    let hmac_data = &page1[SALT_SZ..PAGE_SZ - RESERVE_SZ + IV_SZ];
+    let stored_hmac = &page1[PAGE_SZ - HMAC_SZ..PAGE_SZ];
 
     let Ok(mut mac) = Hmac::<Sha512>::new_from_slice(&mac_key) else {
         return false;
@@ -101,10 +111,82 @@ fn verify_and_decrypt_page1(enc_key: &[u8], page1: &[u8]) -> bool {
     mac.verify_slice(stored_hmac).is_ok()
 }
 
+fn page_cache_path(out_path: &Path) -> PathBuf {
+    let Some(file_name) = out_path.file_name() else {
+        return out_path.with_extension("tgreader-pages");
+    };
+    let mut cache_name = file_name.to_os_string();
+    cache_name.push(".tgreader-pages");
+    out_path.with_file_name(cache_name)
+}
+
+fn page_fingerprint(page_data: &[u8]) -> [u8; PAGE_FINGERPRINT_SZ] {
+    let mut fingerprint = [0u8; PAGE_FINGERPRINT_SZ];
+    if page_data.len() >= PAGE_SZ {
+        let start = PAGE_SZ - HMAC_SZ;
+        fingerprint.copy_from_slice(&page_data[start..start + PAGE_FINGERPRINT_SZ]);
+    }
+    fingerprint
+}
+
+fn read_page_cache(path: &Path) -> Option<PageCache> {
+    let data = fs::read(path).ok()?;
+    let header_len = PAGE_CACHE_MAGIC.len() + 4 + 8 + 8;
+    if data.len() < header_len || &data[..PAGE_CACHE_MAGIC.len()] != PAGE_CACHE_MAGIC {
+        return None;
+    }
+
+    let mut offset = PAGE_CACHE_MAGIC.len();
+    let page_size = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+    offset += 4;
+    if page_size != PAGE_SZ as u32 {
+        return None;
+    }
+
+    // Stored for future compatibility; current incremental logic tolerates growth/shrink.
+    let _source_size = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
+    offset += 8;
+
+    let page_count = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?) as usize;
+    offset += 8;
+    if data.len() != offset + page_count * PAGE_FINGERPRINT_SZ {
+        return None;
+    }
+
+    let fingerprints = data[offset..]
+        .chunks_exact(PAGE_FINGERPRINT_SZ)
+        .map(|chunk| chunk.try_into().ok())
+        .collect::<Option<Vec<[u8; PAGE_FINGERPRINT_SZ]>>>()?;
+
+    Some(PageCache { fingerprints })
+}
+
+fn write_page_cache(
+    path: &Path,
+    source_size: u64,
+    fingerprints: &[[u8; PAGE_FINGERPRINT_SZ]],
+) -> Result<(), String> {
+    let mut data = Vec::with_capacity(
+        PAGE_CACHE_MAGIC.len() + 4 + 8 + 8 + fingerprints.len() * PAGE_FINGERPRINT_SZ,
+    );
+    data.extend_from_slice(PAGE_CACHE_MAGIC);
+    data.extend_from_slice(&(PAGE_SZ as u32).to_le_bytes());
+    data.extend_from_slice(&source_size.to_le_bytes());
+    data.extend_from_slice(&(fingerprints.len() as u64).to_le_bytes());
+    for fingerprint in fingerprints {
+        data.extend_from_slice(fingerprint);
+    }
+    fs::write(path, data).map_err(|e| format!("Cannot write page cache {}: {}", path.display(), e))
+}
+
 /// Decrypt a single database file using the given encryption key.
-fn decrypt_database(db_path: &Path, out_path: &Path, enc_key_hex: &str) -> Result<bool, String> {
-    let enc_key = hex::decode(enc_key_hex)
-        .map_err(|e| format!("Invalid key hex: {}", e))?;
+fn decrypt_database(
+    db_path: &Path,
+    out_path: &Path,
+    enc_key_hex: &str,
+    incremental: bool,
+) -> Result<DecryptFileStats, String> {
+    let enc_key = hex::decode(enc_key_hex).map_err(|e| format!("Invalid key hex: {}", e))?;
 
     if enc_key.len() != KEY_SZ {
         return Err(format!("Invalid key length: {}", enc_key.len()));
@@ -119,8 +201,10 @@ fn decrypt_database(db_path: &Path, out_path: &Path, enc_key_hex: &str) -> Resul
     }
 
     // Read page 1 for HMAC verification
-    let mut file = fs::File::open(db_path)
-        .map_err(|e| format!("Cannot open {}: {}", db_path.display(), e))?;
+    let mut file = BufReader::with_capacity(
+        IO_BUF_SZ,
+        fs::File::open(db_path).map_err(|e| format!("Cannot open {}: {}", db_path.display(), e))?,
+    );
 
     let mut page1 = vec![0u8; PAGE_SZ];
     file.read_exact(&mut page1)
@@ -134,43 +218,144 @@ fn decrypt_database(db_path: &Path, out_path: &Path, enc_key_hex: &str) -> Resul
 
     // Ensure output directory exists
     if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Cannot create output dir: {}", e))?;
+        fs::create_dir_all(parent).map_err(|e| format!("Cannot create output dir: {}", e))?;
     }
 
-    let mut file = fs::File::open(db_path)
-        .map_err(|e| format!("Cannot reopen {}: {}", db_path.display(), e))?;
-
-    let mut out_file = fs::File::create(out_path)
-        .map_err(|e| format!("Cannot create {}: {}", out_path.display(), e))?;
-
-    use std::io::Write;
     let mut page_buf = vec![0u8; PAGE_SZ];
+    let mut out_buf = vec![0u8; PAGE_SZ];
+    let cache_path = page_cache_path(out_path);
+    let old_cache = if incremental && out_path.exists() {
+        read_page_cache(&cache_path)
+    } else {
+        None
+    };
 
-    for pgno in 1..=total_pages {
-        let bytes_read = file.read(&mut page_buf)
-            .map_err(|e| format!("Read error at page {}: {}", pgno, e))?;
+    if let Some(old_cache) = old_cache {
+        let mut out_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(out_path)
+            .map_err(|e| format!("Cannot update {}: {}", out_path.display(), e))?;
+        let old_out_len = fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+        out_file
+            .set_len((total_pages * PAGE_SZ) as u64)
+            .map_err(|e| format!("Cannot resize {}: {}", out_path.display(), e))?;
 
-        if bytes_read == 0 {
-            break;
+        let mut fingerprints = Vec::with_capacity(total_pages);
+        let mut decrypted_pages = 0usize;
+        let mut reused_pages = 0usize;
+
+        let mut handle_page =
+            |pgno: usize, page_data: &[u8], out_buf: &mut [u8]| -> Result<(), String> {
+                let index = pgno - 1;
+                let fingerprint = page_fingerprint(page_data);
+                fingerprints.push(fingerprint);
+
+                let page_end = (pgno * PAGE_SZ) as u64;
+                let can_reuse = old_out_len >= page_end
+                    && old_cache
+                        .fingerprints
+                        .get(index)
+                        .is_some_and(|old| *old == fingerprint);
+
+                if can_reuse {
+                    reused_pages += 1;
+                    return Ok(());
+                }
+
+                decrypt_page_into(&enc_key, page_data, pgno as u32, out_buf)
+                    .ok_or_else(|| format!("Decryption failed at page {}", pgno))?;
+                out_file
+                    .seek(SeekFrom::Start((index * PAGE_SZ) as u64))
+                    .map_err(|e| format!("Seek error at page {}: {}", pgno, e))?;
+                out_file
+                    .write_all(out_buf)
+                    .map_err(|e| format!("Write error at page {}: {}", pgno, e))?;
+                decrypted_pages += 1;
+                Ok(())
+            };
+
+        handle_page(1, &page1, &mut out_buf)?;
+
+        for pgno in 2..=total_pages {
+            let bytes_remaining = file_size as usize - ((pgno - 1) * PAGE_SZ);
+            let bytes_to_read = bytes_remaining.min(PAGE_SZ);
+
+            file.read_exact(&mut page_buf[..bytes_to_read])
+                .map_err(|e| format!("Read error at page {}: {}", pgno, e))?;
+            if bytes_to_read < PAGE_SZ {
+                page_buf[bytes_to_read..].fill(0);
+            }
+
+            handle_page(pgno, &page_buf, &mut out_buf)?;
         }
 
-        let page_data = if bytes_read < PAGE_SZ {
-            let mut p = page_buf[..bytes_read].to_vec();
-            p.resize(PAGE_SZ, 0);
-            p
-        } else {
-            page_buf.clone()
-        };
+        if decrypted_pages == 0 {
+            decrypt_page_into(&enc_key, &page1, 1, &mut out_buf)
+                .ok_or_else(|| "Decryption failed at page 1".to_string())?;
+            out_file
+                .seek(SeekFrom::Start(0))
+                .map_err(|e| format!("Seek error at page 1: {}", e))?;
+            out_file
+                .write_all(&out_buf)
+                .map_err(|e| format!("Write error at page 1: {}", e))?;
+        }
 
-        let decrypted = decrypt_page(&enc_key, &page_data, pgno as u32)
-            .ok_or_else(|| format!("Decryption failed at page {}", pgno))?;
+        out_file
+            .flush()
+            .map_err(|e| format!("Flush error: {}", e))?;
+        write_page_cache(&cache_path, file_size, &fingerprints)?;
 
-        out_file.write_all(&decrypted)
-            .map_err(|e| format!("Write error at page {}: {}", pgno, e))?;
+        return Ok(DecryptFileStats {
+            total_pages,
+            decrypted_pages,
+            reused_pages,
+        });
     }
 
-    Ok(true)
+    let mut out_file = BufWriter::with_capacity(
+        IO_BUF_SZ,
+        fs::File::create(out_path)
+            .map_err(|e| format!("Cannot create {}: {}", out_path.display(), e))?,
+    );
+    let mut fingerprints = Vec::with_capacity(total_pages);
+
+    decrypt_page_into(&enc_key, &page1, 1, &mut out_buf)
+        .ok_or_else(|| "Decryption failed at page 1".to_string())?;
+    fingerprints.push(page_fingerprint(&page1));
+
+    out_file
+        .write_all(&out_buf)
+        .map_err(|e| format!("Write error at page 1: {}", e))?;
+
+    for pgno in 2..=total_pages {
+        let bytes_remaining = file_size as usize - ((pgno - 1) * PAGE_SZ);
+        let bytes_to_read = bytes_remaining.min(PAGE_SZ);
+
+        file.read_exact(&mut page_buf[..bytes_to_read])
+            .map_err(|e| format!("Read error at page {}: {}", pgno, e))?;
+        if bytes_to_read < PAGE_SZ {
+            page_buf[bytes_to_read..].fill(0);
+        }
+        fingerprints.push(page_fingerprint(&page_buf));
+
+        decrypt_page_into(&enc_key, &page_buf, pgno as u32, &mut out_buf)
+            .ok_or_else(|| format!("Decryption failed at page {}", pgno))?;
+
+        out_file
+            .write_all(&out_buf)
+            .map_err(|e| format!("Write error at page {}: {}", pgno, e))?;
+    }
+    out_file
+        .flush()
+        .map_err(|e| format!("Flush error: {}", e))?;
+    write_page_cache(&cache_path, file_size, &fingerprints)?;
+
+    Ok(DecryptFileStats {
+        total_pages,
+        decrypted_pages: total_pages,
+        reused_pages: 0,
+    })
 }
 
 /// Auto-detect Telegram db_storage directory.
@@ -237,7 +422,8 @@ fn collect_db_files(dir: &Path) -> Vec<(String, PathBuf, u64)> {
                         continue;
                     }
                     if let Ok(meta) = fs::metadata(&path) {
-                        let rel = path.strip_prefix(base)
+                        let rel = path
+                            .strip_prefix(base)
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_else(|_| name.to_string());
                         files.push((rel, path.clone(), meta.len()));
@@ -262,8 +448,8 @@ pub fn decrypt_all(
     // Load keys
     let keys_json = fs::read_to_string(keys_path)
         .map_err(|e| format!("Cannot read {}: {}", keys_path.display(), e))?;
-    let keys: HashMap<String, HashMap<String, String>> = serde_json::from_str(&keys_json)
-        .map_err(|e| format!("Invalid keys JSON: {}", e))?;
+    let keys: HashMap<String, HashMap<String, String>> =
+        serde_json::from_str(&keys_json).map_err(|e| format!("Invalid keys JSON: {}", e))?;
 
     // Determine db_storage path
     let db_storage = match db_dir {
@@ -272,31 +458,43 @@ pub fn decrypt_all(
             .ok_or_else(|| "Cannot auto-detect Telegram DB directory. Use --db-dir.".to_string())?,
     };
 
-    println!("DB storage directory: {}", db_storage.display());
-    println!("Loaded {} database keys", keys.len());
+    if !config.quiet {
+        println!("DB storage directory: {}", db_storage.display());
+        println!("Loaded {} database keys", keys.len());
+    }
 
     // Collect all .db files
     let db_files = collect_db_files(&db_storage);
-    println!("Found {} database files\n", db_files.len());
+    if !config.quiet {
+        println!("Found {} database files\n", db_files.len());
+    }
 
-    let mut stats = DecryptStats { success: 0, failed: 0, skipped: 0, total: db_files.len() };
+    let mut stats = DecryptStats {
+        success: 0,
+        failed: 0,
+        skipped: 0,
+        total: db_files.len(),
+    };
 
     for (rel_path, full_path, size) in &db_files {
         // Look up key for this database
-        let enc_key = keys.get(rel_path.as_str())
-            .or_else(|| {
-                // Also try without directory prefix
-                let basename = Path::new(rel_path).file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
-                keys.keys().find(|k| k.ends_with(basename))
-                    .and_then(|k| keys.get(k))
-            });
+        let enc_key = keys.get(rel_path.as_str()).or_else(|| {
+            // Also try without directory prefix
+            let basename = Path::new(rel_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            keys.keys()
+                .find(|k| k.ends_with(basename))
+                .and_then(|k| keys.get(k))
+        });
 
         let enc_key = match enc_key {
             Some(k) => k.get("enc_key"),
             None => {
-                println!("SKIP: {} (no key)", rel_path);
+                if !config.quiet {
+                    println!("SKIP: {} (no key)", rel_path);
+                }
                 stats.failed += 1;
                 continue;
             }
@@ -311,7 +509,9 @@ pub fn decrypt_all(
                     if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
                         let mtime_ts = duration.as_secs() as i64;
                         if mtime_ts < since_ts {
-                            println!("SKIP: {} (not modified since requested time)", rel_path);
+                            if !config.quiet {
+                                println!("SKIP: {} (not modified since requested time)", rel_path);
+                            }
                             stats.skipped += 1;
                             continue;
                         }
@@ -327,7 +527,9 @@ pub fn decrypt_all(
                     if let Ok(dec_meta) = fs::metadata(&out_path) {
                         if let Ok(dec_mtime) = dec_meta.modified() {
                             if dec_mtime >= src_mtime {
-                                println!("SKIP: {} (up to date)", rel_path);
+                                if !config.quiet {
+                                    println!("SKIP: {} (up to date)", rel_path);
+                                }
                                 stats.skipped += 1;
                                 continue;
                             }
@@ -338,34 +540,54 @@ pub fn decrypt_all(
         }
 
         let size_mb = *size as f64 / (1024.0 * 1024.0);
-        print!("Decrypt: {} ({:.1}MB) ... ", rel_path, size_mb);
-        std::io::Write::flush(&mut std::io::stdout()).ok();
+        if !config.quiet {
+            print!("Decrypt: {} ({:.1}MB) ... ", rel_path, size_mb);
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
 
-        match decrypt_database(full_path, &out_path, enc_key.map_or("", |v| v.as_str())) {
-            Ok(true) => {
+        match decrypt_database(
+            full_path,
+            &out_path,
+            enc_key.map_or("", |v| v.as_str()),
+            config.incremental,
+        ) {
+            Ok(file_stats) => {
                 // Verify with SQLite
                 match verify_sqlite(&out_path) {
                     Ok(tables) => {
-                        let table_list: Vec<&str> = tables.iter().take(5).map(|s| s.as_str()).collect();
-                        println!("OK! Tables: {}", table_list.join(", "));
-                        if tables.len() > 5 {
-                            print!(" ... {} total", tables.len());
+                        let table_list: Vec<&str> =
+                            tables.iter().take(5).map(|s| s.as_str()).collect();
+                        if !config.quiet {
+                            if file_stats.reused_pages > 0 {
+                                println!(
+                                    "OK! Pages: {}/{} decrypted, {} reused. Tables: {}",
+                                    file_stats.decrypted_pages,
+                                    file_stats.total_pages,
+                                    file_stats.reused_pages,
+                                    table_list.join(", "),
+                                );
+                            } else {
+                                println!("OK! Tables: {}", table_list.join(", "));
+                            }
+                            if tables.len() > 5 {
+                                print!(" ... {} total", tables.len());
+                            }
+                            println!();
                         }
-                        println!();
                         stats.success += 1;
                     }
                     Err(e) => {
-                        println!("WARN: SQLite verify failed: {}", e);
+                        if !config.quiet {
+                            println!("WARN: SQLite verify failed: {}", e);
+                        }
                         stats.failed += 1;
                     }
                 }
             }
-            Ok(false) => {
-                println!("FAILED (unknown error)");
-                stats.failed += 1;
-            }
             Err(e) => {
-                println!("FAILED: {}", e);
+                if !config.quiet {
+                    println!("FAILED: {}", e);
+                }
                 stats.failed += 1;
             }
         }
@@ -375,13 +597,14 @@ pub fn decrypt_all(
 }
 
 fn verify_sqlite(db_path: &Path) -> Result<Vec<String>, String> {
-    let conn = rusqlite::Connection::open(db_path)
-        .map_err(|e| format!("Cannot open: {}", e))?;
+    let conn = rusqlite::Connection::open(db_path).map_err(|e| format!("Cannot open: {}", e))?;
 
-    let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
         .map_err(|e| format!("Query error: {}", e))?;
 
-    let tables: Vec<String> = stmt.query_map([], |row| row.get(0))
+    let tables: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
         .map_err(|e| format!("Read error: {}", e))?
         .filter_map(|r| r.ok())
         .collect();

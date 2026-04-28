@@ -12,7 +12,8 @@ brew install xiaotianxt/tgreader/tgreader
 sudo tgreader keys
 
 # 2. 解密所有数据库
-tgreader decrypt
+tgreader decrypt          # 默认静默增量刷新，已解密且未变化的库会跳过
+tgreader decrypt --full   # 强制全量重解
 
 # 3. 查看聊天列表
 tgreader sessions
@@ -89,7 +90,9 @@ sudo tgreader keys
 tgreader decrypt
 ```
 
-自动检测Telegram数据库目录，使用提取的密钥解密全部 `.db` 文件。解密后的文件存放在 `decrypted/` 目录。
+自动检测Telegram数据库目录，使用提取的密钥静默增量解密 `.db` 文件。解密后的文件存放在 `decrypted/` 目录；已解密且未变化的库会跳过，变化过的库会按页复用未变化内容，并在旁边维护 `*.db.tgreader-pages` 页缓存。如需强制全量重解，使用 `--full`；如需查看进度，使用 `--verbose`。
+
+`sessions`、`messages`、`search`、`export` 会在读取 `decrypted/` 前自动静默刷新一次缓存；如果当前没有可用的 `all_keys.json` 或无法访问Telegram数据库，会继续读取已有的解密缓存。
 
 ### 3. 查看会话
 
@@ -144,7 +147,7 @@ tgreader export "张三"
 | 命令       | 功能                         |
 |-----------|------------------------------|
 | `keys`    | 从内存提取数据库密钥（需 sudo） |
-| `decrypt` | 解密全部加密数据库             |
+| `decrypt` | 静默增量解密加密数据库（`--full` 强制全量，`--verbose` 显示进度） |
 | `sessions`| 按消息数排序列出所有会话       |
 | `messages`| 分页读取指定会话消息           |
 | `search`  | 跨会话全文搜索                |
