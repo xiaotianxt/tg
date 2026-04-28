@@ -142,6 +142,35 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         jobs: usize,
     },
+    /// Export local cached images from a specific session
+    Image {
+        /// Session username (tgid_xxx) or display name to search
+        session: String,
+        /// Path to decrypted databases
+        #[arg(long, default_value = "decrypted")]
+        decrypted_dir: PathBuf,
+        /// Output directory for readable image files
+        #[arg(long, default_value = "exported/images")]
+        output: PathBuf,
+        /// List recent image messages without exporting
+        #[arg(long, conflicts_with_all = ["all", "index"])]
+        list: bool,
+        /// Export every locally cached image in the selected window
+        #[arg(long, conflicts_with = "index")]
+        all: bool,
+        /// Export the Nth image shown by --list (newest first)
+        #[arg(long)]
+        index: Option<usize>,
+        /// Number of recent image messages to scan
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Only consider images after this time (ISO 8601 or relative: 5min, 1h, today)
+        #[arg(long)]
+        since: Option<String>,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+    },
 }
 
 fn refresh_decrypted_cache(decrypted_dir: &std::path::Path, jobs: usize) {
@@ -273,6 +302,29 @@ fn main() {
                     log::error!("Error: {}", e);
                     std::process::exit(1);
                 }
+            }
+        }
+        Commands::Image { session, decrypted_dir, output, list, all, index, limit, since, jobs } => {
+            let since_ts = match time::parse_since_opt(since.as_deref()) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    log::error!("Error parsing --since: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            refresh_decrypted_cache(&decrypted_dir, jobs);
+            let config = export::ImageExportConfig {
+                output_dir: &output,
+                list,
+                all,
+                index,
+                limit,
+                since: since_ts,
+                jobs,
+            };
+            if let Err(e) = export::export_images(&decrypted_dir, &session, config) {
+                log::error!("Error: {}", e);
+                std::process::exit(1);
             }
         }
     }

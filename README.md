@@ -99,6 +99,15 @@ tgreader messages "张三" --tail --limit 20
 tgreader messages "张三" --offset 100 --limit 50
 ```
 
+导出最近图片到可直接打开的本地文件：
+
+```bash
+tgreader image "张三"
+tgreader image "张三" --list --limit 20
+tgreader image "张三" --index 3
+tgreader image "张三" --all --limit 10 --output exported/images
+```
+
 全局搜索：
 
 ```bash

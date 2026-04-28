@@ -43,6 +43,31 @@ struct MediaExportResult {
     result: Result<PathBuf, String>,
 }
 
+pub struct ImageExportConfig<'a> {
+    pub output_dir: &'a Path,
+    pub list: bool,
+    pub all: bool,
+    pub index: Option<usize>,
+    pub limit: usize,
+    pub since: Option<i64>,
+    pub jobs: usize,
+}
+
+#[derive(Clone)]
+struct ImageMessage {
+    time: String,
+    timestamp: i64,
+    raw_content: String,
+    packed_info: Vec<u8>,
+}
+
+struct ImageCandidate {
+    index: usize,
+    message: ImageMessage,
+    identifier: Option<String>,
+    source: Option<PathBuf>,
+}
+
 /// Export messages for a session.
 pub fn export_messages(
     decrypted_dir: &Path,
@@ -308,6 +333,257 @@ pub fn export_messages(
     ))?;
     out.flush()?;
     Ok(results)
+}
+
+/// Export readable image files for a session.
+pub fn export_images(
+    decrypted_dir: &Path,
+    session_query: &str,
+    config: ImageExportConfig<'_>,
+) -> Result<Vec<PathBuf>, String> {
+    if config.limit == 0 {
+        return Err("--limit must be greater than 0".to_string());
+    }
+    if let Some(index) = config.index {
+        if index == 0 {
+            return Err("--index is 1-based and must be greater than 0".to_string());
+        }
+    }
+
+    let scan_limit = config.limit.max(config.index.unwrap_or(1));
+    let (username, messages) =
+        load_image_messages(decrypted_dir, session_query, config.since, scan_limit, config.jobs)?;
+    if messages.is_empty() {
+        return Err(format!("No image messages found for '{}'", username));
+    }
+
+    let telegram_base = media::find_telegram_base_path()
+        .ok_or_else(|| "Telegram data directory not found".to_string())?;
+
+    let candidates: Vec<ImageCandidate> = messages
+        .into_iter()
+        .enumerate()
+        .map(|(i, message)| {
+            let identifier = image_identifier(&message);
+            let source = identifier
+                .as_deref()
+                .and_then(|id| media::find_cached_media(&telegram_base, &username, "Image", id));
+            ImageCandidate {
+                index: i + 1,
+                message,
+                identifier,
+                source,
+            }
+        })
+        .collect();
+
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+
+    if config.list {
+        out.line(format_args!(
+            "{:<5} {:<19} {:<8} Source",
+            "Index",
+            "Time",
+            "Status"
+        ))?;
+        out.line(format_args!("{}", "-".repeat(100)))?;
+        for candidate in &candidates {
+            let status = if candidate.source.is_some() {
+                "cached"
+            } else {
+                "missing"
+            };
+            let source = candidate
+                .source
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .or_else(|| candidate.identifier.clone())
+                .unwrap_or_else(|| "(no identifier)".to_string());
+            out.line(format_args!(
+                "{:<5} {:<19} {:<8} {}",
+                candidate.index,
+                candidate.message.time,
+                status,
+                source
+            ))?;
+        }
+        out.flush()?;
+        return Ok(Vec::new());
+    }
+
+    let selected = if config.all {
+        candidates
+            .into_iter()
+            .filter(|candidate| candidate.source.is_some())
+            .take(config.limit)
+            .collect::<Vec<_>>()
+    } else if let Some(index) = config.index {
+        let Some(candidate) = candidates.into_iter().find(|candidate| candidate.index == index) else {
+            return Err(format!("Image index {} is outside the scanned window", index));
+        };
+        if candidate.source.is_none() {
+            return Err(format!("Image #{} is not available in local Telegram cache", index));
+        }
+        vec![candidate]
+    } else {
+        let Some(candidate) = candidates.into_iter().find(|candidate| candidate.source.is_some()) else {
+            return Err(format!(
+                "No locally cached images found in the latest {} image messages",
+                config.limit
+            ));
+        };
+        vec![candidate]
+    };
+
+    if selected.is_empty() {
+        return Err(format!(
+            "No locally cached images found in the latest {} image messages",
+            config.limit
+        ));
+    }
+
+    let media_keys = crate::media_key::find_media_keys(&telegram_base);
+    if let Err(ref e) = media_keys {
+        log::warn!("Cannot derive media decryption keys: {}", e);
+    }
+    let media_keys = media_keys.ok();
+
+    let image_jobs = selected
+        .into_iter()
+        .filter_map(|candidate| {
+            candidate.source.map(|src| MediaExportJob::Cached {
+                index: candidate.index,
+                src,
+                category: "Image",
+                msg_type: 3,
+            })
+        })
+        .collect::<Vec<_>>();
+    let image_job_count = parallel::job_count(config.jobs, 4);
+    let image_results = parallel::map_ordered(image_jobs, image_job_count, |job| {
+        match job {
+            MediaExportJob::Cached { index, src, category, msg_type } => MediaExportResult {
+                index,
+                is_sticker: false,
+                result: export_media_with_decrypt(
+                    &src,
+                    config.output_dir,
+                    &username,
+                    category,
+                    msg_type,
+                    index,
+                    media_keys.as_ref(),
+                ),
+            },
+            MediaExportJob::Sticker { .. } => unreachable!("image command only exports images"),
+        }
+    });
+
+    let mut paths = Vec::new();
+    for image_result in image_results {
+        match image_result.result {
+            Ok(path) => {
+                out.line(format_args!("{}", path.display()))?;
+                paths.push(path);
+            }
+            Err(e) => log::warn!("Image #{} export failed: {}", image_result.index, e),
+        }
+    }
+    out.flush()?;
+
+    if paths.is_empty() {
+        return Err("No images were exported".to_string());
+    }
+
+    Ok(paths)
+}
+
+fn load_image_messages(
+    decrypted_dir: &Path,
+    session_query: &str,
+    since: Option<i64>,
+    limit: usize,
+    jobs: usize,
+) -> Result<(String, Vec<ImageMessage>), String> {
+    let (contact_db, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
+    let username =
+        db::resolve_username_for_messages(session_query, contact_db.as_deref(), &message_dbs, jobs)?;
+    let table_name = db::msg_table_name(&username);
+    let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    let since_clause = since
+        .map(|ts| format!(" AND create_time >= {}", ts))
+        .unwrap_or_default();
+
+    let db_jobs = parallel::job_count(jobs, 8);
+    let per_db_messages = parallel::map_ordered(message_dbs, db_jobs, |db_path| {
+        let mut messages = Vec::new();
+        let conn = match Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(_) => return messages,
+        };
+
+        let sql = format!(
+            "SELECT create_time, message_content, WCDB_CT_message_content, packed_info_data \
+             FROM {} WHERE create_time > 0 AND local_type = 3{} ORDER BY create_time DESC LIMIT {}",
+            table_name, since_clause, limit
+        );
+
+        let rows: Vec<(i64, String, Vec<u8>)> = match conn.prepare(&sql) {
+            Ok(mut stmt) => match stmt.query_map([], |row| {
+                let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(2)?;
+                let content: String = if wcdb_ct == Some(4) {
+                    if let Ok(b) = row.get::<_, Vec<u8>>(1) {
+                        message::try_decompress(&b).unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    match row.get::<_, Option<String>>(1) {
+                        Ok(Some(s)) => s,
+                        _ => match row.get::<_, Option<Vec<u8>>>(1) {
+                            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
+                            _ => String::new(),
+                        },
+                    }
+                };
+                let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default();
+                Ok((row.get::<_, Option<i64>>(0)?.unwrap_or(0), content, packed_info))
+            }) {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(_) => vec![],
+            },
+            Err(_) => vec![],
+        };
+
+        for (timestamp, raw_content, packed_info) in rows {
+            let time = chrono::DateTime::from_timestamp(timestamp, 0)
+                .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| timestamp.to_string());
+            messages.push(ImageMessage {
+                time,
+                timestamp,
+                raw_content,
+                packed_info,
+            });
+        }
+        messages
+    });
+
+    let mut messages = Vec::new();
+    for db_messages in per_db_messages {
+        messages.extend(db_messages);
+    }
+    messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    messages.truncate(limit);
+
+    Ok((username, messages))
+}
+
+fn image_identifier(message: &ImageMessage) -> Option<String> {
+    try_protobuf_identifier(&message.packed_info)
+        .or_else(|| extract_xml_attr_str(&message.raw_content, "aeskey"))
+        .or_else(|| extract_xml_attr_str(&message.raw_content, "cdnthumburl"))
 }
 
 /// Try to extract media cache identifier from packed_info protobuf.
