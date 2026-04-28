@@ -13,6 +13,10 @@ categories = ["command-line-utilities", "database"]
 name = "tgreader"
 path = "src/main.rs"
 
+[[bin]]
+name = "try_decrypt"
+path = "src/bin/try_decrypt.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rusqlite = "0.31"
@@ -29,3 +33,4 @@ cipher = "0.4"
 tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
+zstd = "0.13"

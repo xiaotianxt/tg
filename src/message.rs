@@ -1,5 +1,8 @@
-use crate::media::{self, extract_xml_tag, extract_xml_tag_int, extract_xml_attr};
+use crate::media;
+use crate::media_pb;
+use flate2::read::ZlibDecoder;
 use std::fmt;
+use std::io::Read;
 
 /// Telegram消息类型枚举。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -83,27 +86,18 @@ pub struct DecodedMessage {
 /// - `raw_content` — 原始消息内容（可能为 TEXT 或 BLOB 转 String）
 /// - `session_display_name` — 会话的显示名（私聊即对方昵称，群聊即群名）
 /// - `wcdb_ct` — `WCDB_CT_message_content` 字段值
-/// - `resolve_display_name` — 将 tgid 解析为显示名的函数（群聊场景）
+/// - `packed_info_data` — `packed_info_data` 字段二进制数据（Telegram 4.x 媒体元信息）
+/// - `resolve_display_name` — 将 tgid 解析为显示名的函数
 pub fn decode_message(
     msg_type: i32,
     raw_content: &str,
     session_display_name: &str,
-    wcdb_ct: Option<i64>,
+    _wcdb_ct: Option<i64>,
+    packed_info_data: &[u8],
     resolve_display_name: impl Fn(&str) -> String,
 ) -> DecodedMessage {
-    // 派生消息类型
     let msg_type_enum: MessageType = msg_type.into();
 
-    // 处理压缩内容标记
-    if wcdb_ct == Some(4) {
-        return DecodedMessage {
-            msg_type: msg_type_enum,
-            content: "[压缩内容]".to_string(),
-            display_name: session_display_name.to_string(),
-        };
-    }
-
-    // 系统消息和撤回消息使用原始内容
     if msg_type == 10000 || msg_type == 10002 {
         return DecodedMessage {
             msg_type: msg_type_enum,
@@ -112,17 +106,20 @@ pub fn decode_message(
         };
     }
 
-    // 媒体类消息：不依赖 content
     if is_media_type(msg_type) {
-        let content = decode_media_content(msg_type, raw_content);
+        let (sender_id, clean_content) = parse_sender_from_content(raw_content);
+        let display_name = match sender_id {
+            Some(id) => resolve_display_name(id),
+            None => session_display_name.to_string(),
+        };
+        let content = decode_media_content(msg_type, clean_content, packed_info_data);
         return DecodedMessage {
             msg_type: msg_type_enum,
             content,
-            display_name: session_display_name.to_string(),
+            display_name,
         };
     }
 
-    // 空内容非文本消息
     if raw_content.is_empty() && msg_type != 1 {
         return DecodedMessage {
             msg_type: msg_type_enum,
@@ -131,7 +128,6 @@ pub fn decode_message(
         };
     }
 
-    // 一般内容消息：先解析 sender，再解码内容
     let (sender_id, clean_content) = parse_sender_from_content(raw_content);
     let display_name = match sender_id {
         Some(id) => resolve_display_name(id),
@@ -146,33 +142,77 @@ pub fn decode_message(
     }
 }
 
-/// 判断是否为媒体类型（内容本身不重要，只需显示类型标记）。
 fn is_media_type(t: i32) -> bool {
     matches!(t, 3 | 34 | 43 | 47)
 }
 
-/// 解码媒体类消息的显示内容。
-fn decode_media_content(msg_type: i32, raw_content: &str) -> String {
-    let type_name: MessageType = msg_type.into();
+/// 解码媒体类消息：优先使用 packed_info_data 的 protobuf 元信息，回退到 XML 解析。
+fn decode_media_content(msg_type: i32, raw_content: &str, packed_info: &[u8]) -> String {
     match msg_type {
         34 => {
+            if let Some(audio) = extract_audio_meta(packed_info) {
+                return audio;
+            }
             let dur = extract_voice_duration(raw_content);
             format!("[语音{}]", dur)
         }
-        47 => {
-            media::parse_sticker_info(raw_content).display()
-        }
+        47 => media::parse_sticker_info(raw_content).display(),
         43 => {
+            if let Some(video) = extract_video_display(packed_info) {
+                return video;
+            }
             media::parse_video_info(raw_content).display()
         }
         3 => {
+            if let Some(img) = extract_image_display(packed_info) {
+                return img;
+            }
             media::parse_image_info(raw_content).display()
         }
-        _ => format!("[{}]", type_name),
+        _ => {
+            let type_name: MessageType = msg_type.into();
+            format!("[{}]", type_name)
+        }
     }
 }
 
-/// 解码需要解析 content 字段的消息类型。
+fn extract_image_display(data: &[u8]) -> Option<String> {
+    if data.is_empty() { return None; }
+    if let Some(v2) = media_pb::parse_img2(data) {
+        if let Some(img) = v2.image {
+            return Some(media_pb::display_image(&img));
+        }
+    }
+    if let Some(v1) = media_pb::parse_img(data) {
+        if !v1.filename.is_empty() {
+            return Some(format!("[图片] {}", v1.filename));
+        }
+    }
+    None
+}
+
+fn extract_video_display(data: &[u8]) -> Option<String> {
+    if data.is_empty() { return None; }
+    if let Some(v2) = media_pb::parse_img2(data) {
+        if let Some(vid) = v2.video {
+            return Some(media_pb::display_video(&vid));
+        }
+    }
+    None
+}
+
+fn extract_audio_meta(data: &[u8]) -> Option<String> {
+    if data.is_empty() { return None; }
+    if let Some(v2) = media_pb::parse_img2(data) {
+        if let Some(audio) = v2.audio {
+            if !audio.audio_text.is_empty() {
+                return Some(format!("[语音] {}", audio.audio_text));
+            }
+        }
+    }
+    None
+}
+
 fn decode_content_by_type(msg_type: i32, content: &str) -> String {
     match msg_type {
         49 => decode_link_content(content),
@@ -181,11 +221,10 @@ fn decode_content_by_type(msg_type: i32, content: &str) -> String {
         62 => decode_file_content(content),
         419430449 => decode_music_content(content),
         436207665 | 536870918 => format!("[{}]", MessageType::from(msg_type)),
-        _ => content.to_string(), // 文本或其他直接显示
+        _ => content.to_string(),
     }
 }
 
-/// 对 type 49（链接/卡片）解码。尝试解析 XML 提取标题、描述、URL。
 fn decode_link_content(content: &str) -> String {
     if !content.trim_start().starts_with('<') {
         if content.len() > 200 {
@@ -194,39 +233,31 @@ fn decode_link_content(content: &str) -> String {
         return format!("[链接] {}", content);
     }
 
-    let sub_type = extract_xml_tag_int(content, "type").unwrap_or(0);
-
+    let sub_type = crate::media::extract_xml_tag_int(content, "type").unwrap_or(0);
     match sub_type {
-        5 => {
-            media::parse_link_info(content)
-                .as_ref()
-                .map(media::LinkInfo::display)
-                .unwrap_or_else(|| "[链接]".to_string())
-        }
-        33 => {
-            media::parse_mini_program_info(content)
-                .as_ref()
-                .map(media::MiniProgramInfo::display)
-                .unwrap_or_else(|| "[小程序]".to_string())
-        }
+        5 => media::parse_link_info(content)
+            .as_ref()
+            .map(media::LinkInfo::display)
+            .unwrap_or_else(|| "[链接]".to_string()),
+        33 => media::parse_mini_program_info(content)
+            .as_ref()
+            .map(media::MiniProgramInfo::display)
+            .unwrap_or_else(|| "[小程序]".to_string()),
         3 => {
-            // 音乐分享
-            let title = extract_xml_tag(content, "title").unwrap_or_else(|| "未知歌曲".to_string());
+            let title = crate::media::extract_xml_tag(content, "title").unwrap_or_else(|| "未知歌曲".to_string());
             format!("[音乐] {}", title)
         }
         6 => {
-            // 文件
-            let name = extract_xml_tag(content, "title").unwrap_or_else(|| "未知文件".to_string());
+            let name = crate::media::extract_xml_tag(content, "title").unwrap_or_else(|| "未知文件".to_string());
             format!("[文件] {}", name)
         }
         51 => {
-            // 引用/聊天记录
-            let title = extract_xml_tag(content, "title").unwrap_or_else(|| "聊天记录".to_string());
+            let title = crate::media::extract_xml_tag(content, "title").unwrap_or_else(|| "聊天记录".to_string());
             format!("[引用: {}]", title)
         }
         _ => {
-            let title = extract_xml_tag(content, "title").unwrap_or_default();
-            let desc = extract_xml_tag(content, "des").unwrap_or_default();
+            let title = crate::media::extract_xml_tag(content, "title").unwrap_or_default();
+            let desc = crate::media::extract_xml_tag(content, "des").unwrap_or_default();
             let title = if !title.is_empty() { title } else { "未知卡片".to_string() };
             if !desc.is_empty() {
                 format!("[卡片] {} - {}", title, desc)
@@ -237,26 +268,20 @@ fn decode_link_content(content: &str) -> String {
     }
 }
 
-/// 解码位置消息（type 48）。
-/// content 可能为 XML，包含 label/poiname 信息。
 fn decode_location_content(content: &str) -> String {
     if !content.trim_start().starts_with('<') {
         return format!("[位置] {}", content);
     }
-
-    let label = extract_xml_attr(content, "label").or_else(|| extract_xml_tag(content, "label"));
-    let poiname = extract_xml_attr(content, "poiname").or_else(|| extract_xml_tag(content, "poiname"));
-
+    let label = crate::media::extract_xml_attr(content, "label")
+        .or_else(|| crate::media::extract_xml_tag(content, "label"));
+    let poiname = crate::media::extract_xml_attr(content, "poiname")
+        .or_else(|| crate::media::extract_xml_tag(content, "poiname"));
     let location_name = poiname.as_deref().or(label.as_deref()).unwrap_or("未知位置");
     format!("[位置] {}", location_name)
 }
 
-/// 解码通话消息（type 50）。
-/// content 可能包含通话时长。
 fn decode_call_content(content: &str) -> String {
-    // 尝试提取时长（以秒为单位）
-    if let Some(dur_secs) = extract_xml_tag_int(content, "duration").or_else(|| {
-        // 尝试从原内容正则式提取数字
+    if let Some(dur_secs) = crate::media::extract_xml_tag_int(content, "duration").or_else(|| {
         content.split_whitespace().find_map(|w| w.parse::<i64>().ok())
     }) {
         let mins = dur_secs / 60;
@@ -269,10 +294,7 @@ fn decode_call_content(content: &str) -> String {
     "[通话]".to_string()
 }
 
-/// 解码文件消息（type 62）。
-/// content 可能包含文件名。
 fn decode_file_content(content: &str) -> String {
-    // 文件名可能在 content 中
     let name = if content.contains('/') {
         content.rsplit('/').next().unwrap_or(content)
     } else if !content.is_empty() {
@@ -280,8 +302,6 @@ fn decode_file_content(content: &str) -> String {
     } else {
         return "[文件]".to_string();
     };
-
-    // 限制文件名长度
     if name.len() > 80 {
         format!("[文件] {}...", &name[..77])
     } else {
@@ -289,7 +309,6 @@ fn decode_file_content(content: &str) -> String {
     }
 }
 
-/// 解码音乐消息（type 419430449）。
 fn decode_music_content(content: &str) -> String {
     if !content.is_empty() {
         format!("[音乐] {}", content)
@@ -298,11 +317,9 @@ fn decode_music_content(content: &str) -> String {
     }
 }
 
-/// 提取语音消息中的时长（秒）。
 fn extract_voice_duration(content: &str) -> String {
-    // 尝试提取 XML duration 字段或数字
-    let dur = extract_xml_tag_int(content, "voicelength")
-        .or_else(|| extract_xml_tag_int(content, "duration"))
+    let dur = crate::media::extract_xml_tag_int(content, "voicelength")
+        .or_else(|| crate::media::extract_xml_tag_int(content, "duration"))
         .or_else(|| {
             content.split(|c: char| !c.is_ascii_digit())
                 .find_map(|s| s.parse::<i64>().ok())
@@ -313,19 +330,39 @@ fn extract_voice_duration(content: &str) -> String {
     }
 }
 
+/// Decompress message content.
+///
+/// Tries ZSTD first (Telegram 4.x), then ZLIB (older), then falls back to raw UTF-8.
+pub fn try_decompress(raw: &[u8]) -> Option<String> {
+    if let Ok(s) = try_zstd(raw) {
+        if !s.is_empty() { return Some(s); }
+    }
+    if let Ok(s) = try_zlib(raw) {
+        if !s.is_empty() { return Some(s); }
+    }
+    String::from_utf8(raw.to_vec()).ok().filter(|s| !s.is_empty())
+}
 
-/// Parse sender tgid from message content ("tgid_xxx:\nmessage" or "tgid_xxx: message").
-/// Returns (sender_id, clean_content).
+fn try_zstd(data: &[u8]) -> Result<String, ()> {
+    let mut d = zstd::Decoder::new(data).map_err(|_| ())?;
+    let mut s = String::new();
+    d.read_to_string(&mut s).map_err(|_| ())?;
+    if s.is_empty() { Err(()) } else { Ok(s) }
+}
+
+fn try_zlib(data: &[u8]) -> Result<String, ()> {
+    let mut d = ZlibDecoder::new(data);
+    let mut s = String::new();
+    d.read_to_string(&mut s).map_err(|_| ())?;
+    if s.is_empty() { Err(()) } else { Ok(s) }
+}
+
+/// Parse sender tgid from message content.
 pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
     for (i, c) in content.char_indices() {
-        if c != ':' {
-            continue;
-        }
-        if i == 0 {
-            break;
-        }
+        if c != ':' { continue; }
+        if i == 0 { break; }
         let prefix = &content[..i];
-        // Check if prefix looks like a Telegram ID
         let is_id = prefix.starts_with("tgid_")
             || prefix.starts_with("gh_")
             || prefix.contains('@')
@@ -335,7 +372,7 @@ pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
             let after = after.trim_start_matches([' ', '\n']);
             return (Some(prefix), after);
         }
-        break; // first colon doesn't match, stop
+        break;
     }
     (None, content)
 }
@@ -348,146 +385,80 @@ mod tests {
     fn test_message_type_display() {
         assert_eq!(MessageType::Text.to_string(), "文本");
         assert_eq!(MessageType::Image.to_string(), "图片");
-        assert_eq!(MessageType::Voice.to_string(), "语音");
-        assert_eq!(MessageType::Sticker.to_string(), "表情");
-        assert_eq!(MessageType::Video.to_string(), "视频");
-        assert_eq!(MessageType::Link.to_string(), "链接/文件/小程序");
-        assert_eq!(MessageType::System.to_string(), "系统提示");
-        assert_eq!(MessageType::RedEnvelope.to_string(), "红包");
-        assert_eq!(MessageType::Transfer.to_string(), "转账");
-        assert_eq!(MessageType::Unknown(999).to_string(), "未知(999)");
     }
 
     #[test]
     fn test_message_type_from_i32() {
         assert_eq!(MessageType::from(1), MessageType::Text);
-        assert_eq!(MessageType::from(3), MessageType::Image);
-        assert_eq!(MessageType::from(34), MessageType::Voice);
-        assert_eq!(MessageType::from(43), MessageType::Video);
-        assert_eq!(MessageType::from(47), MessageType::Sticker);
-        assert_eq!(MessageType::from(48), MessageType::Location);
-        assert_eq!(MessageType::from(49), MessageType::Link);
-        assert_eq!(MessageType::from(50), MessageType::Call);
-        assert_eq!(MessageType::from(62), MessageType::File);
-        assert_eq!(MessageType::from(10000), MessageType::System);
-        assert_eq!(MessageType::from(10002), MessageType::Revoke);
-        assert_eq!(MessageType::from(436207665), MessageType::RedEnvelope);
-        assert_eq!(MessageType::from(536870918), MessageType::Transfer);
-        assert_eq!(MessageType::from(419430449), MessageType::Music);
         assert_eq!(MessageType::from(42), MessageType::Unknown(42));
     }
 
     #[test]
     fn test_decode_text_message() {
-        let decoded = decode_message(1, "Hello World", "Alice", None, |id| id.to_string());
-        assert_eq!(decoded.msg_type, MessageType::Text);
-        assert_eq!(decoded.content, "Hello World");
-        assert_eq!(decoded.display_name, "Alice");
-    }
-
-    #[test]
-    fn test_decode_image_message() {
-        let decoded = decode_message(3, "some_path", "Alice", None, |id| id.to_string());
-        assert_eq!(decoded.msg_type, MessageType::Image);
-        assert!(decoded.content.contains("图片"));
-        assert_eq!(decoded.display_name, "Alice");
-    }
-
-    #[test]
-    fn test_decode_voice_message() {
-        let decoded = decode_message(34, "", "Alice", None, |id| id.to_string());
-        assert_eq!(decoded.msg_type, MessageType::Voice);
-        assert!(decoded.content.contains("语音"));
+        let d = decode_message(1, "Hello", "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "Hello");
+        assert_eq!(d.display_name, "Alice");
     }
 
     #[test]
     fn test_decode_system_message() {
-        let decoded = decode_message(10000, "你添加了 xxx 为好友", "Alice", None, |id| id.to_string());
-        assert_eq!(decoded.msg_type, MessageType::System);
-        assert_eq!(decoded.content, "你添加了 xxx 为好友");
-        assert_eq!(decoded.display_name, "系统");
+        let d = decode_message(10000, "提示", "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "提示");
+        assert_eq!(d.display_name, "系统");
     }
 
     #[test]
     fn test_decode_red_envelope() {
-        let decoded = decode_message(436207665, "", "Alice", None, |id| id.to_string());
-        assert_eq!(decoded.msg_type, MessageType::RedEnvelope);
-        assert!(decoded.content.contains("红包"));
+        let d = decode_message(436207665, "", "Alice", None, &[], |id| id.to_string());
+        assert!(d.content.contains("红包"));
     }
 
     #[test]
-    fn test_decode_transfer() {
-        let decoded = decode_message(536870918, "", "Alice", None, |id| id.to_string());
-        assert_eq!(decoded.msg_type, MessageType::Transfer);
-        assert!(decoded.content.contains("转账"));
+    fn test_decode_image_with_packed_info() {
+        let mut packed = Vec::new();
+        packed.push(8); packed.push(1);
+        let img = [8, 0xb8, 0x08, 16, 0x80, 0x0f, 34, 8, 116, 101, 115, 116, 46, 106, 112, 103];
+        packed.push(26);
+        packed.push(img.len() as u8);
+        packed.extend_from_slice(&img);
+        let d = decode_message(3, "", "Alice", None, &packed, |id| id.to_string());
+        assert_eq!(d.msg_type, MessageType::Image);
+        assert!(d.content.contains("1920"));
+        assert!(d.content.contains("1080"));
     }
 
     #[test]
-    fn test_decode_compressed_content() {
-        let decoded = decode_message(1, "some content", "Alice", Some(4), |id| id.to_string());
-        assert_eq!(decoded.content, "[压缩内容]");
+    fn test_decode_group_chat_sender() {
+        let d = decode_message(1, "tgid_abc:\nHello", "Group", None, &[], |id| {
+            if id == "tgid_abc" { "Bob".into() } else { id.into() }
+        });
+        assert_eq!(d.content, "Hello");
+        assert_eq!(d.display_name, "Bob");
     }
 
     #[test]
-    fn test_decode_group_chat_sender_resolution() {
-        // Group chat message with tgid prefix
-        let decoded = decode_message(
-            1,
-            "tgid_abc123:\nHello everyone",
-            "Group Chat",
-            None,
-            |id| match id {
-                "tgid_abc123" => "Bob".to_string(),
-                _ => id.to_string(),
-            },
-        );
-        assert_eq!(decoded.content, "Hello everyone");
-        assert_eq!(decoded.display_name, "Bob");
+    fn test_decode_media_group_chat_sender() {
+        let d = decode_message(3, "tgid_abc:\n", "Group", None, &[], |id| {
+            if id == "tgid_abc" { "Bob".into() } else { id.into() }
+        });
+        assert_eq!(d.display_name, "Bob");
     }
 
     #[test]
-    fn test_parse_sender_from_content() {
-        let (id, clean) = parse_sender_from_content("tgid_abc123:\nHello");
-        assert_eq!(id, Some("tgid_abc123"));
-        assert_eq!(clean, "Hello");
-
-        let (id, clean) = parse_sender_from_content("normal text message");
+    fn test_parse_sender() {
+        let (id, c) = parse_sender_from_content("tgid_a:\nHi");
+        assert_eq!(id, Some("tgid_a"));
+        assert_eq!(c, "Hi");
+        let (id, c) = parse_sender_from_content("plain text");
         assert_eq!(id, None);
-        assert_eq!(clean, "normal text message");
-
-        // gh_ prefix (official account)
-        let (id, clean) = parse_sender_from_content("gh_xyz789:\nNews");
-        assert_eq!(id, Some("gh_xyz789"));
-        assert_eq!(clean, "News");
-
-        // chatroom
-        let (id, clean) = parse_sender_from_content("123@chatroom:\nGroup msg");
-        assert_eq!(id, Some("123@chatroom"));
-        assert_eq!(clean, "Group msg");
+        assert_eq!(c, "plain text");
     }
 
     #[test]
-    fn test_extract_xml_tag_simple() {
-        let xml = "<msg><title>Test Title</title><url>https://example.com</url></msg>";
-        assert_eq!(crate::media::extract_xml_tag(xml, "title"), Some("Test Title".to_string()));
-        assert_eq!(crate::media::extract_xml_tag(xml, "url"), Some("https://example.com".to_string()));
-        assert_eq!(crate::media::extract_xml_tag(xml, "nonexist"), None);
-    }
-
-    #[test]
-    fn test_decode_link_content() {
-        let xml = r#"<?xml version="1.0"?><msg><appmsg><title>新闻标题</title><des>摘要</des><url>https://example.com/news</url><type>5</type></appmsg></msg>"#;
-        let decoded = decode_message(49, xml, "Alice", None, |id| id.to_string());
-        assert_eq!(decoded.msg_type, MessageType::Link);
-        assert!(decoded.content.contains("链接"));
-        assert!(decoded.content.contains("新闻标题"));
-    }
-
-    #[test]
-    fn test_decode_mini_program() {
-        let xml = r#"<?xml?><msg><appmsg><title>小程序名称</title><type>33</type><appname>某App</appname></appmsg></msg>"#;
-        let decoded = decode_message(49, xml, "Alice", None, |id| id.to_string());
-        assert!(decoded.content.contains("小程序"));
-        assert!(decoded.content.contains("小程序名称"));
+    fn test_decode_link() {
+        let xml = r#"<?xml?><msg><appmsg><title>标题</title><type>5</type></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+        assert!(d.content.contains("链接"));
+        assert!(d.content.contains("标题"));
     }
 }

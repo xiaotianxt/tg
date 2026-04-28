@@ -1,5 +1,7 @@
+use std::path::{Path, PathBuf};
+use std::fs;
 
-/// Parsed info about an image message (type 3).
+/// Parsed info about an image message (type 3) from XML.
 #[derive(Debug, Clone, Default)]
 pub struct ImageInfo {
     pub aes_key: String,
@@ -31,10 +33,9 @@ impl ImageInfo {
         };
         format!("[图片{}{}]", dims, size)
     }
-
 }
 
-/// Parsed info about a video message (type 43).
+/// Parsed info about a video message (type 43) from XML.
 #[derive(Debug, Clone, Default)]
 pub struct VideoInfo {
     pub aes_key: String,
@@ -62,7 +63,6 @@ impl VideoInfo {
         };
         format!("[视频{}{}]", dur, dims)
     }
-
 }
 
 /// Parsed info about a sticker message (type 47).
@@ -80,7 +80,6 @@ impl StickerInfo {
         let name = if !self.pack_name.is_empty() {
             format!(" {}", self.pack_name)
         } else if !self.product_id.is_empty() {
-            // Shorten the product ID for display
             let short = self.product_id.rsplit('.').next().unwrap_or(&self.product_id);
             if short.len() <= 30 {
                 format!(" {}", short)
@@ -147,29 +146,25 @@ impl MiniProgramInfo {
     }
 }
 
-/// Parse image metadata from XML (type 3).
+// ===== XML parsing =====
+
 pub(crate) fn parse_image_info(xml: &str) -> ImageInfo {
     let mut info = ImageInfo::default();
-
     if let Some(v) = extract_xml_attr(xml, "aeskey") { info.aes_key = v; }
     if let Some(v) = extract_xml_attr(xml, "cdnthumburl") { info.cdn_thumb_url = v; }
     if let Some(v) = extract_xml_attr(xml, "cdnmidiurl") { info.cdn_midi_url = v; }
     if let Some(v) = extract_xml_attr(xml, "cdndisplaybackupurl") { info.cdn_big_url = v; }
-
     if let Some(v) = extract_xml_attr(xml, "cdnthumbwidth").and_then(|s| s.parse().ok()) { info.thumb_width = v; }
     if let Some(v) = extract_xml_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) { info.thumb_height = v; }
     if let Some(v) = extract_xml_attr(xml, "rawlength").and_then(|s| s.parse().ok()) { info.raw_length = v; }
     if info.raw_length == 0 {
         if let Some(v) = extract_xml_attr(xml, "cdnmidimagerawlength").and_then(|s| s.parse().ok()) { info.raw_length = v; }
     }
-
     info
 }
 
-/// Parse video metadata from XML (type 43).
 pub(crate) fn parse_video_info(xml: &str) -> VideoInfo {
     let mut info = VideoInfo::default();
-
     if let Some(v) = extract_xml_attr(xml, "aeskey") { info.aes_key = v; }
     if let Some(v) = extract_xml_attr(xml, "cdnvideourl") { info.cdn_video_url = v; }
     if let Some(v) = extract_xml_attr(xml, "cdnthumburl") { info.cdn_thumb_url = v; }
@@ -177,24 +172,19 @@ pub(crate) fn parse_video_info(xml: &str) -> VideoInfo {
     if let Some(v) = extract_xml_attr(xml, "cdnthumbheight").and_then(|s| s.parse().ok()) { info.thumb_height = v; }
     if let Some(v) = extract_xml_attr(xml, "playlength").and_then(|s| s.parse().ok()) { info.play_length = v; }
     if let Some(v) = extract_xml_attr(xml, "rawvideolength").and_then(|s| s.parse().ok()) { info.raw_video_length = v; }
-
     info
 }
 
-/// Parse sticker metadata from XML (type 47).
 pub(crate) fn parse_sticker_info(xml: &str) -> StickerInfo {
     let mut info = StickerInfo::default();
-
     if let Some(v) = extract_xml_attr(xml, "productid") { info.product_id = v; }
     if let Some(v) = extract_xml_attr(xml, "url") { info.url = v; }
     if let Some(v) = extract_xml_tag(xml, "packname") { info.pack_name = v; }
     if let Some(v) = extract_xml_attr(xml, "packurl") { info.pack_url = v; }
     info.has_emojibuf = xml.contains("<emojibuf>");
-
     info
 }
 
-/// Parse link info from XML (type 49, subtype 5).
 pub(crate) fn parse_link_info(xml: &str) -> Option<LinkInfo> {
     if !xml.contains("<type>5</type>") {
         return None;
@@ -206,7 +196,6 @@ pub(crate) fn parse_link_info(xml: &str) -> Option<LinkInfo> {
     })
 }
 
-/// Parse mini program info from XML (type 49, subtype 33).
 pub(crate) fn parse_mini_program_info(xml: &str) -> Option<MiniProgramInfo> {
     if !xml.contains("<type>33</type>") {
         return None;
@@ -218,10 +207,154 @@ pub(crate) fn parse_mini_program_info(xml: &str) -> Option<MiniProgramInfo> {
     })
 }
 
+// ===== Telegram base path detection =====
 
-// ===== XML helpers =====
+/// Find the Telegram account data directory (base for media cache lookups).
+///
+/// Telegram 3.x: `xtelegram_files/<tgid>/` with `Message/MessageTemp` subdir
+/// Telegram 4.x: `xtelegram_files/<tgid>/` with `msg/` subdir (media at `msg/attach/...`, `msg/video/...`)
+pub fn find_telegram_base_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let docs_base = PathBuf::from(&home)
+        .join("Library/Containers/com.telegram.xinTelegram/Data/Documents/xtelegram_files");
+    if !docs_base.is_dir() {
+        return None;
+    }
 
-/// Extract attribute value from a self-closing XML tag like `<tag attr="value" .../>`.
+    for entry in fs::read_dir(&docs_base).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.join("Message/MessageTemp").is_dir() {
+            return Some(path);
+        }
+        if path.join("msg").is_dir() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+// ===== MediaTemp cache search =====
+
+pub fn find_cached_media(
+    base_path: &Path,
+    session_tgid: &str,
+    category: &str,
+    identifier: &str,
+) -> Option<PathBuf> {
+    // Telegram 3.x: Message/MessageTemp/<session>/<category>/
+    let msg_temp = base_path.join("Message/MessageTemp");
+    if msg_temp.is_dir() {
+        let session_dir = msg_temp.join(session_tgid);
+        if session_dir.is_dir() {
+            let media_dir = session_dir.join(category);
+            if media_dir.is_dir() {
+                if let Some(found) = find_file_containing(&media_dir, identifier) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+
+    // Telegram 4.x: msg/attach/<md5(sender)>/<YYYY-MM>/Img/
+    let msg_attach = base_path.join("msg/attach");
+    if msg_attach.is_dir() {
+        if let Ok(accounts) = fs::read_dir(&msg_attach) {
+            for account in accounts.flatten() {
+                if !account.path().is_dir() {
+                    continue;
+                }
+                if let Ok(months) = fs::read_dir(account.path()) {
+                    for month in months.flatten() {
+                        let img_dir = month.path().join("Img");
+                        if img_dir.is_dir() {
+                            if let Some(found) = find_file_containing(&img_dir, identifier) {
+                                return Some(found);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn find_file_containing(dir: &Path, substr: &str) -> Option<PathBuf> {
+    let lower = substr.to_lowercase();
+    let mut best: Option<PathBuf> = None;
+
+    fn walk(dir: &Path, lower: &str, best: &mut Option<PathBuf>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, lower, best);
+                } else {
+                    let name = path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    if name.to_lowercase().contains(lower) {
+                        let is_thm = name.contains(".pic_thm") || name.contains("thumb");
+                        match best {
+                            None => *best = Some(path.clone()),
+                            Some(ref current) => {
+                                let cur_thm = current.to_string_lossy().to_lowercase();
+                                if !is_thm && cur_thm.contains("thm") {
+                                    *best = Some(path.clone());
+                                } else if !is_thm && !cur_thm.contains("thm") {
+                                    if fs::metadata(&path).ok()
+                                        .zip(fs::metadata(current).ok())
+                                        .map(|(a, b)| a.len() > b.len())
+                                        .unwrap_or(false)
+                                    {
+                                        *best = Some(path.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    walk(dir, &lower, &mut best);
+    best
+}
+
+pub fn export_media_file(
+    src: &Path,
+    output_dir: &Path,
+    session_name: &str,
+    msg_type_name: &str,
+    index: usize,
+) -> Result<PathBuf, String> {
+    let ext = src.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin");
+    let filename = format!("{}_{}_{:04}.{}", sanitize_filename(session_name), msg_type_name, index, ext);
+    let dest = output_dir.join(&filename);
+
+    fs::create_dir_all(output_dir)
+        .map_err(|e| format!("Cannot create media dir: {}", e))?;
+    fs::copy(src, &dest)
+        .map_err(|e| format!("Cannot copy media file: {}", e))?;
+
+    Ok(dest)
+}
+
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+// ===== XML helpers (reused from message.rs) =====
+
 pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
     let pattern = format!(r#"{}=""#, attr);
     let start = xml.find(&pattern)?;
@@ -235,7 +368,6 @@ pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-/// Extract text content from `<tag>text</tag>`.
 pub(crate) fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
@@ -248,7 +380,6 @@ pub(crate) fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-/// Extract integer content from an XML tag.
 pub(crate) fn extract_xml_tag_int(xml: &str, tag: &str) -> Option<i64> {
     let text = extract_xml_tag(xml, tag)?;
     text.parse::<i64>().ok()
