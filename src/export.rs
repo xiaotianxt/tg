@@ -35,7 +35,7 @@ pub fn export_messages(
     let contact_db_path = contact_db.as_deref();
 
     // Resolve session username
-    let username = db::resolve_username(session_query, contact_db_path)?;
+    let username = db::resolve_username_for_messages(session_query, contact_db_path, &message_dbs)?;
 
     // Load contacts for display name
     let contacts = contact_db_path

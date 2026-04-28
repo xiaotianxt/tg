@@ -210,7 +210,7 @@ pub fn list_sessions(decrypted_dir: &Path, top_n: usize) -> Result<Vec<(String, 
 pub fn read_messages(
     decrypted_dir: &Path,
     session_query: &str,
-    limit: usize,
+    limit: Option<usize>,
     offset: usize,
     search_query: Option<&str>,
     since: Option<i64>,
@@ -218,7 +218,7 @@ pub fn read_messages(
 ) -> Result<usize, String> {
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
 
-    let username = resolve_username(session_query, contact_db.as_deref())?;
+    let username = resolve_username_for_messages(session_query, contact_db.as_deref(), &message_dbs)?;
     let table_name = msg_table_name(&username);
     let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
 
@@ -275,8 +275,12 @@ pub fn read_messages(
         // Query messages - collect eagerly to avoid borrow issues
         let sql = format!(
             "SELECT local_type, create_time, message_content, WCDB_CT_message_content, real_sender_id, packed_info_data \
-             FROM {} WHERE create_time > 0{}{} ORDER BY create_time {}",
-            table_name, search_clause, since_clause, order_dir
+             FROM {} WHERE create_time > 0{}{} ORDER BY create_time {}{}",
+            table_name,
+            search_clause,
+            since_clause,
+            order_dir,
+            if tail { limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default() } else { String::new() }
         );
         let rows: Vec<(i64, i64, String, Option<i64>, String, Vec<u8>)> = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
@@ -315,16 +319,21 @@ pub fn read_messages(
     }
 
     if tail {
-        // Query returned DESC, take `limit` latest and reverse for chronological display
-        all_messages.truncate(limit);
+        // Each DB returns its latest rows; merge globally, then reverse for chronological display.
+        all_messages.sort_by(|a, b| b.1.cmp(&a.1));
+        if let Some(limit) = limit {
+            all_messages.truncate(limit);
+        }
         all_messages.reverse();
     } else {
         all_messages.sort_by(|a, b| a.1.cmp(&b.1));
     }
     let messages: Vec<_> = if tail {
         all_messages.iter().collect()
-    } else {
+    } else if let Some(limit) = limit {
         all_messages.iter().skip(offset).take(limit).collect()
+    } else {
+        all_messages.iter().skip(offset).collect()
     };
 
     if messages.is_empty() {
@@ -341,9 +350,17 @@ pub fn read_messages(
         println!("Search: '{}'", q);
     }
     if tail {
-        println!("Showing latest {} of {} messages\n", messages.len(), total_count);
+        if limit.is_some() {
+            println!("Showing latest {} of {} messages\n", messages.len(), total_count);
+        } else {
+            println!("Showing {} of {} messages\n", messages.len(), total_count);
+        }
     } else {
-        println!("Showing {}-{} of {} messages\n", offset + 1, offset + messages.len(), total_count);
+        if limit.is_some() || offset > 0 {
+            println!("Showing {}-{} of {} messages\n", offset + 1, offset + messages.len(), total_count);
+        } else {
+            println!("Showing {} of {} messages\n", messages.len(), total_count);
+        }
     }
 
     for (local_type, create_time, content, wcdb_ct, sender_tgid, packed_info) in &messages {
@@ -467,7 +484,29 @@ pub fn search_messages(
     Ok(total)
 }
 
+pub(crate) fn resolve_username_for_messages(
+    query: &str,
+    contact_db: Option<&Path>,
+    message_dbs: &[PathBuf],
+) -> Result<String, String> {
+    resolve_username_with_context(query, contact_db, Some(message_dbs))
+}
+
+#[allow(dead_code)]
 pub(crate) fn resolve_username(query: &str, contact_db: Option<&Path>) -> Result<String, String> {
+    resolve_username_with_context(query, contact_db, None)
+}
+
+fn resolve_username_with_context(
+    query: &str,
+    contact_db: Option<&Path>,
+    message_dbs: Option<&[PathBuf]>,
+) -> Result<String, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(query.to_string());
+    }
+
     // If it looks like a tgid, use it directly
     if query.starts_with("tgid_") || query.starts_with("gh_") || query.contains("@chatroom") {
         return Ok(query.to_string());
@@ -485,38 +524,299 @@ pub(crate) fn resolve_username(query: &str, contact_db: Option<&Path>) -> Result
         return Ok(c.username.clone());
     }
 
-    // Fuzzy search by display name, nick, remark, alias
-    let results: Vec<_> = contacts.values()
-        .filter(|c| {
-            c.display.contains(query)
-                || c.nick_name.contains(query)
-                || c.remark.contains(query)
-                || c.alias.contains(query)
+    let candidates = contact_match_candidates(&contacts, query, message_dbs);
+    if let Some(best) = candidates.first() {
+        if candidates.len() > 1 || best.score < EXACT_MATCH_SCORE {
+            eprintln!(
+                "Matched '{}' to {} ({}){}",
+                query,
+                best.contact.display,
+                best.contact.username,
+                best.latest_message_time
+                    .map(|ts| format!(" latest {}", format_match_time(ts)))
+                    .unwrap_or_default()
+            );
+        }
+        if candidates.len() > 1 {
+            eprintln!("Other matches:");
+            for candidate in candidates.iter().skip(1).take(4) {
+                eprintln!(
+                    "  {} (nick: {}, remark: {}, alias: {}){}",
+                    candidate.contact.username,
+                    candidate.contact.nick_name,
+                    candidate.contact.remark,
+                    candidate.contact.alias,
+                    candidate.latest_message_time
+                        .map(|ts| format!(" - latest {}", format_match_time(ts)))
+                        .unwrap_or_default()
+                );
+            }
+        }
+        return Ok(best.contact.username.clone());
+    }
+
+    // No contact match. Treat the input as a raw username so callers can still
+    // read sessions whose contact row is missing.
+    Ok(query.to_string())
+}
+
+const EXACT_MATCH_SCORE: i64 = 400;
+const NORMALIZED_EXACT_MATCH_SCORE: i64 = 390;
+const CONTAINS_MATCH_SCORE: i64 = 300;
+const NORMALIZED_CONTAINS_MATCH_SCORE: i64 = 290;
+const TOKEN_MATCH_SCORE: i64 = 280;
+const DIRECT_MATCH_SCORE_FLOOR: i64 = TOKEN_MATCH_SCORE;
+const FUZZY_MATCH_SCORE: i64 = 100;
+
+struct ContactMatch<'a> {
+    contact: &'a Contact,
+    score: i64,
+    field_priority: usize,
+    distance: usize,
+    field_len: usize,
+    latest_message_time: Option<i64>,
+}
+
+fn contact_match_candidates<'a>(
+    contacts: &'a HashMap<String, Contact>,
+    query: &str,
+    message_dbs: Option<&[PathBuf]>,
+) -> Vec<ContactMatch<'a>> {
+    let mut candidates: Vec<_> = contacts.values()
+        .filter_map(|contact| {
+            let (score, field_priority, distance, field_len) = best_contact_score(contact, query)?;
+            Some(ContactMatch {
+                contact,
+                score,
+                field_priority,
+                distance,
+                field_len,
+                latest_message_time: None,
+            })
         })
         .collect();
 
-    if results.is_empty() {
-        // Try matching the msg table name directly
-        let table_name = if query.starts_with("Msg_") {
-            query.to_string()
-        } else {
-            msg_table_name(query)
+    if candidates.iter().any(|candidate| candidate.score >= DIRECT_MATCH_SCORE_FLOOR) {
+        candidates.retain(|candidate| candidate.score >= DIRECT_MATCH_SCORE_FLOOR);
+    }
+
+    if let Some(message_dbs) = message_dbs {
+        let latest_by_username = latest_message_times_for_candidates(message_dbs, &candidates);
+        for candidate in &mut candidates {
+            candidate.latest_message_time = latest_by_username.get(&candidate.contact.username).copied();
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        let a_latest = a.latest_message_time.unwrap_or(0);
+        let b_latest = b.latest_message_time.unwrap_or(0);
+        b.latest_message_time.is_some().cmp(&a.latest_message_time.is_some())
+            .then_with(|| a.field_priority.cmp(&b.field_priority))
+            .then_with(|| b.score.cmp(&a.score))
+            .then_with(|| b_latest.cmp(&a_latest))
+            .then_with(|| a.distance.cmp(&b.distance))
+            .then_with(|| a.field_len.cmp(&b.field_len))
+            .then_with(|| a.contact.display.cmp(&b.contact.display))
+            .then_with(|| a.contact.username.cmp(&b.contact.username))
+    });
+    candidates
+}
+
+fn best_contact_score(contact: &Contact, query: &str) -> Option<(i64, usize, usize, usize)> {
+    let normalized_query = normalize_match_text(query);
+    if normalized_query.is_empty() {
+        return None;
+    }
+    let query_tokens = tokenize_match_text(query);
+
+    contact_match_fields(contact).iter()
+        .filter_map(|(priority, field)| {
+            field_score(field, query, &normalized_query, &query_tokens)
+                .map(|(score, distance, field_len)| (score, *priority, distance, field_len))
+        })
+        .max_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| b.3.cmp(&a.3))
+        })
+}
+
+fn contact_match_fields(contact: &Contact) -> [(usize, &str); 5] {
+    [
+        (0, &contact.display),
+        (1, &contact.remark),
+        (2, &contact.nick_name),
+        (3, &contact.alias),
+        (4, &contact.username),
+    ]
+}
+
+fn field_score(
+    field: &str,
+    query: &str,
+    normalized_query: &str,
+    query_tokens: &[String],
+) -> Option<(i64, usize, usize)> {
+    let field = field.trim();
+    if field.is_empty() {
+        return None;
+    }
+
+    let normalized_field = normalize_match_text(field);
+    let field_len = normalized_field.chars().count();
+    if field_len == 0 {
+        return None;
+    }
+
+    if field == query {
+        return Some((EXACT_MATCH_SCORE, 0, field_len));
+    }
+    if normalized_field == normalized_query {
+        return Some((NORMALIZED_EXACT_MATCH_SCORE, 0, field_len));
+    }
+    if field.contains(query) {
+        return Some((CONTAINS_MATCH_SCORE, 0, field_len));
+    }
+    if normalized_field.contains(normalized_query) {
+        return Some((NORMALIZED_CONTAINS_MATCH_SCORE, 0, field_len));
+    }
+    if query_tokens.len() > 1 && query_tokens.iter().all(|token| normalized_field.contains(token)) {
+        return Some((TOKEN_MATCH_SCORE, 0, field_len));
+    }
+
+    let query_len = normalized_query.chars().count();
+    if query_len < 2 {
+        return None;
+    }
+
+    let distance = levenshtein_distance(&normalized_field, normalized_query);
+    let max_len = field_len.max(query_len);
+    let allowed_distance = if max_len <= 3 {
+        1
+    } else {
+        (max_len / 3).max(1)
+    };
+    if distance > allowed_distance {
+        return None;
+    }
+
+    let similarity = ((max_len - distance) * 100 / max_len) as i64;
+    Some((FUZZY_MATCH_SCORE + similarity, distance, field_len))
+}
+
+fn normalize_match_text(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn tokenize_match_text(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+
+    for c in value.trim().chars().flat_map(|c| c.to_lowercase()) {
+        if c.is_alphanumeric() {
+            current.push(c);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+
+    if left.is_empty() {
+        return right.len();
+    }
+    if right.is_empty() {
+        return left.len();
+    }
+
+    let mut prev: Vec<usize> = (0..=right.len()).collect();
+    let mut curr = vec![0; right.len() + 1];
+
+    for (i, left_char) in left.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, right_char) in right.iter().enumerate() {
+            let substitution = prev[j] + if left_char == right_char { 0 } else { 1 };
+            let insertion = curr[j] + 1;
+            let deletion = prev[j + 1] + 1;
+            curr[j + 1] = substitution.min(insertion).min(deletion);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[right.len()]
+}
+
+fn latest_message_times_for_candidates(
+    message_dbs: &[PathBuf],
+    candidates: &[ContactMatch<'_>],
+) -> HashMap<String, i64> {
+    let table_to_username: HashMap<String, String> = candidates.iter()
+        .map(|candidate| {
+            (
+                msg_table_name(&candidate.contact.username),
+                candidate.contact.username.clone(),
+            )
+        })
+        .collect();
+    let mut latest_by_username: HashMap<String, i64> = HashMap::new();
+
+    for db_path in message_dbs {
+        let conn = match Connection::open(db_path) {
+            Ok(c) => c,
+            Err(_) => continue,
         };
-        return Ok(table_name);
+
+        let tables: Vec<String> = match conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+        ) {
+            Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(_) => vec![],
+            },
+            Err(_) => vec![],
+        };
+
+        for table_name in tables {
+            let username = match table_to_username.get(&table_name) {
+                Some(username) => username,
+                None => continue,
+            };
+            let sql = format!("SELECT MAX(create_time) FROM {} WHERE create_time > 0", table_name);
+            if let Ok(mut stmt) = conn.prepare(&sql) {
+                if let Ok(ts) = stmt.query_row([], |row| row.get::<_, Option<i64>>(0)) {
+                    if let Some(ts) = ts {
+                        let entry = latest_by_username.entry(username.clone()).or_insert(ts);
+                        if ts > *entry {
+                            *entry = ts;
+                        }
+                    }
+                }
+            };
+        }
     }
 
-    if results.len() == 1 {
-        return Ok(results[0].username.clone());
-    }
+    latest_by_username
+}
 
-    // Multiple matches - use the first one
-    eprintln!("Multiple matches for '{}':", query);
-    for c in &results {
-        eprintln!("  {} (nick: {}, remark: {}, alias: {})",
-            c.username, c.nick_name, c.remark, c.alias);
-    }
-    eprintln!("Using: {}", results[0].username);
-    Ok(results[0].username.clone())
+fn format_match_time(timestamp: i64) -> String {
+    let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|t| t.with_timezone(&cst_offset).format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| timestamp.to_string())
 }
 
 fn find_username_by_table(contacts: &HashMap<String, Contact>, table_name: &str) -> Option<String> {
@@ -528,3 +828,146 @@ fn find_username_by_table(contacts: &HashMap<String, Contact>, table_name: &str)
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+    use tempfile::{tempdir, TempDir};
+
+    fn create_contact_db(rows: &[(&str, &str, &str, &str)]) -> (TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("contact.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE contact (
+                username TEXT,
+                nick_name TEXT,
+                remark TEXT,
+                alias TEXT
+            )",
+            [],
+        ).unwrap();
+
+        for (username, nick_name, remark, alias) in rows {
+            conn.execute(
+                "INSERT INTO contact (username, nick_name, remark, alias) VALUES (?1, ?2, ?3, ?4)",
+                params![username, nick_name, remark, alias],
+            ).unwrap();
+        }
+
+        drop(conn);
+        (dir, path)
+    }
+
+    fn create_message_db(rows: &[(&str, usize, i64)]) -> (TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("message_0.db");
+        let conn = Connection::open(&path).unwrap();
+
+        for (username, count, latest_time) in rows {
+            let table_name = msg_table_name(username);
+            conn.execute(
+                &format!(
+                    "CREATE TABLE {} (
+                        local_type INTEGER,
+                        create_time INTEGER,
+                        message_content TEXT
+                    )",
+                    table_name
+                ),
+                [],
+            ).unwrap();
+
+            for i in 0..*count {
+                let create_time = latest_time - (*count - i - 1) as i64;
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {} (local_type, create_time, message_content) VALUES (1, ?1, 'hello')",
+                        table_name
+                    ),
+                    params![create_time],
+                ).unwrap();
+            }
+        }
+
+        drop(conn);
+        (dir, path)
+    }
+
+    #[test]
+    fn resolve_username_for_messages_prefers_latest_duplicate_name() {
+        let (_contact_dir, contact_db) = create_contact_db(&[
+            ("tgid_old", "田雨坤", "", ""),
+            ("tgid_active", "田雨坤", "", ""),
+        ]);
+        let (_message_dir, message_db) = create_message_db(&[
+            ("tgid_old", 190, 1000),
+            ("tgid_active", 2, 2000),
+        ]);
+
+        let username = resolve_username_for_messages("田雨坤", Some(&contact_db), &[message_db]).unwrap();
+
+        assert_eq!(username, "tgid_active");
+    }
+
+    #[test]
+    fn resolve_username_for_messages_prefers_non_empty_contains_match() {
+        let (_contact_dir, contact_db) = create_contact_db(&[
+            ("tgid_empty", "豆", "", ""),
+            ("tgid_doubao", "豆宝", "", ""),
+            ("tgid_meilidou", "美丽豆", "", ""),
+        ]);
+        let (_message_dir, message_db) = create_message_db(&[
+            ("tgid_doubao", 17, 1000),
+            ("tgid_meilidou", 100, 2000),
+        ]);
+
+        let username = resolve_username_for_messages("豆", Some(&contact_db), &[message_db]).unwrap();
+
+        assert_eq!(username, "tgid_meilidou");
+    }
+
+    #[test]
+    fn resolve_username_for_messages_prefers_better_field_before_latest_time() {
+        let (_contact_dir, contact_db) = create_contact_db(&[
+            ("tgid_remark", "Someone", "Linux", ""),
+            ("tgid_alias", "Someone Else", "", "Linux"),
+        ]);
+        let (_message_dir, message_db) = create_message_db(&[
+            ("tgid_remark", 1, 1000),
+            ("tgid_alias", 1, 2000),
+        ]);
+
+        let username = resolve_username_for_messages("Linux", Some(&contact_db), &[message_db]).unwrap();
+
+        assert_eq!(username, "tgid_remark");
+    }
+
+    #[test]
+    fn resolve_username_for_messages_matches_all_query_tokens() {
+        let (_contact_dir, contact_db) = create_contact_db(&[
+            ("linux_2025@chatroom", "Linux 俱乐部 #2025", "", ""),
+            ("linux_2026@chatroom", "Linux 俱乐部 #2026🌅", "", ""),
+        ]);
+        let (_message_dir, message_db) = create_message_db(&[
+            ("linux_2025@chatroom", 1, 1000),
+            ("linux_2026@chatroom", 1, 2000),
+        ]);
+
+        let username = resolve_username_for_messages("Linux 2026", Some(&contact_db), &[message_db]).unwrap();
+
+        assert_eq!(username, "linux_2026@chatroom");
+    }
+
+    #[test]
+    fn resolve_username_uses_fuzzy_match_after_exact_and_contains_fail() {
+        let (_contact_dir, contact_db) = create_contact_db(&[
+            ("tgid_alice", "Alice Zhang", "", ""),
+            ("tgid_bob", "Bob Lee", "", ""),
+        ]);
+
+        let username = resolve_username("Alic Zhang", Some(&contact_db)).unwrap();
+
+        assert_eq!(username, "tgid_alice");
+    }
+}

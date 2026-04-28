@@ -70,9 +70,9 @@ enum Commands {
         /// Path to decrypted databases
         #[arg(long, default_value = "decrypted")]
         decrypted_dir: PathBuf,
-        /// Number of messages to show
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
+        /// Number of messages to show (defaults to 50 unless --since is used)
+        #[arg(long)]
+        limit: Option<usize>,
         /// Offset for pagination
         #[arg(long, default_value_t = 0)]
         offset: usize,
@@ -200,6 +200,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            let limit = limit.or_else(|| since_ts.is_none().then_some(50));
             let use_tail = tail || (!head && offset == 0);
             refresh_decrypted_cache(&decrypted_dir);
             match db::read_messages(&decrypted_dir, &session, limit, offset, search.as_deref(), since_ts, use_tail) {
