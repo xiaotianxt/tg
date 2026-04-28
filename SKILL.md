@@ -1,114 +1,161 @@
 ---
 name: tgreader
-description: Use when the user asks to use or maintain tgreader, a macOS Telegram local chat reader CLI. Supports extracting database keys, decrypting local Telegram databases, listing sessions, reading and searching messages, exporting chats as txt/csv/json, exporting cached media, installing the tool, and troubleshooting common tgreader workflows.
+description: Use when the user needs to read, search, inspect, back up, export, or troubleshoot access to local macOS Telegram chat history. This skill uses tgreader to sign Telegram if needed, extract local database keys, decrypt local databases, list conversations, read or search messages, export chats and cached media, and maintain the tgreader codebase when requested.
 ---
 
 # tgreader
 
-## 能做什么
+## When To Use
 
-tgreader 是一个 macOS 本地Telegram聊天记录读取 CLI。它可以：
+Use this skill for user goals like:
 
-- 从正在运行的Telegram进程中提取数据库密钥。
-- 增量解密本地Telegram数据库到 `decrypted/`。
-- 列出会话，并按显示名、备注、别名、tgid 或群 ID 匹配联系人。
-- 读取指定会话的最新、最早、分页或按时间过滤后的消息。
-- 在单个会话内搜索，或跨全部会话搜索。
-- 导出 `txt`、`csv`、`json`。
-- 使用 `--media-dir` 尝试导出本地缓存图片、视频和表情。
-- 从源码构建、安装和测试 CLI。
+- "帮我读一下和某个人的Telegram聊天记录"
+- "查Telegram里有没有某个关键词"
+- "导出这个Telegram群的聊天记录"
+- "把Telegram聊天备份成 json/csv/txt"
+- "为什么本机Telegram聊天记录读不出来"
+- "修一下 tgreader 的读取、解密、导出逻辑"
 
-除非用户明确要求移动或上传文件，否则聊天数据只应留在本机。
+Do not wait for the user to name tgreader. tgreader is the implementation; the user goal is local macOS Telegram history access.
 
-## 标准流程
+## Operating Principles
 
-1. 确认用户在 macOS 上，并且已安装Telegram。
-2. 如果缺少密钥或密钥过期，让用户保持Telegram运行，然后执行：
+tgreader touches private chat data. Keep work local by default, avoid printing more message content than the user asked for, and treat these files as sensitive: `all_keys.json`, `decrypted/`, `exported/`, media exports.
 
-   ```bash
-   sudo tgreader keys
-   ```
+Optimize for the shortest successful user path. Do not turn normal use into a reverse-engineering walkthrough unless the user is debugging internals.
 
-3. 解密或刷新本地缓存：
+## User Workflow
 
-   ```bash
-   tgreader decrypt
-   ```
+For a fresh setup, use this order:
 
-4. 查找目标会话：
+```bash
+sudo codesign --force --deep --sign - /Applications/Telegram.app
+```
 
-   ```bash
-   tgreader sessions
-   ```
+If Telegram is installed somewhere else, use that `.app` path, for example `/Applications/Telegram.app`.
 
-5. 读取或搜索消息：
+Then have the user open and log in to macOS Telegram:
 
-   ```bash
-   tgreader messages "联系人或群名" --limit 50
-   tgreader messages "联系人或群名" --since today --limit 100
-   tgreader messages "联系人或群名" --search "关键词" --limit 50
-   tgreader search "关键词"
-   ```
+```bash
+sudo tgreader keys
+tgreader decrypt --verbose
+tgreader sessions --top 50
+tgreader messages "联系人或群名" --limit 50
+```
 
-6. 用户需要文件时再导出：
+After the first successful decrypt, `sessions`, `messages`, `search`, and `export` will try a quiet incremental refresh before reading `decrypted/`. If live access fails, they can still read the existing decrypted cache.
 
-   ```bash
-   tgreader export "联系人或群名" --format txt
-   tgreader export "联系人或群名" --format json --output exported
-   tgreader export "联系人或群名" --format json --media-dir exported/media
-   ```
+## Commands By Intent
 
-`sessions`、`messages`、`search`、`export` 在读取 `decrypted/` 前会自动尝试静默增量刷新缓存。如果密钥或实时Telegram数据库不可用，它们仍可读取已有解密缓存。
+Install:
 
-## 命令参考
+```bash
+brew install xiaotianxt/tgreader/tgreader
+tgreader --version
+```
 
-- `sudo tgreader keys`：提取数据库密钥到 `all_keys.json`；需要Telegram正在运行，并且 macOS 允许读取其进程。
-- `tgreader decrypt`：增量解密变化过的数据库到 `decrypted/`。
-- `tgreader decrypt --full`：强制全量重解。
-- `tgreader decrypt --since 1h --verbose`：只处理近期数据库变化，并显示进度。
-- `tgreader sessions --top 50`：按消息数列出主要会话。
-- `tgreader messages "name"`：显示某个会话的最新消息。
-- `tgreader messages "name" --head --limit 20`：显示最早消息。
-- `tgreader messages "name" --tail --limit 20`：按时间顺序显示最新消息。
-- `tgreader messages "name" --offset 100 --limit 50`：分页查看历史消息。
-- `tgreader messages "name" --since yesterday`：按时间过滤消息。
-- `tgreader messages "name" --search "query"`：在单个会话内搜索。
-- `tgreader search "query" --limit 50`：跨会话搜索。
-- `tgreader export "name" --format txt|csv|json --output exported`：导出一个会话。
-- `tgreader export "name" --format json --media-dir exported/media`：导出消息并尝试导出缓存媒体。
+From source inside the repo:
 
-时间过滤支持 ISO 日期如 `2026-04-28`，日期时间如 `2026-04-28 09:30:00`，以及相对表达式 `5min`、`1h`、`2d`、`1w`、`today`、`yesterday`。
+```bash
+make install-local
+```
 
-## 开发流程
+Find a chat:
 
-沿用当前简单的 Rust/C 结构：
+```bash
+tgreader sessions --top 50
+```
 
-- `src/main.rs`：CLI 命令定义和顶层流程。
-- `src/scanner.rs`：封装 `scanner_macos` 调用。
-- `vendor/find_all_keys_macos.c`：macOS 进程内存扫描器。
-- `src/decrypt.rs`：SQLCipher/WCDB 数据库解密。
-- `src/db.rs`：联系人、会话、消息读取和搜索。
-- `src/message.rs`：消息类型解析和展示文本。
-- `src/media*.rs`：媒体元信息解析、缓存查找和媒体解密。
-- `src/export.rs`：txt/csv/json/媒体导出。
+Read a chat:
 
-常用检查：
+```bash
+tgreader messages "张三"
+tgreader messages "张三" --limit 100
+tgreader messages "张三" --since today
+tgreader messages "张三" --search "关键词"
+tgreader messages "张三" --head --limit 20
+tgreader messages "张三" --tail --limit 20
+```
+
+Search globally:
+
+```bash
+tgreader search "关键词" --limit 50
+```
+
+Export:
+
+```bash
+tgreader export "张三" --format txt
+tgreader export "张三" --format csv --output exported/zhangsan
+tgreader export "张三" --format json --output exported/zhangsan
+tgreader export "张三" --format json --output exported/zhangsan --media-dir exported/zhangsan/media
+```
+
+Export cached images:
+
+```bash
+tgreader image "张三" --list --limit 20
+tgreader image "张三" --index 3
+tgreader image "张三" --all --limit 10 --output exported/images
+```
+
+Time filters support dates, datetimes, and relative values:
+
+```bash
+--since 2026-04-28
+--since "2026-04-28 09:30:00"
+--since 5min
+--since 1h
+--since today
+--since yesterday
+```
+
+## Troubleshooting
+
+- `Telegram is not running`: open and log in to macOS Telegram, then run `sudo tgreader keys`.
+- `Scanner binary not found`: from source, run `make build` or `make install-local`.
+- `task_for_pid failed`: confirm `sudo tgreader keys`, quit Telegram, run `sudo codesign --force --deep --sign - /Applications/Telegram.app`, reopen Telegram, retry.
+- `No sessions found`: check `all_keys.json` exists, run `tgreader decrypt --verbose`, then `tgreader sessions --top 50`.
+- Cannot auto-detect DB path: pass `tgreader decrypt --db-dir "/path/to/db_storage"`.
+- Wrong chat matched: use `tgreader sessions --top 100` and rerun with the exact `tgid_...` or `...@chatroom`.
+- Missing media: Telegram may not have cached the file. Open/download it in Telegram, then retry `tgreader image` or `tgreader export --media-dir ...`.
+- `tggf` sticker conversion fails: install `ffmpeg` or set `TGREADER_FFMPEG=/path/to/ffmpeg`.
+
+## Codebase Map
+
+- `src/main.rs`: CLI commands and top-level flow.
+- `src/scanner.rs`: wrapper around `scanner_macos`.
+- `vendor/find_all_keys_macos.c`: macOS Telegram process memory scanner.
+- `src/decrypt.rs`: SQLCipher/WCDB database decrypt.
+- `src/db.rs`: contacts, sessions, message reads, search, username resolution.
+- `src/message.rs`: message type decoding and display text.
+- `src/media*.rs`: media metadata, cache lookup, `.dat` decrypt, media keys.
+- `src/export.rs`: txt/csv/json/media/image export.
+
+## Maintenance Rules
+
+- Keep CLI behavior explicit and predictable. Results go to stdout; progress, warnings, and errors go to stderr logs.
+- Preserve local privacy. Do not upload, paste, or move chat data unless the user explicitly asks.
+- Be conservative with media claims: cached image/video/sticker export is best-effort.
+- When touching key extraction, preserve macOS process scanning compatibility.
+- When touching decrypt logic, keep SQLite verification and avoid writing corrupt outputs.
+- When touching message reads, continue handling TEXT, BLOB, and compressed `WCDB_CT_message_content`.
+- When touching group chats, preserve sender tgid parsing and contact display name resolution.
+- Prefer small focused changes over new abstraction layers.
+
+## Validation
+
+For docs-only changes, run:
+
+```bash
+git diff --check
+```
+
+For Rust or C behavior changes, run the smallest relevant check first, then broader checks if the change affects shared behavior:
 
 ```bash
 cargo test
 cargo build
 make build
 ```
-
-用户需要安装到个人目录时用 `make install-local`；只有用户明确要安装到 `/usr/local/bin` 时才用 `make install`。
-
-## 维护规则
-
-- CLI 行为要明确，输出要方便人和 AI 助手解析。
-- `all_keys.json`、`decrypted/`、导出的聊天和媒体都视为敏感本地数据。
-- 除非用户明确要求，不上传、不粘贴、不移动聊天数据。
-- 修改密钥提取时，保持 macOS Telegram进程扫描兼容。
-- 修改解密逻辑时，保留完整性校验，避免写出损坏的 SQLite。
-- 修改消息读取时，同时处理 TEXT、BLOB 和压缩的 `WCDB_CT_message_content`。
-- 修改群聊处理时，保留发送者 tgid 解析和联系人显示名解析。
-- 优先做聚焦的小改动，不引入不必要的抽象。

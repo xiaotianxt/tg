@@ -1,25 +1,104 @@
 # tgreader
 
-macOS 本地Telegram聊天记录读取 CLI。它用于在本机提取、解密、查询和导出Telegram聊天记录，无需手机备份。
+tgreader 是一个 macOS 本地Telegram聊天记录读取 CLI。它在你的 Mac 上读取Telegram桌面版本地数据库，提取密钥、解密数据库，然后按联系人或群名查询、搜索、导出聊天记录。
 
-## 能做什么
+适合这些场景：
 
-- 从正在运行的Telegram进程中提取数据库密钥
-- 增量解密本地Telegram数据库到 `decrypted/`
-- 列出会话，按联系人、群名、tgid 读取消息
-- 按关键词或时间范围搜索聊天记录
-- 导出 `txt`、`csv`、`json`
-- 可选导出本地缓存中的图片、视频和表情
-- 全程本地运行，不上传聊天数据
+- 备份自己的Telegram聊天记录，不依赖手机备份。
+- 快速找某个人、某个群、某个关键词的历史消息。
+- 把聊天导出成 `txt`、`csv`、`json`，用于归档、整理或本地分析。
+- 从本地缓存里导出图片、视频、表情等媒体文件。
 
-面向 AI/自动化助手的能力说明见 [SKILL.md](SKILL.md)。
+默认数据只留在本机。`all_keys.json`、`decrypted/`、`exported/` 都是敏感文件，请当作聊天原文保存和处理。
+
+## 先看效果
+
+列出会话：
+
+```bash
+$ tgreader sessions --top 5
+Rank Count    Time Range                                     Display Name           Username
+------------------------------------------------------------------------------------------------------------------------
+1    12843    2024-02-03 10:21 ~ 2026-04-28 09:41            产品讨论群              123456789@chatroom
+2    8921     2023-11-18 08:12 ~ 2026-04-27 23:10            张三                    tgid_abcd1234
+3    502      2025-06-01 14:33 ~ 2026-04-20 18:05            文件传输助手            filehelper
+
+Total: 37 sessions
+```
+
+读取最近消息：
+
+```bash
+$ tgreader messages "产品讨论群" --limit 3
+Chat with: 产品讨论群 (123456789@chatroom)
+Showing latest 3 of 12843 messages
+
+[2026-04-28 09:37:12] 我: 今天先把导出格式定下来
+[2026-04-28 09:38:44] 李四: [图片 1280x720 245KB]
+[2026-04-28 09:41:05] 王五: > 李四: [图片]
+        这张可以放到 README 里
+
+--- End of messages ---
+```
+
+导出聊天：
+
+```bash
+$ tgreader export "张三" --format json --output exported/zhangsan
+Exported 8921 messages for 张三 (tgid_abcd1234)
+Exported to:
+  [json] exported/zhangsan/chat.json
+```
+
+导出最近一张本地缓存图片：
+
+```bash
+$ tgreader image "产品讨论群"
+exported/images/123456789_chatroom_Image_3_0001.jpg
+```
+
+## 支持与限制
+
+| 类别 | 当前支持 |
+| --- | --- |
+| 系统 | macOS，本机Telegram桌面版本地数据 |
+| Telegram版本 | 主要面向 macOS Telegram 4.x；Telegram升级后如果数据库结构变化，可能需要跟进适配 |
+| Telegram数据 | 本机 `db_storage` 中的聊天数据库；无需手机备份 |
+| 会话匹配 | 联系人显示名、备注、别名、`tgid_...`、群 ID |
+| 消息读取 | 文本、群聊发送者、系统提示、撤回提示、引用、链接、小程序、位置、文件卡片、图片/视频/语音/表情的可读摘要 |
+| 搜索 | 全局关键词搜索，单个会话内关键词搜索 |
+| 导出 | `txt`、`csv`、`json` |
+| 媒体 | 尝试导出本地缓存图片、视频、表情；`.dat` 图片/视频会尝试解密 |
+| 增量更新 | 默认只解密变化过的数据库 |
+
+暂不支持或不保证：
+
+- 不支持 Windows、iOS、Android、网页版Telegram。
+- 不恢复Telegram本地数据库里已经没有的消息。
+- 不保证导出所有媒体。Telegram没有缓存、缓存被清理、文件未下载时，只能显示消息摘要。
+- `export --media-dir` 会尝试导出图片、视频、表情，但不导出语音音频和普通文件附件本体。
+- 表情导出可能根据消息里的 URL 用 `curl` 下载；普通读取、解密、搜索不会上传聊天数据。
+- `tggf` 表情转换需要本机可用的 `ffmpeg`。
+- 不做 OCR、语义搜索、拼音搜索。
+- 多账号或Telegram路径异常时，可能需要手动指定 `--db-dir`。
 
 ## 安装
+
+### 先重新签名Telegram
+
+退出Telegram后执行：
+
+```bash
+sudo codesign --force --deep --sign - /Applications/Telegram.app
+```
+
+如果你的Telegram路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径，例如 `/Applications/Telegram.app`。
 
 ### Homebrew
 
 ```bash
 brew install xiaotianxt/tgreader/tgreader
+tgreader --version
 ```
 
 安装开发版：
@@ -35,33 +114,63 @@ brew install --HEAD xiaotianxt/tgreader/tgreader
 ```bash
 git clone https://github.com/xiaotianxt/tgreader.git
 cd tgreader
-make install
-```
-
-安装到用户目录：
-
-```bash
 make install-local
 ```
 
-一键安装脚本：
+`make install-local` 会把 `tgreader` 和 `scanner_macos` 安装到 `~/.local/bin`。请确认 `~/.local/bin` 已经在 `PATH` 中。
+
+如果要安装到 `/usr/local/bin`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xiaotianxt/tgreader/main/scripts/install.sh | bash
+make install
 ```
 
-## 快速开始
-
-先确保Telegram正在运行。
+如果没有 C 编译器：
 
 ```bash
-sudo tgreader keys
-tgreader decrypt
-tgreader sessions
+xcode-select --install
+```
+
+## 第一次使用
+
+1. 打开并登录 macOS Telegram。
+2. 提取数据库密钥：
+
+   ```bash
+   sudo tgreader keys
+   ```
+
+   成功后当前目录会出现 `all_keys.json`。
+
+3. 解密数据库：
+
+   ```bash
+   tgreader decrypt --verbose
+   ```
+
+   成功后当前目录会出现 `decrypted/`。
+
+4. 看有哪些会话：
+
+   ```bash
+   tgreader sessions --top 30
+   ```
+
+5. 读取一个会话：
+
+   ```bash
+   tgreader messages "联系人或群名" --limit 50
+   ```
+
+后续使用时通常只需要：
+
+```bash
 tgreader messages "联系人或群名" --limit 50
+tgreader search "关键词"
+tgreader export "联系人或群名" --format json
 ```
 
-`keys` 需要读取Telegram进程内存，所以可能需要 sudo、部分关闭 SIP，或对Telegram重新签名以允许 `task_for_pid`。
+`sessions`、`messages`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。
 
 ## 常用命令
 
@@ -77,7 +186,10 @@ sudo tgreader keys
 tgreader decrypt
 tgreader decrypt --full
 tgreader decrypt --since 1h --verbose
+tgreader decrypt --db-dir "/path/to/your/db_storage"
 ```
+
+常见 `db_storage` 位置在Telegram容器目录下，例如 `Documents/xtelegram_files/.../db_storage` 或 `Library/Application Support/com.telegram.xinTelegram/.../db_storage`。
 
 查看会话：
 
@@ -99,16 +211,7 @@ tgreader messages "张三" --tail --limit 20
 tgreader messages "张三" --offset 100 --limit 50
 ```
 
-导出最近图片到可直接打开的本地文件：
-
-```bash
-tgreader image "张三"
-tgreader image "张三" --list --limit 20
-tgreader image "张三" --index 3
-tgreader image "张三" --all --limit 10 --output exported/images
-```
-
-全局搜索：
+搜索：
 
 ```bash
 tgreader search "关键词"
@@ -119,17 +222,33 @@ tgreader search "关键词" --limit 50
 
 ```bash
 tgreader export "张三" --format txt
-tgreader export "张三" --format csv --output exported
-tgreader export "张三" --format json --output exported
+tgreader export "张三" --format csv --output exported/zhangsan
+tgreader export "张三" --format json --output exported/zhangsan
 ```
 
 导出聊天并尝试导出本地缓存媒体：
 
 ```bash
-tgreader export "张三" --format json --output exported --media-dir exported/media
+tgreader export "张三" --format json --output exported/zhangsan --media-dir exported/zhangsan/media
 ```
 
-媒体导出依赖Telegram本地缓存；缓存不存在时会跳过对应文件。
+导出图片：
+
+```bash
+tgreader image "张三"
+tgreader image "张三" --list --limit 20
+tgreader image "张三" --index 3
+tgreader image "张三" --all --limit 10 --output exported/images
+```
+
+`image --list` 会先列出最近图片是否还在本地缓存里：
+
+```text
+Index Time                Status   Source
+----------------------------------------------------------------------------------------------------
+1     2026-04-28 09:38:44 cached   .../msg/attach/...
+2     2026-04-27 22:10:01 missing  cdnthumburl...
+```
 
 ## 时间过滤
 
@@ -140,13 +259,92 @@ tgreader export "张三" --format json --output exported --media-dir exported/me
 - 相对时间：`5min`、`1h`、`2d`、`1w`
 - 命名时间：`today`、`yesterday`
 
-## 读取缓存
+## 输出文件
 
-`sessions`、`messages`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。
+默认会在当前目录生成这些文件或目录：
+
+- `all_keys.json`：数据库密钥。
+- `decrypted/`：解密后的 SQLite 数据库。
+- `exported/`：导出的聊天和媒体。
+
+这些文件都应视为敏感数据。使用后如需清理：
+
+```bash
+# 确认当前目录后再清理
+rm -rf all_keys.json decrypted exported
+```
+
+## 常见问题
+
+### `Telegram is not running`
+
+先打开并登录 macOS Telegram，再运行 `sudo tgreader keys`。
+
+### `Scanner binary not found`
+
+源码安装时先运行：
+
+```bash
+make install-local
+```
+
+或在仓库目录里运行：
+
+```bash
+make build
+```
+
+### `task_for_pid failed`
+
+先确认用了 `sudo tgreader keys`。如果仍失败，退出Telegram后重新签名：
+
+```bash
+sudo codesign --force --deep --sign - /Applications/Telegram.app
+```
+
+然后重新打开Telegram，再运行 `sudo tgreader keys`。
+
+### `No sessions found`
+
+通常是还没有成功解密数据库。按顺序检查：
+
+```bash
+ls all_keys.json
+tgreader decrypt --verbose
+tgreader sessions --top 30
+```
+
+如果Telegram数据目录不是默认位置，给 `decrypt` 加 `--db-dir`。
+
+### 找到了错误联系人
+
+同名联系人或群较多时，先用 `tgreader sessions --top 100` 找到准确的 `tgid_...` 或 `...@chatroom`，再用这个 ID 读取：
+
+```bash
+tgreader messages "tgid_abcd1234" --limit 50
+```
+
+### 图片或视频导不出来
+
+媒体导出依赖Telegram本地缓存。可以先在Telegram里打开对应图片或视频，让Telegram把文件下载到本机，再重新运行 `tgreader image` 或 `tgreader export --media-dir ...`。
+
+### `tggf` 表情转换失败
+
+安装 `ffmpeg`：
+
+```bash
+brew install ffmpeg
+```
+
+如果 `ffmpeg` 不在 `PATH`，可以指定：
+
+```bash
+TGREADER_FFMPEG=/path/to/ffmpeg tgreader export "张三" --media-dir exported/media
+```
 
 ## 日志
 
-聊天记录、会话表格、搜索结果等命令结果写到 stdout。运行状态、警告和错误写到 stderr 日志。
+聊天记录、会话表格、搜索结果等命令结果写到 stdout。运行状态、警告和错误写到 stderr。
 
 默认日志等级是 `info`。可以用 `TGREADER_LOG` 或 `RUST_LOG` 调整：
 
@@ -165,21 +363,15 @@ cargo build
 
 项目入口是 `src/main.rs`。主要模块：
 
-- `src/scanner.rs`：调用密钥扫描器
-- `src/decrypt.rs`：数据库解密
-- `src/db.rs`：会话、联系人和消息查询
-- `src/message.rs`：消息类型解析
-- `src/media*.rs`：媒体元信息、缓存查找和解密
-- `src/export.rs`：导出
-- `vendor/find_all_keys_macos.c`：macOS Telegram进程扫描器
+- `src/scanner.rs`：调用密钥扫描器。
+- `src/decrypt.rs`：数据库解密。
+- `src/db.rs`：会话、联系人和消息查询。
+- `src/message.rs`：消息类型解析。
+- `src/media*.rs`：媒体元信息、缓存查找和解密。
+- `src/export.rs`：导出。
+- `vendor/find_all_keys_macos.c`：macOS Telegram进程扫描器。
 
-## 隐私
-
-- `all_keys.json` 包含数据库密钥
-- `decrypted/` 包含解密后的数据库
-- `exported/` 或自定义导出目录包含聊天内容和媒体
-
-这些文件都应视为敏感数据。使用后可按需删除。
+面向 AI/自动化助手的能力说明见 [SKILL.md](SKILL.md)。
 
 ## License
 
