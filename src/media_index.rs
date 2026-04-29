@@ -389,10 +389,10 @@ fn discover_media_dirs(
 
     let msg_temp = base_path.join("Message/MessageTemp").join(session_id);
     for category in categories {
-        let legacy_dir = msg_temp.join(category);
-        if legacy_dir.is_dir() {
+        let message_temp_dir = msg_temp.join(category);
+        if message_temp_dir.is_dir() {
             dirs.push(MediaDirSpec {
-                path: legacy_dir,
+                path: message_temp_dir,
                 category: (*category).to_string(),
             });
         }

@@ -23,9 +23,6 @@ install-local: build
 	@echo "  tg sessions       # 查看会话"
 
 clean:
-	rm -f scanner_macos
 	cargo clean
-	sudo rm -f /usr/local/bin/scanner_macos 2>/dev/null || true
 	sudo rm -f /usr/local/bin/tg 2>/dev/null || true
-	rm -f ~/.local/bin/scanner_macos 2>/dev/null || true
 	rm -f ~/.local/bin/tg 2>/dev/null || true

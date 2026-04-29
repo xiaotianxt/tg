@@ -3,6 +3,6 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         cc::Build::new()
             .file("vendor/find_all_keys_macos.c")
-            .compile("tg_scanner_macos");
+            .compile("tg_key_scanner");
     }
 }

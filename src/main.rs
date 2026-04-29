@@ -86,9 +86,6 @@ struct Cli {
 enum Commands {
     /// Extract DB encryption keys from Telegram process memory (requires sudo)
     Keys {
-        /// Legacy option; ignored because the scanner is embedded in tg
-        #[arg(long, hide = true)]
-        scanner: Option<PathBuf>,
         /// Timeout in seconds
         #[arg(long, default_value = "30")]
         timeout: u64,
@@ -273,18 +270,13 @@ fn main() {
     let cli = Cli::parse_from(normalize_args_for_default_messages(std::env::args_os()));
 
     match cli.command {
-        Commands::Keys { scanner, timeout } => {
-            if scanner.is_some() {
-                log::warn!("--scanner is ignored; the key scanner is built into tg.");
+        Commands::Keys { timeout } => match scanner::extract_keys(timeout) {
+            Ok(path) => print_output(format_args!("Keys saved to: {}", path)),
+            Err(e) => {
+                log::error!("Error: {}", e);
+                std::process::exit(1);
             }
-            match scanner::extract_keys(timeout) {
-                Ok(path) => print_output(format_args!("Keys saved to: {}", path)),
-                Err(e) => {
-                    log::error!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
+        },
         Commands::Decrypt {
             keys,
             output,
