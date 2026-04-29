@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn find_telegram_pid() -> Result<i32, String> {
     let output = Command::new("pgrep")
@@ -90,7 +91,7 @@ fn find_db_storage_dir() -> Option<PathBuf> {
 
 /// Extract DB encryption keys from Telegram process memory.
 /// Runs the C scanner binary, wrapping with sudo if not already root.
-pub fn extract_keys(scanner_path: &Path, _timeout_secs: u64) -> Result<String, String> {
+pub fn extract_keys(scanner_path: &Path, timeout_secs: u64) -> Result<String, String> {
     if !scanner_path.exists() {
         return Err(format!(
             "Scanner binary not found at {}. Run 'make scanner' first.",
@@ -115,16 +116,39 @@ pub fn extract_keys(scanner_path: &Path, _timeout_secs: u64) -> Result<String, S
         c.stderr(Stdio::inherit());
         c
     } else {
-        Command::new(scanner_str.as_ref())
+        let mut c = Command::new(scanner_str.as_ref());
+        c.stderr(Stdio::piped());
+        c
     };
+    cmd.stdout(Stdio::piped());
     cmd.arg(format!("{}", pid));
     if let Some(db_storage) = find_db_storage_dir() {
         cmd.arg(db_storage);
     }
 
-    let output = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("Failed to run scanner: {}", e))?;
+
+    let started = Instant::now();
+    loop {
+        match child
+            .try_wait()
+            .map_err(|e| format!("Failed to wait for scanner: {}", e))?
+        {
+            Some(_) => break,
+            None if timeout_secs > 0 && started.elapsed() >= Duration::from_secs(timeout_secs) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Scanner timed out after {} seconds.", timeout_secs));
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to read scanner output: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

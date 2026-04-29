@@ -52,7 +52,7 @@ pub(crate) fn find_decrypted_dbs(decrypted_dir: &Path) -> (Option<PathBuf>, Vec<
     (contact_db, message_dbs)
 }
 
-fn is_message_db_name(name: &str) -> bool {
+pub(crate) fn is_message_db_name(name: &str) -> bool {
     let Some(stem) = name
         .strip_prefix("message_")
         .and_then(|s| s.strip_suffix(".db"))
@@ -82,6 +82,16 @@ struct SessionInfo {
 type MessageRow = (i64, i64, String, Option<i64>, String, Vec<u8>);
 type SearchRow = (i64, i64, String, String);
 const SESSION_TIME_BOUNDARY_ROWS: usize = 128;
+
+pub(crate) struct ReadMessagesOptions<'a> {
+    pub session_query: &'a str,
+    pub limit: Option<usize>,
+    pub offset: usize,
+    pub search_query: Option<&'a str>,
+    pub since: Option<i64>,
+    pub tail: bool,
+    pub jobs: usize,
+}
 
 pub(crate) fn load_contacts(contact_db: &Path) -> Result<HashMap<String, Contact>, String> {
     let conn =
@@ -344,18 +354,16 @@ pub fn list_sessions(
 /// Read messages from a specific session.
 pub fn read_messages(
     decrypted_dir: &Path,
-    session_query: &str,
-    limit: Option<usize>,
-    offset: usize,
-    search_query: Option<&str>,
-    since: Option<i64>,
-    tail: bool,
-    jobs: usize,
+    options: ReadMessagesOptions<'_>,
 ) -> Result<usize, String> {
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
 
-    let username =
-        resolve_username_for_messages(session_query, contact_db.as_deref(), &message_dbs, jobs)?;
+    let username = resolve_username_for_messages(
+        options.session_query,
+        contact_db.as_deref(),
+        &message_dbs,
+        options.jobs,
+    )?;
     let table_name = msg_table_name(&username);
     let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
 
@@ -369,15 +377,17 @@ pub fn read_messages(
         .map(|c| c.display.as_str())
         .unwrap_or(&username);
 
-    let search_clause = search_query
+    let search_clause = options
+        .search_query
         .map(|q| format!(" AND message_content LIKE '%{}'", q.replace('\'', "''")))
         .unwrap_or_default();
 
-    let since_clause = since
+    let since_clause = options
+        .since
         .map(|ts| format!(" AND create_time >= {}", ts))
         .unwrap_or_default();
 
-    let db_jobs = parallel::job_count(jobs, 8);
+    let db_jobs = parallel::job_count(options.jobs, 8);
     let per_db_messages = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
         let mut total_count = 0usize;
         let mut rows: Vec<MessageRow> = Vec::new();
@@ -418,7 +428,7 @@ pub fn read_messages(
                 Err(_) => HashMap::new(),
             };
 
-        let order_dir = if tail { "DESC" } else { "ASC" };
+        let order_dir = if options.tail { "DESC" } else { "ASC" };
 
         // Query messages - collect eagerly to avoid borrow issues
         let sql = format!(
@@ -428,7 +438,7 @@ pub fn read_messages(
             search_clause,
             since_clause,
             order_dir,
-            if tail { limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default() } else { String::new() }
+            if options.tail { options.limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default() } else { String::new() }
         );
         rows = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
@@ -475,22 +485,26 @@ pub fn read_messages(
         all_messages.extend(rows);
     }
 
-    if tail {
+    if options.tail {
         // Each DB returns its latest rows; merge globally, then reverse for chronological display.
         all_messages.sort_by(|a, b| b.1.cmp(&a.1));
-        if let Some(limit) = limit {
+        if let Some(limit) = options.limit {
             all_messages.truncate(limit);
         }
         all_messages.reverse();
     } else {
         all_messages.sort_by(|a, b| a.1.cmp(&b.1));
     }
-    let messages: Vec<_> = if tail {
+    let messages: Vec<_> = if options.tail {
         all_messages.iter().collect()
-    } else if let Some(limit) = limit {
-        all_messages.iter().skip(offset).take(limit).collect()
+    } else if let Some(limit) = options.limit {
+        all_messages
+            .iter()
+            .skip(options.offset)
+            .take(limit)
+            .collect()
     } else {
-        all_messages.iter().skip(offset).collect()
+        all_messages.iter().skip(options.offset).collect()
     };
 
     if messages.is_empty() {
@@ -501,11 +515,11 @@ pub fn read_messages(
     let mut out = crate::output::Output::new(stdout.lock());
 
     out.line(format_args!("Chat with: {} ({})", display_name, username))?;
-    if let Some(q) = search_query {
+    if let Some(q) = options.search_query {
         out.line(format_args!("Search: '{}'", q))?;
     }
-    if tail {
-        if limit.is_some() {
+    if options.tail {
+        if options.limit.is_some() {
             out.line(format_args!(
                 "Showing latest {} of {} messages",
                 messages.len(),
@@ -518,21 +532,19 @@ pub fn read_messages(
                 total_count
             ))?;
         }
+    } else if options.limit.is_some() || options.offset > 0 {
+        out.line(format_args!(
+            "Showing {}-{} of {} messages",
+            options.offset + 1,
+            options.offset + messages.len(),
+            total_count
+        ))?;
     } else {
-        if limit.is_some() || offset > 0 {
-            out.line(format_args!(
-                "Showing {}-{} of {} messages",
-                offset + 1,
-                offset + messages.len(),
-                total_count
-            ))?;
-        } else {
-            out.line(format_args!(
-                "Showing {} of {} messages",
-                messages.len(),
-                total_count
-            ))?;
-        }
+        out.line(format_args!(
+            "Showing {} of {} messages",
+            messages.len(),
+            total_count
+        ))?;
     }
     out.blank_line()?;
 
@@ -1033,12 +1045,10 @@ fn latest_message_times_for_candidates(
                 table_name
             );
             if let Ok(mut stmt) = conn.prepare(&sql) {
-                if let Ok(ts) = stmt.query_row([], |row| row.get::<_, Option<i64>>(0)) {
-                    if let Some(ts) = ts {
-                        let entry = latest_by_username.entry(username.clone()).or_insert(ts);
-                        if ts > *entry {
-                            *entry = ts;
-                        }
+                if let Ok(Some(ts)) = stmt.query_row([], |row| row.get::<_, Option<i64>>(0)) {
+                    let entry = latest_by_username.entry(username.clone()).or_insert(ts);
+                    if ts > *entry {
+                        *entry = ts;
                     }
                 }
             };

@@ -25,6 +25,8 @@ struct ExportMessage {
     packed_info: Vec<u8>,
 }
 
+type ExportMessageRow = (i64, i64, String, Option<i64>, Vec<u8>);
+
 enum MediaExportJob {
     Cached {
         index: usize,
@@ -112,7 +114,7 @@ pub fn export_messages(
             table_name
         );
 
-        let rows: Vec<(i64, i64, String, Option<i64>, Vec<u8>)> = match conn.prepare(&sql) {
+        let rows: Vec<ExportMessageRow> = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
                 let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(3)?;
                 let content: String = if wcdb_ct == Some(4) {

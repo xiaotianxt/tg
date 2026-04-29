@@ -1,0 +1,95 @@
+use std::path::Path;
+
+use crate::{db, decrypt, scanner};
+
+const KEY_REFRESH_TIMEOUT_SECS: u64 = 30;
+
+pub(crate) fn refresh_decrypted(
+    decrypted_dir: &Path,
+    jobs: usize,
+) -> Result<decrypt::DecryptStats, String> {
+    let config = decrypt::DecryptConfig {
+        incremental: true,
+        since: None,
+        quiet: true,
+        jobs,
+    };
+    decrypt::decrypt_all(
+        std::path::Path::new("all_keys.json"),
+        decrypted_dir,
+        None,
+        &config,
+    )
+}
+
+pub(crate) fn refresh_keys_and_decrypted(
+    decrypted_dir: &Path,
+    jobs: usize,
+) -> Result<decrypt::DecryptStats, String> {
+    let scanner_path = scanner::default_scanner_path();
+    scanner::extract_keys(&scanner_path, KEY_REFRESH_TIMEOUT_SECS)?;
+    refresh_decrypted(decrypted_dir, jobs)
+}
+
+pub(crate) fn needs_message_key_retry(refresh: &Result<decrypt::DecryptStats, String>) -> bool {
+    match refresh {
+        Ok(stats) => failures_can_affect_messages(stats),
+        Err(_) => true,
+    }
+}
+
+pub(crate) fn retry_reason(refresh: &Result<decrypt::DecryptStats, String>) -> String {
+    match refresh {
+        Ok(_) => "contact/message database failed to decrypt".to_string(),
+        Err(e) => e.clone(),
+    }
+}
+
+pub(crate) fn failures_can_affect_messages(stats: &decrypt::DecryptStats) -> bool {
+    stats
+        .failed_paths
+        .iter()
+        .any(|path| failure_can_affect_messages(path))
+}
+
+fn failure_can_affect_messages(path: &str) -> bool {
+    path == "contact/contact.db"
+        || path
+            .strip_prefix("message/")
+            .is_some_and(db::is_message_db_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats_with_failed_paths(paths: &[&str]) -> decrypt::DecryptStats {
+        decrypt::DecryptStats {
+            success: 0,
+            failed: paths.len(),
+            skipped: 0,
+            total: paths.len(),
+            failed_paths: paths.iter().map(|path| path.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn message_retry_considers_contact_and_numbered_message_dbs_relevant() {
+        assert!(failures_can_affect_messages(&stats_with_failed_paths(&[
+            "contact/contact.db"
+        ])));
+        assert!(failures_can_affect_messages(&stats_with_failed_paths(&[
+            "message/message_0.db"
+        ])));
+    }
+
+    #[test]
+    fn message_retry_ignores_unrelated_decrypt_failures() {
+        assert!(!failures_can_affect_messages(&stats_with_failed_paths(&[
+            "favorite/favorite.db"
+        ])));
+        assert!(!failures_can_affect_messages(&stats_with_failed_paths(&[
+            "message/message_fts.db"
+        ])));
+    }
+}

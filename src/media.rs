@@ -381,7 +381,7 @@ pub fn decrypt_sticker_aes_cbc(data: &[u8], aes_key_hex: &str) -> Option<Vec<u8>
     use cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 
     let key = hex::decode(aes_key_hex).ok()?;
-    if key.len() != 16 || data.is_empty() || data.len() % 16 != 0 {
+    if key.len() != 16 || data.is_empty() || !data.len().is_multiple_of(16) {
         return None;
     }
 

@@ -35,10 +35,10 @@ fn main() {
     let xor_len = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
     let flag = data[14];
 
-    let aes_cipher_len = if aes_len % 16 == 0 {
+    let aes_cipher_len = if aes_len.is_multiple_of(16) {
         aes_len + 16
     } else {
-        (aes_len + 15) / 16 * 16
+        aes_len.div_ceil(16) * 16
     };
 
     log::info!("File: {} ({} bytes)", dat_path, data.len());
@@ -101,9 +101,8 @@ fn main() {
                         let encrypted = &data[15..15 + aes_cipher_len];
                         let mut decrypted = encrypted.to_vec();
                         for chunk in decrypted.chunks_exact_mut(16) {
-                            let mut b =
-                                aes::cipher::generic_array::GenericArray::from_mut_slice(chunk);
-                            cipher.decrypt_block(&mut b);
+                            let b = aes::cipher::generic_array::GenericArray::from_mut_slice(chunk);
+                            cipher.decrypt_block(b);
                         }
                         // PKCS7 unpad
                         let pad = decrypted.last().copied().unwrap_or(0) as usize;

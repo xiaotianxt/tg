@@ -18,7 +18,7 @@
 //! | middle   | payload.len - aesCipher - xorLen | plaintext                |
 //! | XOR tail | xorLen                          | each byte ^ xorKey       |
 //!
-//! aesCipherLen = if aesLen % 16 == 0 { aesLen + 16 } else { (aesLen + 15) / 16 * 16 }
+//! aesCipherLen = if aesLen is block-aligned { aesLen + 16 } else { aesLen rounded up to 16 }
 
 use crate::media_key::MediaKeys;
 use std::fs;
@@ -77,10 +77,10 @@ pub fn decrypt_v2_dat(src: &Path, dest: &Path, keys: &MediaKeys) -> Result<&'sta
     let aes_len = u32::from_le_bytes([data[6], data[7], data[8], data[9]]) as usize;
     let xor_len = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
 
-    let aes_cipher_len = if aes_len % 16 == 0 {
+    let aes_cipher_len = if aes_len.is_multiple_of(16) {
         aes_len + 16
     } else {
-        (aes_len + 15) / 16 * 16
+        aes_len.div_ceil(16) * 16
     };
 
     if 15 + aes_cipher_len > data.len() {
@@ -225,8 +225,8 @@ fn aes_ecb_decrypt(data: &[u8], key: &[u8; 16]) -> Vec<u8> {
     let cipher = Aes128::new_from_slice(key).expect("AES-128 key must be 16 bytes");
     let mut buf = data.to_vec();
     for block in buf.chunks_exact_mut(16) {
-        let mut b = aes::cipher::generic_array::GenericArray::from_mut_slice(block);
-        cipher.decrypt_block(&mut b);
+        let b = aes::cipher::generic_array::GenericArray::from_mut_slice(block);
+        cipher.decrypt_block(b);
     }
     buf
 }
