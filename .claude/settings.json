@@ -1,8 +1,8 @@
 {
   "skills": {
-    "tgreader": {
-      "name": "tgreader",
-      "prompt": "Telegram聊天记录读取工具 tgreader 已安装。\n\n可用命令：\n  tgreader keys              # 提取密钥（需 sudo）\n  tgreader decrypt            # 解密数据库\n  tgreader sessions           # 列出会话\n  tgreader messages <会话名>   # 读取消息（支持 --limit --offset --search）\n  tgreader search <关键词>     # 全文搜索\n  tgreader export <会话名>     # 导出（--format txt|csv|json）\n\n工作流程：\n1. 确保Telegram正在运行\n2. sudo tgreader keys → 提取密钥到 all_keys.json\n3. tgreader decrypt → 解密到 decrypted/\n4. tgreader sessions → 查看会话列表\n5. tgreader messages \"联系人\" → 读消息\n\n群聊消息会自动解析 tgid 为联系人昵称。支持 --search 参数在会话内搜索。"
+    "tg": {
+      "name": "tg",
+      "prompt": "Telegram聊天记录读取工具 tg 已安装。\n\n可用命令：\n  tg keys              # 提取密钥（需 sudo）\n  tg decrypt            # 解密数据库\n  tg sessions           # 列出会话\n  tg messages <会话名>   # 读取消息（支持 --limit --offset --search）\n  tg search <关键词>     # 全文搜索\n  tg export <会话名>     # 导出（--format txt|csv|json）\n\n工作流程：\n1. 确保Telegram正在运行\n2. sudo tg keys → 提取密钥到 all_keys.json\n3. tg decrypt → 解密到 decrypted/\n4. tg sessions → 查看会话列表\n5. tg messages \"联系人\" → 读消息\n\n群聊消息会自动解析 tgid 为联系人昵称。支持 --search 参数在会话内搜索。"
     }
   }
 }

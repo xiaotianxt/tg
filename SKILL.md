@@ -1,9 +1,9 @@
 ---
-name: tgreader
-description: Use when the user needs to read, search, inspect, back up, export, or troubleshoot access to local macOS Telegram chat history. This skill uses tgreader to sign Telegram if needed, extract local database keys, decrypt local databases, list conversations, read or search messages, export chats and cached media, and maintain the tgreader codebase when requested.
+name: tg
+description: Use when the user needs to read, search, inspect, back up, export, or troubleshoot access to local macOS Telegram chat history. This skill uses tg to sign Telegram if needed, extract local database keys, decrypt local databases, list conversations, read or search messages, export chats and cached media, and maintain the tg codebase when requested.
 ---
 
-# tgreader
+# tg
 
 ## When To Use
 
@@ -14,13 +14,13 @@ Use this skill for user goals like:
 - "导出这个Telegram群的聊天记录"
 - "把Telegram聊天备份成 json/csv/txt"
 - "为什么本机Telegram聊天记录读不出来"
-- "修一下 tgreader 的读取、解密、导出逻辑"
+- "修一下 tg 的读取、解密、导出逻辑"
 
-Do not wait for the user to name tgreader. tgreader is the implementation; the user goal is local macOS Telegram history access.
+Do not wait for the user to name tg. tg is the implementation; the user goal is local macOS Telegram history access.
 
 ## Operating Principles
 
-tgreader touches private chat data. Keep work local by default, avoid printing more message content than the user asked for, and treat these files as sensitive: `all_keys.json`, `decrypted/`, `exported/`, media exports.
+tg touches private chat data. Keep work local by default, avoid printing more message content than the user asked for, and treat these files as sensitive: `all_keys.json`, `decrypted/`, `exported/`, media exports.
 
 Optimize for the shortest successful user path. Do not turn normal use into a reverse-engineering walkthrough unless the user is debugging internals.
 
@@ -37,10 +37,10 @@ If Telegram is installed somewhere else, use that `.app` path, for example `/App
 Then have the user open and log in to macOS Telegram:
 
 ```bash
-sudo tgreader keys
-tgreader refresh
-tgreader sessions --top 50
-tgreader "联系人或群名" --limit 50
+sudo tg keys
+tg refresh
+tg sessions --top 50
+tg "联系人或群名" --limit 50
 ```
 
 After the first successful decrypt, `sessions`, `messages`, `search`, and `export` will try a quiet incremental refresh before reading `decrypted/`. If live access fails, they can still read the existing decrypted cache.
@@ -50,8 +50,8 @@ After the first successful decrypt, `sessions`, `messages`, `search`, and `expor
 Install:
 
 ```bash
-brew install xiaotianxt/tgreader/tgreader
-tgreader --version
+brew install xiaotianxt/tap/tg
+tg --version
 ```
 
 From source inside the repo:
@@ -63,53 +63,53 @@ make install-local
 Find a chat:
 
 ```bash
-tgreader sessions --top 50
+tg sessions --top 50
 ```
 
 Read a chat:
 
 ```bash
-tgreader "张三"
-tgreader "张三" --limit 100
-tgreader messages "张三"
-tgreader messages "张三" --limit 100
-tgreader messages "张三" --since today
-tgreader messages "张三" --search "关键词"
-tgreader messages "张三" --head --limit 20
-tgreader messages "张三" --tail --limit 20
+tg "张三"
+tg "张三" --limit 100
+tg messages "张三"
+tg messages "张三" --limit 100
+tg messages "张三" --since today
+tg messages "张三" --search "关键词"
+tg messages "张三" --head --limit 20
+tg messages "张三" --tail --limit 20
 ```
 
 Search globally:
 
 ```bash
-tgreader search "关键词" --limit 50
-tgreader search "关键词" --since today
+tg search "关键词" --limit 50
+tg search "关键词" --since today
 ```
 
 Diagnose or refresh:
 
 ```bash
-tgreader doctor
-tgreader doctor "张三"
-tgreader refresh
-tgreader refresh --keys
+tg doctor
+tg doctor "张三"
+tg refresh
+tg refresh --keys
 ```
 
 Export:
 
 ```bash
-tgreader export "张三" --format txt
-tgreader export "张三" --format csv --output exported/zhangsan
-tgreader export "张三" --format json --output exported/zhangsan
-tgreader export "张三" --format json --output exported/zhangsan --media-dir exported/zhangsan/media
+tg export "张三" --format txt
+tg export "张三" --format csv --output exported/zhangsan
+tg export "张三" --format json --output exported/zhangsan
+tg export "张三" --format json --output exported/zhangsan --media-dir exported/zhangsan/media
 ```
 
 Export cached images:
 
 ```bash
-tgreader image "张三" --list --limit 20
-tgreader image "张三" --index 3
-tgreader image "张三" --all --limit 10 --output exported/images
+tg image "张三" --list --limit 20
+tg image "张三" --index 3
+tg image "张三" --all --limit 10 --output exported/images
 ```
 
 Time filters support dates, datetimes, and relative values:
@@ -125,15 +125,15 @@ Time filters support dates, datetimes, and relative values:
 
 ## Troubleshooting
 
-- `Telegram is not running`: open and log in to macOS Telegram, then run `sudo tgreader keys`.
+- `Telegram is not running`: open and log in to macOS Telegram, then run `sudo tg keys`.
 - `Scanner binary not found`: from source, run `make build` or `make install-local`.
-- `task_for_pid failed`: confirm `sudo tgreader keys`, quit Telegram, run `sudo codesign --force --deep --sign - /Applications/Telegram.app`, reopen Telegram, retry.
-- Unknown read failure: run `tgreader doctor` or `tgreader doctor "联系人或群名"`.
-- `No sessions found`: check `all_keys.json` exists, run `tgreader decrypt --verbose`, then `tgreader sessions --top 50`.
-- Cannot auto-detect DB path: pass `tgreader decrypt --db-dir "/path/to/db_storage"`.
-- Wrong chat matched: use `tgreader sessions --top 100` and rerun with the exact `tgid_...` or `...@chatroom`.
-- Missing media: Telegram may not have cached the file. Open/download it in Telegram, then retry `tgreader image` or `tgreader export --media-dir ...`.
-- `tggf` sticker conversion fails: install `ffmpeg` or set `TGREADER_FFMPEG=/path/to/ffmpeg`.
+- `task_for_pid failed`: confirm `sudo tg keys`, quit Telegram, run `sudo codesign --force --deep --sign - /Applications/Telegram.app`, reopen Telegram, retry.
+- Unknown read failure: run `tg doctor` or `tg doctor "联系人或群名"`.
+- `No sessions found`: check `all_keys.json` exists, run `tg decrypt --verbose`, then `tg sessions --top 50`.
+- Cannot auto-detect DB path: pass `tg decrypt --db-dir "/path/to/db_storage"`.
+- Wrong chat matched: use `tg sessions --top 100` and rerun with the exact `tgid_...` or `...@chatroom`.
+- Missing media: Telegram may not have cached the file. Open/download it in Telegram, then retry `tg image` or `tg export --media-dir ...`.
+- `tggf` sticker conversion fails: install `ffmpeg` or set `TG_FFMPEG=/path/to/ffmpeg`.
 
 ## Codebase Map
 

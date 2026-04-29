@@ -364,13 +364,13 @@ fn open_cache_connection(base_path: &Path, cache_dir: Option<&Path>) -> Connecti
 fn cache_file_path(base_path: &Path, cache_dir: Option<&Path>) -> Option<PathBuf> {
     let cache_dir = match cache_dir {
         Some(path) => path.to_path_buf(),
-        None => std::env::var("TGREADER_CACHE_DIR")
+        None => std::env::var("TG_CACHE_DIR")
             .map(PathBuf::from)
             .ok()
             .or_else(|| {
                 std::env::var("HOME")
                     .ok()
-                    .map(|home| PathBuf::from(home).join("Library/Caches/tgreader"))
+                    .map(|home| PathBuf::from(home).join("Library/Caches/tg"))
             })?,
     };
 

@@ -70,7 +70,7 @@ fn print_refresh_stats(label: &str, stats: &decrypt::DecryptStats) {
 
 #[derive(Parser)]
 #[command(
-    name = "tgreader",
+    name = "tg",
     version,
     about = "Read Telegram messages from local databases"
 )]
@@ -129,7 +129,7 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         jobs: usize,
     },
-    /// Diagnose tgreader setup and optionally a specific chat
+    /// Diagnose tg setup and optionally a specific chat
     Doctor {
         /// Optional session username (tgid_xxx) or display name to inspect
         session: Option<String>,
@@ -559,8 +559,8 @@ mod tests {
     #[test]
     fn unknown_first_arg_defaults_to_messages() {
         assert_eq!(
-            normalize_args_for_default_messages(args(&["tgreader", "张三", "--limit", "20"])),
-            args(&["tgreader", "messages", "张三", "--limit", "20"])
+            normalize_args_for_default_messages(args(&["tg", "张三", "--limit", "20"])),
+            args(&["tg", "messages", "张三", "--limit", "20"])
         );
     }
 
@@ -571,8 +571,8 @@ mod tests {
             "refresh",
         ] {
             assert_eq!(
-                normalize_args_for_default_messages(args(&["tgreader", command])),
-                args(&["tgreader", command])
+                normalize_args_for_default_messages(args(&["tg", command])),
+                args(&["tg", command])
             );
         }
     }
@@ -580,12 +580,12 @@ mod tests {
     #[test]
     fn top_level_flags_and_help_subcommand_are_not_rewritten() {
         assert_eq!(
-            normalize_args_for_default_messages(args(&["tgreader", "--help"])),
-            args(&["tgreader", "--help"])
+            normalize_args_for_default_messages(args(&["tg", "--help"])),
+            args(&["tg", "--help"])
         );
         assert_eq!(
-            normalize_args_for_default_messages(args(&["tgreader", "help", "messages"])),
-            args(&["tgreader", "help", "messages"])
+            normalize_args_for_default_messages(args(&["tg", "help", "messages"])),
+            args(&["tg", "help", "messages"])
         );
     }
 }

@@ -1,16 +1,16 @@
 [package]
-name = "tgreader"
-version = "1.1.0"
+name = "tg"
+version = "1.1.1"
 edition = "2021"
 description = "macOS Telegram 聊天记录读取 CLI 工具"
 authors = ["xiaotianxt"]
-repository = "https://github.com/xiaotianxt/tgreader"
+repository = "https://github.com/xiaotianxt/tg"
 license = "MIT"
 keywords = ["telegram", "telegram", "chat", "decrypt", "sqlcipher"]
 categories = ["command-line-utilities", "database"]
 
 [[bin]]
-name = "tgreader"
+name = "tg"
 path = "src/main.rs"
 
 [[bin]]

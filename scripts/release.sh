@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_SLUG="${REPO_SLUG:-xiaotianxt/tgreader}"
-TAP_NAME="${TAP_NAME:-xiaotianxt/tgreader}"
-FORMULA_REF="${FORMULA_REF:-xiaotianxt/tgreader/tgreader}"
+REPO_SLUG="${REPO_SLUG:-xiaotianxt/tg}"
+TAP_NAME="${TAP_NAME:-xiaotianxt/tap}"
+FORMULA_REF="${FORMULA_REF:-xiaotianxt/tap/tg}"
 WORKFLOW="${WORKFLOW:-release.yml}"
 
 RUN_TESTS=1
@@ -17,7 +17,7 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/release.sh [options]
 
-Create a tgreader release, bumping Cargo.toml when needed, wait for GitHub
+Create a tg release, bumping Cargo.toml when needed, wait for GitHub
 Actions to publish the arm64 artifact, update the Homebrew tap, and verify brew.
 
 Options:
@@ -32,9 +32,9 @@ Options:
   -h, --help           Show this help.
 
 Environment:
-  REPO_SLUG            GitHub repo slug. Default: xiaotianxt/tgreader
-  TAP_NAME             Homebrew tap name. Default: xiaotianxt/tgreader
-  FORMULA_REF          Brew formula ref. Default: xiaotianxt/tgreader/tgreader
+  REPO_SLUG            GitHub repo slug. Default: xiaotianxt/tg
+  TAP_NAME             Homebrew tap name. Default: xiaotianxt/tap
+  FORMULA_REF          Brew formula ref. Default: xiaotianxt/tap/tg
   WORKFLOW             Release workflow file/name. Default: release.yml
 USAGE
 }
@@ -135,7 +135,7 @@ def replace_package_version(path, package_name=None):
     raise SystemExit(f"package version not found in {path}")
 
 replace_package_version(Path("Cargo.toml"))
-replace_package_version(Path("Cargo.lock"), "tgreader")
+replace_package_version(Path("Cargo.lock"), "tg")
 PY
 }
 
@@ -225,7 +225,7 @@ TAP_DIR=""
 FORMULA_PATH=""
 if [[ "$UPDATE_TAP" -eq 1 ]]; then
   TAP_DIR="$(brew --repo "$TAP_NAME")"
-  FORMULA_PATH="${TAP_DIR}/Formula/tgreader.rb"
+  FORMULA_PATH="${TAP_DIR}/Formula/tg.rb"
   [[ -f "$FORMULA_PATH" ]] || die "formula not found: ${FORMULA_PATH}"
   [[ -z "$(git -C "$TAP_DIR" status --porcelain)" ]] || die "tap working tree is dirty: ${TAP_DIR}"
 
@@ -283,7 +283,7 @@ if ! git diff --quiet -- Cargo.toml Cargo.lock; then
   log "committing version bump"
   git diff --check -- Cargo.toml Cargo.lock
   git add Cargo.toml Cargo.lock
-  git commit -m "chore: bump tgreader version to ${VERSION}"
+  git commit -m "chore: bump tg version to ${VERSION}"
   HEAD_SHA="$(git rev-parse HEAD)"
 fi
 
@@ -292,7 +292,7 @@ if [[ "$HEAD_SHA" != "$(git rev-parse origin/main)" ]]; then
   git push origin HEAD:main
 fi
 
-ASSET_NAME="tgreader-${TAG}-darwin-arm64.tar.gz"
+ASSET_NAME="tg-${TAG}-darwin-arm64.tar.gz"
 ASSET_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/${ASSET_NAME}"
 
 log "preparing ${TAG}"
@@ -375,12 +375,12 @@ text = re.sub(r'(?m)^  version ".*"$', f'  version "{version}"', text, count=1)
 path.write_text(text)
 PY
 
-  if git -C "$TAP_DIR" diff --quiet -- Formula/tgreader.rb; then
+  if git -C "$TAP_DIR" diff --quiet -- Formula/tg.rb; then
     log "tap already points to ${VERSION}"
   else
-    git -C "$TAP_DIR" diff --check -- Formula/tgreader.rb
-    git -C "$TAP_DIR" add Formula/tgreader.rb
-    git -C "$TAP_DIR" commit -m "tgreader ${VERSION}"
+    git -C "$TAP_DIR" diff --check -- Formula/tg.rb
+    git -C "$TAP_DIR" add Formula/tg.rb
+    git -C "$TAP_DIR" commit -m "tg ${VERSION}"
     git -C "$TAP_DIR" push origin main
   fi
 fi
@@ -389,7 +389,7 @@ if [[ "$BREW_VERIFY" -eq 1 ]]; then
   log "verifying Homebrew install"
   brew update
   brew upgrade "$FORMULA_REF" || brew reinstall "$FORMULA_REF"
-  tgreader --version
+  tg --version
   brew test "$FORMULA_REF"
 fi
 

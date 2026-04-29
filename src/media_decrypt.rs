@@ -130,7 +130,7 @@ pub fn convert_tggf_to_jpg(data: &[u8]) -> Result<Vec<u8>, String> {
     let hevc = find_tggf_hevc_partition(data)
         .ok_or_else(|| "tggf HEVC partition not found".to_string())?;
 
-    let ffmpeg = std::env::var("TGREADER_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
+    let ffmpeg = std::env::var("TG_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
     let mut child = Command::new(&ffmpeg)
         .args([
             "-hide_banner",

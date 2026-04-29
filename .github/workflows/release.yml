@@ -24,15 +24,15 @@ jobs:
       - name: Archive
         run: |
           mkdir -p archive
-          cp target/release/tgreader scanner_macos archive/
+          cp target/release/tg scanner_macos archive/
           cd archive
-          tar czf ../tgreader-${{ github.ref_name }}-darwin-arm64.tar.gz \
-            tgreader scanner_macos
+          tar czf ../tg-${{ github.ref_name }}-darwin-arm64.tar.gz \
+            tg scanner_macos
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tgreader-${{ github.ref_name }}-darwin-arm64
-          path: tgreader-${{ github.ref_name }}-darwin-arm64.tar.gz
+          name: tg-${{ github.ref_name }}-darwin-arm64
+          path: tg-${{ github.ref_name }}-darwin-arm64.tar.gz
 
   release:
     needs: build
@@ -43,10 +43,10 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: tgreader-*
+          pattern: tg-*
           merge-multiple: true
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: tgreader-*.tar.gz
+          files: tg-*.tar.gz
           generate_release_notes: true

@@ -1,6 +1,6 @@
-# tgreader
+# tg
 
-tgreader 是一个 macOS 本地Telegram聊天记录读取 CLI。它在你的 Mac 上读取Telegram桌面版本地数据库，提取密钥、解密数据库，然后按联系人或群名查询、搜索、导出聊天记录。
+tg 是一个 macOS 本地Telegram聊天记录读取 CLI。它在你的 Mac 上读取Telegram桌面版本地数据库，提取密钥、解密数据库，然后按联系人或群名查询、搜索、导出聊天记录。
 
 适合这些场景：
 
@@ -16,7 +16,7 @@ tgreader 是一个 macOS 本地Telegram聊天记录读取 CLI。它在你的 Mac
 列出会话：
 
 ```bash
-$ tgreader sessions --top 5
+$ tg sessions --top 5
 Rank Count    Time Range                                     Display Name           Username
 ------------------------------------------------------------------------------------------------------------------------
 1    12843    2024-02-03 10:21 ~ 2026-04-28 09:41            产品讨论群              123456789@chatroom
@@ -29,7 +29,7 @@ Total: 37 sessions
 读取最近消息：
 
 ```bash
-$ tgreader messages "产品讨论群" --limit 3
+$ tg messages "产品讨论群" --limit 3
 Chat with: 产品讨论群 (123456789@chatroom)
 Showing latest 3 of 12843 messages
 
@@ -44,7 +44,7 @@ Showing latest 3 of 12843 messages
 导出聊天：
 
 ```bash
-$ tgreader export "张三" --format json --output exported/zhangsan
+$ tg export "张三" --format json --output exported/zhangsan
 Exported 8921 messages for 张三 (tgid_abcd1234)
 Exported to:
   [json] exported/zhangsan/chat.json
@@ -53,7 +53,7 @@ Exported to:
 导出最近一张本地缓存图片：
 
 ```bash
-$ tgreader image "产品讨论群"
+$ tg image "产品讨论群"
 exported/images/123456789_chatroom_Image_3_0001.jpg
 ```
 
@@ -97,14 +97,14 @@ sudo codesign --force --deep --sign - /Applications/Telegram.app
 ### Homebrew
 
 ```bash
-brew install xiaotianxt/tgreader/tgreader
-tgreader --version
+brew install xiaotianxt/tap/tg
+tg --version
 ```
 
 安装开发版：
 
 ```bash
-brew install --HEAD xiaotianxt/tgreader/tgreader
+brew install --HEAD xiaotianxt/tap/tg
 ```
 
 ### 源码安装
@@ -112,12 +112,12 @@ brew install --HEAD xiaotianxt/tgreader/tgreader
 需要 Rust 工具链和 Xcode Command Line Tools。
 
 ```bash
-git clone https://github.com/xiaotianxt/tgreader.git
-cd tgreader
+git clone https://github.com/xiaotianxt/tg.git
+cd tg
 make install-local
 ```
 
-`make install-local` 会把 `tgreader` 和 `scanner_macos` 安装到 `~/.local/bin`。请确认 `~/.local/bin` 已经在 `PATH` 中。
+`make install-local` 会把 `tg` 和 `scanner_macos` 安装到 `~/.local/bin`。请确认 `~/.local/bin` 已经在 `PATH` 中。
 
 如果要安装到 `/usr/local/bin`：
 
@@ -137,7 +137,7 @@ xcode-select --install
 2. 提取数据库密钥：
 
    ```bash
-   sudo tgreader keys
+   sudo tg keys
    ```
 
    成功后当前目录会出现 `all_keys.json`。
@@ -145,7 +145,7 @@ xcode-select --install
 3. 解密数据库：
 
    ```bash
-   tgreader decrypt --verbose
+   tg decrypt --verbose
    ```
 
    成功后当前目录会出现 `decrypted/`。
@@ -153,42 +153,42 @@ xcode-select --install
 4. 看有哪些会话：
 
    ```bash
-   tgreader sessions --top 30
+   tg sessions --top 30
    ```
 
 5. 读取一个会话：
 
    ```bash
-   tgreader "联系人或群名" --limit 50
+   tg "联系人或群名" --limit 50
    ```
 
 后续使用时通常只需要：
 
 ```bash
-tgreader "联系人或群名" --limit 50
-tgreader search "关键词"
-tgreader export "联系人或群名" --format json
+tg "联系人或群名" --limit 50
+tg search "关键词"
+tg export "联系人或群名" --format json
 ```
 
-`sessions`、`messages`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 如果没有读到结果，并且刚才的 contact/message 数据库刷新失败，会自动重新提取 keys、刷新解密缓存，然后重试一次。读不到时先跑 `tgreader doctor` 或 `tgreader doctor "联系人或群名"` 看具体状态。
+`sessions`、`messages`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 如果没有读到结果，并且刚才的 contact/message 数据库刷新失败，会自动重新提取 keys、刷新解密缓存，然后重试一次。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
 
 ## 常用命令
 
 提取密钥：
 
 ```bash
-sudo tgreader keys
+sudo tg keys
 ```
 
 解密数据库：
 
 ```bash
-tgreader refresh
-tgreader refresh --keys
-tgreader decrypt
-tgreader decrypt --full
-tgreader decrypt --since 1h --verbose
-tgreader decrypt --db-dir "/path/to/your/db_storage"
+tg refresh
+tg refresh --keys
+tg decrypt
+tg decrypt --full
+tg decrypt --since 1h --verbose
+tg decrypt --db-dir "/path/to/your/db_storage"
 ```
 
 常见 `db_storage` 位置在Telegram容器目录下，例如 `Documents/xtelegram_files/.../db_storage` 或 `Library/Application Support/com.telegram.xinTelegram/.../db_storage`。
@@ -196,61 +196,61 @@ tgreader decrypt --db-dir "/path/to/your/db_storage"
 查看会话：
 
 ```bash
-tgreader sessions
-tgreader sessions --top 50
+tg sessions
+tg sessions --top 50
 ```
 
 读取消息：
 
 ```bash
-tgreader "张三"
-tgreader "张三" --limit 100
-tgreader messages "张三"
-tgreader messages "张三" --limit 100
-tgreader messages "张三" --since today
-tgreader messages "张三" --since yesterday
-tgreader messages "张三" --search "项目"
-tgreader messages "张三" --head --limit 20
-tgreader messages "张三" --tail --limit 20
-tgreader messages "张三" --offset 100 --limit 50
+tg "张三"
+tg "张三" --limit 100
+tg messages "张三"
+tg messages "张三" --limit 100
+tg messages "张三" --since today
+tg messages "张三" --since yesterday
+tg messages "张三" --search "项目"
+tg messages "张三" --head --limit 20
+tg messages "张三" --tail --limit 20
+tg messages "张三" --offset 100 --limit 50
 ```
 
 搜索：
 
 ```bash
-tgreader search "关键词"
-tgreader search "关键词" --limit 50
-tgreader search "关键词" --since today
+tg search "关键词"
+tg search "关键词" --limit 50
+tg search "关键词" --since today
 ```
 
 诊断：
 
 ```bash
-tgreader doctor
-tgreader doctor "张三"
+tg doctor
+tg doctor "张三"
 ```
 
 导出聊天：
 
 ```bash
-tgreader export "张三" --format txt
-tgreader export "张三" --format csv --output exported/zhangsan
-tgreader export "张三" --format json --output exported/zhangsan
+tg export "张三" --format txt
+tg export "张三" --format csv --output exported/zhangsan
+tg export "张三" --format json --output exported/zhangsan
 ```
 
 导出聊天并尝试导出本地缓存媒体：
 
 ```bash
-tgreader export "张三" --format json --output exported/zhangsan --media-dir exported/zhangsan/media
+tg export "张三" --format json --output exported/zhangsan --media-dir exported/zhangsan/media
 ```
 
 导出图片：
 
 ```bash
-tgreader image "张三"
-tgreader image "张三" --list --limit 20
-tgreader image "张三" --index 3
-tgreader image "张三" --all --limit 10 --output exported/images
+tg image "张三"
+tg image "张三" --list --limit 20
+tg image "张三" --index 3
+tg image "张三" --all --limit 10 --output exported/images
 ```
 
 `image --list` 会先列出最近图片是否还在本地缓存里：
@@ -290,7 +290,7 @@ rm -rf all_keys.json decrypted exported
 
 ### `Telegram is not running`
 
-先打开并登录 macOS Telegram，再运行 `sudo tgreader keys`。
+先打开并登录 macOS Telegram，再运行 `sudo tg keys`。
 
 ### `Scanner binary not found`
 
@@ -308,13 +308,13 @@ make build
 
 ### `task_for_pid failed`
 
-先确认用了 `sudo tgreader keys`。如果仍失败，退出Telegram后重新签名：
+先确认用了 `sudo tg keys`。如果仍失败，退出Telegram后重新签名：
 
 ```bash
 sudo codesign --force --deep --sign - /Applications/Telegram.app
 ```
 
-然后重新打开Telegram，再运行 `sudo tgreader keys`。
+然后重新打开Telegram，再运行 `sudo tg keys`。
 
 ### `No sessions found`
 
@@ -322,23 +322,23 @@ sudo codesign --force --deep --sign - /Applications/Telegram.app
 
 ```bash
 ls all_keys.json
-tgreader decrypt --verbose
-tgreader sessions --top 30
+tg decrypt --verbose
+tg sessions --top 30
 ```
 
 如果Telegram数据目录不是默认位置，给 `decrypt` 加 `--db-dir`。
 
 ### 找到了错误联系人
 
-同名联系人或群较多时，先用 `tgreader sessions --top 100` 找到准确的 `tgid_...` 或 `...@chatroom`，再用这个 ID 读取：
+同名联系人或群较多时，先用 `tg sessions --top 100` 找到准确的 `tgid_...` 或 `...@chatroom`，再用这个 ID 读取：
 
 ```bash
-tgreader messages "tgid_abcd1234" --limit 50
+tg messages "tgid_abcd1234" --limit 50
 ```
 
 ### 图片或视频导不出来
 
-媒体导出依赖Telegram本地缓存。可以先在Telegram里打开对应图片或视频，让Telegram把文件下载到本机，再重新运行 `tgreader image` 或 `tgreader export --media-dir ...`。
+媒体导出依赖Telegram本地缓存。可以先在Telegram里打开对应图片或视频，让Telegram把文件下载到本机，再重新运行 `tg image` 或 `tg export --media-dir ...`。
 
 ### `tggf` 表情转换失败
 
@@ -351,18 +351,18 @@ brew install ffmpeg
 如果 `ffmpeg` 不在 `PATH`，可以指定：
 
 ```bash
-TGREADER_FFMPEG=/path/to/ffmpeg tgreader export "张三" --media-dir exported/media
+TG_FFMPEG=/path/to/ffmpeg tg export "张三" --media-dir exported/media
 ```
 
 ## 日志
 
 聊天记录、会话表格、搜索结果等命令结果写到 stdout。运行状态、警告和错误写到 stderr。
 
-默认日志等级是 `info`。可以用 `TGREADER_LOG` 或 `RUST_LOG` 调整：
+默认日志等级是 `info`。可以用 `TG_LOG` 或 `RUST_LOG` 调整：
 
 ```bash
-TGREADER_LOG=warn tgreader decrypt
-TGREADER_LOG=debug tgreader messages "张三"
+TG_LOG=warn tg decrypt
+TG_LOG=debug tg messages "张三"
 ```
 
 ## 开发

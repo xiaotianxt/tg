@@ -144,10 +144,10 @@ fn verify_and_decrypt_page1(enc_key: &[u8], page1: &[u8]) -> bool {
 
 fn page_cache_path(out_path: &Path) -> PathBuf {
     let Some(file_name) = out_path.file_name() else {
-        return out_path.with_extension("tgreader-pages");
+        return out_path.with_extension("tg-pages");
     };
     let mut cache_name = file_name.to_os_string();
-    cache_name.push(".tgreader-pages");
+    cache_name.push(".tg-pages");
     out_path.with_file_name(cache_name)
 }
 

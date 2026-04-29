@@ -45,7 +45,7 @@ impl Log for SimpleLogger {
 }
 
 fn level_from_env() -> LevelFilter {
-    std::env::var("TGREADER_LOG")
+    std::env::var("TG_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
         .ok()
         .as_deref()

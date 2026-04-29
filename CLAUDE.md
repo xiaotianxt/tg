@@ -1,20 +1,20 @@
-# tgreader 项目指南
+# tg 项目指南
 
 ## 项目简介
 
-tgreader 是一款 macOS Telegram聊天记录读取 CLI 工具。它从Telegram进程内存中提取 SQLCipher 4 密钥，解密本地数据库，然后提供命令行查询和导出功能。
+tg 是一款 macOS Telegram聊天记录读取 CLI 工具。它从Telegram进程内存中提取 SQLCipher 4 密钥，解密本地数据库，然后提供命令行查询和导出功能。
 
 ## 快速命令
 
 ```bash
 make install                 # 编译 + 安装到 /usr/local/bin
-sudo tgreader keys           # 从内存提取密钥
-tgreader decrypt             # 默认静默增量解密数据库
-tgreader decrypt --full      # 强制全量重解
-tgreader sessions            # 列出会话
-tgreader messages "名称"     # 读取消息
-tgreader search "关键词"     # 全文搜索
-tgreader export "名称" -f txt # 导出
+sudo tg keys           # 从内存提取密钥
+tg decrypt             # 默认静默增量解密数据库
+tg decrypt --full      # 强制全量重解
+tg sessions            # 列出会话
+tg messages "名称"     # 读取消息
+tg search "关键词"     # 全文搜索
+tg export "名称" -f txt # 导出
 ```
 
 ## 架构
@@ -30,9 +30,9 @@ tgreader export "名称" -f txt # 导出
 
 ## 关键数据流
 
-1. **密钥提取**: `sudo tgreader keys` → C 扫描器遍历Telegram内存 → 查找 `x'<96hex>'` 模式 → 输出 `all_keys.json`
-2. **数据库解密**: `tgreader decrypt` → 读取 `all_keys.json` → 默认静默增量刷新 → 逐页 AES-256-CBC 解密变化内容 → 验证 SQLite → 输出到 `decrypted/`
-3. **消息查询**: `tgreader messages` → 先静默刷新 `decrypted/` 缓存 → 打开解密后的 `message/message_0.db` → 通过 MD5(username) 定位 `Msg_<hash>` 表 → 解析 tgid 前缀为联系人昵称 → 展示
+1. **密钥提取**: `sudo tg keys` → C 扫描器遍历Telegram内存 → 查找 `x'<96hex>'` 模式 → 输出 `all_keys.json`
+2. **数据库解密**: `tg decrypt` → 读取 `all_keys.json` → 默认静默增量刷新 → 逐页 AES-256-CBC 解密变化内容 → 验证 SQLite → 输出到 `decrypted/`
+3. **消息查询**: `tg messages` → 先静默刷新 `decrypted/` 缓存 → 打开解密后的 `message/message_0.db` → 通过 MD5(username) 定位 `Msg_<hash>` 表 → 解析 tgid 前缀为联系人昵称 → 展示
 
 ## 数据库结构
 

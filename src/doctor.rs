@@ -12,7 +12,7 @@ pub(crate) fn run(options: DoctorOptions<'_>) -> Result<(), String> {
     let stdout = std::io::stdout();
     let mut out = Output::new(stdout.lock());
 
-    out.line(format_args!("tgreader doctor"))?;
+    out.line(format_args!("tg doctor"))?;
     out.blank_line()?;
 
     write_process_status(&mut out)?;
