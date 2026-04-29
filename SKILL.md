@@ -38,9 +38,9 @@ Then have the user open and log in to macOS Telegram:
 
 ```bash
 sudo tgreader keys
-tgreader decrypt --verbose
+tgreader refresh
 tgreader sessions --top 50
-tgreader messages "联系人或群名" --limit 50
+tgreader "联系人或群名" --limit 50
 ```
 
 After the first successful decrypt, `sessions`, `messages`, `search`, and `export` will try a quiet incremental refresh before reading `decrypted/`. If live access fails, they can still read the existing decrypted cache.
@@ -69,6 +69,8 @@ tgreader sessions --top 50
 Read a chat:
 
 ```bash
+tgreader "张三"
+tgreader "张三" --limit 100
 tgreader messages "张三"
 tgreader messages "张三" --limit 100
 tgreader messages "张三" --since today
@@ -81,6 +83,16 @@ Search globally:
 
 ```bash
 tgreader search "关键词" --limit 50
+tgreader search "关键词" --since today
+```
+
+Diagnose or refresh:
+
+```bash
+tgreader doctor
+tgreader doctor "张三"
+tgreader refresh
+tgreader refresh --keys
 ```
 
 Export:
@@ -116,6 +128,7 @@ Time filters support dates, datetimes, and relative values:
 - `Telegram is not running`: open and log in to macOS Telegram, then run `sudo tgreader keys`.
 - `Scanner binary not found`: from source, run `make build` or `make install-local`.
 - `task_for_pid failed`: confirm `sudo tgreader keys`, quit Telegram, run `sudo codesign --force --deep --sign - /Applications/Telegram.app`, reopen Telegram, retry.
+- Unknown read failure: run `tgreader doctor` or `tgreader doctor "联系人或群名"`.
 - `No sessions found`: check `all_keys.json` exists, run `tgreader decrypt --verbose`, then `tgreader sessions --top 50`.
 - Cannot auto-detect DB path: pass `tgreader decrypt --db-dir "/path/to/db_storage"`.
 - Wrong chat matched: use `tgreader sessions --top 100` and rerun with the exact `tgid_...` or `...@chatroom`.
@@ -125,6 +138,8 @@ Time filters support dates, datetimes, and relative values:
 ## Codebase Map
 
 - `src/main.rs`: CLI commands and top-level flow.
+- `src/cache.rs`: quiet decrypt refresh and key-refresh retry policy.
+- `src/doctor.rs`: read-only setup and chat diagnostics.
 - `src/scanner.rs`: wrapper around `scanner_macos`.
 - `vendor/find_all_keys_macos.c`: macOS Telegram process memory scanner.
 - `src/decrypt.rs`: SQLCipher/WCDB database decrypt.

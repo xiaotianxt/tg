@@ -21,6 +21,10 @@ fn find_telegram_pid() -> Result<i32, String> {
     Ok(pid)
 }
 
+pub(crate) fn telegram_pid() -> Result<i32, String> {
+    find_telegram_pid()
+}
+
 fn is_root() -> bool {
     Command::new("id")
         .arg("-u")

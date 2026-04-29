@@ -93,6 +93,21 @@ pub(crate) struct ReadMessagesOptions<'a> {
     pub jobs: usize,
 }
 
+pub(crate) struct SessionProbe {
+    pub username: String,
+    pub display_name: String,
+    pub table_name: String,
+    pub matching_dbs: usize,
+    pub message_count: usize,
+}
+
+pub(crate) struct SearchMessagesOptions<'a> {
+    pub query: &'a str,
+    pub limit: usize,
+    pub since: Option<i64>,
+    pub jobs: usize,
+}
+
 pub(crate) fn load_contacts(contact_db: &Path) -> Result<HashMap<String, Contact>, String> {
     let conn =
         Connection::open(contact_db).map_err(|e| format!("Cannot open contact DB: {}", e))?;
@@ -585,12 +600,56 @@ pub fn read_messages(
     Ok(total_count)
 }
 
+pub(crate) fn probe_session(
+    decrypted_dir: &Path,
+    session_query: &str,
+    jobs: usize,
+) -> Result<SessionProbe, String> {
+    let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
+    let username =
+        resolve_username_for_messages(session_query, contact_db.as_deref(), &message_dbs, jobs)?;
+    let table_name = msg_table_name(&username);
+    let contacts = contact_db
+        .as_ref()
+        .and_then(|p| load_contacts(p).ok())
+        .unwrap_or_default();
+    let display_name = contacts
+        .get(&username)
+        .map(|contact| contact.display.clone())
+        .unwrap_or_else(|| username.clone());
+
+    let db_jobs = parallel::job_count(jobs, 8);
+    let per_db_counts = parallel::map_ordered(message_dbs, db_jobs, |db_path| {
+        let conn = match Connection::open(&db_path) {
+            Ok(conn) => conn,
+            Err(_) => return None,
+        };
+        let sql = format!("SELECT COUNT(*) FROM {} WHERE create_time > 0", table_name);
+        conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+            .ok()
+            .map(|count| count.max(0) as usize)
+    });
+
+    let mut matching_dbs = 0usize;
+    let mut message_count = 0usize;
+    for count in per_db_counts.into_iter().flatten() {
+        matching_dbs += 1;
+        message_count += count;
+    }
+
+    Ok(SessionProbe {
+        username,
+        display_name,
+        table_name,
+        matching_dbs,
+        message_count,
+    })
+}
+
 /// Search across all sessions.
 pub fn search_messages(
     decrypted_dir: &Path,
-    query: &str,
-    limit: usize,
-    jobs: usize,
+    options: SearchMessagesOptions<'_>,
 ) -> Result<usize, String> {
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
     let contacts = contact_db
@@ -598,8 +657,12 @@ pub fn search_messages(
         .and_then(|p| load_contacts(p).ok())
         .unwrap_or_default();
 
-    let escaped = query.replace('\'', "''");
-    let db_jobs = parallel::job_count(jobs, 8);
+    let escaped = options.query.replace('\'', "''");
+    let since_clause = options
+        .since
+        .map(|ts| format!(" AND create_time >= {}", ts))
+        .unwrap_or_default();
+    let db_jobs = parallel::job_count(options.jobs, 8);
     let per_db_results = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
         let mut results: Vec<SearchRow> = Vec::new();
         let conn = match Connection::open(&db_path) {
@@ -621,9 +684,9 @@ pub fn search_messages(
         for table_name in &tables {
             let sql = format!(
                 "SELECT local_type, create_time, message_content \
-                 FROM {} WHERE message_content LIKE '%{}' \
+                 FROM {} WHERE message_content LIKE '%{}'{} \
                  ORDER BY create_time ASC LIMIT 50",
-                table_name, escaped
+                table_name, escaped, since_clause
             );
             let rows: Vec<SearchRow> = match conn.prepare(&sql) {
                 Ok(mut q) => match q.query_map([], |row| {
@@ -669,11 +732,12 @@ pub fn search_messages(
 
     out.line(format_args!(
         "Search results for '{}': {} matches",
-        query, total
+        options.query, total
     ))?;
     out.blank_line()?;
 
-    for (i, (_, create_time, content, table_name)) in results.iter().enumerate().take(limit) {
+    for (i, (_, create_time, content, table_name)) in results.iter().enumerate().take(options.limit)
+    {
         let time_str = chrono::DateTime::from_timestamp(*create_time, 0)
             .map(|t| {
                 t.with_timezone(&cst_offset)
@@ -700,8 +764,11 @@ pub fn search_messages(
         ))?;
     }
 
-    if total > limit {
-        out.line(format_args!("... and {} more results", total - limit))?;
+    if total > options.limit {
+        out.line(format_args!(
+            "... and {} more results",
+            total - options.limit
+        ))?;
     }
 
     out.flush()?;

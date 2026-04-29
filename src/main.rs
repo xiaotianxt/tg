@@ -1,6 +1,7 @@
 mod cache;
 mod db;
 mod decrypt;
+mod doctor;
 mod export;
 mod logger;
 mod media;
@@ -15,6 +16,7 @@ mod scanner;
 mod time;
 
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 fn print_output(args: std::fmt::Arguments<'_>) {
@@ -22,6 +24,48 @@ fn print_output(args: std::fmt::Arguments<'_>) {
         log::error!("Error: {}", e);
         std::process::exit(1);
     }
+}
+
+fn normalize_args_for_default_messages<I>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args: Vec<OsString> = args.into_iter().collect();
+    if should_default_to_messages(&args) {
+        args.insert(1, OsString::from("messages"));
+    }
+    args
+}
+
+fn should_default_to_messages(args: &[OsString]) -> bool {
+    let Some(first_arg) = args.get(1).and_then(|arg| arg.to_str()) else {
+        return false;
+    };
+
+    !first_arg.starts_with('-') && !is_known_subcommand(first_arg)
+}
+
+fn is_known_subcommand(value: &str) -> bool {
+    matches!(
+        value,
+        "keys"
+            | "decrypt"
+            | "sessions"
+            | "messages"
+            | "search"
+            | "export"
+            | "image"
+            | "doctor"
+            | "refresh"
+            | "help"
+    )
+}
+
+fn print_refresh_stats(label: &str, stats: &decrypt::DecryptStats) {
+    print_output(format_args!(
+        "{}: {} succeeded, {} failed, {} skipped, {} total",
+        label, stats.success, stats.failed, stats.skipped, stats.total
+    ));
 }
 
 #[derive(Parser)]
@@ -85,6 +129,29 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         jobs: usize,
     },
+    /// Diagnose tgreader setup and optionally a specific chat
+    Doctor {
+        /// Optional session username (tgid_xxx) or display name to inspect
+        session: Option<String>,
+        /// Path to decrypted databases
+        #[arg(long, default_value = "decrypted")]
+        decrypted_dir: PathBuf,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+    },
+    /// Refresh decrypted cache, refreshing keys if needed
+    Refresh {
+        /// Path to decrypted databases
+        #[arg(long, default_value = "decrypted")]
+        decrypted_dir: PathBuf,
+        /// Extract keys before decrypting
+        #[arg(long)]
+        keys: bool,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+    },
     /// Read messages from a specific session
     Messages {
         /// Session username (tgid_xxx) or display name to search
@@ -124,6 +191,9 @@ enum Commands {
         /// Number of results
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Show matches after this time (ISO 8601 or relative: 5min, 1h, today)
+        #[arg(long)]
+        since: Option<String>,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
@@ -181,7 +251,7 @@ enum Commands {
 
 fn main() {
     logger::init();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_args_for_default_messages(std::env::args_os()));
 
     match cli.command {
         Commands::Keys { scanner, timeout } => {
@@ -253,6 +323,48 @@ fn main() {
                         ));
                     }
                 }
+                Err(e) => {
+                    log::error!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Doctor {
+            session,
+            decrypted_dir,
+            jobs,
+        } => {
+            if let Err(e) = doctor::run(doctor::DoctorOptions {
+                session: session.as_deref(),
+                decrypted_dir: &decrypted_dir,
+                jobs,
+            }) {
+                log::error!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Refresh {
+            decrypted_dir,
+            keys,
+            jobs,
+        } => {
+            let refresh = if keys {
+                cache::refresh_keys_and_decrypted(&decrypted_dir, jobs)
+            } else {
+                let refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
+                if cache::needs_message_key_retry(&refresh) {
+                    log::warn!(
+                        "Decrypted cache refresh had issues ({}). Refreshing keys and retrying once.",
+                        cache::retry_reason(&refresh)
+                    );
+                    cache::refresh_keys_and_decrypted(&decrypted_dir, jobs)
+                } else {
+                    refresh
+                }
+            };
+
+            match refresh {
+                Ok(stats) => print_refresh_stats("Refresh complete", &stats),
                 Err(e) => {
                     log::error!("Error: {}", e);
                     std::process::exit(1);
@@ -340,10 +452,26 @@ fn main() {
             query,
             decrypted_dir,
             limit,
+            since,
             jobs,
         } => {
+            let since_ts = match time::parse_since_opt(since.as_deref()) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    log::error!("Error parsing --since: {}", e);
+                    std::process::exit(1);
+                }
+            };
             let _ = cache::refresh_decrypted(&decrypted_dir, jobs);
-            match db::search_messages(&decrypted_dir, &query, limit, jobs) {
+            match db::search_messages(
+                &decrypted_dir,
+                db::SearchMessagesOptions {
+                    query: &query,
+                    limit,
+                    since: since_ts,
+                    jobs,
+                },
+            ) {
                 Ok(count) => {
                     if count == 0 {
                         print_output(format_args!("No messages found for '{}'.", query));
@@ -417,5 +545,47 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn unknown_first_arg_defaults_to_messages() {
+        assert_eq!(
+            normalize_args_for_default_messages(args(&["tgreader", "张三", "--limit", "20"])),
+            args(&["tgreader", "messages", "张三", "--limit", "20"])
+        );
+    }
+
+    #[test]
+    fn known_subcommands_are_not_rewritten() {
+        for command in [
+            "keys", "decrypt", "sessions", "messages", "search", "export", "image", "doctor",
+            "refresh",
+        ] {
+            assert_eq!(
+                normalize_args_for_default_messages(args(&["tgreader", command])),
+                args(&["tgreader", command])
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_flags_and_help_subcommand_are_not_rewritten() {
+        assert_eq!(
+            normalize_args_for_default_messages(args(&["tgreader", "--help"])),
+            args(&["tgreader", "--help"])
+        );
+        assert_eq!(
+            normalize_args_for_default_messages(args(&["tgreader", "help", "messages"])),
+            args(&["tgreader", "help", "messages"])
+        );
     }
 }

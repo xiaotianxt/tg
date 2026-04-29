@@ -159,18 +159,18 @@ xcode-select --install
 5. 读取一个会话：
 
    ```bash
-   tgreader messages "联系人或群名" --limit 50
+   tgreader "联系人或群名" --limit 50
    ```
 
 后续使用时通常只需要：
 
 ```bash
-tgreader messages "联系人或群名" --limit 50
+tgreader "联系人或群名" --limit 50
 tgreader search "关键词"
 tgreader export "联系人或群名" --format json
 ```
 
-`sessions`、`messages`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 如果没有读到结果，并且刚才的 contact/message 数据库刷新失败，会自动重新提取 keys、刷新解密缓存，然后重试一次。
+`sessions`、`messages`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 如果没有读到结果，并且刚才的 contact/message 数据库刷新失败，会自动重新提取 keys、刷新解密缓存，然后重试一次。读不到时先跑 `tgreader doctor` 或 `tgreader doctor "联系人或群名"` 看具体状态。
 
 ## 常用命令
 
@@ -183,6 +183,8 @@ sudo tgreader keys
 解密数据库：
 
 ```bash
+tgreader refresh
+tgreader refresh --keys
 tgreader decrypt
 tgreader decrypt --full
 tgreader decrypt --since 1h --verbose
@@ -201,6 +203,8 @@ tgreader sessions --top 50
 读取消息：
 
 ```bash
+tgreader "张三"
+tgreader "张三" --limit 100
 tgreader messages "张三"
 tgreader messages "张三" --limit 100
 tgreader messages "张三" --since today
@@ -216,6 +220,14 @@ tgreader messages "张三" --offset 100 --limit 50
 ```bash
 tgreader search "关键词"
 tgreader search "关键词" --limit 50
+tgreader search "关键词" --since today
+```
+
+诊断：
+
+```bash
+tgreader doctor
+tgreader doctor "张三"
 ```
 
 导出聊天：
