@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "tgreader"
-version = "0.2.8"
+version = "1.0.0"
 dependencies = [
  "aes",
  "cbc",
