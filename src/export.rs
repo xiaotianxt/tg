@@ -699,7 +699,7 @@ fn export_txt(
     let mut f = std::fs::File::create(path)
         .map_err(|e| format!("Cannot create {}: {}", path.display(), e))?;
 
-    writeln!(f, "Telegram聊天记录: {} ({})", display_name, username).ok();
+    writeln!(f, "Telegram 聊天记录: {} ({})", display_name, username).ok();
     writeln!(f, "总消息数: {}", messages.len()).ok();
     writeln!(
         f,

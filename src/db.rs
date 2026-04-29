@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::dictionary;
 use crate::message;
 use crate::parallel;
 
@@ -82,6 +83,9 @@ struct SessionInfo {
 type MessageRow = (i64, i64, String, Option<i64>, String, Vec<u8>);
 type SearchRow = (i64, i64, String, String);
 const SESSION_TIME_BOUNDARY_ROWS: usize = 128;
+const SEARCH_PREVIEW_CHARS: usize = 100;
+const TELEGRAM_FTS_CONTENT_TABLE_PREFIX: &str = "message_fts_v4_";
+const TELEGRAM_FTS_CONTENT_TABLE_SUFFIX: &str = "_content";
 
 pub(crate) struct ReadMessagesOptions<'a> {
     pub session_query: &'a str,
@@ -105,6 +109,7 @@ pub(crate) struct SearchMessagesOptions<'a> {
     pub query: &'a str,
     pub limit: usize,
     pub since: Option<i64>,
+    pub use_telegram_fts: bool,
     pub jobs: usize,
 }
 
@@ -394,7 +399,7 @@ pub fn read_messages(
 
     let search_clause = options
         .search_query
-        .map(|q| format!(" AND message_content LIKE '%{}'", q.replace('\'', "''")))
+        .map(|q| format!(" AND {}", message_content_like_clause(q)))
         .unwrap_or_default();
 
     let since_clause = options
@@ -430,7 +435,7 @@ pub fn read_messages(
             }
         }
 
-        // Load Name2Id mapping (sender_id → tgid)
+        // Load Name2Id mapping (sender_id to account id)
         let name2id: HashMap<i64, String> =
             match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
                 Ok(mut stmt) => stmt
@@ -474,14 +479,14 @@ pub fn read_messages(
                     }
                 };
                 let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
-                let sender_tgid = name2id.get(&sender_id).cloned().unwrap_or_default();
+                let sender_account_id = name2id.get(&sender_id).cloned().unwrap_or_default();
                 let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
                 Ok((
                     row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
                     row.get::<_, Option<i64>>(1)?.unwrap_or(0),
                     content,
                     wcdb_ct,
-                    sender_tgid,
+                    sender_account_id,
                     packed_info,
                 ))
             }) {
@@ -563,7 +568,7 @@ pub fn read_messages(
     }
     out.blank_line()?;
 
-    for (local_type, create_time, content, wcdb_ct, sender_tgid, packed_info) in &messages {
+    for (local_type, create_time, content, wcdb_ct, sender_account_id, packed_info) in &messages {
         let time_str = chrono::DateTime::from_timestamp(*create_time, 0)
             .map(|t| {
                 t.with_timezone(&cst_offset)
@@ -573,7 +578,7 @@ pub fn read_messages(
             .unwrap_or_default();
 
         // 1-on-1 chat: if the sender is not the chat partner, it's "me"
-        let sender_display = if sender_tgid.is_empty() || sender_tgid == &username {
+        let sender_display = if sender_account_id.is_empty() || sender_account_id == &username {
             display_name
         } else {
             "我"
@@ -657,17 +662,33 @@ pub fn search_messages(
         .and_then(|p| load_contacts(p).ok())
         .unwrap_or_default();
 
-    let escaped = options.query.replace('\'', "''");
+    let (total, results) = if options.use_telegram_fts {
+        search_messages_with_telegram_fts(decrypted_dir, &options)
+            .unwrap_or_else(|| search_messages_by_scanning(message_dbs, &options))
+    } else {
+        search_messages_by_scanning(message_dbs, &options)
+    };
+
+    print_search_results(options.query, total, results, &contacts)
+}
+
+fn search_messages_by_scanning(
+    message_dbs: Vec<PathBuf>,
+    options: &SearchMessagesOptions<'_>,
+) -> (usize, Vec<SearchRow>) {
+    let search_clause = message_content_like_clause(options.query);
     let since_clause = options
         .since
         .map(|ts| format!(" AND create_time >= {}", ts))
         .unwrap_or_default();
+    let result_limit = options.limit;
     let db_jobs = parallel::job_count(options.jobs, 8);
     let per_db_results = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
+        let mut total_count = 0usize;
         let mut results: Vec<SearchRow> = Vec::new();
         let conn = match Connection::open(&db_path) {
             Ok(c) => c,
-            Err(_) => return results,
+            Err(_) => return (total_count, results),
         };
 
         // Find Msg_ tables - collect eagerly
@@ -682,11 +703,21 @@ pub fn search_messages(
         };
 
         for table_name in &tables {
+            let count_sql = format!(
+                "SELECT COUNT(*) FROM {} WHERE {}{}",
+                table_name, search_clause, since_clause
+            );
+            if let Ok(mut stmt) = conn.prepare(&count_sql) {
+                if let Ok(count) = stmt.query_row([], |row| row.get::<_, i64>(0)) {
+                    total_count += count.max(0) as usize;
+                }
+            }
+
             let sql = format!(
                 "SELECT local_type, create_time, message_content \
-                 FROM {} WHERE message_content LIKE '%{}'{} \
-                 ORDER BY create_time ASC LIMIT 50",
-                table_name, escaped, since_clause
+                 FROM {} WHERE {}{} \
+                 ORDER BY create_time DESC LIMIT {}",
+                table_name, search_clause, since_clause, result_limit
             );
             let rows: Vec<SearchRow> = match conn.prepare(&sql) {
                 Ok(mut q) => match q.query_map([], |row| {
@@ -711,16 +742,97 @@ pub fn search_messages(
             };
             results.extend(rows);
         }
-        results
+        (total_count, results)
     });
 
     let mut results = Vec::new();
-    for rows in per_db_results {
+    let mut total = 0usize;
+    for (count, rows) in per_db_results {
+        total += count;
         results.extend(rows);
     }
 
+    results.sort_by(|a, b| b.1.cmp(&a.1));
+    results.truncate(options.limit);
     results.sort_by(|a, b| a.1.cmp(&b.1));
-    let total = results.len();
+
+    (total, results)
+}
+
+fn search_messages_with_telegram_fts(
+    decrypted_dir: &Path,
+    options: &SearchMessagesOptions<'_>,
+) -> Option<(usize, Vec<SearchRow>)> {
+    let fts_db = find_message_fts_db(decrypted_dir)?;
+    let conn = Connection::open(fts_db).ok()?;
+    let content_tables = telegram_fts_content_tables(&conn)?;
+    if content_tables.is_empty() {
+        return None;
+    }
+
+    let name2id = load_fts_name2id(&conn);
+    let search_clause = fts_content_like_clause(options.query);
+    let since_clause = options
+        .since
+        .map(|ts| format!(" AND c6 >= {}", ts))
+        .unwrap_or_default();
+
+    let mut total = 0usize;
+    let mut results: Vec<SearchRow> = Vec::new();
+
+    for table_name in content_tables {
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE {}{}",
+            table_name, search_clause, since_clause
+        );
+        if let Ok(mut stmt) = conn.prepare(&count_sql) {
+            if let Ok(count) = stmt.query_row([], |row| row.get::<_, i64>(0)) {
+                total += count.max(0) as usize;
+            }
+        }
+
+        let sql = format!(
+            "SELECT c1, c6, c0, c4 \
+             FROM {} WHERE {}{} \
+             ORDER BY c6 DESC LIMIT {}",
+            table_name, search_clause, since_clause, options.limit
+        );
+        let rows: Vec<SearchRow> = match conn.prepare(&sql) {
+            Ok(mut stmt) => stmt
+                .query_map([], |row| {
+                    let session_id = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+                    let session = name2id
+                        .get(&session_id)
+                        .cloned()
+                        .unwrap_or_else(|| session_id.to_string());
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
+                        row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                        row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        session,
+                    ))
+                })
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        results.extend(rows);
+    }
+
+    results.sort_by(|a, b| b.1.cmp(&a.1));
+    results.truncate(options.limit);
+    results.sort_by(|a, b| a.1.cmp(&b.1));
+
+    Some((total, results))
+}
+
+fn print_search_results(
+    query: &str,
+    total: usize,
+    results: Vec<SearchRow>,
+    contacts: &HashMap<String, Contact>,
+) -> Result<usize, String> {
     let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
 
     if total == 0 {
@@ -732,12 +844,13 @@ pub fn search_messages(
 
     out.line(format_args!(
         "Search results for '{}': {} matches",
-        options.query, total
+        query, total
     ))?;
     out.blank_line()?;
 
-    for (i, (_, create_time, content, table_name)) in results.iter().enumerate().take(options.limit)
-    {
+    let display_results = &results;
+
+    for (i, (_, create_time, content, table_name)) in display_results.iter().enumerate() {
         let time_str = chrono::DateTime::from_timestamp(*create_time, 0)
             .map(|t| {
                 t.with_timezone(&cst_offset)
@@ -746,14 +859,9 @@ pub fn search_messages(
             })
             .unwrap_or_default();
 
-        let display =
-            find_username_by_table(&contacts, table_name).unwrap_or_else(|| "(?)".to_string());
+        let display = search_session_display(contacts, table_name);
 
-        let display_content = if content.len() > 100 {
-            format!("{}...", &content[..100])
-        } else {
-            content.clone()
-        };
+        let display_content = truncate_preview(content, SEARCH_PREVIEW_CHARS);
 
         out.line(format_args!(
             "[{}] {} | {}: {}",
@@ -764,15 +872,93 @@ pub fn search_messages(
         ))?;
     }
 
-    if total > options.limit {
+    if total > display_results.len() {
         out.line(format_args!(
-            "... and {} more results",
-            total - options.limit
+            "... and {} older results",
+            total - display_results.len()
         ))?;
     }
 
     out.flush()?;
     Ok(total)
+}
+
+fn find_message_fts_db(decrypted_dir: &Path) -> Option<PathBuf> {
+    let path = decrypted_dir.join("message/message_fts.db");
+    if path.exists() {
+        return Some(path);
+    }
+
+    decrypted_dir
+        .parent()
+        .map(|p| p.join("decrypted/message/message_fts.db"))
+        .filter(|p| p.exists())
+}
+
+fn telegram_fts_content_tables(conn: &Connection) -> Option<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master \
+             WHERE type='table' AND name LIKE 'message_fts_v4_%_content' \
+             ORDER BY name",
+        )
+        .ok()?;
+    let tables: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .ok()?
+        .filter_map(|row| row.ok())
+        .filter(|name| {
+            name.starts_with(TELEGRAM_FTS_CONTENT_TABLE_PREFIX)
+                && name.ends_with(TELEGRAM_FTS_CONTENT_TABLE_SUFFIX)
+                && name[TELEGRAM_FTS_CONTENT_TABLE_PREFIX.len()
+                    ..name.len() - TELEGRAM_FTS_CONTENT_TABLE_SUFFIX.len()]
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+        })
+        .collect();
+    Some(tables)
+}
+
+fn load_fts_name2id(conn: &Connection) -> HashMap<i64, String> {
+    match conn.prepare("SELECT rowid, username FROM name2id") {
+        Ok(mut stmt) => stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+fn search_session_display(contacts: &HashMap<String, Contact>, session: &str) -> String {
+    if session.starts_with("Msg_") {
+        return find_username_by_table(contacts, session).unwrap_or_else(|| "(?)".to_string());
+    }
+
+    contacts
+        .get(session)
+        .map(|c| c.display.clone())
+        .unwrap_or_else(|| session.to_string())
+}
+
+fn message_content_like_clause(query: &str) -> String {
+    format!("message_content LIKE '%{}%'", query.replace('\'', "''"))
+}
+
+fn fts_content_like_clause(query: &str) -> String {
+    format!("c0 LIKE '%{}%'", query.replace('\'', "''"))
+}
+
+fn truncate_preview(content: &str, max_chars: usize) -> String {
+    let mut chars = content.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", preview)
+    } else {
+        content.to_string()
+    }
 }
 
 pub(crate) fn resolve_username_for_messages(
@@ -800,8 +986,11 @@ fn resolve_username_with_context(
         return Ok(query.to_string());
     }
 
-    // If it looks like a tgid, use it directly
-    if query.starts_with("tgid_") || query.starts_with("gh_") || query.contains("@chatroom") {
+    // If it looks like a native account id, use it directly.
+    if query.starts_with(&dictionary::account_id_prefix())
+        || query.starts_with("gh_")
+        || query.contains("@chatroom")
+    {
         return Ok(query.to_string());
     }
 
@@ -1228,6 +1417,93 @@ mod tests {
         (dir, path)
     }
 
+    fn create_decrypted_dir_with_messages(username: &str, contents: &[&str]) -> TempDir {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let path = message_dir.join("message_0.db");
+        let conn = Connection::open(&path).unwrap();
+        let table_name = msg_table_name(username);
+        conn.execute(
+            &format!(
+                "CREATE TABLE {} (
+                    local_type INTEGER,
+                    create_time INTEGER,
+                    message_content TEXT,
+                    WCDB_CT_message_content INTEGER,
+                    real_sender_id INTEGER,
+                    packed_info_data BLOB
+                )",
+                table_name
+            ),
+            [],
+        )
+        .unwrap();
+
+        for (i, content) in contents.iter().enumerate() {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {} (
+                        local_type,
+                        create_time,
+                        message_content,
+                        WCDB_CT_message_content,
+                        real_sender_id,
+                        packed_info_data
+                    ) VALUES (1, ?1, ?2, NULL, 0, x'')",
+                    table_name
+                ),
+                params![1000 + i as i64, content],
+            )
+            .unwrap();
+        }
+
+        drop(conn);
+        dir
+    }
+
+    fn create_decrypted_dir_with_fts(contents: &[&str]) -> TempDir {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let path = message_dir.join("message_fts.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE name2id(username TEXT PRIMARY KEY)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO name2id (rowid, username) VALUES (7, 'tgid_fts_session')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE message_fts_v4_0_content (
+                id INTEGER PRIMARY KEY,
+                c0,
+                c1,
+                c2,
+                c3,
+                c4,
+                c5,
+                c6
+            )",
+            [],
+        )
+        .unwrap();
+
+        for (i, content) in contents.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO message_fts_v4_0_content
+                 (id, c0, c1, c2, c3, c4, c5, c6)
+                 VALUES (?1, ?2, 1, 0, ?1, 7, 0, ?3)",
+                params![i as i64 + 1, content, 1000 + i as i64],
+            )
+            .unwrap();
+        }
+
+        drop(conn);
+        dir
+    }
+
     #[test]
     fn filters_only_numbered_message_dbs() {
         assert!(is_message_db_name("message_0.db"));
@@ -1289,6 +1565,77 @@ mod tests {
         assert_eq!(stats.count, 2);
         assert_eq!(stats.earliest, Some(1000));
         assert_eq!(stats.latest, Some(2000));
+    }
+
+    #[test]
+    fn search_messages_matches_query_inside_content() {
+        let dir = create_decrypted_dir_with_messages(
+            "tgid_search",
+            &["before needle after", "before needle", "no match"],
+        );
+
+        let count = search_messages(
+            dir.path(),
+            SearchMessagesOptions {
+                query: "needle",
+                limit: 20,
+                since: None,
+                use_telegram_fts: true,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn read_messages_search_matches_query_inside_content() {
+        let dir = create_decrypted_dir_with_messages(
+            "tgid_search",
+            &["before needle after", "before needle", "no match"],
+        );
+
+        let count = read_messages(
+            dir.path(),
+            ReadMessagesOptions {
+                session_query: "tgid_search",
+                limit: None,
+                offset: 0,
+                search_query: Some("needle"),
+                since: None,
+                tail: false,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn search_messages_uses_telegram_fts_content_cache() {
+        let dir =
+            create_decrypted_dir_with_fts(&["before needle after", "before needle", "no match"]);
+
+        let count = search_messages(
+            dir.path(),
+            SearchMessagesOptions {
+                query: "needle",
+                limit: 20,
+                since: None,
+                use_telegram_fts: true,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn truncate_preview_handles_multibyte_content() {
+        assert_eq!(truncate_preview("提取一下", 2), "提取...");
     }
 
     #[test]

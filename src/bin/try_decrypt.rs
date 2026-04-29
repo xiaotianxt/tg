@@ -9,6 +9,8 @@ use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes128;
 use std::fs;
 
+#[path = "../dictionary.rs"]
+mod dictionary;
 #[path = "../logger.rs"]
 mod logger;
 
@@ -54,11 +56,8 @@ fn main() {
 
     // Try to derive keys from kvcomm
     let home = std::env::var("HOME").unwrap_or_default();
-    let kvcomm = format!(
-        "{}/Library/Containers/com.telegram.xinTelegram/Data/Documents/app_data/net/kvcomm",
-        home
-    );
-    let kvcomm_path = std::path::Path::new(&kvcomm);
+    let kvcomm = dictionary::kvcomm_dir(&std::path::PathBuf::from(home));
+    let kvcomm_path = kvcomm.as_path();
 
     if kvcomm_path.is_dir() {
         if let Ok(entries) = fs::read_dir(kvcomm_path) {
@@ -66,15 +65,15 @@ fn main() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if let Some(code) = extract_code(&name) {
                     // Derive key and test
-                    let tgid = match find_tgid() {
+                    let account_id = match find_account_id() {
                         Some(id) => id,
                         None => continue,
                     };
-                    let aes_key_str = derive_key(code, &tgid);
+                    let aes_key_str = derive_key(code, &account_id);
                     let aes_key = aes_key_str.as_bytes();
                     let xor_key = (code & 0xff) as u8;
 
-                    log::info!("Trying: code={}, tgid={}", code, tgid);
+                    log::info!("Trying: code={}, account_id={}", code, account_id);
                     log::info!("  AES key (ASCII): {}", aes_key_str);
                     log::info!("  XOR key: {:#04x}", xor_key);
 
@@ -143,7 +142,7 @@ fn main() {
             }
         }
     } else {
-        log::error!("kvcomm dir not found at {}", kvcomm);
+        log::error!("kvcomm dir not found at {}", kvcomm.display());
     }
 }
 
@@ -156,25 +155,25 @@ fn extract_code(filename: &str) -> Option<u64> {
     rest[..end].parse::<u64>().ok()
 }
 
-fn derive_key(code: u64, tgid: &str) -> String {
+fn derive_key(code: u64, account_id: &str) -> String {
     use md5::{Digest, Md5};
     let mut hasher = Md5::new();
     hasher.update(code.to_string().as_bytes());
-    hasher.update(tgid.as_bytes());
+    hasher.update(account_id.as_bytes());
     format!("{:x}", &hasher.finalize())[..16].to_string()
 }
 
-fn find_tgid() -> Option<String> {
+fn find_account_id() -> Option<String> {
     let home = std::env::var("HOME").ok()?;
-    let base = std::path::Path::new(&home)
-        .join("Library/Containers/com.telegram.xinTelegram/Data/Documents/xtelegram_files");
+    let base = dictionary::documents_account_files_dir(&std::path::PathBuf::from(home));
     let entries = fs::read_dir(base).ok()?;
+    let account_prefix = dictionary::account_id_prefix();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("tgid_") || name.starts_with("gh_") {
+        if name.starts_with(&account_prefix) || name.starts_with("gh_") {
             if let Some(pos) = name.rfind('_') {
                 let clean = &name[..pos];
-                if clean.starts_with("tgid_") || clean.starts_with("gh_") {
+                if clean.starts_with(&account_prefix) || clean.starts_with("gh_") {
                     return Some(clean.to_string());
                 }
             }

@@ -20,7 +20,7 @@
 //!
 //! aesCipherLen = if aesLen is block-aligned { aesLen + 16 } else { aesLen rounded up to 16 }
 
-use crate::media_key::MediaKeys;
+use crate::{dictionary, media_key::MediaKeys};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -36,6 +36,7 @@ pub fn is_v2_dat(header: &[u8]) -> bool {
 
 /// Detect the output file extension from decrypted content magic bytes.
 pub fn detect_ext(data: &[u8]) -> &'static str {
+    let sticker_magic = dictionary::sticker_magic();
     if data.len() >= 4 && data[..4] == [0x89, 0x50, 0x4E, 0x47] {
         "png"
     } else if data.len() >= 2 && data[..2] == [0xFF, 0xD8] {
@@ -52,7 +53,8 @@ pub fn detect_ext(data: &[u8]) -> &'static str {
         "gif"
     } else if data.len() >= 2 && data[..2] == [0x42, 0x4D] {
         "bmp"
-    } else if data.len() >= 4 && &data[..4] == b"tggf" {
+    } else if data.len() >= sticker_magic.len() && data[..sticker_magic.len()] == sticker_magic[..]
+    {
         "tggf"
     } else {
         "bin"
@@ -267,7 +269,9 @@ mod tests {
         assert_eq!(detect_ext(b"RIFF\x00\x00\x00\x00WEBP"), "webp");
         assert_eq!(detect_ext(b"\x00\x00\x00\x18ftypmp42"), "mp4");
         assert_eq!(detect_ext(b"\x00\x00\x00\x18ftypavif"), "avif");
-        assert_eq!(detect_ext(b"tggf\x13\x00\x00\x00"), "tggf");
+        let mut data = dictionary::sticker_magic();
+        data.extend_from_slice(b"\x13\x00\x00\x00");
+        assert_eq!(detect_ext(&data), "tggf");
     }
 
     #[test]
@@ -281,7 +285,8 @@ mod tests {
     #[test]
     fn test_find_tggf_hevc_partition() {
         let hevc = b"\x00\x00\x00\x01\x40\x01\x0c\x01";
-        let mut data = b"tggf\x08abc".to_vec();
+        let mut data = dictionary::sticker_magic();
+        data.extend_from_slice(b"\x08abc");
         data.extend_from_slice(&(hevc.len() as u32).to_be_bytes());
         data.extend_from_slice(hevc);
         data.extend_from_slice(b"tail");

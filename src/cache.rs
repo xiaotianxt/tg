@@ -45,6 +45,22 @@ pub(crate) fn retry_reason(refresh: &Result<decrypt::DecryptStats, String>) -> S
     }
 }
 
+pub(crate) fn needs_search_refresh_warning(
+    refresh: &Result<decrypt::DecryptStats, String>,
+) -> bool {
+    match refresh {
+        Ok(stats) => failures_can_affect_search(stats),
+        Err(_) => true,
+    }
+}
+
+pub(crate) fn search_refresh_reason(refresh: &Result<decrypt::DecryptStats, String>) -> String {
+    match refresh {
+        Ok(_) => "contact/message/search index database failed to decrypt".to_string(),
+        Err(e) => e.clone(),
+    }
+}
+
 pub(crate) fn failures_can_affect_messages(stats: &decrypt::DecryptStats) -> bool {
     stats
         .failed_paths
@@ -52,11 +68,29 @@ pub(crate) fn failures_can_affect_messages(stats: &decrypt::DecryptStats) -> boo
         .any(|path| failure_can_affect_messages(path))
 }
 
+pub(crate) fn failures_can_affect_search(stats: &decrypt::DecryptStats) -> bool {
+    stats
+        .failed_paths
+        .iter()
+        .any(|path| failure_can_affect_messages(path) || failure_can_affect_telegram_fts(path))
+}
+
+pub(crate) fn failures_can_affect_telegram_fts(stats: &decrypt::DecryptStats) -> bool {
+    stats
+        .failed_paths
+        .iter()
+        .any(|path| failure_can_affect_telegram_fts(path))
+}
+
 fn failure_can_affect_messages(path: &str) -> bool {
     path == "contact/contact.db"
         || path
             .strip_prefix("message/")
             .is_some_and(db::is_message_db_name)
+}
+
+fn failure_can_affect_telegram_fts(path: &str) -> bool {
+    path == "message/message_fts.db"
 }
 
 #[cfg(test)]
@@ -91,5 +125,15 @@ mod tests {
         assert!(!failures_can_affect_messages(&stats_with_failed_paths(&[
             "message/message_fts.db"
         ])));
+    }
+
+    #[test]
+    fn search_considers_telegram_fts_relevant() {
+        assert!(failures_can_affect_search(&stats_with_failed_paths(&[
+            "message/message_fts.db"
+        ])));
+        assert!(failures_can_affect_telegram_fts(&stats_with_failed_paths(
+            &["message/message_fts.db"]
+        )));
     }
 }

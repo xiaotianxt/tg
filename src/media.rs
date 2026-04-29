@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::dictionary;
+
 /// Parsed info about an image message (type 3) from XML.
 #[derive(Debug, Clone, Default)]
 pub struct ImageInfo {
@@ -298,12 +300,11 @@ pub(crate) fn parse_mini_program_info(xml: &str) -> Option<MiniProgramInfo> {
 
 /// Find the Telegram account data directory (base for media cache lookups).
 ///
-/// Telegram 3.x: `xtelegram_files/<tgid>/` with `Message/MessageTemp` subdir
-/// Telegram 4.x: `xtelegram_files/<tgid>/` with `msg/` subdir (media at `msg/attach/...`, `msg/video/...`)
+/// Telegram 3.x: account files with `Message/MessageTemp` subdir
+/// Telegram 4.x: account files with `msg/` subdir
 pub fn find_telegram_base_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    let docs_base = PathBuf::from(&home)
-        .join("Library/Containers/com.telegram.xinTelegram/Data/Documents/xtelegram_files");
+    let docs_base = dictionary::documents_account_files_dir(&PathBuf::from(home));
     if !docs_base.is_dir() {
         return None;
     }

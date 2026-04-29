@@ -1,10 +1,11 @@
+use crate::dictionary;
 use crate::media;
 use crate::media_pb;
 use flate2::read::ZlibDecoder;
 use std::fmt;
 use std::io::Read;
 
-/// Telegram消息类型枚举。
+/// Telegram 消息类型枚举。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MessageType {
     Text,         // 1
@@ -75,7 +76,7 @@ pub struct DecodedMessage {
     pub msg_type: MessageType,
     /// 人类可读的内容。
     pub content: String,
-    /// 发送者显示名（群聊中会从 tgid 解析为昵称）。
+    /// 发送者显示名（群聊中会从账号 ID 解析为昵称）。
     pub display_name: String,
 }
 
@@ -87,7 +88,7 @@ pub struct DecodedMessage {
 /// - `session_display_name` — 会话的显示名（私聊即对方昵称，群聊即群名）
 /// - `wcdb_ct` — `WCDB_CT_message_content` 字段值
 /// - `packed_info_data` — `packed_info_data` 字段二进制数据（Telegram 4.x 媒体元信息）
-/// - `resolve_display_name` — 将 tgid 解析为显示名的函数
+/// - `resolve_display_name` — 将账号 ID 解析为显示名的函数
 pub fn decode_message(
     msg_type: i32,
     raw_content: &str,
@@ -487,8 +488,9 @@ fn try_zlib(data: &[u8]) -> Result<String, ()> {
     }
 }
 
-/// Parse sender tgid from message content.
+/// Parse sender account id from message content.
 pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
+    let account_prefix = dictionary::account_id_prefix();
     for (i, c) in content.char_indices() {
         if c != ':' {
             continue;
@@ -497,7 +499,7 @@ pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
             break;
         }
         let prefix = &content[..i];
-        let is_id = prefix.starts_with("tgid_")
+        let is_id = prefix.starts_with(&account_prefix)
             || prefix.starts_with("gh_")
             || prefix.contains('@')
             || prefix

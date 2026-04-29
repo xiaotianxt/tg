@@ -788,6 +788,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "tg"
+version = "1.1.1"
+dependencies = [
+ "aes",
+ "cbc",
+ "chrono",
+ "cipher",
+ "clap",
+ "flate2",
+ "hex",
+ "hmac",
+ "log",
+ "md-5",
+ "pbkdf2",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "zstd",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1080,29 +1103,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "tg"
-version = "1.1.1"
-dependencies = [
- "aes",
- "cbc",
- "chrono",
- "cipher",
- "clap",
- "flate2",
- "hex",
- "hmac",
- "log",
- "md-5",
- "pbkdf2",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "zstd",
 ]
 
 [[package]]

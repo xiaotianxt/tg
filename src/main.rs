@@ -1,6 +1,7 @@
 mod cache;
 mod db;
 mod decrypt;
+mod dictionary;
 mod doctor;
 mod export;
 mod logger;
@@ -462,13 +463,24 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let _ = cache::refresh_decrypted(&decrypted_dir, jobs);
+            let refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
+            if cache::needs_search_refresh_warning(&refresh) {
+                log::warn!(
+                    "Decrypted cache refresh had issues ({}). Search results may be stale.",
+                    cache::search_refresh_reason(&refresh)
+                );
+            }
+            let use_telegram_fts = match &refresh {
+                Ok(stats) => !cache::failures_can_affect_telegram_fts(stats),
+                Err(_) => true,
+            };
             match db::search_messages(
                 &decrypted_dir,
                 db::SearchMessagesOptions {
                     query: &query,
                     limit,
                     since: since_ts,
+                    use_telegram_fts,
                     jobs,
                 },
             ) {

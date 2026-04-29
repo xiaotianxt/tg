@@ -6,7 +6,7 @@ description = "macOS Telegram 聊天记录读取 CLI 工具"
 authors = ["xiaotianxt"]
 repository = "https://github.com/xiaotianxt/tg"
 license = "MIT"
-keywords = ["telegram", "telegram", "chat", "decrypt", "sqlcipher"]
+keywords = ["telegram", "chat", "decrypt", "sqlcipher", "backup"]
 categories = ["command-line-utilities", "database"]
 
 [[bin]]

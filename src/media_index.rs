@@ -45,16 +45,16 @@ struct ScannedMediaFile {
 impl MediaIndex {
     pub(crate) fn load(
         base_path: &Path,
-        session_tgid: &str,
+        session_id: &str,
         categories: &[&str],
         jobs: usize,
     ) -> Self {
-        Self::load_with_cache_dir(base_path, session_tgid, categories, jobs, None)
+        Self::load_with_cache_dir(base_path, session_id, categories, jobs, None)
     }
 
     fn load_with_cache_dir(
         base_path: &Path,
-        session_tgid: &str,
+        session_id: &str,
         categories: &[&str],
         jobs: usize,
         cache_dir: Option<&Path>,
@@ -74,7 +74,7 @@ impl MediaIndex {
             &mut conn,
             base_path,
             &base_path_string,
-            session_tgid,
+            session_id,
             categories,
             jobs,
         ) {
@@ -146,11 +146,11 @@ fn refresh_index(
     conn: &mut Connection,
     base_path: &Path,
     base_path_string: &str,
-    session_tgid: &str,
+    session_id: &str,
     categories: &[&str],
     jobs: usize,
 ) -> Result<(), String> {
-    let dirs = discover_media_dirs(base_path, session_tgid, categories);
+    let dirs = discover_media_dirs(base_path, session_id, categories);
     let run_id = current_run_id();
     let mut reusable_dirs = Vec::new();
     let mut scan_jobs = Vec::new();
@@ -382,12 +382,12 @@ fn cache_file_path(base_path: &Path, cache_dir: Option<&Path>) -> Option<PathBuf
 
 fn discover_media_dirs(
     base_path: &Path,
-    session_tgid: &str,
+    session_id: &str,
     categories: &[&str],
 ) -> Vec<MediaDirSpec> {
     let mut dirs = Vec::new();
 
-    let msg_temp = base_path.join("Message/MessageTemp").join(session_tgid);
+    let msg_temp = base_path.join("Message/MessageTemp").join(session_id);
     for category in categories {
         let legacy_dir = msg_temp.join(category);
         if legacy_dir.is_dir() {

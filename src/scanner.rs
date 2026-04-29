@@ -2,10 +2,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::dictionary;
+
 fn find_telegram_pid() -> Result<i32, String> {
+    let process = dictionary::desktop_app_process();
     let output = Command::new("pgrep")
         .arg("-x")
-        .arg("Telegram")
+        .arg(process)
         .output()
         .map_err(|e| format!("Failed to run pgrep: {}", e))?;
 
@@ -63,13 +66,12 @@ fn real_home_dir() -> Option<PathBuf> {
 
 fn find_db_storage_dir() -> Option<PathBuf> {
     let home = real_home_dir()?;
-    let xtelegram_base =
-        home.join("Library/Containers/com.telegram.xinTelegram/Data/Documents/xtelegram_files");
-    if !xtelegram_base.is_dir() {
+    let account_files = dictionary::documents_account_files_dir(&home);
+    if !account_files.is_dir() {
         return None;
     }
 
-    for entry in std::fs::read_dir(&xtelegram_base).ok()?.flatten() {
+    for entry in std::fs::read_dir(&account_files).ok()?.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;

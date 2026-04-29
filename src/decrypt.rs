@@ -9,7 +9,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::parallel;
+use crate::{dictionary, parallel};
 
 type Aes256CbcDec = Decryptor<Aes256>;
 
@@ -392,10 +392,9 @@ fn decrypt_database(
 /// Auto-detect Telegram db_storage directory.
 fn auto_detect_db_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
+    let home = PathBuf::from(home);
 
-    // Old path
-    let old_path = PathBuf::from(&home)
-        .join("Library/Containers/com.telegram.xinTelegram/Data/Documents/xtelegram_files");
+    let old_path = dictionary::documents_account_files_dir(&home);
     if old_path.exists() {
         // Find the first account directory with db_storage
         if let Ok(entries) = fs::read_dir(&old_path) {
@@ -408,9 +407,7 @@ fn auto_detect_db_dir() -> Option<PathBuf> {
         }
     }
 
-    // New path (Telegram 4.0.5+)
-    let new_base = PathBuf::from(&home)
-        .join("Library/Containers/com.telegram.xinTelegram/Data/Library/Application Support/com.telegram.xinTelegram");
+    let new_base = dictionary::app_support_dir(&home);
     if new_base.exists() {
         if let Ok(entries) = fs::read_dir(&new_base) {
             // Look for versioned subdirectories

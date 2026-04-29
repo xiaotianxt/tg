@@ -3,11 +3,13 @@
 //! Key derivation:
 //!   code   = extracted from `key_<code>_*.statistic` filename
 //!   xorKey = code & 0xff
-//!   aesKey = md5("{code}{cleanTgid}").hex_lower()[0..16] as ASCII bytes
+//!   aesKey = md5("{code}{cleanAccountId}").hex_lower()[0..16] as ASCII bytes
 
 use md5::{Digest, Md5};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::dictionary;
 
 const KVCOMM_REL: &str = "Documents/app_data/net/kvcomm";
 
@@ -20,24 +22,23 @@ pub struct MediaKeys {
 
 /// Derive media decryption keys for the current Telegram account.
 ///
-/// `telegram_base` should be the path returned by [`media::find_telegram_base_path()`],
-/// e.g. `.../xtelegram_files/tgid_XXXX_e4d5/`.
+/// `telegram_base` should be the path returned by [`media::find_telegram_base_path()`].
 pub fn find_media_keys(telegram_base: &Path) -> Result<MediaKeys, String> {
-    let clean_tgid = extract_clean_tgid(telegram_base)?;
+    let clean_account_id = extract_clean_account_id(telegram_base)?;
     let kvcomm_dir = find_kvcomm_dir()?;
     let code = find_code_in_kvcomm(&kvcomm_dir)?;
 
     let xor_key = (code & 0xff) as u8;
-    let aes_key = derive_aes_key(code, &clean_tgid);
+    let aes_key = derive_aes_key(code, &clean_account_id);
 
     Ok(MediaKeys { aes_key, xor_key })
 }
 
 /// Derive the 16-byte AES key as ASCII bytes.
-fn derive_aes_key(code: u64, tgid: &str) -> [u8; 16] {
+fn derive_aes_key(code: u64, account_id: &str) -> [u8; 16] {
     let mut hasher = Md5::new();
     hasher.update(code.to_string().as_bytes());
-    hasher.update(tgid.as_bytes());
+    hasher.update(account_id.as_bytes());
     let digest = hasher.finalize();
     let hex = format!("{:x}", digest);
     let hex16 = &hex[..16];
@@ -46,41 +47,37 @@ fn derive_aes_key(code: u64, tgid: &str) -> [u8; 16] {
     key
 }
 
-/// Extract the clean tgid from the telegram base path directory name.
-///
-/// Input:  `.../xtelegram_files/tgid_7286922865011_e4d5/`
-/// Output: `tgid_7286922865011`
-fn extract_clean_tgid(base: &Path) -> Result<String, String> {
+/// Extract the clean account id from the Telegram base path directory name.
+fn extract_clean_account_id(base: &Path) -> Result<String, String> {
     let dir_name = base
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| "Cannot extract directory name from telegram base path".to_string())?;
 
     // The directory name ends with `_<random>` suffix; strip it
-    if dir_name.starts_with("tgid_") || dir_name.starts_with("gh_") {
+    let account_prefix = dictionary::account_id_prefix();
+    if dir_name.starts_with(&account_prefix) || dir_name.starts_with("gh_") {
         if let Some(pos) = dir_name.rfind('_') {
             let clean = &dir_name[..pos];
-            if clean.starts_with("tgid_") || clean.starts_with("gh_") {
+            if clean.starts_with(&account_prefix) || clean.starts_with("gh_") {
                 return Ok(clean.to_string());
             }
         }
     }
     // If no suffix pattern, use as-is
-    if dir_name.starts_with("tgid_") || dir_name.starts_with("gh_") {
+    if dir_name.starts_with(&account_prefix) || dir_name.starts_with("gh_") {
         return Ok(dir_name.to_string());
     }
 
     Err(format!(
-        "Cannot determine clean tgid from path: {}",
+        "Cannot determine clean account id from path: {}",
         base.display()
     ))
 }
 
 fn find_kvcomm_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-    let candidate = PathBuf::from(&home)
-        .join("Library/Containers/com.telegram.xinTelegram/Data")
-        .join(KVCOMM_REL);
+    let candidate = dictionary::container_data_dir(&PathBuf::from(home)).join(KVCOMM_REL);
 
     if candidate.is_dir() {
         return Ok(candidate);
@@ -138,8 +135,8 @@ mod tests {
 
     #[test]
     fn test_derive_aes_key() {
-        // Known sample: code=1020215821, tgid=tgid_7286922865011
-        let key = derive_aes_key(1020215821, "tgid_7286922865011");
+        let account_id = format!("{}7286922865011", dictionary::account_id_prefix());
+        let key = derive_aes_key(1020215821, &account_id);
         let s = std::str::from_utf8(&key).unwrap();
         assert_eq!(s, "68ec773d54b0245b");
     }
