@@ -113,6 +113,8 @@ Time filters support dates, datetimes, and relative values:
 --since yesterday
 ```
 
+Date, datetime, and displayed message times use the current system time zone.
+
 ## Troubleshooting
 
 - `Telegram is not running`: open and log in to macOS Telegram, then run `sudo tg keys`.

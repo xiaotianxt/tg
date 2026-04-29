@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::dictionary;
 use crate::message;
 use crate::parallel;
+use crate::time;
 
 /// Resolve a sender ID to a display name from contacts.
 pub fn resolve_sender_name(sender_id: &str, contacts: &HashMap<String, Contact>) -> String {
@@ -337,12 +338,8 @@ pub fn list_sessions(
 
         let time_range = match (info.earliest, info.latest) {
             (Some(e), Some(l)) => {
-                let e_ts = chrono::DateTime::from_timestamp(e, 0)
-                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or_default();
-                let l_ts = chrono::DateTime::from_timestamp(l, 0)
-                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or_default();
+                let e_ts = time::format_local_timestamp_minutes(e);
+                let l_ts = time::format_local_timestamp_minutes(l);
                 format!("{} ~ {}", e_ts, l_ts)
             }
             _ => String::new(),
@@ -385,7 +382,6 @@ pub fn read_messages(
         options.jobs,
     )?;
     let table_name = msg_table_name(&username);
-    let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
 
     let contacts = contact_db
         .as_ref()
@@ -569,13 +565,7 @@ pub fn read_messages(
     out.blank_line()?;
 
     for (local_type, create_time, content, wcdb_ct, sender_account_id, packed_info) in &messages {
-        let time_str = chrono::DateTime::from_timestamp(*create_time, 0)
-            .map(|t| {
-                t.with_timezone(&cst_offset)
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string()
-            })
-            .unwrap_or_default();
+        let time_str = time::format_local_timestamp(*create_time);
 
         // 1-on-1 chat: if the sender is not the chat partner, it's "me"
         let sender_display = if sender_account_id.is_empty() || sender_account_id == &username {
@@ -833,8 +823,6 @@ fn print_search_results(
     results: Vec<SearchRow>,
     contacts: &HashMap<String, Contact>,
 ) -> Result<usize, String> {
-    let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-
     if total == 0 {
         return Ok(0);
     }
@@ -851,13 +839,7 @@ fn print_search_results(
     let display_results = &results;
 
     for (i, (_, create_time, content, table_name)) in display_results.iter().enumerate() {
-        let time_str = chrono::DateTime::from_timestamp(*create_time, 0)
-            .map(|t| {
-                t.with_timezone(&cst_offset)
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string()
-            })
-            .unwrap_or_default();
+        let time_str = time::format_local_timestamp(*create_time);
 
         let display = search_session_display(contacts, table_name);
 
@@ -1325,14 +1307,7 @@ fn latest_message_times_for_candidates(
 }
 
 fn format_match_time(timestamp: i64) -> String {
-    let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-    chrono::DateTime::from_timestamp(timestamp, 0)
-        .map(|t| {
-            t.with_timezone(&cst_offset)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        })
-        .unwrap_or_else(|| timestamp.to_string())
+    time::format_local_timestamp(timestamp)
 }
 
 fn find_username_by_table(contacts: &HashMap<String, Contact>, table_name: &str) -> Option<String> {

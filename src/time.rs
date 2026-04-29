@@ -1,4 +1,7 @@
-use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone};
+
+const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+const MINUTE_FORMAT: &str = "%Y-%m-%d %H:%M";
 
 /// Parse a time expression into a Unix timestamp.
 ///
@@ -13,29 +16,31 @@ pub fn parse_relative_time(s: &str) -> Result<i64, String> {
     // Try common date-time formats
     for fmt in &["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
         if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Ok(dt.and_utc().timestamp());
+            return local_timestamp(dt);
         }
     }
 
     // Date-only: assume start of day
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         if let Some(dt) = d.and_hms_opt(0, 0, 0) {
-            return Ok(dt.and_utc().timestamp());
+            return local_timestamp(dt);
         }
     }
 
     // Named expressions
-    let now = Utc::now();
+    let now = Local::now();
     match s {
         "today" => {
             let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-            return Ok(start.and_utc().timestamp());
+            return local_timestamp(start);
         }
         "yesterday" => {
-            let yesterday =
-                (now - Duration::try_days(1).unwrap_or(Duration::hours(24))).date_naive();
+            let yesterday = now
+                .date_naive()
+                .pred_opt()
+                .unwrap_or_else(|| now.date_naive());
             let start = yesterday.and_hms_opt(0, 0, 0).unwrap();
-            return Ok(start.and_utc().timestamp());
+            return local_timestamp(start);
         }
         _ => {}
     }
@@ -72,4 +77,63 @@ pub fn parse_relative_time(s: &str) -> Result<i64, String> {
 /// Parse an optional time expression string into a Unix timestamp.
 pub fn parse_since_opt(since: Option<&str>) -> Result<Option<i64>, String> {
     since.map(parse_relative_time).transpose()
+}
+
+pub fn format_local_timestamp(timestamp: i64) -> String {
+    format_local_timestamp_with(timestamp, DATETIME_FORMAT)
+}
+
+pub fn format_local_timestamp_minutes(timestamp: i64) -> String {
+    format_local_timestamp_with(timestamp, MINUTE_FORMAT)
+}
+
+fn format_local_timestamp_with(timestamp: i64, format: &str) -> String {
+    DateTime::from_timestamp(timestamp, 0)
+        .map(|t| t.with_timezone(&Local).format(format).to_string())
+        .unwrap_or_else(|| timestamp.to_string())
+}
+
+fn local_timestamp(dt: NaiveDateTime) -> Result<i64, String> {
+    match Local.from_local_datetime(&dt) {
+        LocalResult::Single(dt) => Ok(dt.timestamp()),
+        LocalResult::Ambiguous(earliest, _) => Ok(earliest.timestamp()),
+        LocalResult::None => Err(format!(
+            "Local time '{}' does not exist in the system time zone.",
+            dt.format(DATETIME_FORMAT)
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_only_uses_local_midnight() {
+        let parsed = parse_relative_time("2026-04-28").unwrap();
+        let local_midnight = Local
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 4, 28)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            )
+            .earliest()
+            .unwrap()
+            .timestamp();
+
+        assert_eq!(parsed, local_midnight);
+    }
+
+    #[test]
+    fn formats_timestamps_in_local_time() {
+        let timestamp = 1_775_000_000;
+        let expected = DateTime::from_timestamp(timestamp, 0)
+            .unwrap()
+            .with_timezone(&Local)
+            .format(DATETIME_FORMAT)
+            .to_string();
+
+        assert_eq!(format_local_timestamp(timestamp), expected);
+    }
 }

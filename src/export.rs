@@ -9,6 +9,7 @@ use crate::media;
 use crate::media_index::MediaIndex;
 use crate::message;
 use crate::parallel;
+use crate::time;
 
 #[derive(Clone, serde::Serialize)]
 struct ExportMessage {
@@ -98,7 +99,6 @@ pub fn export_messages(
 
     // Table name
     let table_name = db::msg_table_name(&username);
-    let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
 
     let db_jobs = parallel::job_count(jobs, 8);
     let per_db_messages = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
@@ -148,13 +148,7 @@ pub fn export_messages(
         };
 
         for (local_type, create_time, content, wcdb_ct, packed_info) in rows {
-            let time_str = chrono::DateTime::from_timestamp(create_time, 0)
-                .map(|t| {
-                    t.with_timezone(&cst_offset)
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string()
-                })
-                .unwrap_or_default();
+            let time_str = time::format_local_timestamp(create_time);
 
             let decoded = message::decode_message(
                 local_type as i32,
@@ -552,7 +546,6 @@ fn load_image_messages(
         jobs,
     )?;
     let table_name = db::msg_table_name(&username);
-    let cst_offset = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
     let since_clause = since
         .map(|ts| format!(" AND create_time >= {}", ts))
         .unwrap_or_default();
@@ -603,13 +596,7 @@ fn load_image_messages(
         };
 
         for (timestamp, raw_content, packed_info) in rows {
-            let time = chrono::DateTime::from_timestamp(timestamp, 0)
-                .map(|t| {
-                    t.with_timezone(&cst_offset)
-                        .format("%Y-%m-%d %H:%M:%S")
-                        .to_string()
-                })
-                .unwrap_or_else(|| timestamp.to_string());
+            let time = time::format_local_timestamp(timestamp);
             messages.push(ImageMessage {
                 time,
                 timestamp,
