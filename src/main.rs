@@ -14,7 +14,9 @@ mod scanner;
 mod time;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const KEY_REFRESH_TIMEOUT_SECS: u64 = 30;
 
 fn print_output(args: std::fmt::Arguments<'_>) {
     if let Err(e) = output::stdout_line(args) {
@@ -178,19 +180,70 @@ enum Commands {
     },
 }
 
-fn refresh_decrypted_cache(decrypted_dir: &std::path::Path, jobs: usize) {
+fn refresh_decrypted_cache(
+    decrypted_dir: &Path,
+    jobs: usize,
+) -> Result<decrypt::DecryptStats, String> {
     let config = decrypt::DecryptConfig {
         incremental: true,
         since: None,
         quiet: true,
         jobs,
     };
-    let _ = decrypt::decrypt_all(
+    decrypt::decrypt_all(
         std::path::Path::new("all_keys.json"),
         decrypted_dir,
         None,
         &config,
-    );
+    )
+}
+
+fn refresh_keys_and_decrypted_cache(
+    decrypted_dir: &Path,
+    jobs: usize,
+) -> Result<decrypt::DecryptStats, String> {
+    let scanner_path = scanner::default_scanner_path();
+    scanner::extract_keys(&scanner_path, KEY_REFRESH_TIMEOUT_SECS)?;
+    refresh_decrypted_cache(decrypted_dir, jobs)
+}
+
+fn cache_refresh_needs_key_retry(refresh: &Result<decrypt::DecryptStats, String>) -> bool {
+    match refresh {
+        Ok(stats) => decrypt_failures_can_affect_messages(stats),
+        Err(_) => true,
+    }
+}
+
+fn cache_refresh_retry_reason(refresh: &Result<decrypt::DecryptStats, String>) -> String {
+    match refresh {
+        Ok(_) => "contact/message database failed to decrypt".to_string(),
+        Err(e) => e.clone(),
+    }
+}
+
+fn decrypt_failures_can_affect_messages(stats: &decrypt::DecryptStats) -> bool {
+    stats
+        .failed_paths
+        .iter()
+        .any(|path| decrypt_failure_can_affect_messages(path))
+}
+
+fn decrypt_failure_can_affect_messages(path: &str) -> bool {
+    path == "contact/contact.db"
+        || path
+            .strip_prefix("message/")
+            .is_some_and(is_numbered_message_db_name)
+}
+
+fn is_numbered_message_db_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix("message_")
+        .and_then(|value| value.strip_suffix(".db"))
+    else {
+        return false;
+    };
+
+    !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit())
 }
 
 fn main() {
@@ -258,7 +311,7 @@ fn main() {
             top,
             jobs,
         } => {
-            refresh_decrypted_cache(&decrypted_dir, jobs);
+            let _ = refresh_decrypted_cache(&decrypted_dir, jobs);
             match db::list_sessions(&decrypted_dir, top, jobs) {
                 Ok(sessions) => {
                     if sessions.is_empty() {
@@ -293,29 +346,59 @@ fn main() {
             };
             let limit = limit.or_else(|| since_ts.is_none().then_some(50));
             let use_tail = tail || (!head && offset == 0);
-            refresh_decrypted_cache(&decrypted_dir, jobs);
-            match db::read_messages(
-                &decrypted_dir,
-                &session,
-                limit,
-                offset,
-                search.as_deref(),
-                since_ts,
-                use_tail,
-                jobs,
-            ) {
-                Ok(msg_count) => {
-                    if msg_count == 0 {
-                        print_output(format_args!(
-                            "No messages found for '{}'. Use 'sessions' to list available sessions.",
-                            session
-                        ));
-                    }
-                }
+            let refresh = refresh_decrypted_cache(&decrypted_dir, jobs);
+            let read_messages = || {
+                db::read_messages(
+                    &decrypted_dir,
+                    &session,
+                    limit,
+                    offset,
+                    search.as_deref(),
+                    since_ts,
+                    use_tail,
+                    jobs,
+                )
+            };
+
+            let mut msg_count = match read_messages() {
+                Ok(count) => count,
                 Err(e) => {
                     log::error!("Error: {}", e);
                     std::process::exit(1);
                 }
+            };
+
+            if msg_count == 0 && cache_refresh_needs_key_retry(&refresh) {
+                log::warn!(
+                    "No messages found and decrypted cache refresh had issues ({}). Refreshing keys and retrying once.",
+                    cache_refresh_retry_reason(&refresh)
+                );
+                match refresh_keys_and_decrypted_cache(&decrypted_dir, jobs) {
+                    Ok(stats) => {
+                        if decrypt_failures_can_affect_messages(&stats) {
+                            log::warn!(
+                                "Some contact/message databases still failed to decrypt after refreshing keys."
+                            );
+                        }
+                        msg_count = match read_messages() {
+                            Ok(count) => count,
+                            Err(e) => {
+                                log::error!("Error: {}", e);
+                                std::process::exit(1);
+                            }
+                        };
+                    }
+                    Err(e) => {
+                        log::warn!("Automatic key refresh failed: {}", e);
+                    }
+                }
+            }
+
+            if msg_count == 0 {
+                print_output(format_args!(
+                    "No messages found for '{}'. Use 'sessions' to list available sessions.",
+                    session
+                ));
             }
         }
         Commands::Search {
@@ -324,7 +407,7 @@ fn main() {
             limit,
             jobs,
         } => {
-            refresh_decrypted_cache(&decrypted_dir, jobs);
+            let _ = refresh_decrypted_cache(&decrypted_dir, jobs);
             match db::search_messages(&decrypted_dir, &query, limit, jobs) {
                 Ok(count) => {
                     if count == 0 {
@@ -345,7 +428,7 @@ fn main() {
             media_dir,
             jobs,
         } => {
-            refresh_decrypted_cache(&decrypted_dir, jobs);
+            let _ = refresh_decrypted_cache(&decrypted_dir, jobs);
             match export::export_messages(
                 &decrypted_dir,
                 &session,
@@ -384,7 +467,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            refresh_decrypted_cache(&decrypted_dir, jobs);
+            let _ = refresh_decrypted_cache(&decrypted_dir, jobs);
             let config = export::ImageExportConfig {
                 output_dir: &output,
                 list,
@@ -399,5 +482,40 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats_with_failed_paths(paths: &[&str]) -> decrypt::DecryptStats {
+        decrypt::DecryptStats {
+            success: 0,
+            failed: paths.len(),
+            skipped: 0,
+            total: paths.len(),
+            failed_paths: paths.iter().map(|path| path.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn message_retry_considers_contact_and_message_dbs_relevant() {
+        assert!(decrypt_failures_can_affect_messages(
+            &stats_with_failed_paths(&["contact/contact.db"])
+        ));
+        assert!(decrypt_failures_can_affect_messages(
+            &stats_with_failed_paths(&["message/message_0.db"])
+        ));
+    }
+
+    #[test]
+    fn message_retry_ignores_unrelated_decrypt_failures() {
+        assert!(!decrypt_failures_can_affect_messages(
+            &stats_with_failed_paths(&["favorite/favorite.db"])
+        ));
+        assert!(!decrypt_failures_can_affect_messages(
+            &stats_with_failed_paths(&["message/message_fts.db"])
+        ));
     }
 }

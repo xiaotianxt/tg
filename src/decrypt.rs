@@ -29,6 +29,7 @@ pub struct DecryptStats {
     pub failed: usize,
     pub skipped: usize,
     pub total: usize,
+    pub failed_paths: Vec<String>,
 }
 
 struct DecryptFileStats {
@@ -601,6 +602,7 @@ pub fn decrypt_all(
         failed: 0,
         skipped: 0,
         total: plan.len(),
+        failed_paths: Vec::new(),
     };
 
     for item in plan {
@@ -615,6 +617,7 @@ pub fn decrypt_all(
                 }
                 if counts_as_failed {
                     stats.failed += 1;
+                    stats.failed_paths.push(rel_path);
                 } else {
                     stats.skipped += 1;
                 }
@@ -654,12 +657,14 @@ pub fn decrypt_all(
                             log::warn!("{}", message);
                         }
                         stats.failed += 1;
+                        stats.failed_paths.push(task.rel_path.clone());
                     }
                     DecryptOutcome::Failed(message) => {
                         if !config.quiet {
                             log::error!("{}", message);
                         }
                         stats.failed += 1;
+                        stats.failed_paths.push(task.rel_path.clone());
                     }
                 }
             }

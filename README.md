@@ -170,7 +170,7 @@ tgreader search "关键词"
 tgreader export "联系人或群名" --format json
 ```
 
-`sessions`、`messages`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。
+`sessions`、`messages`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 如果没有读到结果，并且刚才的 contact/message 数据库刷新失败，会自动重新提取 keys、刷新解密缓存，然后重试一次。
 
 ## 常用命令
 

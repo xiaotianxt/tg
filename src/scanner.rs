@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn find_telegram_pid() -> Result<i32, String> {
     let output = Command::new("pgrep")
@@ -111,6 +111,8 @@ pub fn extract_keys(scanner_path: &Path, _timeout_secs: u64) -> Result<String, S
     let mut cmd = if needs_sudo {
         let mut c = Command::new("sudo");
         c.arg(scanner_str.as_ref());
+        c.stdin(Stdio::inherit());
+        c.stderr(Stdio::inherit());
         c
     } else {
         Command::new(scanner_str.as_ref())
