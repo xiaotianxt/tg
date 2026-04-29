@@ -126,7 +126,6 @@ Time filters support dates, datetimes, and relative values:
 ## Troubleshooting
 
 - `Telegram is not running`: open and log in to macOS Telegram, then run `sudo tg keys`.
-- `Scanner binary not found`: from source, run `make build` or `make install-local`.
 - `task_for_pid failed`: confirm `sudo tg keys`, quit Telegram, run `sudo codesign --force --deep --sign - /Applications/Telegram.app`, reopen Telegram, retry.
 - Unknown read failure: run `tg doctor` or `tg doctor "联系人或群名"`.
 - `No sessions found`: check `all_keys.json` exists, run `tg decrypt --verbose`, then `tg sessions --top 50`.
@@ -140,8 +139,8 @@ Time filters support dates, datetimes, and relative values:
 - `src/main.rs`: CLI commands and top-level flow.
 - `src/cache.rs`: quiet decrypt refresh and key-refresh retry policy.
 - `src/doctor.rs`: read-only setup and chat diagnostics.
-- `src/scanner.rs`: wrapper around `scanner_macos`.
-- `vendor/find_all_keys_macos.c`: macOS Telegram process memory scanner.
+- `src/scanner.rs`: wrapper around tg's embedded macOS key scanner.
+- `vendor/find_all_keys_macos.c`: macOS Telegram process memory scanner linked into `tg`.
 - `src/decrypt.rs`: SQLCipher/WCDB database decrypt.
 - `src/db.rs`: contacts, sessions, message reads, search, username resolution.
 - `src/message.rs`: message type decoding and display text.

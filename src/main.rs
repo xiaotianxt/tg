@@ -14,6 +14,7 @@ mod message;
 mod output;
 mod parallel;
 mod scanner;
+mod skill;
 mod time;
 
 use clap::{Parser, Subcommand};
@@ -58,6 +59,7 @@ fn is_known_subcommand(value: &str) -> bool {
             | "image"
             | "doctor"
             | "refresh"
+            | "skill"
             | "help"
     )
 }
@@ -84,8 +86,8 @@ struct Cli {
 enum Commands {
     /// Extract DB encryption keys from Telegram process memory (requires sudo)
     Keys {
-        /// Path to the key scanner binary (auto-detected if not provided)
-        #[arg(long)]
+        /// Legacy option; ignored because the scanner is embedded in tg
+        #[arg(long, hide = true)]
         scanner: Option<PathBuf>,
         /// Timeout in seconds
         #[arg(long, default_value = "30")]
@@ -248,16 +250,34 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         jobs: usize,
     },
+    /// Install or manage the local agent skill
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillCommands {
+    /// Install the local SKILL.md generated from tg's bundled template
+    Install {
+        /// Skill directory to write; defaults to $CODEX_HOME/skills/tg or ~/.codex/skills/tg
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 fn main() {
     logger::init();
+    scanner::maybe_run_internal_scanner();
     let cli = Cli::parse_from(normalize_args_for_default_messages(std::env::args_os()));
 
     match cli.command {
         Commands::Keys { scanner, timeout } => {
-            let scanner_path = scanner.unwrap_or_else(scanner::default_scanner_path);
-            match scanner::extract_keys(&scanner_path, timeout) {
+            if scanner.is_some() {
+                log::warn!("--scanner is ignored; the key scanner is built into tg.");
+            }
+            match scanner::extract_keys(timeout) {
                 Ok(path) => print_output(format_args!("Keys saved to: {}", path)),
                 Err(e) => {
                     log::error!("Error: {}", e);
@@ -557,6 +577,17 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Skill { command } => match command {
+            SkillCommands::Install { dir } => {
+                match skill::install(skill::InstallOptions { target_dir: dir }) {
+                    Ok(path) => print_output(format_args!("Skill installed to: {}", path.display())),
+                    Err(e) => {
+                        log::error!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
     }
 }
 
@@ -580,7 +611,7 @@ mod tests {
     fn known_subcommands_are_not_rewritten() {
         for command in [
             "keys", "decrypt", "sessions", "messages", "search", "export", "image", "doctor",
-            "refresh",
+            "refresh", "skill",
         ] {
             assert_eq!(
                 normalize_args_for_default_messages(args(&["tg", command])),

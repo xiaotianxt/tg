@@ -16,7 +16,7 @@ pub(crate) fn run(options: DoctorOptions<'_>) -> Result<(), String> {
     out.blank_line()?;
 
     write_process_status(&mut out)?;
-    write_file_status(&mut out, "scanner", &scanner::default_scanner_path())?;
+    out.line(format_args!("scanner: OK (embedded in tg)"))?;
     write_keys_status(&mut out)?;
     write_cache_status(&mut out, options.decrypted_dir)?;
 
@@ -32,18 +32,6 @@ fn write_process_status<W: std::io::Write>(out: &mut Output<W>) -> Result<(), St
     match scanner::telegram_pid() {
         Ok(pid) => out.line(format_args!("Telegram process: OK (pid {})", pid)),
         Err(e) => out.line(format_args!("Telegram process: MISSING ({})", e)),
-    }
-}
-
-fn write_file_status<W: std::io::Write>(
-    out: &mut Output<W>,
-    label: &str,
-    path: &Path,
-) -> Result<(), String> {
-    if path.exists() {
-        out.line(format_args!("{}: OK ({})", label, path.display()))
-    } else {
-        out.line(format_args!("{}: MISSING ({})", label, path.display()))
     }
 }
 

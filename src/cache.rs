@@ -26,8 +26,7 @@ pub(crate) fn refresh_keys_and_decrypted(
     decrypted_dir: &Path,
     jobs: usize,
 ) -> Result<decrypt::DecryptStats, String> {
-    let scanner_path = scanner::default_scanner_path();
-    scanner::extract_keys(&scanner_path, KEY_REFRESH_TIMEOUT_SECS)?;
+    scanner::extract_keys(KEY_REFRESH_TIMEOUT_SECS)?;
     refresh_decrypted(decrypted_dir, jobs)
 }
 

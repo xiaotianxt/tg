@@ -1,8 +1,58 @@
-use std::path::{Path, PathBuf};
+use std::ffi::{CString, OsStr, OsString};
+use std::os::raw::{c_char, c_int};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::dictionary;
+
+const INTERNAL_SCAN_ARG: &str = "__tg-scan-keys";
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn tg_scan_keys_macos(argc: c_int, argv: *const *const c_char) -> c_int;
+}
+
+pub(crate) fn maybe_run_internal_scanner() {
+    let mut args = std::env::args_os();
+    let _exe = args.next();
+    let Some(first) = args.next() else {
+        return;
+    };
+    if first != OsStr::new(INTERNAL_SCAN_ARG) {
+        return;
+    }
+
+    let code = run_internal_scanner(args.collect());
+    std::process::exit(code);
+}
+
+#[cfg(target_os = "macos")]
+fn run_internal_scanner(args: Vec<OsString>) -> i32 {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut cstrings = Vec::with_capacity(args.len() + 1);
+    cstrings.push(CString::new("tg-scan-keys").expect("static scanner argv is valid"));
+
+    for arg in args {
+        match CString::new(arg.as_os_str().as_bytes()) {
+            Ok(value) => cstrings.push(value),
+            Err(_) => {
+                eprintln!("scanner argument contains an unsupported NUL byte");
+                return 2;
+            }
+        }
+    }
+
+    let argv: Vec<*const c_char> = cstrings.iter().map(|arg| arg.as_ptr()).collect();
+    unsafe { tg_scan_keys_macos(argv.len() as c_int, argv.as_ptr()) }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_internal_scanner(_args: Vec<OsString>) -> i32 {
+    eprintln!("tg key extraction is only supported on macOS");
+    1
+}
 
 fn find_telegram_pid() -> Result<i32, String> {
     let process = dictionary::desktop_app_process();
@@ -37,19 +87,6 @@ fn is_root() -> bool {
         .and_then(|s| s.trim().parse::<u32>().ok())
         .map(|uid| uid == 0)
         .unwrap_or(false)
-}
-
-pub fn default_scanner_path() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let installed = dir.join("scanner_macos");
-            if installed.exists() {
-                return installed;
-            }
-        }
-    }
-
-    PathBuf::from("./scanner_macos")
 }
 
 fn real_home_dir() -> Option<PathBuf> {
@@ -96,15 +133,8 @@ fn find_db_storage_dir() -> Option<PathBuf> {
 }
 
 /// Extract DB encryption keys from Telegram process memory.
-/// Runs the C scanner binary, wrapping with sudo if not already root.
-pub fn extract_keys(scanner_path: &Path, timeout_secs: u64) -> Result<String, String> {
-    if !scanner_path.exists() {
-        return Err(format!(
-            "Scanner binary not found at {}. Run 'make scanner' first.",
-            scanner_path.display()
-        ));
-    }
-
+/// Runs tg's embedded macOS scanner, wrapping with sudo if not already root.
+pub fn extract_keys(timeout_secs: u64) -> Result<String, String> {
     let pid = find_telegram_pid().map_err(|e| format!("Cannot find Telegram process: {}", e))?;
     log::info!("Telegram PID: {}", pid);
 
@@ -114,19 +144,21 @@ pub fn extract_keys(scanner_path: &Path, timeout_secs: u64) -> Result<String, St
         log::info!("You may be prompted for your password.");
     }
 
-    let scanner_str = scanner_path.to_string_lossy();
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Cannot locate current tg binary: {}", e))?;
     let mut cmd = if needs_sudo {
         let mut c = Command::new("sudo");
-        c.arg(scanner_str.as_ref());
+        c.arg(&exe);
         c.stdin(Stdio::inherit());
         c.stderr(Stdio::inherit());
         c
     } else {
-        let mut c = Command::new(scanner_str.as_ref());
+        let mut c = Command::new(&exe);
         c.stderr(Stdio::piped());
         c
     };
     cmd.stdout(Stdio::piped());
+    cmd.arg(INTERNAL_SCAN_ARG);
     cmd.arg(format!("{}", pid));
     if let Some(db_storage) = find_db_storage_dir() {
         cmd.arg(db_storage);

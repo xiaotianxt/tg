@@ -20,9 +20,6 @@ jobs:
       - name: Verify arm64 runner
         run: test "$(uname -m)" = "arm64"
 
-      - name: Build scanner
-        run: cc -O2 -o scanner_macos vendor/find_all_keys_macos.c -framework Foundation
-
       - name: Build
         run: cargo build --release
 

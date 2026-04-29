@@ -1,15 +1,11 @@
-.PHONY: all build scanner install install-local clean
+.PHONY: all build install install-local clean
 
-all: build scanner
+all: build
 
-scanner: vendor/find_all_keys_macos.c
-	cc -O2 -o scanner_macos vendor/find_all_keys_macos.c -framework Foundation
-
-build: scanner
+build:
 	cargo build --release
 
 install: build
-	sudo cp scanner_macos /usr/local/bin/
 	sudo cp target/release/tg /usr/local/bin/
 	@echo ""
 	@echo "安装完成！现在可以直接使用以下命令："
@@ -19,7 +15,6 @@ install: build
 
 install-local: build
 	mkdir -p ~/.local/bin
-	cp scanner_macos ~/.local/bin/
 	cp target/release/tg ~/.local/bin/
 	@echo ""
 	@echo "已安装到 ~/.local/bin，请确保该目录在 PATH 中。"

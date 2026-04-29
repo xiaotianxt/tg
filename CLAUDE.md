@@ -22,7 +22,7 @@ tg export "名称" -f txt # 导出
 | 模块 | 职责 | 关键技术 |
 |------|------|----------|
 | `src/main.rs` | CLI 入口 | clap 子命令解析 |
-| `src/scanner.rs` | 密钥提取 | 调用 `scanner_macos` 子进程 |
+| `src/scanner.rs` | 密钥提取 | 运行 `tg` 内嵌扫描器 |
 | `src/decrypt.rs` | 数据库解密 | AES-256-CBC, HMAC-SHA512, PBKDF2 |
 | `src/db.rs` | 数据查询 | rusqlite, 联系人/消息读取 |
 | `src/export.rs` | 消息导出 | TXT/CSV/JSON |

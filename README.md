@@ -101,12 +101,6 @@ brew install xiaotianxt/tap/tg
 tg --version
 ```
 
-安装开发版：
-
-```bash
-brew install --HEAD xiaotianxt/tap/tg
-```
-
 ### 源码安装
 
 需要 Rust 工具链和 Xcode Command Line Tools。
@@ -117,7 +111,7 @@ cd tg
 make install-local
 ```
 
-`make install-local` 会把 `tg` 和 `scanner_macos` 安装到 `~/.local/bin`。请确认 `~/.local/bin` 已经在 `PATH` 中。
+`make install-local` 会把 `tg` 安装到 `~/.local/bin`。请确认 `~/.local/bin` 已经在 `PATH` 中。
 
 如果要安装到 `/usr/local/bin`：
 
@@ -292,20 +286,6 @@ rm -rf all_keys.json decrypted exported
 
 先打开并登录 macOS Telegram，再运行 `sudo tg keys`。
 
-### `Scanner binary not found`
-
-源码安装时先运行：
-
-```bash
-make install-local
-```
-
-或在仓库目录里运行：
-
-```bash
-make build
-```
-
 ### `task_for_pid failed`
 
 先确认用了 `sudo tg keys`。如果仍失败，退出Telegram后重新签名：
@@ -375,13 +355,13 @@ cargo build
 
 项目入口是 `src/main.rs`。主要模块：
 
-- `src/scanner.rs`：调用密钥扫描器。
+- `src/scanner.rs`：运行内嵌的 macOS 密钥扫描器。
 - `src/decrypt.rs`：数据库解密。
 - `src/db.rs`：会话、联系人和消息查询。
 - `src/message.rs`：消息类型解析。
 - `src/media*.rs`：媒体元信息、缓存查找和解密。
 - `src/export.rs`：导出。
-- `vendor/find_all_keys_macos.c`：macOS Telegram进程扫描器。
+- `vendor/find_all_keys_macos.c`：链接进 `tg` 的 macOS Telegram 进程扫描器。
 
 面向 AI/自动化助手的能力说明见 [SKILL.md](SKILL.md)。
 

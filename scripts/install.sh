@@ -10,13 +10,6 @@ if ! command -v cargo &>/dev/null; then
     exit 1
 fi
 
-# --- 检测 cc ---
-if ! command -v cc &>/dev/null; then
-    echo "错误: 未找到 C 编译器。请安装 Xcode Command Line Tools:"
-    echo "  xcode-select --install"
-    exit 1
-fi
-
 # --- 确定安装目录 ---
 if [[ "${1:-}" == "--local" ]]; then
     BIN_DIR="$HOME/.local/bin"
@@ -33,10 +26,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
 # --- 编译 ---
-echo ""
-echo "==> 编译 C 内存扫描器..."
-cc -O2 -o scanner_macos vendor/find_all_keys_macos.c -framework Foundation
-
 echo "==> 编译 Rust CLI..."
 cargo build --release
 
@@ -44,10 +33,8 @@ cargo build --release
 echo ""
 echo "==> 安装二进制文件..."
 if [[ "$BIN_DIR" == "/usr/local/bin" ]]; then
-    sudo cp scanner_macos "$BIN_DIR/"
     sudo cp target/release/tg "$BIN_DIR/"
 else
-    cp scanner_macos "$BIN_DIR/"
     cp target/release/tg "$BIN_DIR/"
 fi
 

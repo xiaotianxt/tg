@@ -15,19 +15,16 @@ jobs:
       - name: Verify arm64 runner
         run: test "$(uname -m)" = "arm64"
 
-      - name: Build scanner
-        run: cc -O2 -o scanner_macos vendor/find_all_keys_macos.c -framework Foundation
-
       - name: Build
         run: cargo build --release
 
       - name: Archive
         run: |
           mkdir -p archive
-          cp target/release/tg scanner_macos archive/
+          cp target/release/tg archive/
           cd archive
           tar czf ../tg-${{ github.ref_name }}-darwin-arm64.tar.gz \
-            tg scanner_macos
+            tg
 
       - uses: actions/upload-artifact@v4
         with:

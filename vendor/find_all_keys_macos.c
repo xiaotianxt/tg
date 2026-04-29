@@ -135,26 +135,7 @@ static int nftw_collect_db(const char *fpath, const struct stat *sb,
     return 0;
 }
 
-static int scan_db_storage(const char *base_path) {
-    DIR *dir = opendir(base_path);
-    if (!dir) return -1;
-
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL) {
-        if (ent->d_name[0] == '.') continue;
-        char storage_path[1024];
-        snprintf(storage_path, sizeof(storage_path),
-            "%s/%s/db_storage", base_path, ent->d_name);
-        struct stat st;
-        if (stat(storage_path, &st) == 0 && S_ISDIR(st.st_mode)) {
-            nftw(storage_path, nftw_collect_db, 20, FTW_PHYS);
-        }
-    }
-    closedir(dir);
-    return 0;
-}
-
-int main(int argc, char *argv[]) {
+int tg_scan_keys_macos(int argc, const char *argv[]) {
     pid_t pid = -1;
     const char *db_path_arg = NULL;
 
@@ -379,3 +360,9 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
+
+#ifdef TG_SCANNER_STANDALONE
+int main(int argc, char *argv[]) {
+    return tg_scan_keys_macos(argc, (const char **)argv);
+}
+#endif
