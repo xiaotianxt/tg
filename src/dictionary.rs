@@ -17,6 +17,14 @@ pub(crate) fn desktop_app_process() -> String {
     decode(&[13, 63, 25, 50, 59, 46])
 }
 
+pub(crate) fn desktop_app_name() -> String {
+    desktop_app_process()
+}
+
+pub(crate) fn desktop_app_localized_name() -> String {
+    decode(&[191, 228, 244, 190, 229, 251])
+}
+
 pub(crate) fn container_id() -> String {
     decode(&[
         57, 53, 55, 116, 46, 63, 52, 57, 63, 52, 46, 116, 34, 51, 52, 13, 63, 25, 50, 59, 46,

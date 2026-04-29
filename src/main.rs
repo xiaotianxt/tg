@@ -580,7 +580,9 @@ fn main() {
         Commands::Skill { command } => match command {
             SkillCommands::Install { dir } => {
                 match skill::install(skill::InstallOptions { target_dir: dir }) {
-                    Ok(path) => print_output(format_args!("Skill installed to: {}", path.display())),
+                    Ok(path) => {
+                        print_output(format_args!("Skill installed to: {}", path.display()))
+                    }
                     Err(e) => {
                         log::error!("Error: {}", e);
                         std::process::exit(1);
