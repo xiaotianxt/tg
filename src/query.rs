@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::{db, dictionary, message, message_index, output, parallel};
+use crate::{contact, db, dictionary, message, message_index, output, parallel};
 
 const MESSAGE_TARGETS: &[&str] = &["messages", "message", "all-messages"];
 const MAX_QUERY_KEYWORDS: usize = 16;
@@ -356,14 +356,14 @@ fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryConte
     let (contact_db, message_dbs) = db::find_decrypted_dbs(options.decrypted_dir);
     let contacts = contact_db
         .as_ref()
-        .and_then(|path| db::load_contacts(path).ok())
+        .and_then(|path| contact::load_contacts(path).ok())
         .unwrap_or_default();
 
     let mut table_to_session = HashMap::new();
     let mut table_to_display = HashMap::new();
     let mut sender_display = HashMap::new();
     for (username, contact) in &contacts {
-        let display = contact.display.clone();
+        let display = contact.personal_display_name().to_string();
         table_to_session.insert(db::msg_table_name(username), username.clone());
         table_to_display.insert(db::msg_table_name(username), display.clone());
         sender_display.insert(username.clone(), display);

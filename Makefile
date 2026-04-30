@@ -7,15 +7,15 @@ fmt:
 	cargo fmt --all -- --check
 
 clippy:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --all-targets --all-features -- -D warnings
 
 test:
-	cargo test
+	cargo test --all-features
 
 check:
 	cargo fmt --all -- --check
-	cargo clippy --all-targets -- -D warnings
-	cargo test
+	cargo clippy --all-targets --all-features -- -D warnings
+	cargo test --all-features
 
 build:
 	cargo build --release

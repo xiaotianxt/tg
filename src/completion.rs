@@ -8,6 +8,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 
+use crate::contact;
 use crate::db;
 use crate::paths;
 use crate::CompleteKind;
@@ -367,12 +368,13 @@ struct ContactCompletionRow {
 }
 
 impl ContactCompletionRow {
-    fn from_contact(id: i64, contact: db::Contact) -> Self {
-        let sort_key = make_contact_sort_key(&contact.display, &contact.username);
+    fn from_contact(id: i64, contact: contact::Contact) -> Self {
+        let display = contact.personal_display_name().to_string();
+        let sort_key = make_contact_sort_key(&display, &contact.username);
         Self {
             id,
             username: contact.username,
-            display: contact.display,
+            display,
             remark: contact.remark,
             nick_name: contact.nick_name,
             alias: contact.alias,
@@ -432,7 +434,7 @@ fn session_candidates_from_contact_db(
     limit: usize,
     query: &str,
 ) -> Result<Vec<Candidate>, String> {
-    let contacts = db::load_contacts(contact_db)?;
+    let contacts = contact::load_contacts(contact_db)?;
     let rows = contacts
         .into_values()
         .filter(|contact| !contact.username.trim().is_empty())
@@ -581,7 +583,7 @@ fn rebuild_contact_cache(
     contact_db: &Path,
     source_signature: &str,
 ) -> Result<(), String> {
-    let contacts = db::load_contacts(contact_db)?;
+    let contacts = contact::load_contacts(contact_db)?;
     let mut rows = contacts
         .into_values()
         .filter(|contact| !contact.username.trim().is_empty())

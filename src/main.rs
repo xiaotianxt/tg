@@ -1,5 +1,6 @@
 mod cache;
 mod completion;
+mod contact;
 mod db;
 mod decrypt;
 mod dictionary;
@@ -612,9 +613,9 @@ fn main() {
                         tail: use_tail,
                         time_bucket,
                         name_mode: if anonymous {
-                            db::DisplayNameMode::Anonymous
+                            contact::DisplayNameMode::Anonymous
                         } else {
-                            db::DisplayNameMode::PersonalRemark
+                            contact::DisplayNameMode::PersonalRemark
                         },
                         jobs,
                     },

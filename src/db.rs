@@ -1,49 +1,17 @@
 use md5::{Digest, Md5};
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::contact::{self, Contact, DisplayNameMode};
 use crate::dictionary;
 use crate::message;
 use crate::message_index;
 use crate::parallel;
 use crate::time;
-
-/// Resolve a sender ID to a display name from contacts.
-pub fn resolve_sender_name(sender_id: &str, contacts: &HashMap<String, Contact>) -> String {
-    resolve_sender_name_with_mode(
-        sender_id,
-        contacts,
-        DisplayNameMode::PersonalRemark,
-        &HashMap::new(),
-    )
-}
-
-fn resolve_sender_name_with_mode(
-    sender_id: &str,
-    contacts: &HashMap<String, Contact>,
-    mode: DisplayNameMode,
-    room_member_names: &HashMap<String, String>,
-) -> String {
-    if mode == DisplayNameMode::Anonymous {
-        if let Some(name) = room_member_names
-            .get(sender_id)
-            .map(|name| name.trim())
-            .filter(|name| !name.is_empty())
-        {
-            return name.to_string();
-        }
-    }
-
-    contacts
-        .get(sender_id)
-        .map(|c| c.display_name(mode))
-        .unwrap_or(sender_id)
-        .to_string()
-}
 
 /// Find decrypted databases.
 pub(crate) fn find_decrypted_dbs(decrypted_dir: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
@@ -91,31 +59,6 @@ pub(crate) fn is_message_db_name(name: &str) -> bool {
     };
 
     !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit())
-}
-
-/// Contact info.
-pub(crate) struct Contact {
-    pub username: String,
-    pub nick_name: String,
-    pub remark: String,
-    pub alias: String,
-    pub display: String,
-    pub is_stranger: bool,
-}
-
-impl Contact {
-    fn display_name(&self, mode: DisplayNameMode) -> &str {
-        match mode {
-            DisplayNameMode::PersonalRemark => first_non_empty([&self.display, &self.username]),
-            DisplayNameMode::Anonymous => first_non_empty([&self.nick_name, &self.username]),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DisplayNameMode {
-    PersonalRemark,
-    Anonymous,
 }
 
 #[derive(Default)]
@@ -174,149 +117,6 @@ pub(crate) struct SearchMessagesOptions<'a> {
     pub since: Option<i64>,
     pub use_telegram_fts: bool,
     pub jobs: usize,
-}
-
-pub(crate) fn load_contacts(contact_db: &Path) -> Result<HashMap<String, Contact>, String> {
-    let conn =
-        Connection::open(contact_db).map_err(|e| format!("Cannot open contact DB: {}", e))?;
-
-    let mut contacts = load_contact_table(&conn, "contact", false)
-        .map_err(|e| format!("Contact read error: {}", e))?;
-    for (username, stranger) in load_contact_table(&conn, "stranger", true).unwrap_or_default() {
-        contacts
-            .entry(username)
-            .and_modify(|contact| contact.is_stranger = true)
-            .or_insert(stranger);
-    }
-
-    Ok(contacts)
-}
-
-fn load_contact_table(
-    conn: &Connection,
-    table: &str,
-    is_stranger: bool,
-) -> rusqlite::Result<HashMap<String, Contact>> {
-    let sql = format!(
-        "SELECT username, nick_name, remark, alias FROM {}",
-        quote_identifier(table)
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let contacts = stmt
-        .query_map([], |row| {
-            let username: String = row.get(0)?;
-            let nick_name: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
-            let remark: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
-            let alias: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
-            let display = if !remark.is_empty() {
-                remark.clone()
-            } else {
-                nick_name.clone()
-            };
-            Ok((
-                username.clone(),
-                Contact {
-                    username,
-                    nick_name,
-                    remark,
-                    alias,
-                    display,
-                    is_stranger,
-                },
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(contacts)
-}
-
-fn first_non_empty<const N: usize>(values: [&str; N]) -> &str {
-    values
-        .into_iter()
-        .map(str::trim)
-        .find(|value| !value.is_empty())
-        .unwrap_or("")
-}
-
-fn load_chat_room_member_names(
-    contact_db: &Path,
-    room_username: &str,
-) -> Result<HashMap<String, String>, String> {
-    let conn =
-        Connection::open(contact_db).map_err(|e| format!("Cannot open contact DB: {}", e))?;
-    let ext_buffer: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT ext_buffer FROM chat_room WHERE username = ?1",
-            params![room_username],
-            |row| row.get::<_, Option<Vec<u8>>>(0),
-        )
-        .optional()
-        .map_err(|e| format!("Chat room member query error: {}", e))?
-        .flatten();
-
-    Ok(ext_buffer
-        .as_deref()
-        .map(parse_chat_room_member_names)
-        .unwrap_or_default())
-}
-
-fn parse_chat_room_member_names(data: &[u8]) -> HashMap<String, String> {
-    use crate::media_pb::wire::{decode_varint, skip_field, tag_field};
-
-    let mut names = HashMap::new();
-    let mut pos = 0;
-    while pos < data.len() {
-        let Some(tag) = decode_varint(data, &mut pos) else {
-            break;
-        };
-        let (field, wire) = tag_field(tag);
-        if (field, wire) != (1, 2) {
-            if skip_field(data, &mut pos, wire).is_none() {
-                break;
-            }
-            continue;
-        }
-
-        let Some(len) = decode_varint(data, &mut pos).map(|len| len as usize) else {
-            break;
-        };
-        let Some(end) = pos.checked_add(len) else {
-            break;
-        };
-        let Some(member) = data.get(pos..end) else {
-            break;
-        };
-        pos = end;
-
-        if let Some((username, display_name)) = parse_chat_room_member_name(member) {
-            names.insert(username, display_name);
-        }
-    }
-    names
-}
-
-fn parse_chat_room_member_name(data: &[u8]) -> Option<(String, String)> {
-    use crate::media_pb::wire::{decode_string, decode_varint, skip_field, tag_field};
-
-    let mut username = String::new();
-    let mut display_name = String::new();
-    let mut pos = 0;
-    while pos < data.len() {
-        let tag = decode_varint(data, &mut pos)?;
-        let (field, wire) = tag_field(tag);
-        match (field, wire) {
-            (1, 2) => username = decode_string(data, &mut pos)?,
-            (2, 2) => display_name = decode_string(data, &mut pos)?,
-            _ => skip_field(data, &mut pos, wire)?,
-        }
-    }
-
-    let username = username.trim();
-    let display_name = display_name.trim();
-    if username.is_empty() || display_name.is_empty() {
-        return None;
-    }
-    Some((username.to_string(), display_name.to_string()))
 }
 
 pub(crate) fn msg_table_name(username: &str) -> String {
@@ -399,7 +199,7 @@ pub fn list_sessions(
 
     // Load contacts
     let contacts = match &contact_db {
-        Some(path) => load_contacts(path).unwrap_or_default(),
+        Some(path) => contact::load_contacts(path).unwrap_or_default(),
         None => HashMap::new(),
     };
 
@@ -410,7 +210,7 @@ pub fn list_sessions(
         let table = msg_table_name(username);
         table_to_username.insert(table, username.clone());
         // Also store by display name
-        let display_table = msg_table_name(&contact.display);
+        let display_table = msg_table_name(contact.personal_display_name());
         table_to_username
             .entry(display_table)
             .or_insert_with(|| username.clone());
@@ -494,7 +294,7 @@ pub fn list_sessions(
                 .unwrap_or_else(|| table.clone());
             let display = contacts
                 .get(&username)
-                .map(|c| c.display.clone())
+                .map(|c| c.personal_display_name().to_string())
                 .unwrap_or_else(|| "(?)".to_string());
 
             SessionListEntry {
@@ -654,7 +454,7 @@ pub fn read_messages(
 
     let contacts = contact_db
         .as_ref()
-        .and_then(|p| load_contacts(p).ok())
+        .and_then(|p| contact::load_contacts(p).ok())
         .unwrap_or_default();
 
     let display_name = contacts
@@ -666,7 +466,7 @@ pub fn read_messages(
     let room_member_names = if options.name_mode == DisplayNameMode::Anonymous {
         contact_db
             .as_ref()
-            .and_then(|p| load_chat_room_member_names(p, &username).ok())
+            .and_then(|p| contact::load_chat_room_member_names(p, &username).ok())
             .unwrap_or_default()
     } else {
         HashMap::new()
@@ -868,7 +668,12 @@ pub fn read_messages(
             packed_info,
             options.time_bucket,
             |id| {
-                resolve_sender_name_with_mode(id, &contacts, options.name_mode, &room_member_names)
+                contact::resolve_sender_name_with_mode(
+                    id,
+                    &contacts,
+                    options.name_mode,
+                    &room_member_names,
+                )
             },
         );
 
@@ -1012,11 +817,11 @@ pub(crate) fn probe_session(
     let table_name = msg_table_name(&username);
     let contacts = contact_db
         .as_ref()
-        .and_then(|p| load_contacts(p).ok())
+        .and_then(|p| contact::load_contacts(p).ok())
         .unwrap_or_default();
     let display_name = contacts
         .get(&username)
-        .map(|contact| contact.display.clone())
+        .map(|contact| contact.personal_display_name().to_string())
         .unwrap_or_else(|| username.clone());
 
     let db_jobs = parallel::job_count(jobs, 8);
@@ -1058,7 +863,7 @@ pub fn search_messages(
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
     let contacts = contact_db
         .as_ref()
-        .and_then(|p| load_contacts(p).ok())
+        .and_then(|p| contact::load_contacts(p).ok())
         .unwrap_or_default();
 
     if let Some(since) = options.since {
@@ -1382,7 +1187,7 @@ fn search_session_display(contacts: &HashMap<String, Contact>, session: &str) ->
 
     contacts
         .get(session)
-        .map(|c| c.display.clone())
+        .map(|c| c.personal_display_name().to_string())
         .unwrap_or_else(|| session.to_string())
 }
 
@@ -1458,7 +1263,7 @@ fn resolve_username_with_context(
         None => return Ok(query.to_string()),
     };
 
-    let contacts = load_contacts(contact_db)?;
+    let contacts = contact::load_contacts(contact_db)?;
 
     // Try exact username match
     if let Some(c) = contacts.get(query) {
@@ -1471,7 +1276,7 @@ fn resolve_username_with_context(
             log::info!(
                 "Matched '{}' to {} ({}){}",
                 query,
-                best.contact.display,
+                best.contact.personal_display_name(),
                 best.contact.username,
                 best.latest_message_time
                     .map(|ts| format!(" latest {}", format_match_time(ts)))
@@ -1575,7 +1380,11 @@ fn contact_match_candidates<'a>(
             .then_with(|| b_latest.cmp(&a_latest))
             .then_with(|| a.distance.cmp(&b.distance))
             .then_with(|| a.field_len.cmp(&b.field_len))
-            .then_with(|| a.contact.display.cmp(&b.contact.display))
+            .then_with(|| {
+                a.contact
+                    .personal_display_name()
+                    .cmp(b.contact.personal_display_name())
+            })
             .then_with(|| a.contact.username.cmp(&b.contact.username))
     });
     candidates
@@ -1619,7 +1428,7 @@ pub(crate) fn best_contact_field_score(
 
 fn contact_match_fields(contact: &Contact) -> [(usize, &str); 5] {
     [
-        (0, &contact.display),
+        (0, contact.personal_display_name()),
         (1, &contact.remark),
         (2, &contact.nick_name),
         (3, &contact.alias),
@@ -1815,7 +1624,7 @@ fn find_username_by_table(contacts: &HashMap<String, Contact>, table_name: &str)
         if msg_table_name(username) == table_name {
             return Some(format!(
                 "{} ({})",
-                contacts.get(username)?.display,
+                contacts.get(username)?.personal_display_name(),
                 username
             ));
         }
@@ -2055,51 +1864,6 @@ mod tests {
         dir
     }
 
-    fn push_proto_varint(out: &mut Vec<u8>, mut value: u64) {
-        loop {
-            let mut byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value != 0 {
-                byte |= 0x80;
-            }
-            out.push(byte);
-            if value == 0 {
-                break;
-            }
-        }
-    }
-
-    fn push_proto_len_field(out: &mut Vec<u8>, field: u32, value: &[u8]) {
-        push_proto_varint(out, ((field as u64) << 3) | 2);
-        push_proto_varint(out, value.len() as u64);
-        out.extend_from_slice(value);
-    }
-
-    fn push_proto_varint_field(out: &mut Vec<u8>, field: u32, value: u64) {
-        push_proto_varint(out, (field as u64) << 3);
-        push_proto_varint(out, value);
-    }
-
-    fn chat_room_member_record(username: &str, display_name: &str) -> Vec<u8> {
-        let mut record = Vec::new();
-        push_proto_len_field(&mut record, 1, username.as_bytes());
-        push_proto_len_field(&mut record, 2, display_name.as_bytes());
-        push_proto_varint_field(&mut record, 3, 1);
-        record
-    }
-
-    fn chat_room_ext_buffer(members: &[(&str, &str)]) -> Vec<u8> {
-        let mut data = Vec::new();
-        for (username, display_name) in members {
-            push_proto_len_field(
-                &mut data,
-                1,
-                &chat_room_member_record(username, display_name),
-            );
-        }
-        data
-    }
-
     #[test]
     fn filters_only_numbered_message_dbs() {
         assert!(is_message_db_name("message_0.db"));
@@ -2107,101 +1871,6 @@ mod tests {
         assert!(!is_message_db_name("message_fts.db"));
         assert!(!is_message_db_name("message_resource.db"));
         assert!(!is_message_db_name("biz_message_0.db"));
-    }
-
-    #[test]
-    fn parses_chat_room_member_names_from_ext_buffer() {
-        let names = parse_chat_room_member_names(&chat_room_ext_buffer(&[
-            ("tgid_alice", "Alice In Group"),
-            ("tgid_bob", ""),
-            ("tgid_cara", "Cara"),
-        ]));
-
-        assert_eq!(
-            names.get("tgid_alice").map(String::as_str),
-            Some("Alice In Group")
-        );
-        assert_eq!(names.get("tgid_cara").map(String::as_str), Some("Cara"));
-        assert!(!names.contains_key("tgid_bob"));
-    }
-
-    #[test]
-    fn loads_chat_room_member_names_for_room() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("contact.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute(
-            "CREATE TABLE chat_room (
-                id INTEGER PRIMARY KEY,
-                username TEXT,
-                owner TEXT,
-                ext_buffer BLOB
-            )",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO chat_room (username, ext_buffer) VALUES (?1, ?2)",
-            params![
-                "room@chatroom",
-                chat_room_ext_buffer(&[("tgid_alice", "Alice In Group")])
-            ],
-        )
-        .unwrap();
-        drop(conn);
-
-        let names = load_chat_room_member_names(&path, "room@chatroom").unwrap();
-
-        assert_eq!(
-            names.get("tgid_alice").map(String::as_str),
-            Some("Alice In Group")
-        );
-    }
-
-    #[test]
-    fn sender_name_modes_choose_expected_display_source() {
-        let mut contacts = HashMap::new();
-        contacts.insert(
-            "tgid_alice".to_string(),
-            Contact {
-                username: "tgid_alice".to_string(),
-                nick_name: "Alice Default".to_string(),
-                remark: "Alice Remark".to_string(),
-                alias: String::new(),
-                display: "Alice Remark".to_string(),
-                is_stranger: false,
-            },
-        );
-        let mut room_names = HashMap::new();
-        room_names.insert("tgid_alice".to_string(), "Alice In Group".to_string());
-
-        assert_eq!(
-            resolve_sender_name_with_mode(
-                "tgid_alice",
-                &contacts,
-                DisplayNameMode::PersonalRemark,
-                &room_names,
-            ),
-            "Alice Remark"
-        );
-        assert_eq!(
-            resolve_sender_name_with_mode(
-                "tgid_alice",
-                &contacts,
-                DisplayNameMode::Anonymous,
-                &room_names,
-            ),
-            "Alice In Group"
-        );
-        assert_eq!(
-            resolve_sender_name_with_mode(
-                "tgid_alice",
-                &contacts,
-                DisplayNameMode::Anonymous,
-                &HashMap::new(),
-            ),
-            "Alice Default"
-        );
     }
 
     #[test]

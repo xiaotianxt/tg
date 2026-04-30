@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::contact;
 use crate::db;
 use crate::dictionary;
 use crate::media;
@@ -111,11 +112,11 @@ pub fn export_messages(
 
     // Load contacts for display name
     let contacts = contact_db_path
-        .and_then(|p| db::load_contacts(p).ok())
+        .and_then(|p| contact::load_contacts(p).ok())
         .unwrap_or_default();
     let display_name = contacts
         .get(&username)
-        .map(|c| c.display.as_str())
+        .map(|c| c.personal_display_name())
         .unwrap_or(&username);
 
     // Table name
@@ -221,7 +222,7 @@ pub fn export_messages(
                     display_name,
                     wcdb_ct,
                     &packed_info,
-                    |id| crate::db::resolve_sender_name(id, &contacts),
+                    |id| contact::resolve_sender_name(id, &contacts),
                 );
 
                 messages.push(ExportMessage {
@@ -427,7 +428,7 @@ fn load_indexed_export_messages(
     index: &message_index::HotIndex,
     username: &str,
     display_name: &str,
-    contacts: &std::collections::HashMap<String, db::Contact>,
+    contacts: &std::collections::HashMap<String, contact::Contact>,
     since: i64,
     limit: Option<usize>,
 ) -> Result<Vec<ExportMessage>, String> {
@@ -464,7 +465,7 @@ fn load_indexed_export_messages(
                 display_name,
                 wcdb_ct,
                 &packed_info,
-                |id| crate::db::resolve_sender_name(id, contacts),
+                |id| contact::resolve_sender_name(id, contacts),
             );
             ExportMessage {
                 time: time::format_local_timestamp(create_time),

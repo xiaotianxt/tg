@@ -1,7 +1,7 @@
 //! V2 .dat decryptor: derives key from kvcomm and decrypts a .dat file.
 //!
 //! Usage:
-//!   cargo run --bin try_decrypt <path_to.dat>
+//!   cargo run --features debug-tools --bin try_decrypt <path_to.dat>
 //!
 //! Derives the AES key from Telegram kvcomm files, decrypts, and writes to /tmp/.
 
@@ -30,6 +30,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    if data.len() < 31 {
+        log::error!("Not enough data for a V2 .dat header");
+        std::process::exit(1);
+    }
 
     // Parse V2 header
     let magic = &data[..6];
@@ -73,12 +78,12 @@ fn main() {
                     let aes_key = aes_key_str.as_bytes();
                     let xor_key = (code & 0xff) as u8;
 
-                    log::info!("Trying: code={}, account_id={}", code, account_id);
-                    log::info!("  AES key (ASCII): {}", aes_key_str);
-                    log::info!("  XOR key: {:#04x}", xor_key);
+                    log::info!("Trying key candidate from local cache");
+                    log::info!("  AES/XOR key material derived");
 
                     // Validate: decrypt first block
-                    let cipher = Aes128::new_from_slice(aes_key).unwrap();
+                    let cipher =
+                        Aes128::new_from_slice(aes_key).expect("derived AES-128 key is 16 bytes");
                     let mut block = data[15..31].to_vec();
                     cipher.decrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
                         &mut block,

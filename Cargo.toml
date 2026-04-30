@@ -16,6 +16,11 @@ path = "src/main.rs"
 [[bin]]
 name = "try_decrypt"
 path = "src/bin/try_decrypt.rs"
+required-features = ["debug-tools"]
+
+[features]
+default = []
+debug-tools = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

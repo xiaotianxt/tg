@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::{db, dictionary, message, parallel, paths, time};
+use crate::{contact, db, dictionary, message, parallel, paths, time};
 
 const INDEX_FILE: &str = ".tg_index.db";
 const SCHEMA_VERSION: i64 = 1;
@@ -223,7 +223,7 @@ fn refresh_changed_sources(
 
     let contacts = contact_db
         .as_ref()
-        .and_then(|path| db::load_contacts(path).ok())
+        .and_then(|path| contact::load_contacts(path).ok())
         .unwrap_or_default();
     let table_context = table_context(&contacts);
     let sources = source_files(decrypted_dir, message_dbs);
@@ -430,16 +430,17 @@ struct TableContext {
     sender_display: HashMap<String, String>,
 }
 
-fn table_context(contacts: &HashMap<String, db::Contact>) -> TableContext {
+fn table_context(contacts: &HashMap<String, contact::Contact>) -> TableContext {
     let mut table_to_session = HashMap::new();
     let mut table_to_display = HashMap::new();
     let mut sender_display = HashMap::new();
 
     for (username, contact) in contacts {
         let table = db::msg_table_name(username);
+        let display = contact.personal_display_name().to_string();
         table_to_session.insert(table.clone(), username.clone());
-        table_to_display.insert(table, contact.display.clone());
-        sender_display.insert(username.clone(), contact.display.clone());
+        table_to_display.insert(table, display.clone());
+        sender_display.insert(username.clone(), display);
     }
 
     TableContext {
