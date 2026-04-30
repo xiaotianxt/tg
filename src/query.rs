@@ -1023,14 +1023,17 @@ mod tests {
         let message_dir = dir.path().join("message");
         std::fs::create_dir_all(&message_dir).unwrap();
         let conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let marker_col = dictionary::msg_compression_marker_column();
         conn.execute(
-            "CREATE TABLE Msg_test (
+            &format!(
+                "CREATE TABLE Msg_test (
                 local_type INTEGER,
                 create_time INTEGER,
                 message_content TEXT,
-                WCDB_CT_message_content INTEGER,
+                {marker_col} INTEGER,
                 real_sender_id INTEGER
-            )",
+            )"
+            ),
             [],
         )
         .unwrap();
@@ -1042,20 +1045,26 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO Msg_test (local_type, create_time, message_content, WCDB_CT_message_content, real_sender_id)
-             VALUES (1, 1000, 'before needle after', NULL, 7)",
+            &format!(
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id)
+             VALUES (1, 1000, 'before needle after', NULL, 7)"
+            ),
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO Msg_test (local_type, create_time, message_content, WCDB_CT_message_content, real_sender_id)
-             VALUES (1, 1001, 'ordinary update', NULL, 0)",
+            &format!(
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id)
+             VALUES (1, 1001, 'ordinary update', NULL, 0)"
+            ),
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO Msg_test (local_type, create_time, message_content, WCDB_CT_message_content, real_sender_id)
-             VALUES (1, 1002, 'literal 100%_match', NULL, 0)",
+            &format!(
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id)
+             VALUES (1, 1002, 'literal 100%_match', NULL, 0)"
+            ),
             [],
         )
         .unwrap();

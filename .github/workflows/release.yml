@@ -9,7 +9,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Verify arm64 runner
@@ -26,7 +26,7 @@ jobs:
           tar czf ../tg-${{ github.ref_name }}-darwin-arm64.tar.gz \
             tg
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tg-${{ github.ref_name }}-darwin-arm64
           path: tg-${{ github.ref_name }}-darwin-arm64.tar.gz
@@ -38,12 +38,12 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: tg-*
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: tg-*.tar.gz
           generate_release_notes: true

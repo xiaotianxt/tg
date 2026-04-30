@@ -550,8 +550,8 @@ pub fn read_messages(
             rows = match conn.prepare(&sql) {
                 Ok(mut stmt) => {
                     let map_row = |row: &rusqlite::Row<'_>| {
-                        let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(3)?;
-                        let content: String = if wcdb_ct == Some(4) {
+                        let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
+                        let content: String = if compression_marker == Some(4) {
                             if let Ok(b) = row.get::<_, Vec<u8>>(2) {
                                 message::try_decompress(&b).unwrap_or_default()
                             } else {
@@ -575,7 +575,7 @@ pub fn read_messages(
                             row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
                             row.get::<_, Option<i64>>(1)?.unwrap_or(0),
                             content,
-                            wcdb_ct,
+                            compression_marker,
                             sender_account_id,
                             packed_info,
                         ))
@@ -652,7 +652,9 @@ pub fn read_messages(
 
     let mut last_time_key = None;
     let mut last_sender: Option<String> = None;
-    for (local_type, create_time, content, wcdb_ct, sender_account_id, packed_info) in &messages {
+    for (local_type, create_time, content, compression_marker, sender_account_id, packed_info) in
+        &messages
+    {
         // 1-on-1 chat: if the sender is not the chat partner, it's "me"
         let sender_display = if sender_account_id.is_empty() || sender_account_id == &username {
             display_name.as_str()
@@ -664,7 +666,7 @@ pub fn read_messages(
             *local_type as i32,
             content,
             sender_display,
-            *wcdb_ct,
+            *compression_marker,
             packed_info,
             options.time_bucket,
             |id| {

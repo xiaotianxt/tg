@@ -181,8 +181,8 @@ pub fn export_messages(
 
             let rows: Vec<ExportMessageRow> = match conn.prepare(&sql) {
                 Ok(mut stmt) => match stmt.query_map([], |row| {
-                    let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(3)?;
-                    let content: String = if wcdb_ct == Some(4) {
+                    let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
+                    let content: String = if compression_marker == Some(4) {
                         if let Ok(b) = row.get::<_, Vec<u8>>(2) {
                             message::try_decompress(&b).unwrap_or_default()
                         } else {
@@ -203,7 +203,7 @@ pub fn export_messages(
                         row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
                         row.get::<_, Option<i64>>(1)?.unwrap_or(0),
                         content,
-                        row.get::<_, Option<i64>>(3)?,
+                        compression_marker,
                         packed_info,
                     ))
                 }) {
@@ -213,14 +213,14 @@ pub fn export_messages(
                 Err(_) => vec![],
             };
 
-            for (local_type, create_time, content, wcdb_ct, packed_info) in rows {
+            for (local_type, create_time, content, compression_marker, packed_info) in rows {
                 let time_str = time::format_local_timestamp(create_time);
 
                 let decoded = message::decode_message(
                     local_type as i32,
                     &content,
                     display_name,
-                    wcdb_ct,
+                    compression_marker,
                     &packed_info,
                     |id| contact::resolve_sender_name(id, &contacts),
                 );
@@ -458,26 +458,28 @@ fn load_indexed_export_messages(
 
     let mut messages = rows
         .filter_map(|row| row.ok())
-        .map(|(local_type, create_time, content, wcdb_ct, packed_info)| {
-            let decoded = message::decode_message(
-                local_type as i32,
-                &content,
-                display_name,
-                wcdb_ct,
-                &packed_info,
-                |id| contact::resolve_sender_name(id, contacts),
-            );
-            ExportMessage {
-                time: time::format_local_timestamp(create_time),
-                timestamp: create_time,
-                sender: decoded.display_name,
-                msg_type: local_type,
-                type_name: decoded.msg_type.to_string(),
-                content: decoded.content,
-                raw_content: content,
-                packed_info,
-            }
-        })
+        .map(
+            |(local_type, create_time, content, compression_marker, packed_info)| {
+                let decoded = message::decode_message(
+                    local_type as i32,
+                    &content,
+                    display_name,
+                    compression_marker,
+                    &packed_info,
+                    |id| contact::resolve_sender_name(id, contacts),
+                );
+                ExportMessage {
+                    time: time::format_local_timestamp(create_time),
+                    timestamp: create_time,
+                    sender: decoded.display_name,
+                    msg_type: local_type,
+                    type_name: decoded.msg_type.to_string(),
+                    content: decoded.content,
+                    raw_content: content,
+                    packed_info,
+                }
+            },
+        )
         .collect::<Vec<_>>();
     messages.sort_by_key(|message| message.timestamp);
     Ok(messages)
@@ -783,8 +785,8 @@ fn load_image_messages(
 
         let rows: Vec<(i64, String, Vec<u8>)> = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
-                let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(2)?;
-                let content: String = if wcdb_ct == Some(4) {
+                let compression_marker: Option<i64> = row.get::<_, Option<i64>>(2)?;
+                let content: String = if compression_marker == Some(4) {
                     if let Ok(b) = row.get::<_, Vec<u8>>(1) {
                         message::try_decompress(&b).unwrap_or_default()
                     } else {

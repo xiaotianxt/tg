@@ -87,14 +87,14 @@ pub struct DecodedMessage {
 /// - `msg_type` — 原始消息类型值
 /// - `raw_content` — 原始消息内容（可能为 TEXT 或 BLOB 转 String）
 /// - `session_display_name` — 会话的显示名（私聊即对方昵称，群聊即群名）
-/// - `wcdb_ct` — message compression marker from the source row
+/// - `compression_marker` — message compression marker from the source row
 /// - `packed_info` — packed media metadata bytes
 /// - `resolve_display_name` — 将账号 ID 解析为显示名的函数
 pub fn decode_message(
     msg_type: i32,
     raw_content: &str,
     session_display_name: &str,
-    _wcdb_ct: Option<i64>,
+    _compression_marker: Option<i64>,
     packed_info: &[u8],
     resolve_display_name: impl Fn(&str) -> String,
 ) -> DecodedMessage {
@@ -102,7 +102,7 @@ pub fn decode_message(
         msg_type,
         raw_content,
         session_display_name,
-        _wcdb_ct,
+        _compression_marker,
         packed_info,
         time::MessageTimeBucket::Minute(1),
         resolve_display_name,
@@ -113,7 +113,7 @@ pub(crate) fn decode_message_with_time_bucket(
     msg_type: i32,
     raw_content: &str,
     session_display_name: &str,
-    _wcdb_ct: Option<i64>,
+    _compression_marker: Option<i64>,
     packed_info: &[u8],
     time_bucket: time::MessageTimeBucket,
     resolve_display_name: impl Fn(&str) -> String,
