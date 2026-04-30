@@ -662,13 +662,13 @@ pub fn read_messages(
         .map(|ts| format!(" AND create_time >= {}", ts))
         .unwrap_or_default();
 
+    let query_limit = query_window_limit(options.limit, options.offset, options.tail);
     let db_jobs = parallel::job_count(options.jobs, 8);
     let per_db_messages = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
-        let mut total_count = 0usize;
         let mut rows: Vec<MessageRow> = Vec::new();
         let conn = match Connection::open(&db_path) {
             Ok(c) => c,
-            Err(_) => return (total_count, rows),
+            Err(_) => return rows,
         };
 
         // Check if table exists quickly
@@ -677,22 +677,7 @@ pub fn read_messages(
             .prepare(&format!("SELECT 1 FROM {} LIMIT 1", table))
             .is_ok();
         if !table_exists {
-            return (total_count, rows);
-        }
-
-        // Get total count for this DB
-        let count_sql = format!(
-            "SELECT COUNT(*) FROM {} WHERE create_time > 0{}{}",
-            table, search_clause, since_clause
-        );
-        if let Ok(mut stmt) = conn.prepare(&count_sql) {
-            let count = match &search_pattern {
-                Some(pattern) => stmt.query_row(params![pattern], |row| row.get::<_, i64>(0)),
-                None => stmt.query_row([], |row| row.get::<_, i64>(0)),
-            };
-            if let Ok(cnt) = count {
-                total_count += cnt.max(0) as usize;
-            }
+            return rows;
         }
 
         // Load Name2Id mapping (sender_id to account id)
@@ -726,8 +711,9 @@ pub fn read_messages(
             search_clause = search_clause,
             since_clause = since_clause,
             order_dir = order_dir,
-            limit_clause =
-                if options.tail { options.limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default() } else { String::new() }
+            limit_clause = query_limit
+                .map(|n| format!(" LIMIT {}", n))
+                .unwrap_or_default()
         );
         rows = match conn.prepare(&sql) {
             Ok(mut stmt) => {
@@ -772,13 +758,11 @@ pub fn read_messages(
             }
             Err(_) => vec![],
         };
-        (total_count, rows)
+        rows
     });
 
     let mut all_messages = Vec::new();
-    let mut total_count: usize = 0;
-    for (db_count, rows) in per_db_messages {
-        total_count += db_count;
+    for rows in per_db_messages {
         all_messages.extend(rows);
     }
 
@@ -817,31 +801,18 @@ pub fn read_messages(
     }
     if options.tail {
         if options.limit.is_some() {
-            out.line(format_args!(
-                "Showing latest {} of {} messages",
-                messages.len(),
-                total_count
-            ))?;
+            out.line(format_args!("Showing latest {} messages", messages.len()))?;
         } else {
-            out.line(format_args!(
-                "Showing {} of {} messages",
-                messages.len(),
-                total_count
-            ))?;
+            out.line(format_args!("Showing {} messages", messages.len()))?;
         }
     } else if options.limit.is_some() || options.offset > 0 {
         out.line(format_args!(
-            "Showing {}-{} of {} messages",
+            "Showing messages {}-{}",
             options.offset + 1,
-            options.offset + messages.len(),
-            total_count
+            options.offset + messages.len()
         ))?;
     } else {
-        out.line(format_args!(
-            "Showing {} of {} messages",
-            messages.len(),
-            total_count
-        ))?;
+        out.line(format_args!("Showing {} messages", messages.len()))?;
     }
     out.blank_line()?;
 
@@ -900,7 +871,15 @@ pub fn read_messages(
     out.blank_line()?;
     out.line(format_args!("--- End of messages ---"))?;
     out.flush()?;
-    Ok(total_count)
+    Ok(messages.len())
+}
+
+fn query_window_limit(limit: Option<usize>, offset: usize, tail: bool) -> Option<usize> {
+    if tail {
+        limit
+    } else {
+        limit.and_then(|n| n.checked_add(offset))
+    }
 }
 
 pub(crate) fn probe_session(
@@ -963,34 +942,33 @@ pub fn search_messages(
         .and_then(|p| load_contacts(p).ok())
         .unwrap_or_default();
 
-    let (total, results) = if options.use_telegram_fts {
+    let (displayed, has_more, results) = if options.use_telegram_fts {
         search_messages_with_telegram_fts(decrypted_dir, &options)
             .unwrap_or_else(|| search_messages_by_scanning(message_dbs, &options))
     } else {
         search_messages_by_scanning(message_dbs, &options)
     };
 
-    print_search_results(options.query, total, results, &contacts)
+    print_search_results(options.query, displayed, has_more, results, &contacts)
 }
 
 fn search_messages_by_scanning(
     message_dbs: Vec<PathBuf>,
     options: &SearchMessagesOptions<'_>,
-) -> (usize, Vec<SearchRow>) {
+) -> (usize, bool, Vec<SearchRow>) {
     let search_clause = msg_body_like_clause();
     let search_pattern = like_contains_pattern(options.query);
     let since_clause = options
         .since
         .map(|ts| format!(" AND create_time >= {}", ts))
         .unwrap_or_default();
-    let result_limit = options.limit;
+    let result_limit = options.limit.saturating_add(1);
     let db_jobs = parallel::job_count(options.jobs, 8);
     let per_db_results = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
-        let mut total_count = 0usize;
         let mut results: Vec<SearchRow> = Vec::new();
         let conn = match Connection::open(&db_path) {
             Ok(c) => c,
-            Err(_) => return (total_count, results),
+            Err(_) => return results,
         };
 
         // Find Msg_ tables - collect eagerly
@@ -1006,18 +984,6 @@ fn search_messages_by_scanning(
 
         for table_name in &tables {
             let table = quote_identifier(table_name);
-            let count_sql = format!(
-                "SELECT COUNT(*) FROM {} WHERE {}{}",
-                table, search_clause, since_clause
-            );
-            if let Ok(mut stmt) = conn.prepare(&count_sql) {
-                if let Ok(count) =
-                    stmt.query_row(params![&search_pattern], |row| row.get::<_, i64>(0))
-                {
-                    total_count += count.max(0) as usize;
-                }
-            }
-
             let sql = format!(
                 "SELECT local_type, create_time, {} \
                  FROM {} WHERE {}{} \
@@ -1051,27 +1017,27 @@ fn search_messages_by_scanning(
             };
             results.extend(rows);
         }
-        (total_count, results)
+        results
     });
 
     let mut results = Vec::new();
-    let mut total = 0usize;
-    for (count, rows) in per_db_results {
-        total += count;
+    for rows in per_db_results {
         results.extend(rows);
     }
 
     results.sort_by(|a, b| b.1.cmp(&a.1));
+    let has_more = results.len() > options.limit;
     results.truncate(options.limit);
+    let displayed = results.len();
     results.sort_by(|a, b| a.1.cmp(&b.1));
 
-    (total, results)
+    (displayed, has_more, results)
 }
 
 fn search_messages_with_telegram_fts(
     decrypted_dir: &Path,
     options: &SearchMessagesOptions<'_>,
-) -> Option<(usize, Vec<SearchRow>)> {
+) -> Option<(usize, bool, Vec<SearchRow>)> {
     let fts_db = find_message_fts_db(decrypted_dir)?;
     let conn = Connection::open(fts_db).ok()?;
     let content_tables = telegram_fts_content_tables(&conn)?;
@@ -1087,27 +1053,16 @@ fn search_messages_with_telegram_fts(
         .map(|ts| format!(" AND c6 >= {}", ts))
         .unwrap_or_default();
 
-    let mut total = 0usize;
     let mut results: Vec<SearchRow> = Vec::new();
+    let result_limit = options.limit.saturating_add(1);
 
     for table_name in content_tables {
         let table = quote_identifier(&table_name);
-        let count_sql = format!(
-            "SELECT COUNT(*) FROM {} WHERE {}{}",
-            table, search_clause, since_clause
-        );
-        if let Ok(mut stmt) = conn.prepare(&count_sql) {
-            if let Ok(count) = stmt.query_row(params![&search_pattern], |row| row.get::<_, i64>(0))
-            {
-                total += count.max(0) as usize;
-            }
-        }
-
         let sql = format!(
             "SELECT c1, c6, c0, c4 \
              FROM {} WHERE {}{} \
              ORDER BY c6 DESC LIMIT {}",
-            table, search_clause, since_clause, options.limit
+            table, search_clause, since_clause, result_limit
         );
         let rows: Vec<SearchRow> = match conn.prepare(&sql) {
             Ok(mut stmt) => stmt
@@ -1133,29 +1088,39 @@ fn search_messages_with_telegram_fts(
     }
 
     results.sort_by(|a, b| b.1.cmp(&a.1));
+    let has_more = results.len() > options.limit;
     results.truncate(options.limit);
+    let displayed = results.len();
     results.sort_by(|a, b| a.1.cmp(&b.1));
 
-    Some((total, results))
+    Some((displayed, has_more, results))
 }
 
 fn print_search_results(
     query: &str,
-    total: usize,
+    displayed: usize,
+    has_more: bool,
     results: Vec<SearchRow>,
     contacts: &HashMap<String, Contact>,
 ) -> Result<usize, String> {
-    if total == 0 {
+    if displayed == 0 {
         return Ok(0);
     }
 
     let stdout = std::io::stdout();
     let mut out = crate::output::Output::new(stdout.lock());
 
-    out.line(format_args!(
-        "Search results for '{}': {} matches",
-        query, total
-    ))?;
+    if has_more {
+        out.line(format_args!(
+            "Search results for '{}': showing latest {} matches (more available)",
+            query, displayed
+        ))?;
+    } else {
+        out.line(format_args!(
+            "Search results for '{}': {} matches",
+            query, displayed
+        ))?;
+    }
     out.blank_line()?;
 
     let display_results = &results;
@@ -1176,15 +1141,12 @@ fn print_search_results(
         ))?;
     }
 
-    if total > display_results.len() {
-        out.line(format_args!(
-            "... and {} older results",
-            total - display_results.len()
-        ))?;
+    if has_more {
+        out.line(format_args!("... more older results available"))?;
     }
 
     out.flush()?;
-    Ok(total)
+    Ok(displayed)
 }
 
 fn find_message_fts_db(decrypted_dir: &Path) -> Option<PathBuf> {

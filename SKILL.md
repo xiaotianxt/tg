@@ -77,6 +77,7 @@ Search globally:
 ```bash
 tg search "关键词" --limit 50
 tg search "关键词" --since today
+tg search "关键词" --all-time
 ```
 
 Use structured lookup when the user wants precise filters, multiple keywords,
@@ -88,6 +89,7 @@ tg query --contains "关键词" --limit 50
 tg query --session "张三" --contains "关键词" --fields time,sender,body --limit 20
 tg query --contains "项目" --contains "上线" --match-mode all --since today
 tg query --contains "项目" --not "已取消" --format json --fields timestamp,session,body
+tg query --contains "项目" --all-time
 tg schema --db message_0
 ```
 
@@ -96,7 +98,8 @@ shows the public query contract, not raw database table or column names.
 
 Query safety rules:
 
-- `query` requires at least `--contains` or `--since`.
+- `search`, `query`, and `export` default to the recent 365-day window; use `--all-time` only when the user asks for full history.
+- With `--all-time`, `query` requires at least `--contains` or `--since`.
 - Empty `--contains` / `--not` values are rejected.
 - Use `--session`, `--since`, and a reasonable `--limit` when results could be large.
 - Table output escapes terminal control characters; use `--format json` for machine parsing.
@@ -114,8 +117,9 @@ Export:
 
 ```bash
 tg export "张三" --format txt
-tg export "张三" --format csv --output exported/zhangsan
-tg export "张三" --format json --output exported/zhangsan
+tg export "张三" --format csv --since 30d --output exported/zhangsan
+tg export "张三" --format json --limit 1000 --output exported/zhangsan
+tg export "张三" --format json --all-time --output exported/zhangsan
 tg export "张三" --format json --output exported/zhangsan --media-dir exported/zhangsan/media
 ```
 
@@ -134,6 +138,7 @@ Time filters support dates, datetimes, and relative values:
 --since "2026-04-28 09:30:00"
 --since 5min
 --since 1h
+--since 1y
 --since today
 --since yesterday
 ```

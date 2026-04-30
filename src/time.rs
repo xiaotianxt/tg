@@ -6,6 +6,7 @@ const HOUR_FORMAT: &str = "%Y-%m-%d %H:00";
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const MONTH_FORMAT: &str = "%Y-%m";
 const YEAR_FORMAT: &str = "%Y";
+pub(crate) const DEFAULT_RECENT_DAYS: i64 = 365;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MessageTimeBucket {
@@ -21,7 +22,7 @@ pub(crate) enum MessageTimeBucket {
 /// Parse a time expression into a Unix timestamp.
 ///
 /// Accepts ISO 8601 formats (e.g. "2024-01-01T00:00:00", "2024-01-01 00:00:00")
-/// and relative expressions (e.g. "5min", "1h", "30s", "2d", "1w", "today").
+/// and relative expressions (e.g. "5min", "1h", "30s", "2d", "1w", "1y", "today").
 pub fn parse_relative_time(s: &str) -> Result<i64, String> {
     // Try ISO 8601 / RFC 3339
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
@@ -68,7 +69,7 @@ pub fn parse_relative_time(s: &str) -> Result<i64, String> {
         return Ok(now.timestamp() - minutes * 60);
     }
 
-    // Try single-char suffixes: s, h, d, w
+    // Try single-char suffixes: s, h, d, w, y
     if s.len() >= 2 {
         let (num_part, unit) = s.split_at(s.len() - 1);
         if let Ok(num) = num_part.parse::<i64>() {
@@ -77,6 +78,7 @@ pub fn parse_relative_time(s: &str) -> Result<i64, String> {
                 "h" => Ok(now.timestamp() - num * 3600),
                 "d" => Ok(now.timestamp() - num * 86400),
                 "w" => Ok(now.timestamp() - num * 604800),
+                "y" => Ok(now.timestamp() - num * 365 * 86400),
                 _ => Err(format!("Unknown time unit '{}' in '{}'", unit, s)),
             };
         }
@@ -84,7 +86,7 @@ pub fn parse_relative_time(s: &str) -> Result<i64, String> {
 
     Err(format!(
         "Cannot parse time expression '{}'. Use ISO 8601 (e.g. '2024-01-01T00:00:00') \
-         or relative (e.g. '5min', '1h', 'today').",
+         or relative (e.g. '5min', '1h', '7d', '1y', 'today').",
         s
     ))
 }
@@ -92,6 +94,10 @@ pub fn parse_relative_time(s: &str) -> Result<i64, String> {
 /// Parse an optional time expression string into a Unix timestamp.
 pub fn parse_since_opt(since: Option<&str>) -> Result<Option<i64>, String> {
     since.map(parse_relative_time).transpose()
+}
+
+pub(crate) fn default_recent_since() -> i64 {
+    Local::now().timestamp() - DEFAULT_RECENT_DAYS * 86400
 }
 
 pub(crate) fn parse_message_time_bucket(s: &str) -> Result<MessageTimeBucket, String> {
@@ -230,6 +236,15 @@ mod tests {
             .to_string();
 
         assert_eq!(format_local_timestamp(timestamp), expected);
+    }
+
+    #[test]
+    fn parses_year_relative_time() {
+        let before = Local::now().timestamp() - 365 * 86400;
+        let parsed = parse_relative_time("1y").unwrap();
+        let after = Local::now().timestamp() - 365 * 86400;
+
+        assert!(parsed >= before && parsed <= after);
     }
 
     #[test]

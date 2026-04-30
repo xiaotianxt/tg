@@ -81,6 +81,8 @@ pub fn export_messages(
     format: &str,
     output_dir: &Path,
     media_dir: Option<&Path>,
+    since: Option<i64>,
+    limit: Option<usize>,
     jobs: usize,
 ) -> Result<Vec<(&'static str, PathBuf)>, String> {
     let (contact_db, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
@@ -101,6 +103,11 @@ pub fn export_messages(
 
     // Table name
     let table_name = db::msg_table_name(&username);
+    let since_clause = since
+        .map(|ts| format!(" AND create_time >= {}", ts))
+        .unwrap_or_default();
+    let order_dir = if limit.is_some() { "DESC" } else { "ASC" };
+    let limit_clause = limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default();
 
     let db_jobs = parallel::job_count(jobs, 8);
     let per_db_messages = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
@@ -116,7 +123,7 @@ pub fn export_messages(
         let table = db::quote_identifier(&table_name);
         let sql = format!(
             "SELECT local_type, create_time, {body_col}, {marker_col}, {packed_col} \
-             FROM {table} WHERE create_time > 0 ORDER BY create_time ASC"
+             FROM {table} WHERE create_time > 0{since_clause} ORDER BY create_time {order_dir}{limit_clause}"
         );
 
         let rows: Vec<ExportMessageRow> = match conn.prepare(&sql) {
@@ -184,6 +191,13 @@ pub fn export_messages(
     }
 
     all_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    if let Some(limit) = limit {
+        if all_messages.len() > limit {
+            all_messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            all_messages.truncate(limit);
+            all_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        }
+    }
 
     if all_messages.is_empty() {
         return Err(format!("No messages found for '{}'", username));
@@ -1217,6 +1231,8 @@ mod tests {
             "json",
             output.path(),
             None,
+            None,
+            None,
             1,
         )
         .unwrap();
@@ -1248,6 +1264,8 @@ mod tests {
             "all",
             output.path(),
             None,
+            None,
+            None,
             1,
         )
         .unwrap();
@@ -1264,6 +1282,32 @@ mod tests {
         assert!(csv.contains("时间,发送者,类型,内容"));
         assert!(csv.contains("\"second, \"\"quoted\"\" message\""));
         assert!(output.path().join("chat.json").exists());
+    }
+
+    #[test]
+    fn export_messages_respects_since_and_limit() {
+        let decrypted = create_export_decrypted_dir();
+        let output = tempdir().unwrap();
+
+        export_messages(
+            decrypted.path(),
+            "tgid_export",
+            "json",
+            output.path(),
+            None,
+            Some(1000),
+            Some(1),
+            1,
+        )
+        .unwrap();
+
+        let data: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(output.path().join("chat.json")).unwrap(),
+        )
+        .unwrap();
+        let messages = data.as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["timestamp"], 1001);
     }
 
     #[test]

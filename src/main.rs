@@ -237,8 +237,11 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Show matches after this time (ISO 8601 or relative: 5min, 1h, today)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all_time")]
         since: Option<String>,
+        /// Search the full history instead of the default recent window
+        #[arg(long)]
+        all_time: bool,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
@@ -258,8 +261,11 @@ enum Commands {
         #[arg(long = "not")]
         not_contains: Vec<String>,
         /// Show messages after this time (ISO 8601 or relative: 5min, 1h, today)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all_time")]
         since: Option<String>,
+        /// Search the full history instead of the default recent window
+        #[arg(long)]
+        all_time: bool,
         /// Show messages before this time (ISO 8601 or relative: 5min, 1h, today)
         #[arg(long)]
         until: Option<String>,
@@ -322,6 +328,15 @@ enum Commands {
         /// Directory to save decoded media files (images, stickers, videos)
         #[arg(long)]
         media_dir: Option<PathBuf>,
+        /// Export messages after this time (defaults to the recent window)
+        #[arg(long, conflicts_with = "all_time")]
+        since: Option<String>,
+        /// Export at most this many latest messages from the selected window
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Export the full history instead of the default recent window
+        #[arg(long)]
+        all_time: bool,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
@@ -441,7 +456,7 @@ fn main() {
             top,
             jobs,
         } => {
-            let _ = cache::refresh_decrypted(&decrypted_dir, jobs);
+            let _ = cache::refresh_message_decrypted(&decrypted_dir, jobs);
             match db::list_sessions(&decrypted_dir, top, query.as_deref(), jobs) {
                 Ok(sessions) => {
                     if sessions.is_empty() {
@@ -575,14 +590,24 @@ fn main() {
             decrypted_dir,
             limit,
             since,
+            all_time,
             jobs,
         } => {
+            if limit == 0 {
+                log::error!("Error: --limit must be greater than 0");
+                std::process::exit(1);
+            }
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
                     log::error!("Error parsing --since: {}", e);
                     std::process::exit(1);
                 }
+            };
+            let since_ts = if all_time {
+                since_ts
+            } else {
+                Some(since_ts.unwrap_or_else(time::default_recent_since))
             };
             let refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
             if cache::needs_search_refresh_warning(&refresh) {
@@ -622,6 +647,7 @@ fn main() {
             contains,
             not_contains,
             since,
+            all_time,
             until,
             limit,
             offset,
@@ -638,6 +664,11 @@ fn main() {
                     log::error!("Error parsing --since: {}", e);
                     std::process::exit(1);
                 }
+            };
+            let since_ts = if all_time {
+                since_ts
+            } else {
+                Some(since_ts.unwrap_or_else(time::default_recent_since))
             };
             let until_ts = match time::parse_since_opt(until.as_deref()) {
                 Ok(ts) => ts,
@@ -674,11 +705,11 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
-            if cache::needs_search_refresh_warning(&refresh) {
+            let refresh = cache::refresh_message_decrypted(&decrypted_dir, jobs);
+            if cache::needs_message_key_retry(&refresh) {
                 log::warn!(
-                    "Decrypted cache refresh had issues ({}). Query results may be stale.",
-                    cache::search_refresh_reason(&refresh)
+                    "Decrypted message cache refresh had issues ({}). Query results may be stale.",
+                    cache::retry_reason(&refresh)
                 );
             }
             match query::run(query::QueryOptions {
@@ -746,15 +777,42 @@ fn main() {
             format,
             output,
             media_dir,
+            since,
+            limit,
+            all_time,
             jobs,
         } => {
-            let _ = cache::refresh_decrypted(&decrypted_dir, jobs);
+            let since_ts = match time::parse_since_opt(since.as_deref()) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    log::error!("Error parsing --since: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let since_ts = if all_time {
+                since_ts
+            } else {
+                Some(since_ts.unwrap_or_else(time::default_recent_since))
+            };
+            if limit == Some(0) {
+                log::error!("Error: --limit must be greater than 0");
+                std::process::exit(1);
+            }
+            let refresh = cache::refresh_message_decrypted(&decrypted_dir, jobs);
+            if cache::needs_message_key_retry(&refresh) {
+                log::warn!(
+                    "Decrypted message cache refresh had issues ({}). Export may be stale.",
+                    cache::retry_reason(&refresh)
+                );
+            }
             match export::export_messages(
                 &decrypted_dir,
                 &session,
                 &format,
                 &output,
                 media_dir.as_deref(),
+                since_ts,
+                limit,
                 jobs,
             ) {
                 Ok(paths) => {
