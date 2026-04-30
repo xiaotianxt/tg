@@ -1,6 +1,6 @@
 [package]
 name = "tg"
-version = "1.1.8"
+version = "1.1.9"
 edition = "2021"
 description = "macOS Telegram 聊天记录读取 CLI 工具"
 authors = ["xiaotianxt"]
