@@ -1049,6 +1049,8 @@ fn escape_csv(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
+    use tempfile::{tempdir, TempDir};
 
     fn packed_image(filename: &str) -> Vec<u8> {
         let mut packed = Vec::new();
@@ -1070,6 +1072,131 @@ mod tests {
         packed
     }
 
+    fn create_export_decrypted_dir() -> TempDir {
+        let dir = tempdir().unwrap();
+        let contact_dir = dir.path().join("contact");
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&contact_dir).unwrap();
+        std::fs::create_dir_all(&message_dir).unwrap();
+
+        let contact_conn = Connection::open(contact_dir.join("contact.db")).unwrap();
+        contact_conn
+            .execute(
+                "CREATE TABLE contact (
+                    username TEXT,
+                    nick_name TEXT,
+                    remark TEXT,
+                    alias TEXT
+                )",
+                [],
+            )
+            .unwrap();
+        contact_conn
+            .execute(
+                "INSERT INTO contact (username, nick_name, remark, alias)
+                 VALUES ('tgid_export', 'Export Nick', 'Export Remark', '')",
+                [],
+            )
+            .unwrap();
+        drop(contact_conn);
+
+        let message_conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let table_name = db::msg_table_name("tgid_export");
+        let body_col = db::quote_identifier(&dictionary::msg_body_column());
+        let marker_col = db::quote_identifier(&dictionary::msg_compression_marker_column());
+        let packed_col = db::quote_identifier(&dictionary::msg_packed_meta_column());
+        message_conn
+            .execute(
+                &format!(
+                    "CREATE TABLE {} (
+                        local_type INTEGER,
+                        create_time INTEGER,
+                        {} TEXT,
+                        {} INTEGER,
+                        {} BLOB
+                    )",
+                    table_name, body_col, marker_col, packed_col
+                ),
+                [],
+            )
+            .unwrap();
+        for (timestamp, content) in [
+            (1001, "second, \"quoted\" message"),
+            (1000, "first message"),
+        ] {
+            message_conn
+                .execute(
+                    &format!(
+                        "INSERT INTO {} (local_type, create_time, {}, {}, {})
+                         VALUES (1, ?1, ?2, NULL, x'')",
+                        table_name, body_col, marker_col, packed_col
+                    ),
+                    params![timestamp, content],
+                )
+                .unwrap();
+        }
+        drop(message_conn);
+
+        dir
+    }
+
+    fn create_image_decrypted_dir() -> TempDir {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+
+        let message_conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let table_name = db::msg_table_name("tgid_images");
+        let body_col = db::quote_identifier(&dictionary::msg_body_column());
+        let marker_col = db::quote_identifier(&dictionary::msg_compression_marker_column());
+        let packed_col = db::quote_identifier(&dictionary::msg_packed_meta_column());
+        message_conn
+            .execute(
+                &format!(
+                    "CREATE TABLE {} (
+                        local_type INTEGER,
+                        create_time INTEGER,
+                        {} TEXT,
+                        {} INTEGER,
+                        {} BLOB
+                    )",
+                    table_name, body_col, marker_col, packed_col
+                ),
+                [],
+            )
+            .unwrap();
+
+        for (msg_type, timestamp, content, packed) in [
+            (
+                3,
+                1000,
+                r#"<msg><img aeskey="old-xml-key" /></msg>"#,
+                packed_image("old.dat"),
+            ),
+            (1, 1001, "not an image", Vec::new()),
+            (
+                3,
+                1002,
+                r#"<msg><img aeskey="new-xml-key" /></msg>"#,
+                packed_image("new.dat"),
+            ),
+        ] {
+            message_conn
+                .execute(
+                    &format!(
+                        "INSERT INTO {} (local_type, create_time, {}, {}, {})
+                         VALUES (?1, ?2, ?3, NULL, ?4)",
+                        table_name, body_col, marker_col, packed_col
+                    ),
+                    params![msg_type, timestamp, content, packed],
+                )
+                .unwrap();
+        }
+        drop(message_conn);
+
+        dir
+    }
+
     fn image_message(raw_content: &str, packed_info: Vec<u8>) -> ImageMessage {
         ImageMessage {
             time: "2026-04-28 09:38:44".to_string(),
@@ -1077,6 +1204,96 @@ mod tests {
             raw_content: raw_content.to_string(),
             packed_info,
         }
+    }
+
+    #[test]
+    fn export_messages_writes_json_in_chronological_order() {
+        let decrypted = create_export_decrypted_dir();
+        let output = tempdir().unwrap();
+
+        let results = export_messages(
+            decrypted.path(),
+            "tgid_export",
+            "json",
+            output.path(),
+            None,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "json");
+        let data: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(output.path().join("chat.json")).unwrap(),
+        )
+        .unwrap();
+        let messages = data.as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["timestamp"], 1000);
+        assert_eq!(messages[0]["sender"], "Export Remark");
+        assert_eq!(messages[0]["content"], "first message");
+        assert_eq!(messages[1]["timestamp"], 1001);
+        assert!(messages[0].get("raw_content").is_none());
+        assert!(messages[0].get("packed_info").is_none());
+    }
+
+    #[test]
+    fn export_messages_writes_all_formats_by_default() {
+        let decrypted = create_export_decrypted_dir();
+        let output = tempdir().unwrap();
+
+        let results = export_messages(
+            decrypted.path(),
+            "tgid_export",
+            "all",
+            output.path(),
+            None,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            results.iter().map(|(fmt, _)| *fmt).collect::<Vec<_>>(),
+            vec!["txt", "csv", "json"]
+        );
+        let txt = std::fs::read_to_string(output.path().join("chat.txt")).unwrap();
+        assert!(txt.contains("Export Remark (tgid_export)"));
+        assert!(txt.contains("first message"));
+
+        let csv = std::fs::read_to_string(output.path().join("chat.csv")).unwrap();
+        assert!(csv.contains("时间,发送者,类型,内容"));
+        assert!(csv.contains("\"second, \"\"quoted\"\" message\""));
+        assert!(output.path().join("chat.json").exists());
+    }
+
+    #[test]
+    fn load_image_messages_returns_images_newest_first() {
+        let decrypted = create_image_decrypted_dir();
+
+        let (username, messages) =
+            load_image_messages(decrypted.path(), "tgid_images", None, 10, 1).unwrap();
+
+        assert_eq!(username, "tgid_images");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.timestamp)
+                .collect::<Vec<_>>(),
+            vec![1002, 1000]
+        );
+        assert_eq!(image_identifier(&messages[0]).as_deref(), Some("new.dat"));
+    }
+
+    #[test]
+    fn load_image_messages_respects_since_and_limit() {
+        let decrypted = create_image_decrypted_dir();
+
+        let (_, messages) =
+            load_image_messages(decrypted.path(), "tgid_images", Some(1001), 1, 1).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].timestamp, 1002);
+        assert_eq!(image_identifier(&messages[0]).as_deref(), Some("new.dat"));
     }
 
     #[test]

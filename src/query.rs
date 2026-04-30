@@ -933,8 +933,37 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO Msg_test (local_type, create_time, message_content, WCDB_CT_message_content, real_sender_id)
+             VALUES (1, 1002, 'literal 100%_match', NULL, 0)",
+            [],
+        )
+        .unwrap();
         drop(conn);
         dir
+    }
+
+    fn default_query_options<'a>(
+        dir: &'a Path,
+        contains: &'a [String],
+        not_contains: &'a [String],
+    ) -> QueryOptions<'a> {
+        QueryOptions {
+            decrypted_dir: dir,
+            session: None,
+            contains,
+            not_contains,
+            since: None,
+            until: None,
+            limit: 100,
+            offset: 0,
+            sort: QuerySort::Newest,
+            match_mode: QueryMatchMode::All,
+            fields: QueryFields::parse("timestamp,body").unwrap(),
+            format: QueryOutputFormat::Table,
+            max_cell_chars: 500,
+            jobs: 1,
+        }
     }
 
     fn run_messages_for_test(
@@ -946,22 +975,7 @@ mod tests {
         let count = {
             let mut out = output::Output::new(&mut bytes);
             let count = run_messages_with_output(
-                QueryOptions {
-                    decrypted_dir: dir,
-                    session: None,
-                    contains,
-                    not_contains,
-                    since: None,
-                    until: None,
-                    limit: 100,
-                    offset: 0,
-                    sort: QuerySort::Newest,
-                    match_mode: QueryMatchMode::All,
-                    fields: QueryFields::parse("timestamp,body").unwrap(),
-                    format: QueryOutputFormat::Table,
-                    max_cell_chars: 500,
-                    jobs: 1,
-                },
+                default_query_options(dir, contains, not_contains),
                 &mut out,
             )?;
             out.flush()?;
@@ -993,6 +1007,17 @@ mod tests {
     }
 
     #[test]
+    fn message_query_treats_like_wildcards_as_text() {
+        let dir = create_query_test_dir();
+        let contains = vec!["%".to_string()];
+
+        let (count, output) = run_messages_for_test(dir.path(), &contains, &[]).unwrap();
+
+        assert_eq!(count, 1);
+        assert!(output.contains("literal 100%_match"));
+    }
+
+    #[test]
     fn message_query_rejects_empty_keywords() {
         let dir = create_query_test_dir();
         let contains = vec!["   ".to_string()];
@@ -1007,27 +1032,11 @@ mod tests {
         let contains = vec!["needle".to_string()];
         let mut bytes = Vec::new();
         let mut out = output::Output::new(&mut bytes);
+        let mut options = default_query_options(dir.path(), &contains, &[]);
+        options.limit = MAX_QUERY_RESULT_WINDOW;
+        options.offset = 1;
 
-        let err = run_messages_with_output(
-            QueryOptions {
-                decrypted_dir: dir.path(),
-                session: None,
-                contains: &contains,
-                not_contains: &[],
-                since: None,
-                until: None,
-                limit: MAX_QUERY_RESULT_WINDOW,
-                offset: 1,
-                sort: QuerySort::Newest,
-                match_mode: QueryMatchMode::All,
-                fields: QueryFields::parse("timestamp,body").unwrap(),
-                format: QueryOutputFormat::Table,
-                max_cell_chars: 500,
-                jobs: 1,
-            },
-            &mut out,
-        )
-        .unwrap_err();
+        let err = run_messages_with_output(options, &mut out).unwrap_err();
 
         assert!(err.contains("--limit plus --offset"));
     }
@@ -1038,27 +1047,10 @@ mod tests {
         let contains = vec!["needle".to_string()];
         let mut bytes = Vec::new();
         let mut out = output::Output::new(&mut bytes);
+        let mut options = default_query_options(dir.path(), &contains, &[]);
+        options.max_cell_chars = MAX_TABLE_CELL_CHARS + 1;
 
-        let err = run_messages_with_output(
-            QueryOptions {
-                decrypted_dir: dir.path(),
-                session: None,
-                contains: &contains,
-                not_contains: &[],
-                since: None,
-                until: None,
-                limit: 100,
-                offset: 0,
-                sort: QuerySort::Newest,
-                match_mode: QueryMatchMode::All,
-                fields: QueryFields::parse("timestamp,body").unwrap(),
-                format: QueryOutputFormat::Table,
-                max_cell_chars: MAX_TABLE_CELL_CHARS + 1,
-                jobs: 1,
-            },
-            &mut out,
-        )
-        .unwrap_err();
+        let err = run_messages_with_output(options, &mut out).unwrap_err();
 
         assert!(err.contains("--max-cell-chars"));
     }
@@ -1107,6 +1099,19 @@ mod tests {
         assert!(output.contains("field\tbody\tstring"));
         assert!(!output.contains("CREATE TABLE"));
         assert!(!output.contains("Msg_test"));
+    }
+
+    #[test]
+    fn message_query_opens_database_read_only() {
+        let dir = create_query_test_dir();
+        let path = dir.path().join("message/message_0.db");
+
+        let conn = open_readonly(&path).unwrap();
+
+        assert!(conn.is_readonly(rusqlite::MAIN_DB).unwrap());
+        assert!(conn
+            .execute("CREATE TABLE write_probe (id INTEGER)", [])
+            .is_err());
     }
 
     #[test]

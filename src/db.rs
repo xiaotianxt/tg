@@ -464,7 +464,7 @@ pub fn list_sessions(
         let display = contacts
             .get(&username)
             .map(|c| c.display.as_str())
-            .unwrap_or("(?))");
+            .unwrap_or("(?)");
 
         let time_range = match (info.earliest, info.latest) {
             (Some(e), Some(l)) => {
@@ -1614,6 +1614,76 @@ mod tests {
         (dir, path)
     }
 
+    fn create_decrypted_dir_with_session_counts(
+        contacts: &[(&str, &str, &str, &str)],
+        rows: &[(&str, usize, i64)],
+    ) -> TempDir {
+        let dir = tempdir().unwrap();
+        let contact_dir = dir.path().join("contact");
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&contact_dir).unwrap();
+        std::fs::create_dir_all(&message_dir).unwrap();
+
+        let contact_conn = Connection::open(contact_dir.join("contact.db")).unwrap();
+        contact_conn
+            .execute(
+                "CREATE TABLE contact (
+                    username TEXT,
+                    nick_name TEXT,
+                    remark TEXT,
+                    alias TEXT
+                )",
+                [],
+            )
+            .unwrap();
+        for (username, nick_name, remark, alias) in contacts {
+            contact_conn
+                .execute(
+                    "INSERT INTO contact (username, nick_name, remark, alias)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![username, nick_name, remark, alias],
+                )
+                .unwrap();
+        }
+        drop(contact_conn);
+
+        let message_conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let body_col = quote_identifier(&dictionary::msg_body_column());
+        for (username, count, latest_time) in rows {
+            let table_name = msg_table_name(username);
+            message_conn
+                .execute(
+                    &format!(
+                        "CREATE TABLE {} (
+                            local_type INTEGER,
+                            create_time INTEGER,
+                            {} TEXT
+                        )",
+                        table_name, body_col
+                    ),
+                    [],
+                )
+                .unwrap();
+
+            for i in 0..*count {
+                let create_time = latest_time - (*count - i - 1) as i64;
+                message_conn
+                    .execute(
+                        &format!(
+                            "INSERT INTO {} (local_type, create_time, {})
+                             VALUES (1, ?1, 'hello')",
+                            table_name, body_col
+                        ),
+                        params![create_time],
+                    )
+                    .unwrap();
+            }
+        }
+        drop(message_conn);
+
+        dir
+    }
+
     fn create_decrypted_dir_with_messages(username: &str, contents: &[&str]) -> TempDir {
         let dir = tempdir().unwrap();
         let message_dir = dir.path().join("message");
@@ -1915,6 +1985,27 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_returns_sorted_contact_display_names() {
+        let dir = create_decrypted_dir_with_session_counts(
+            &[
+                ("tgid_low", "Low Nick", "Low Remark", ""),
+                ("tgid_high", "High Nick", "", ""),
+            ],
+            &[("tgid_low", 1, 1000), ("tgid_high", 3, 2000)],
+        );
+
+        let sessions = list_sessions(dir.path(), 10, 1).unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].0, "tgid_high");
+        assert_eq!(sessions[0].1, 3);
+        assert_eq!(sessions[0].3, "High Nick");
+        assert_eq!(sessions[1].0, "tgid_low");
+        assert_eq!(sessions[1].1, 1);
+        assert_eq!(sessions[1].3, "Low Remark");
+    }
+
+    #[test]
     fn search_messages_matches_query_inside_content() {
         let dir = create_decrypted_dir_with_messages(
             "tgid_search",
@@ -1956,6 +2047,50 @@ mod tests {
         .unwrap();
 
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn search_messages_treats_wildcards_as_text() {
+        let dir = create_decrypted_dir_with_messages(
+            "tgid_search",
+            &["literal 100%_match", "ordinary update"],
+        );
+
+        let count = search_messages(
+            dir.path(),
+            SearchMessagesOptions {
+                query: "%",
+                limit: 20,
+                since: None,
+                use_telegram_fts: false,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn search_messages_respects_since_filter() {
+        let dir = create_decrypted_dir_with_messages(
+            "tgid_search",
+            &["old needle", "new needle", "no match"],
+        );
+
+        let count = search_messages(
+            dir.path(),
+            SearchMessagesOptions {
+                query: "needle",
+                limit: 20,
+                since: Some(1001),
+                use_telegram_fts: false,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -2011,6 +2146,32 @@ mod tests {
     }
 
     #[test]
+    fn read_messages_respects_since_filter() {
+        let dir = create_decrypted_dir_with_messages(
+            "tgid_search",
+            &["old needle", "new needle", "no match"],
+        );
+
+        let count = read_messages(
+            dir.path(),
+            ReadMessagesOptions {
+                session_query: "tgid_search",
+                limit: None,
+                offset: 0,
+                search_query: Some("needle"),
+                since: Some(1001),
+                tail: false,
+                time_bucket: time::MessageTimeBucket::PerMessage,
+                name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn search_messages_uses_telegram_fts_content_cache() {
         let dir =
             create_decrypted_dir_with_fts(&["before needle after", "before needle", "no match"]);
@@ -2048,6 +2209,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn fts_search_treats_wildcards_as_text() {
+        let dir = create_decrypted_dir_with_fts(&["literal 100%_match", "ordinary update"]);
+
+        let count = search_messages(
+            dir.path(),
+            SearchMessagesOptions {
+                query: "%",
+                limit: 20,
+                since: None,
+                use_telegram_fts: true,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn fts_search_respects_since_filter() {
+        let dir = create_decrypted_dir_with_fts(&["old needle", "new needle", "no match"]);
+
+        let count = search_messages(
+            dir.path(),
+            SearchMessagesOptions {
+                query: "needle",
+                limit: 20,
+                since: Some(1001),
+                use_telegram_fts: true,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
     }
 
     #[test]
