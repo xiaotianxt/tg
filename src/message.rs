@@ -251,14 +251,94 @@ fn decode_content_by_type(
     resolve_display_name: &impl Fn(&str) -> String,
 ) -> String {
     match msg_type {
+        1 => decode_text_content(content, time_bucket, resolve_display_name),
         49 => decode_link_content(content, time_bucket, resolve_display_name),
         48 => decode_location_content(content),
         50 => decode_call_content(content),
         62 => decode_file_content(content),
         419430449 => decode_music_content(content),
         436207665 | 536870918 => format!("[{}]", MessageType::from(msg_type)),
-        _ => content.to_string(),
+        _ => decode_text_content(content, time_bucket, resolve_display_name),
     }
+}
+
+fn decode_text_content(
+    content: &str,
+    time_bucket: time::MessageTimeBucket,
+    resolve_display_name: &impl Fn(&str) -> String,
+) -> String {
+    decode_text_with_internal_xml(content, time_bucket, resolve_display_name)
+        .unwrap_or_else(|| content.to_string())
+}
+
+fn decode_text_with_internal_xml(
+    content: &str,
+    time_bucket: time::MessageTimeBucket,
+    resolve_display_name: &impl Fn(&str) -> String,
+) -> Option<String> {
+    let normalized = strip_display_prefix(content);
+    if let Some(decoded) =
+        decode_internal_xml_fragment(normalized, time_bucket, resolve_display_name)
+    {
+        return Some(decoded);
+    }
+
+    let start = find_internal_xml_start(content)?;
+    let prefix = content[..start].trim_end();
+    let fragment = &content[start..];
+    let decoded = decode_internal_xml_fragment(fragment, time_bucket, resolve_display_name)?;
+    if prefix.is_empty() {
+        Some(decoded)
+    } else {
+        Some(format!("{}\n{}", prefix, decoded))
+    }
+}
+
+fn decode_internal_xml_fragment(
+    fragment: &str,
+    time_bucket: time::MessageTimeBucket,
+    resolve_display_name: &impl Fn(&str) -> String,
+) -> Option<String> {
+    let fragment = strip_display_prefix(fragment).trim_start();
+    let xml = if fragment.starts_with("<?xml") {
+        let start = fragment.find("<msg")?;
+        &fragment[start..]
+    } else {
+        fragment
+    };
+
+    if !xml.starts_with("<msg") {
+        return None;
+    }
+
+    if xml.contains("<appmsg") {
+        return Some(decode_link_content(xml, time_bucket, resolve_display_name));
+    }
+    if xml.contains("<img") {
+        return Some(media::parse_image_info(xml).display());
+    }
+    if xml.contains("<videomsg") || xml.contains("<video") {
+        return Some(media::parse_video_info(xml).display());
+    }
+
+    None
+}
+
+fn strip_display_prefix(content: &str) -> &str {
+    let trimmed = content.trim_start();
+    for prefix in ["[链接]", "[卡片]", "[小程序]", "[文件]"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.trim_start();
+        }
+    }
+    trimmed
+}
+
+fn find_internal_xml_start(content: &str) -> Option<usize> {
+    ["<?xml", "<msg"]
+        .iter()
+        .filter_map(|needle| content.find(needle))
+        .min()
 }
 
 fn decode_system_content(content: &str, msg_type: MessageType) -> String {
@@ -580,15 +660,20 @@ fn decode_refermsg_content(
         format!("[{}]", MessageType::from(ref_type))
     } else {
         match ref_type {
-            1 => clean_content.to_string(),
+            1 => decode_text_content(clean_content, time_bucket, resolve_display_name),
             t if is_media_type(t) => decode_media_content(t, clean_content, &[]),
-            49 if clean_content.trim_start().starts_with('<') => {
-                decode_link_content(clean_content, time_bucket, resolve_display_name)
+            49 => {
+                let normalized = strip_display_prefix(clean_content);
+                if normalized.trim_start().starts_with('<') {
+                    decode_link_content(normalized, time_bucket, resolve_display_name)
+                } else {
+                    decode_text_content(clean_content, time_bucket, resolve_display_name)
+                }
             }
             _ if clean_content.trim_start().starts_with('<') => {
                 format!("[{}]", MessageType::from(ref_type))
             }
-            _ => clean_content.to_string(),
+            _ => decode_text_content(clean_content, time_bucket, resolve_display_name),
         }
     };
 
@@ -607,8 +692,9 @@ fn decode_refermsg_sender(
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty());
 
-    let sender_id = crate::media::extract_xml_tag(refermsg, "chatusr")
-        .or_else(|| content_sender.map(|id| id.to_string()))
+    let sender_id = content_sender
+        .map(|id| id.to_string())
+        .or_else(|| crate::media::extract_xml_tag(refermsg, "chatusr"))
         .or_else(|| {
             crate::media::extract_xml_tag(refermsg, "fromusr")
                 .filter(|id| !id.contains("@chatroom"))
@@ -793,9 +879,9 @@ mod tests {
 
     #[test]
     fn test_decode_revoke_system_message() {
-        let xml = r#"<?xml version="1.0"?><sysmsg type="revokemsg"><revokemsg><content>&quot;俞腾飞 22&quot; 撤回了一条消息</content><revoketime>0</revoketime></revokemsg></sysmsg>"#;
+        let xml = r#"<?xml version="1.0"?><sysmsg type="revokemsg"><revokemsg><content>&quot;张三&quot; 撤回了一条消息</content><revoketime>0</revoketime></revokemsg></sysmsg>"#;
         let d = decode_message(10000, xml, "Alice", None, &[], |id| id.to_string());
-        assert_eq!(d.content, r#"[撤回] "俞腾飞 22" 撤回了一条消息"#);
+        assert_eq!(d.content, r#"[撤回] "张三" 撤回了一条消息"#);
         assert_eq!(d.display_name, "系统");
     }
 
@@ -972,5 +1058,32 @@ continues</datadesc></dataitem><dataitem datatype="1" dataid="c"><sourcename>B</
             }
         });
         assert_eq!(d.content, "> Bob: [img]\n 回复图片");
+    }
+
+    #[test]
+    fn test_decode_quoted_link_with_display_prefix() {
+        let xml = r#"<msg><appmsg><title>回复链接</title><type>57</type><refermsg><type>49</type><displayname>Bob</displayname><content>[链接] &lt;?xml version="1.0"?&gt;&lt;msg&gt;&lt;appmsg&gt;&lt;title&gt;Example&lt;/title&gt;&lt;type&gt;5&lt;/type&gt;&lt;/appmsg&gt;&lt;/msg&gt;</content></refermsg></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+
+        assert_eq!(d.content, "> Bob: [链接] Example\n 回复链接");
+    }
+
+    #[test]
+    fn test_decode_quoted_text_replaces_embedded_app_xml() {
+        let xml = r#"<msg><appmsg><title>外层回复文本</title><type>57</type><refermsg><type>1</type><displayname>Bob</displayname><content>tgid_bob:
+被引用的占位文本
+&lt;msg&gt;&lt;appmsg&gt;&lt;title&gt;嵌套引用标题&lt;/title&gt;&lt;type&gt;57&lt;/type&gt;&lt;refermsg&gt;&lt;type&gt;3&lt;/type&gt;&lt;chatusr&gt;tgid_alice&lt;/chatusr&gt;&lt;content&gt;tgid_alice:
+&amp;lt;msg&amp;gt;&amp;lt;img aeskey="img-key" /&amp;gt;&amp;lt;/msg&amp;gt;&lt;/content&gt;&lt;/refermsg&gt;&lt;/appmsg&gt;&lt;/msg&gt;</content></refermsg></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| match id {
+            "tgid_alice" => "Alice".to_string(),
+            "tgid_bob" => "Bob".to_string(),
+            _ => id.to_string(),
+        });
+
+        assert!(d.content.contains("被引用的占位文本"));
+        assert!(d.content.contains("嵌套引用标题"));
+        assert!(d.content.contains("外层回复文本"));
+        assert!(!d.content.contains("<msg"));
+        assert!(!d.content.contains("<appmsg"));
     }
 }
