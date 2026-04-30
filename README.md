@@ -124,6 +124,18 @@ make install-local
 make install
 ```
 
+安装 shell completion：
+
+```bash
+tg completions fish > ~/.config/fish/completions/tg.fish
+tg completions zsh > ~/.zsh/completions/_tg
+tg completions bash > ~/.local/share/bash-completion/completions/tg
+```
+
+补全脚本支持命令、常用 flags、会话名和 `query --session`。动态会话候选只读取本地
+`~/.tg/decrypted/.tg_index.db` 或 contact cache，不会触发解密、刷新或读取在线服务。
+release formula 会为 Homebrew 用户自动安装这些 completions。
+
 如果没有 C 编译器：
 
 ```bash

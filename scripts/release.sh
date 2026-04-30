@@ -392,6 +392,7 @@ path.write_text(f'''class Tg < Formula
 
   def install
     bin.install "tg"
+    generate_completions_from_executable(bin/"tg", "completions")
   end
 
   test do

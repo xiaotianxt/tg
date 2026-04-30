@@ -1,4 +1,5 @@
 mod cache;
+mod completion;
 mod db;
 mod decrypt;
 mod dictionary;
@@ -20,7 +21,7 @@ mod scanner;
 mod skill;
 mod time;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -66,6 +67,8 @@ fn is_known_subcommand(value: &str) -> bool {
             | "doctor"
             | "refresh"
             | "skill"
+            | "completions"
+            | "__complete"
             | "help"
     )
 }
@@ -378,6 +381,23 @@ enum Commands {
         #[command(subcommand)]
         command: SkillCommands,
     },
+    /// Generate shell completion scripts
+    Completions {
+        /// Shell to generate completions for
+        shell: CompletionShell,
+    },
+    /// Internal dynamic completion helper
+    #[command(name = "__complete", hide = true)]
+    Complete {
+        /// Dynamic candidate kind
+        kind: CompleteKind,
+        /// Path to decrypted databases
+        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        decrypted_dir: PathBuf,
+        /// Maximum candidates to return
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -388,6 +408,18 @@ enum SkillCommands {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CompletionShell {
+    Fish,
+    Zsh,
+    Bash,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CompleteKind {
+    Sessions,
 }
 
 fn main() {
@@ -880,6 +912,22 @@ fn main() {
                 }
             }
         },
+        Commands::Completions { shell } => {
+            if let Err(e) = completion::print_script(shell) {
+                log::error!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Complete {
+            kind,
+            decrypted_dir,
+            limit,
+        } => {
+            if let Err(e) = completion::print_candidates(kind, &decrypted_dir, limit) {
+                log::error!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -902,8 +950,21 @@ mod tests {
     #[test]
     fn known_subcommands_are_not_rewritten() {
         for command in [
-            "keys", "decrypt", "sessions", "messages", "search", "query", "schema", "sql",
-            "export", "image", "doctor", "refresh", "skill",
+            "keys",
+            "decrypt",
+            "sessions",
+            "messages",
+            "search",
+            "query",
+            "schema",
+            "sql",
+            "export",
+            "image",
+            "doctor",
+            "refresh",
+            "skill",
+            "completions",
+            "__complete",
         ] {
             assert_eq!(
                 normalize_args_for_default_messages(args(&["tg", command])),
