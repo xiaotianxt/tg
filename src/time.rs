@@ -97,7 +97,11 @@ pub fn parse_since_opt(since: Option<&str>) -> Result<Option<i64>, String> {
 }
 
 pub(crate) fn default_recent_since() -> i64 {
-    Local::now().timestamp() - DEFAULT_RECENT_DAYS * 86400
+    now_timestamp() - DEFAULT_RECENT_DAYS * 86400
+}
+
+pub(crate) fn now_timestamp() -> i64 {
+    Local::now().timestamp()
 }
 
 pub(crate) fn parse_message_time_bucket(s: &str) -> Result<MessageTimeBucket, String> {

@@ -1,6 +1,6 @@
 use std::{path::Path, time::Duration};
 
-use crate::{db, decrypt, scanner};
+use crate::{db, decrypt, paths, scanner};
 
 const KEY_REFRESH_TIMEOUT_SECS: u64 = 30;
 const MESSAGE_AUTO_REFRESH_GRACE: Duration = Duration::from_secs(60);
@@ -17,12 +17,7 @@ pub(crate) fn refresh_decrypted(
         quiet: true,
         jobs,
     };
-    decrypt::decrypt_all(
-        std::path::Path::new("all_keys.json"),
-        decrypted_dir,
-        None,
-        &config,
-    )
+    decrypt::decrypt_all(&paths::default_keys_path(), decrypted_dir, None, &config)
 }
 
 pub(crate) fn refresh_message_decrypted(
@@ -37,12 +32,7 @@ pub(crate) fn refresh_message_decrypted(
         quiet: true,
         jobs,
     };
-    decrypt::decrypt_all(
-        std::path::Path::new("all_keys.json"),
-        decrypted_dir,
-        None,
-        &config,
-    )
+    decrypt::decrypt_all(&paths::default_keys_path(), decrypted_dir, None, &config)
 }
 
 pub(crate) fn refresh_keys_and_decrypted(

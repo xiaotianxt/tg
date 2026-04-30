@@ -2,6 +2,7 @@ AGENTS.md
 /target
 all_keys.json
 /decrypted
+/.tg
 /export
 /scanner_macos
 *.db

@@ -10,7 +10,7 @@ tg 是一个 macOS 本地 Telegram 聊天记录读取 CLI。它在你的 Mac 上
 - 把聊天导出成 `txt`、`csv`、`json`，用于归档、整理或本地分析。
 - 从本地缓存里导出图片、视频、表情等媒体文件。
 
-默认数据只留在本机。`all_keys.json`、`decrypted/`、`exported/` 都是敏感文件，请当作聊天原文保存和处理。
+默认数据只留在本机。`~/.tg/all_keys.json`、`~/.tg/decrypted/`、`exported/` 都是敏感文件，请当作聊天原文保存和处理。
 
 ## 先看效果
 
@@ -139,7 +139,7 @@ xcode-select --install
    sudo tg keys
    ```
 
-   成功后当前目录会出现 `all_keys.json`。
+   成功后密钥会保存到 `~/.tg/all_keys.json`。
 
 3. 解密数据库：
 
@@ -147,7 +147,7 @@ xcode-select --install
    tg decrypt --verbose
    ```
 
-   成功后当前目录会出现 `decrypted/`。
+   成功后解密缓存会保存到 `~/.tg/decrypted/`。
 
 4. 看有哪些会话：
 
@@ -172,7 +172,7 @@ tg export "联系人或群名" --format json
 
 `search`、`query`、`export` 默认只看最近 365 天，这是大多数查询和导出的热路径。需要全量历史时加 `--all-time`；需要更窄窗口时加 `--since today`、`--since 30d` 或具体日期。
 
-`sessions`、`search`、`query`、`schema`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
+`sessions`、`search`、`query`、`schema`、`export` 在读取前会尝试静默增量刷新 `~/.tg/decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
 
 ## 常用命令
 
@@ -305,17 +305,18 @@ Index Time                Status   Source
 
 ## 输出文件
 
-默认会在当前目录生成这些文件或目录：
+默认会生成这些文件或目录：
 
-- `all_keys.json`：数据库密钥。
-- `decrypted/`：解密后的 SQLite 数据库。
-- `exported/`：导出的聊天和媒体。
+- `~/.tg/all_keys.json`：数据库密钥。
+- `~/.tg/decrypted/`：解密后的 SQLite 数据库。
+- `~/.tg/decrypted/.tg_index.db`：`refresh` 维护的本地热索引，默认查询和导出会优先使用；可删除后重新 `refresh` 构建。
+- `exported/`：导出的聊天和媒体，默认位于当前目录。
 
 这些文件都应视为敏感数据。使用后如需清理：
 
 ```bash
-# 确认当前目录后再清理
-rm -rf all_keys.json decrypted exported
+# 确认后再清理
+rm -rf ~/.tg exported
 ```
 
 ## 常见问题
@@ -339,7 +340,7 @@ sudo codesign --force --deep --sign - /Applications/Telegram.app
 通常是还没有成功解密数据库。按顺序检查：
 
 ```bash
-ls all_keys.json
+ls ~/.tg/all_keys.json
 tg decrypt --verbose
 tg sessions --top 30
 ```

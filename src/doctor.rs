@@ -1,9 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use crate::{db, decrypt, output::Output, scanner};
+use crate::{db, decrypt, output::Output, paths, scanner};
 
-const KEY_PATH: &str = "all_keys.json";
 const PATH_LIST_LIMIT: usize = 20;
 const HOT_WAL_LIST_LIMIT: usize = 8;
 
@@ -43,7 +44,7 @@ fn write_process_status<W: std::io::Write>(out: &mut Output<W>) -> Result<(), St
 fn write_keys_status<W: std::io::Write>(
     out: &mut Output<W>,
 ) -> Result<Option<decrypt::DatabaseKeys>, String> {
-    let path = PathBuf::from(KEY_PATH);
+    let path = paths::default_keys_path();
     match std::fs::read_to_string(&path) {
         Ok(content) => {
             let keys = match serde_json::from_str::<decrypt::DatabaseKeys>(&content) {

@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,6 +9,7 @@ use crate::dictionary;
 use crate::media;
 use crate::media_index::MediaIndex;
 use crate::message;
+use crate::message_index;
 use crate::parallel;
 use crate::time;
 
@@ -109,83 +110,119 @@ pub fn export_messages(
     let order_dir = if limit.is_some() { "DESC" } else { "ASC" };
     let limit_clause = limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default();
 
-    let db_jobs = parallel::job_count(jobs, 8);
-    let per_db_messages = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
-        let mut messages = Vec::new();
-        let conn = match Connection::open(&db_path) {
-            Ok(c) => c,
-            Err(_) => return messages,
-        };
+    let mut used_index = false;
+    let mut all_messages: Vec<ExportMessage> = if let Some(since_ts) = since {
+        match message_index::open_existing_recent(decrypted_dir) {
+            Ok(Some(index)) if index.covers(since_ts) => {
+                match load_indexed_export_messages(
+                    &index,
+                    &username,
+                    display_name,
+                    &contacts,
+                    since_ts,
+                    limit,
+                ) {
+                    Ok(messages) => {
+                        used_index = true;
+                        messages
+                    }
+                    Err(e) => {
+                        log::warn!("Message index export failed; falling back: {}", e);
+                        Vec::new()
+                    }
+                }
+            }
+            Ok(_) => Vec::new(),
+            Err(e) => {
+                log::warn!("Message index read failed; falling back: {}", e);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
-        let body_col = dictionary::msg_body_column();
-        let marker_col = dictionary::msg_compression_marker_column();
-        let packed_col = dictionary::msg_packed_meta_column();
-        let table = db::quote_identifier(&table_name);
-        let sql = format!(
+    let db_jobs = parallel::job_count(jobs, 8);
+    let per_db_messages = if used_index {
+        Vec::new()
+    } else {
+        parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
+            let mut messages = Vec::new();
+            let conn = match Connection::open(&db_path) {
+                Ok(c) => c,
+                Err(_) => return messages,
+            };
+
+            let body_col = dictionary::msg_body_column();
+            let marker_col = dictionary::msg_compression_marker_column();
+            let packed_col = dictionary::msg_packed_meta_column();
+            let table = db::quote_identifier(&table_name);
+            let sql = format!(
             "SELECT local_type, create_time, {body_col}, {marker_col}, {packed_col} \
              FROM {table} WHERE create_time > 0{since_clause} ORDER BY create_time {order_dir}{limit_clause}"
         );
 
-        let rows: Vec<ExportMessageRow> = match conn.prepare(&sql) {
-            Ok(mut stmt) => match stmt.query_map([], |row| {
-                let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(3)?;
-                let content: String = if wcdb_ct == Some(4) {
-                    if let Ok(b) = row.get::<_, Vec<u8>>(2) {
-                        message::try_decompress(&b).unwrap_or_default()
+            let rows: Vec<ExportMessageRow> = match conn.prepare(&sql) {
+                Ok(mut stmt) => match stmt.query_map([], |row| {
+                    let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(3)?;
+                    let content: String = if wcdb_ct == Some(4) {
+                        if let Ok(b) = row.get::<_, Vec<u8>>(2) {
+                            message::try_decompress(&b).unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
                     } else {
-                        String::new()
-                    }
-                } else {
-                    match row.get::<_, Option<String>>(2) {
-                        Ok(Some(s)) => s,
-                        _ => match row.get::<_, Option<Vec<u8>>>(2) {
-                            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                            _ => String::new(),
-                        },
-                    }
-                };
-                let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
-                Ok((
-                    row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
-                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    content,
-                    row.get::<_, Option<i64>>(3)?,
-                    packed_info,
-                ))
-            }) {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                        match row.get::<_, Option<String>>(2) {
+                            Ok(Some(s)) => s,
+                            _ => match row.get::<_, Option<Vec<u8>>>(2) {
+                                Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
+                                _ => String::new(),
+                            },
+                        }
+                    };
+                    let packed_info: Vec<u8> =
+                        row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
+                        row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                        content,
+                        row.get::<_, Option<i64>>(3)?,
+                        packed_info,
+                    ))
+                }) {
+                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                    Err(_) => vec![],
+                },
                 Err(_) => vec![],
-            },
-            Err(_) => vec![],
-        };
+            };
 
-        for (local_type, create_time, content, wcdb_ct, packed_info) in rows {
-            let time_str = time::format_local_timestamp(create_time);
+            for (local_type, create_time, content, wcdb_ct, packed_info) in rows {
+                let time_str = time::format_local_timestamp(create_time);
 
-            let decoded = message::decode_message(
-                local_type as i32,
-                &content,
-                display_name,
-                wcdb_ct,
-                &packed_info,
-                |id| crate::db::resolve_sender_name(id, &contacts),
-            );
+                let decoded = message::decode_message(
+                    local_type as i32,
+                    &content,
+                    display_name,
+                    wcdb_ct,
+                    &packed_info,
+                    |id| crate::db::resolve_sender_name(id, &contacts),
+                );
 
-            messages.push(ExportMessage {
-                time: time_str,
-                timestamp: create_time,
-                sender: decoded.display_name,
-                msg_type: local_type,
-                type_name: decoded.msg_type.to_string(),
-                content: decoded.content,
-                raw_content: content,
-                packed_info,
-            });
-        }
-        messages
-    });
+                messages.push(ExportMessage {
+                    time: time_str,
+                    timestamp: create_time,
+                    sender: decoded.display_name,
+                    msg_type: local_type,
+                    type_name: decoded.msg_type.to_string(),
+                    content: decoded.content,
+                    raw_content: content,
+                    packed_info,
+                });
+            }
+            messages
+        })
+    };
 
-    let mut all_messages: Vec<ExportMessage> = Vec::new();
     for messages in per_db_messages {
         all_messages.extend(messages);
     }
@@ -368,6 +405,65 @@ pub fn export_messages(
     ))?;
     out.flush()?;
     Ok(results)
+}
+
+fn load_indexed_export_messages(
+    index: &message_index::HotIndex,
+    username: &str,
+    display_name: &str,
+    contacts: &std::collections::HashMap<String, db::Contact>,
+    since: i64,
+    limit: Option<usize>,
+) -> Result<Vec<ExportMessage>, String> {
+    let conn = Connection::open(&index.path)
+        .map_err(|e| format!("Cannot open message index {}: {}", index.path.display(), e))?;
+    let limit_clause = limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default();
+    let sql = format!(
+        "SELECT local_type, create_time, body, marker, packed_info
+         FROM messages
+         WHERE session_id = ?1 AND create_time >= ?2
+         ORDER BY create_time DESC{limit_clause}"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Prepare indexed export: {}", e))?;
+    let rows = stmt
+        .query_map(params![username, since], |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+            ))
+        })
+        .map_err(|e| format!("Read indexed export: {}", e))?;
+
+    let mut messages = rows
+        .filter_map(|row| row.ok())
+        .map(|(local_type, create_time, content, wcdb_ct, packed_info)| {
+            let decoded = message::decode_message(
+                local_type as i32,
+                &content,
+                display_name,
+                wcdb_ct,
+                &packed_info,
+                |id| crate::db::resolve_sender_name(id, contacts),
+            );
+            ExportMessage {
+                time: time::format_local_timestamp(create_time),
+                timestamp: create_time,
+                sender: decoded.display_name,
+                msg_type: local_type,
+                type_name: decoded.msg_type.to_string(),
+                content: decoded.content,
+                raw_content: content,
+                packed_info,
+            }
+        })
+        .collect::<Vec<_>>();
+    messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    Ok(messages)
 }
 
 /// Export readable image files for a session.

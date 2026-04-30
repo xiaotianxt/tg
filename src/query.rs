@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::{db, dictionary, message, output, parallel};
+use crate::{db, dictionary, message, message_index, output, parallel};
 
 const MESSAGE_TARGETS: &[&str] = &["messages", "message", "all-messages"];
 const MAX_QUERY_KEYWORDS: usize = 16;
@@ -208,6 +208,12 @@ fn run_messages_with_output<W: Write>(
     out: &mut output::Output<W>,
 ) -> Result<usize, String> {
     validate_message_options(&options)?;
+    match try_run_indexed_messages_with_output(&options, out) {
+        Ok(Some(displayed)) => return Ok(displayed),
+        Ok(None) => {}
+        Err(e) => log::warn!("Message index query failed; falling back: {}", e),
+    }
+
     let context = build_message_context(&options)?;
     if context.targets.is_empty() {
         return Err("No message databases found. Try 'tg refresh' first.".to_string());
@@ -241,6 +247,35 @@ fn run_messages_with_output<W: Write>(
     )?;
     out.flush()?;
     Ok(displayed)
+}
+
+fn try_run_indexed_messages_with_output<W: Write>(
+    options: &QueryOptions<'_>,
+    out: &mut output::Output<W>,
+) -> Result<Option<usize>, String> {
+    let Some(since) = options.since else {
+        return Ok(None);
+    };
+    let index = match message_index::open_existing_recent(options.decrypted_dir) {
+        Ok(Some(index)) if index.covers(since) => index,
+        Ok(_) => return Ok(None),
+        Err(e) => {
+            log::warn!("Message index read failed; falling back: {}", e);
+            return Ok(None);
+        }
+    };
+
+    let rows = query_indexed_messages(&index, options)?;
+    let displayed = rows.len();
+    write_message_rows(
+        out,
+        &rows,
+        &options.fields,
+        options.format,
+        options.max_cell_chars,
+    )?;
+    out.flush()?;
+    Ok(Some(displayed))
 }
 
 fn run_schema_with_output<W: Write>(
@@ -477,6 +512,90 @@ fn query_message_table(
         .map_err(|e| format!("Message query error in {}: {}", target.label, e))?;
 
     Ok(mapped.filter_map(|row| row.ok()).collect())
+}
+
+fn query_indexed_messages(
+    index: &message_index::HotIndex,
+    options: &QueryOptions<'_>,
+) -> Result<Vec<MessageRow>, String> {
+    let selected_session = resolve_index_session(options)?;
+    let result_window = message_query_window(options)?;
+    let body_col = "body";
+    let mut clauses = vec!["create_time > 0".to_string()];
+    let mut params = Vec::new();
+
+    if let Some(session) = selected_session {
+        clauses.push("session_id = ?".to_string());
+        params.push(Value::Text(session));
+    }
+    if let Some(since) = options.since {
+        clauses.push("create_time >= ?".to_string());
+        params.push(Value::Integer(since));
+    }
+    if let Some(until) = options.until {
+        clauses.push("create_time <= ?".to_string());
+        params.push(Value::Integer(until));
+    }
+
+    if !options.contains.is_empty() {
+        let contains_clause = options
+            .contains
+            .iter()
+            .map(|query| {
+                params.push(Value::Text(like_contains_pattern(query)));
+                format!("{body_col} LIKE ? ESCAPE '\\'")
+            })
+            .collect::<Vec<_>>()
+            .join(options.match_mode.joiner());
+        clauses.push(format!("({})", contains_clause));
+    }
+
+    for query in options.not_contains {
+        params.push(Value::Text(like_contains_pattern(query)));
+        clauses.push(format!("{body_col} NOT LIKE ? ESCAPE '\\'"));
+    }
+
+    let sql = format!(
+        "SELECT session_display, sender_display, local_type, create_time, body
+         FROM messages
+         WHERE {where_clause}
+         ORDER BY create_time {order_dir}
+         LIMIT {limit}",
+        where_clause = clauses.join(" AND "),
+        order_dir = options.sort.order_dir(),
+        limit = result_window,
+    );
+    let conn = Connection::open(&index.path)
+        .map_err(|e| format!("Cannot open message index {}: {}", index.path.display(), e))?;
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Prepare indexed query: {}", e))?;
+    let mapped = stmt
+        .query_map(params_from_iter(params.iter()), |row| {
+            Ok(MessageRow {
+                session: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                sender: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                local_type: row.get::<_, Option<i64>>(2)?.unwrap_or(-1),
+                create_time: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                body: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            })
+        })
+        .map_err(|e| format!("Run indexed query: {}", e))?;
+
+    Ok(mapped
+        .filter_map(|row| row.ok())
+        .skip(options.offset)
+        .take(options.limit)
+        .collect())
+}
+
+fn resolve_index_session(options: &QueryOptions<'_>) -> Result<Option<String>, String> {
+    let Some(session) = options.session else {
+        return Ok(None);
+    };
+    let (contact_db, message_dbs) = db::find_decrypted_dbs(options.decrypted_dir);
+    db::resolve_username_for_messages(session, contact_db.as_deref(), &message_dbs, options.jobs)
+        .map(Some)
 }
 
 fn read_message_body(row: &rusqlite::Row<'_>, index: usize, marker: Option<i64>) -> String {

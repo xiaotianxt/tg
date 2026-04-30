@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::dictionary;
+use crate::{dictionary, paths};
 
 const INTERNAL_SCAN_ARG: &str = "__tg-scan-keys";
 
@@ -137,6 +137,10 @@ fn find_db_storage_dir() -> Option<PathBuf> {
 pub fn extract_keys(timeout_secs: u64) -> Result<String, String> {
     let pid = find_telegram_pid().map_err(|e| format!("Cannot find Telegram process: {}", e))?;
     log::info!("Telegram PID: {}", pid);
+    let work_dir = tempfile::Builder::new()
+        .prefix("tg-keys-")
+        .tempdir()
+        .map_err(|e| format!("Cannot create temporary key scan dir: {}", e))?;
 
     let needs_sudo = !is_root();
     if needs_sudo {
@@ -158,6 +162,7 @@ pub fn extract_keys(timeout_secs: u64) -> Result<String, String> {
         c
     };
     cmd.stdout(Stdio::piped());
+    cmd.current_dir(work_dir.path());
     cmd.arg(INTERNAL_SCAN_ARG);
     cmd.arg(format!("{}", pid));
     if let Some(db_storage) = find_db_storage_dir() {
@@ -205,10 +210,18 @@ pub fn extract_keys(timeout_secs: u64) -> Result<String, String> {
 
     log::info!("{}", stdout.trim_end());
 
-    let keys_path = PathBuf::from("all_keys.json");
-    if keys_path.exists() {
-        let content = std::fs::read_to_string(&keys_path)
+    let scanned_keys_path = work_dir.path().join("all_keys.json");
+    let keys_path = paths::default_keys_path();
+    if scanned_keys_path.exists() {
+        let content = std::fs::read_to_string(&scanned_keys_path)
             .map_err(|e| format!("Cannot read keys file: {}", e))?;
+        if let Some(parent) = keys_path.parent() {
+            paths::ensure_private_dir(parent)
+                .map_err(|e| format!("Cannot create key directory {}: {}", parent.display(), e))?;
+        }
+        std::fs::write(&keys_path, &content)
+            .map_err(|e| format!("Cannot write keys file {}: {}", keys_path.display(), e))?;
+        restrict_key_file_permissions(&keys_path);
         let key_count = content.matches("\"enc_key\"").count();
         log::info!("Found {} database keys.", key_count);
         Ok(keys_path.to_string_lossy().to_string())
@@ -216,3 +229,13 @@ pub fn extract_keys(timeout_secs: u64) -> Result<String, String> {
         Err("all_keys.json not found. Key extraction may have failed.".to_string())
     }
 }
+
+#[cfg(unix)]
+fn restrict_key_file_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_key_file_permissions(_path: &std::path::Path) {}

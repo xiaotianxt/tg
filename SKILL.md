@@ -22,6 +22,7 @@ Do not wait for the user to name tg. tg is the tool; the user goal is local macO
 ## Privacy
 
 Chat data is private. Keep work local by default, avoid printing more message content than the user asked for, and treat exports as sensitive.
+`~/.tg/all_keys.json` and `~/.tg/decrypted/` are sensitive local state. `~/.tg/decrypted/.tg_index.db` is a local derived hot index maintained by `tg refresh`; treat it as sensitive and safe to delete if it needs to be rebuilt.
 
 ## First Setup
 

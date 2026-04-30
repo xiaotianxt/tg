@@ -11,8 +11,10 @@ mod media_index;
 mod media_key;
 mod media_pb;
 mod message;
+mod message_index;
 mod output;
 mod parallel;
+mod paths;
 mod query;
 mod scanner;
 mod skill;
@@ -76,6 +78,7 @@ fn print_refresh_stats(label: &str, stats: &decrypt::DecryptStats) {
 }
 
 fn ensure_message_cache_ready(decrypted_dir: &Path, jobs: usize) {
+    log::info!("Refreshing local message cache");
     let refresh = cache::refresh_message_decrypted(decrypted_dir, jobs);
     let refresh = if cache::needs_message_key_retry(&refresh) {
         log::warn!(
@@ -130,17 +133,14 @@ enum Commands {
     /// Decrypt all encrypted databases using extracted keys
     Decrypt {
         /// Path to all_keys.json
-        #[arg(long, default_value = "all_keys.json")]
+        #[arg(long, default_value_os_t = paths::default_keys_path())]
         keys: PathBuf,
         /// Output directory for decrypted databases
-        #[arg(long, default_value = "decrypted")]
+        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
         output: PathBuf,
         /// Path to Telegram db_storage directory (auto-detected if not provided)
         #[arg(long)]
         db_dir: Option<PathBuf>,
-        /// Incremental mode is the default; kept for compatibility with old scripts
-        #[arg(short, long, hide = true)]
-        incremental: bool,
         /// Force decrypting every database even when cached outputs are up to date
         #[arg(long)]
         full: bool,
@@ -159,7 +159,7 @@ enum Commands {
         /// Optional display name or username query to filter sessions
         query: Option<String>,
         /// Path to decrypted databases
-        #[arg(long, default_value = "decrypted")]
+        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
         decrypted_dir: PathBuf,
         /// Number of top sessions to show
         #[arg(long, default_value_t = 30)]
@@ -173,7 +173,7 @@ enum Commands {
         /// Optional session username (tgid_xxx) or display name to inspect
         session: Option<String>,
         /// Path to decrypted databases
-        #[arg(long, default_value = "decrypted")]
+        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
         decrypted_dir: PathBuf,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
@@ -182,7 +182,7 @@ enum Commands {
     /// Refresh decrypted cache, refreshing keys if needed
     Refresh {
         /// Path to decrypted databases
-        #[arg(long, default_value = "decrypted")]
+        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
         decrypted_dir: PathBuf,
         /// Extract keys before decrypting
         #[arg(long)]
@@ -196,7 +196,7 @@ enum Commands {
         /// Session username (tgid_xxx) or display name to search
         session: String,
         /// Path to decrypted databases
-        #[arg(long, default_value = "decrypted")]
+        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
         decrypted_dir: PathBuf,
         /// Number of messages to show (defaults to 50 unless --since is used)
         #[arg(long)]
@@ -231,7 +231,7 @@ enum Commands {
         /// Search query
         query: String,
         /// Path to decrypted databases
-        #[arg(long, default_value = "decrypted")]
+        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
         decrypted_dir: PathBuf,
         /// Number of results
         #[arg(long, default_value_t = 20)]
@@ -252,7 +252,7 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
         /// Path to decrypted databases
-        #[arg(long, default_value = "decrypted")]
+        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
         decrypted_dir: PathBuf,
         /// Keyword that must appear in message text; repeat for multiple keywords
         #[arg(long = "contains")]
@@ -300,7 +300,7 @@ enum Commands {
         #[arg(long, default_value = "messages")]
         db: String,
         /// Path to decrypted databases
-        #[arg(long, default_value = "decrypted")]
+        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
         decrypted_dir: PathBuf,
         /// Output format: table or json
         #[arg(long, default_value = "table")]
@@ -317,7 +317,7 @@ enum Commands {
         /// Session username (tgid_xxx)
         session: String,
         /// Path to decrypted databases
-        #[arg(long, default_value = "decrypted")]
+        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
         decrypted_dir: PathBuf,
         /// Output format: txt, csv, or json
         #[arg(long, default_value = "txt")]
@@ -346,7 +346,7 @@ enum Commands {
         /// Session username (tgid_xxx) or display name to search
         session: String,
         /// Path to decrypted databases
-        #[arg(long, default_value = "decrypted")]
+        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
         decrypted_dir: PathBuf,
         /// Output directory for readable image files
         #[arg(long, default_value = "exported/images")]
@@ -407,7 +407,6 @@ fn main() {
             keys,
             output,
             db_dir,
-            incremental: _,
             full,
             since,
             verbose,
@@ -512,7 +511,13 @@ fn main() {
             };
 
             match refresh {
-                Ok(stats) => print_refresh_stats("Refresh complete", &stats),
+                Ok(stats) => {
+                    log::info!("Refreshing local message index");
+                    if let Err(e) = message_index::ensure_recent(&decrypted_dir, jobs) {
+                        log::warn!("Message index refresh failed: {}", e);
+                    }
+                    print_refresh_stats("Refresh complete", &stats);
+                }
                 Err(e) => {
                     log::error!("Error: {}", e);
                     std::process::exit(1);

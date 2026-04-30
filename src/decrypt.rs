@@ -11,7 +11,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::{dictionary, parallel};
+use crate::{dictionary, parallel, paths};
 
 type Aes256CbcDec = Decryptor<Aes256>;
 pub(crate) type DatabaseKeys = HashMap<String, HashMap<String, String>>;
@@ -140,7 +140,7 @@ impl Drop for TempPathGuard {
 }
 
 fn acquire_refresh_lock(output_dir: &Path) -> Result<RefreshLock, String> {
-    fs::create_dir_all(output_dir)
+    paths::ensure_private_dir(output_dir)
         .map_err(|e| format!("Cannot create output dir {}: {}", output_dir.display(), e))?;
 
     let lock_path = output_dir.join(REFRESH_LOCK_FILE);
@@ -298,7 +298,7 @@ fn create_temp_file_for(dest: &Path) -> Result<(PathBuf, fs::File, TempPathGuard
     let parent = dest
         .parent()
         .ok_or_else(|| format!("Cannot determine parent dir for {}", dest.display()))?;
-    fs::create_dir_all(parent)
+    paths::ensure_private_dir(parent)
         .map_err(|e| format!("Cannot create output dir {}: {}", parent.display(), e))?;
 
     let file_name = dest
@@ -466,7 +466,7 @@ fn read_page_cache(path: &Path) -> Option<PageCache> {
         return None;
     }
 
-    // Stored for future compatibility; current incremental logic tolerates growth/shrink.
+    // Reserved metadata; current incremental logic tolerates growth and shrink.
     let _source_size = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
     offset += 8;
 
@@ -605,10 +605,18 @@ fn decrypt_database(
     }
 
     let total_pages = (file_size as usize).div_ceil(PAGE_SZ);
+    if incremental {
+        if let Some(result) =
+            decrypt_database_in_place(db_path, out_path, &enc_key, file_size, total_pages)?
+        {
+            return Ok(result);
+        }
+    }
 
     // Ensure output directory exists
     if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Cannot create output dir: {}", e))?;
+        paths::ensure_private_dir(parent)
+            .map_err(|e| format!("Cannot create output dir: {}", e))?;
     }
 
     let (tmp_path, tmp_file, temp_guard) = create_temp_file_for(out_path)?;
@@ -680,6 +688,104 @@ fn decrypt_database(
         },
         tables,
     })
+}
+
+fn decrypt_database_in_place(
+    db_path: &Path,
+    out_path: &Path,
+    enc_key: &[u8],
+    file_size: u64,
+    total_pages: usize,
+) -> Result<Option<DecryptFileResult>, String> {
+    let cache_path = page_cache_path(out_path);
+    let Some(cache) = read_page_cache(&cache_path) else {
+        return Ok(None);
+    };
+    if cache.fingerprints.is_empty() || total_pages < cache.fingerprints.len() {
+        return Ok(None);
+    }
+
+    let out_meta = match fs::metadata(out_path) {
+        Ok(meta) => meta,
+        Err(_) => return Ok(None),
+    };
+    let reusable_pages = cache.fingerprints.len().min(total_pages);
+    if out_meta.len() < (reusable_pages * PAGE_SZ) as u64 {
+        return Ok(None);
+    }
+
+    let mut source = BufReader::with_capacity(
+        IO_BUF_SZ,
+        fs::File::open(db_path).map_err(|e| format!("Cannot open {}: {}", db_path.display(), e))?,
+    );
+    let mut output = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(out_path)
+        .map_err(|e| format!("Cannot open output {}: {}", out_path.display(), e))?;
+
+    let output_len = (total_pages * PAGE_SZ) as u64;
+    if out_meta.len() != output_len {
+        output
+            .set_len(output_len)
+            .map_err(|e| format!("Cannot resize output {}: {}", out_path.display(), e))?;
+    }
+
+    let mut fingerprints = Vec::with_capacity(total_pages);
+    let mut page_buf = vec![0u8; PAGE_SZ];
+    let mut out_buf = vec![0u8; PAGE_SZ];
+    let mut decrypted_pages = 0usize;
+    let mut reused_pages = 0usize;
+
+    for pgno in 1..=total_pages {
+        let bytes_remaining = file_size as usize - ((pgno - 1) * PAGE_SZ);
+        let bytes_to_read = bytes_remaining.min(PAGE_SZ);
+        source
+            .read_exact(&mut page_buf[..bytes_to_read])
+            .map_err(|e| format!("Read error at page {}: {}", pgno, e))?;
+        if bytes_to_read < PAGE_SZ {
+            page_buf[bytes_to_read..].fill(0);
+        }
+
+        let index = pgno - 1;
+        let fingerprint = page_fingerprint(&page_buf);
+        fingerprints.push(fingerprint);
+        if cache
+            .fingerprints
+            .get(index)
+            .is_some_and(|old| *old == fingerprint)
+        {
+            reused_pages += 1;
+            continue;
+        }
+
+        decrypt_page_into(enc_key, &page_buf, pgno as u32, &mut out_buf)
+            .ok_or_else(|| format!("Decryption failed at page {}", pgno))?;
+        output
+            .seek(SeekFrom::Start((index * PAGE_SZ) as u64))
+            .map_err(|e| format!("Seek error at page {}: {}", pgno, e))?;
+        output
+            .write_all(&out_buf)
+            .map_err(|e| format!("Write error at page {}: {}", pgno, e))?;
+        decrypted_pages += 1;
+    }
+
+    output
+        .sync_all()
+        .map_err(|e| format!("Sync error for {}: {}", out_path.display(), e))?;
+    drop(output);
+
+    let tables = verify_sqlite(out_path).map_err(|e| format!("SQLite verify failed: {}", e))?;
+    write_page_cache(&cache_path, file_size, &fingerprints)?;
+
+    Ok(Some(DecryptFileResult {
+        stats: DecryptFileStats {
+            total_pages,
+            decrypted_pages,
+            reused_pages,
+        },
+        tables,
+    }))
 }
 
 /// Auto-detect Telegram db_storage directory.
