@@ -1,6 +1,7 @@
 use crate::dictionary;
 use crate::media;
 use crate::media_pb;
+use crate::time;
 use flate2::read::ZlibDecoder;
 use std::fmt;
 use std::io::Read;
@@ -97,6 +98,26 @@ pub fn decode_message(
     packed_info_data: &[u8],
     resolve_display_name: impl Fn(&str) -> String,
 ) -> DecodedMessage {
+    decode_message_with_time_bucket(
+        msg_type,
+        raw_content,
+        session_display_name,
+        _wcdb_ct,
+        packed_info_data,
+        time::MessageTimeBucket::Minute(1),
+        resolve_display_name,
+    )
+}
+
+pub(crate) fn decode_message_with_time_bucket(
+    msg_type: i32,
+    raw_content: &str,
+    session_display_name: &str,
+    _wcdb_ct: Option<i64>,
+    packed_info_data: &[u8],
+    time_bucket: time::MessageTimeBucket,
+    resolve_display_name: impl Fn(&str) -> String,
+) -> DecodedMessage {
     let msg_type_enum: MessageType = msg_type.into();
 
     if msg_type == 10000 || msg_type == 10002 {
@@ -134,7 +155,8 @@ pub fn decode_message(
         Some(id) => resolve_display_name(id),
         None => session_display_name.to_string(),
     };
-    let content = decode_content_by_type(msg_type, clean_content, &resolve_display_name);
+    let content =
+        decode_content_by_type(msg_type, clean_content, time_bucket, &resolve_display_name);
 
     DecodedMessage {
         msg_type: msg_type_enum,
@@ -225,10 +247,11 @@ fn extract_audio_meta(data: &[u8]) -> Option<String> {
 fn decode_content_by_type(
     msg_type: i32,
     content: &str,
+    time_bucket: time::MessageTimeBucket,
     resolve_display_name: &impl Fn(&str) -> String,
 ) -> String {
     match msg_type {
-        49 => decode_link_content(content, resolve_display_name),
+        49 => decode_link_content(content, time_bucket, resolve_display_name),
         48 => decode_location_content(content),
         50 => decode_call_content(content),
         62 => decode_file_content(content),
@@ -261,7 +284,11 @@ fn decode_system_content(content: &str, msg_type: MessageType) -> String {
     content.to_string()
 }
 
-fn decode_link_content(content: &str, resolve_display_name: &impl Fn(&str) -> String) -> String {
+fn decode_link_content(
+    content: &str,
+    time_bucket: time::MessageTimeBucket,
+    resolve_display_name: &impl Fn(&str) -> String,
+) -> String {
     if !content.trim_start().starts_with('<') {
         if content.len() > 200 {
             return format!("[链接] {}", &content[..200]);
@@ -289,7 +316,8 @@ fn decode_link_content(content: &str, resolve_display_name: &impl Fn(&str) -> St
                 .unwrap_or_else(|| "未知文件".to_string());
             format!("[文件] {}", name)
         }
-        57 => decode_quote_content(content, resolve_display_name),
+        19 => decode_chat_history_content(content, time_bucket),
+        57 => decode_quote_content(content, time_bucket, resolve_display_name),
         51 => {
             let title = crate::media::extract_xml_tag(content, "title")
                 .unwrap_or_else(|| "聊天记录".to_string());
@@ -312,10 +340,221 @@ fn decode_link_content(content: &str, resolve_display_name: &impl Fn(&str) -> St
     }
 }
 
-fn decode_quote_content(content: &str, resolve_display_name: &impl Fn(&str) -> String) -> String {
+#[derive(Debug, PartialEq)]
+struct ChatHistoryItem {
+    source_name: String,
+    source_time: Option<String>,
+    source_timestamp: Option<i64>,
+    body: String,
+}
+
+fn decode_chat_history_content(content: &str, time_bucket: time::MessageTimeBucket) -> String {
+    let title = crate::media::extract_xml_tag(content, "title")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "聊天记录".to_string());
+    let record_item = crate::media::extract_xml_tag(content, "recorditem")
+        .map(|s| strip_cdata(&s).to_string())
+        .unwrap_or_default();
+
+    let items = parse_chat_history_items(&record_item);
+    if items.is_empty() {
+        let desc = crate::media::extract_xml_tag(content, "des").unwrap_or_default();
+        if desc.is_empty() {
+            return format!("[聊天记录] {}", title);
+        }
+        return format!("[聊天记录] {} - {}", title, desc);
+    }
+
+    let mut out = format!("[聊天记录] {} ({}条)", title, items.len());
+    render_chat_history_items(&mut out, &items, time_bucket);
+    out
+}
+
+fn strip_cdata(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix("<![CDATA[")
+        .and_then(|s| s.strip_suffix("]]>"))
+        .unwrap_or(trimmed)
+}
+
+fn parse_chat_history_items(record_info: &str) -> Vec<ChatHistoryItem> {
+    let mut items = Vec::new();
+    let mut rest = record_info;
+
+    while let Some(start) = rest.find("<dataitem") {
+        rest = &rest[start..];
+        let Some(open_end) = rest.find('>') else {
+            break;
+        };
+        let Some(close_start) = rest[open_end + 1..].find("</dataitem>") else {
+            break;
+        };
+        let item_end = open_end + 1 + close_start + "</dataitem>".len();
+        let item_xml = &rest[..item_end];
+
+        if let Some(item) = parse_chat_history_item(item_xml) {
+            items.push(item);
+        }
+
+        rest = &rest[item_end..];
+    }
+
+    items
+}
+
+fn parse_chat_history_item(item_xml: &str) -> Option<ChatHistoryItem> {
+    let source_name = crate::media::extract_xml_tag(item_xml, "sourcename")
+        .or_else(|| crate::media::extract_xml_tag(item_xml, "sourcedisplayname"))
+        .unwrap_or_else(|| "未知".to_string());
+    let source_time = crate::media::extract_xml_tag(item_xml, "sourcetime");
+    let source_timestamp = source_time
+        .as_deref()
+        .and_then(time::parse_local_timestamp_minutes);
+    let datatype =
+        crate::media::extract_xml_attr(item_xml, "datatype").and_then(|s| s.parse::<i64>().ok());
+    let body = decode_chat_history_item_body(item_xml, datatype);
+    if body.is_empty() {
+        return None;
+    }
+
+    Some(ChatHistoryItem {
+        source_name,
+        source_time,
+        source_timestamp,
+        body,
+    })
+}
+
+fn decode_chat_history_item_body(item_xml: &str, datatype: Option<i64>) -> String {
+    let desc = crate::media::extract_xml_tag(item_xml, "datadesc").unwrap_or_default();
+    if !desc.is_empty() {
+        return desc;
+    }
+
+    let title = crate::media::extract_xml_tag(item_xml, "datatitle")
+        .or_else(|| crate::media::extract_xml_tag(item_xml, "title"))
+        .unwrap_or_default();
+
+    match datatype {
+        Some(2) => chat_history_image_tag(item_xml),
+        Some(3) => fallback_tag_with_title("语音", &title),
+        Some(4) | Some(15) => fallback_tag_with_title("视频", &title),
+        Some(5) => fallback_tag_with_title("链接", &title),
+        Some(6) => fallback_tag_with_title("位置", &title),
+        Some(8) => fallback_tag_with_title("文件", &title),
+        _ if !title.is_empty() => title,
+        Some(t) => format!("[记录:{}]", t),
+        None => "[记录]".to_string(),
+    }
+}
+
+fn chat_history_image_tag(item_xml: &str) -> String {
+    if let Some(id) = crate::media::extract_xml_tag(item_xml, "fullmd5")
+        .or_else(|| crate::media::extract_xml_tag(item_xml, "thumbfullmd5"))
+        .or_else(|| crate::media::extract_xml_attr(item_xml, "dataid"))
+    {
+        crate::media::image_tag(Some(&id))
+    } else {
+        crate::media::image_tag(None)
+    }
+}
+
+fn fallback_tag_with_title(label: &str, title: &str) -> String {
+    if title.is_empty() {
+        format!("[{}]", label)
+    } else {
+        format!("[{}] {}", label, title)
+    }
+}
+
+fn render_chat_history_items(
+    out: &mut String,
+    items: &[ChatHistoryItem],
+    time_bucket: time::MessageTimeBucket,
+) {
+    if time_bucket == time::MessageTimeBucket::PerMessage {
+        for item in items {
+            append_chat_history_item(out, item, true, item.source_time.as_deref());
+        }
+        return;
+    }
+
+    let mut last_time_label: Option<String> = None;
+    let mut last_sender: Option<String> = None;
+
+    for item in items {
+        let time_label = chat_history_time_label(item, time_bucket);
+        if time_label != last_time_label {
+            if let Some(label) = &time_label {
+                append_chat_history_line(out, &format!("[{}]", label));
+            }
+            last_time_label = time_label;
+            last_sender = None;
+        }
+
+        let show_sender = last_sender.as_deref() != Some(item.source_name.as_str());
+        append_chat_history_item(out, item, show_sender, None);
+        last_sender = Some(item.source_name.clone());
+    }
+}
+
+fn chat_history_time_label(
+    item: &ChatHistoryItem,
+    time_bucket: time::MessageTimeBucket,
+) -> Option<String> {
+    match time_bucket {
+        time::MessageTimeBucket::PerMessage | time::MessageTimeBucket::None => None,
+        _ => item
+            .source_timestamp
+            .map(|ts| time::format_message_time_bucket(ts, time_bucket))
+            .or_else(|| item.source_time.clone()),
+    }
+}
+
+fn append_chat_history_item(
+    out: &mut String,
+    item: &ChatHistoryItem,
+    show_sender: bool,
+    inline_time: Option<&str>,
+) {
+    let mut lines = item.body.lines();
+    let Some(first) = lines.next() else {
+        return;
+    };
+
+    let first_line = match (inline_time, show_sender) {
+        (Some(t), true) => format!("[{}] {}: {}", t, item.source_name, first),
+        (Some(t), false) => format!("[{}] {}", t, first),
+        (None, true) => format!("{}: {}", item.source_name, first),
+        (None, false) => format!(" {}", first),
+    };
+    append_chat_history_line(out, &first_line);
+
+    for line in lines {
+        let continuation = if show_sender {
+            format!("  {}", line)
+        } else {
+            format!(" {}", line)
+        };
+        append_chat_history_line(out, &continuation);
+    }
+}
+
+fn append_chat_history_line(out: &mut String, line: &str) {
+    out.push('\n');
+    out.push_str("        ");
+    out.push_str(line);
+}
+
+fn decode_quote_content(
+    content: &str,
+    time_bucket: time::MessageTimeBucket,
+    resolve_display_name: &impl Fn(&str) -> String,
+) -> String {
     let reply = crate::media::extract_xml_tag(content, "title").unwrap_or_default();
     let quoted = crate::media::extract_xml_tag(content, "refermsg")
-        .map(|refermsg| decode_refermsg_content(&refermsg, resolve_display_name))
+        .map(|refermsg| decode_refermsg_content(&refermsg, time_bucket, resolve_display_name))
         .unwrap_or_default();
 
     match (quoted.is_empty(), reply.is_empty()) {
@@ -328,6 +567,7 @@ fn decode_quote_content(content: &str, resolve_display_name: &impl Fn(&str) -> S
 
 fn decode_refermsg_content(
     refermsg: &str,
+    time_bucket: time::MessageTimeBucket,
     resolve_display_name: &impl Fn(&str) -> String,
 ) -> String {
     let ref_type = crate::media::extract_xml_tag_int(refermsg, "type")
@@ -343,7 +583,7 @@ fn decode_refermsg_content(
             1 => clean_content.to_string(),
             t if is_media_type(t) => decode_media_content(t, clean_content, &[]),
             49 if clean_content.trim_start().starts_with('<') => {
-                decode_link_content(clean_content, resolve_display_name)
+                decode_link_content(clean_content, time_bucket, resolve_display_name)
             }
             _ if clean_content.trim_start().starts_with('<') => {
                 format!("[{}]", MessageType::from(ref_type))
@@ -648,6 +888,45 @@ mod tests {
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
         assert!(d.content.contains("链接"));
         assert!(d.content.contains("标题"));
+    }
+
+    #[test]
+    fn test_decode_chat_history_expands_record_items() {
+        let xml = r#"<msg><appmsg><title>Chat History for A and B</title><des>A: first
+B: second</des><type>19</type><recorditem><![CDATA[<recordinfo><datalist count="4"><dataitem datatype="1" dataid="a"><sourcename>A</sourcename><sourcetime>2026-04-29 07:39</sourcetime><datadesc>first</datadesc></dataitem><dataitem datatype="1" dataid="b"><sourcename>B</sourcename><sourcetime>2026-04-29 21:15</sourcetime><datadesc>second line
+continues</datadesc></dataitem><dataitem datatype="1" dataid="c"><sourcename>B</sourcename><sourcetime>2026-04-29 21:15</sourcetime><datadesc>follow-up</datadesc></dataitem><dataitem datatype="2" dataid="img123"><sourcename>A</sourcename><sourcetime>2026-04-29 21:16</sourcetime></dataitem></datalist></recordinfo>]]></recorditem></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+
+        assert_eq!(
+            d.content,
+            "[聊天记录] Chat History for A and B (4条)\n        [2026-04-29 07:39]\n        A: first\n        [2026-04-29 21:15]\n        B: second line\n          continues\n         follow-up\n        [2026-04-29 21:16]\n        A: [img:img123]"
+        );
+    }
+
+    #[test]
+    fn test_decode_chat_history_uses_requested_time_bucket() {
+        let xml = r#"<msg><appmsg><title>Chat History</title><type>19</type><recorditem><![CDATA[<recordinfo><datalist count="2"><dataitem datatype="1"><sourcename>A</sourcename><sourcetime>2026-04-29 21:15</sourcetime><datadesc>first</datadesc></dataitem><dataitem datatype="1"><sourcename>B</sourcename><sourcetime>2026-04-29 21:59</sourcetime><datadesc>second</datadesc></dataitem></datalist></recordinfo>]]></recorditem></appmsg></msg>"#;
+        let d = decode_message_with_time_bucket(
+            49,
+            xml,
+            "Alice",
+            None,
+            &[],
+            time::MessageTimeBucket::Hour(1),
+            |id| id.to_string(),
+        );
+
+        assert_eq!(
+            d.content,
+            "[聊天记录] Chat History (2条)\n        [2026-04-29 21:00]\n        A: first\n        B: second"
+        );
+    }
+
+    #[test]
+    fn test_decode_chat_history_falls_back_to_summary() {
+        let xml = r#"<msg><appmsg><title>Chat History</title><des>A: first</des><type>19</type></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "[聊天记录] Chat History - A: first");
     }
 
     #[test]

@@ -137,6 +137,13 @@ pub fn format_local_timestamp_minutes(timestamp: i64) -> String {
     format_local_timestamp_with(timestamp, MINUTE_FORMAT)
 }
 
+pub(crate) fn parse_local_timestamp_minutes(s: &str) -> Option<i64> {
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, DATETIME_FORMAT))
+        .ok()
+        .and_then(|dt| local_timestamp(dt).ok())
+}
+
 fn format_local_timestamp_with(timestamp: i64, format: &str) -> String {
     DateTime::from_timestamp(timestamp, 0)
         .map(|t| t.with_timezone(&Local).format(format).to_string())

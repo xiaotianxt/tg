@@ -575,12 +575,13 @@ pub fn read_messages(
             "我"
         };
 
-        let decoded = message::decode_message(
+        let decoded = message::decode_message_with_time_bucket(
             *local_type as i32,
             content,
             sender_display,
             *wcdb_ct,
             packed_info,
+            options.time_bucket,
             |id| resolve_sender_name(id, &contacts),
         );
 
