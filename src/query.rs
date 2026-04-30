@@ -1,6 +1,7 @@
 use rusqlite::types::Value;
 use rusqlite::{params_from_iter, Connection, OpenFlags, MAIN_DB};
 use serde_json::{Map, Number, Value as JsonValue};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -658,8 +659,8 @@ fn load_name2id(conn: &Connection) -> HashMap<i64, String> {
 
 fn sort_message_rows(rows: &mut [MessageRow], sort: QuerySort) {
     match sort {
-        QuerySort::Newest => rows.sort_by(|a, b| b.create_time.cmp(&a.create_time)),
-        QuerySort::Oldest => rows.sort_by(|a, b| a.create_time.cmp(&b.create_time)),
+        QuerySort::Newest => rows.sort_by_key(|row| Reverse(row.create_time)),
+        QuerySort::Oldest => rows.sort_by_key(|row| row.create_time),
     }
 }
 

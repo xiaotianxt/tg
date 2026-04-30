@@ -1,4 +1,5 @@
 use rusqlite::{params, Connection};
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -242,12 +243,12 @@ pub fn export_messages(
         all_messages.extend(messages);
     }
 
-    all_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    all_messages.sort_by_key(|message| message.timestamp);
     if let Some(limit) = limit {
         if all_messages.len() > limit {
-            all_messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            all_messages.sort_by_key(|message| Reverse(message.timestamp));
             all_messages.truncate(limit);
-            all_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+            all_messages.sort_by_key(|message| message.timestamp);
         }
     }
 
@@ -477,7 +478,7 @@ fn load_indexed_export_messages(
             }
         })
         .collect::<Vec<_>>();
-    messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    messages.sort_by_key(|message| message.timestamp);
     Ok(messages)
 }
 
@@ -826,7 +827,7 @@ fn load_image_messages(
     for db_messages in per_db_messages {
         messages.extend(db_messages);
     }
-    messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    messages.sort_by_key(|message| Reverse(message.timestamp));
     messages.truncate(limit);
 
     Ok((username, messages))

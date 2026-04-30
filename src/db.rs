@@ -1,6 +1,7 @@
 use md5::{Digest, Md5};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -477,7 +478,7 @@ pub fn list_sessions(
 
     // Sort by message count
     let mut sorted: Vec<_> = sessions.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+    sorted.sort_by_key(|entry| Reverse(entry.1.count));
 
     if sorted.is_empty() {
         return Ok(Vec::new());
@@ -801,13 +802,13 @@ pub fn read_messages(
 
     if options.tail {
         // Each DB returns its latest rows; merge globally, then reverse for chronological display.
-        all_messages.sort_by(|a, b| b.1.cmp(&a.1));
+        all_messages.sort_by_key(|row| Reverse(row.1));
         if let Some(limit) = options.limit {
             all_messages.truncate(limit);
         }
         all_messages.reverse();
     } else {
-        all_messages.sort_by(|a, b| a.1.cmp(&b.1));
+        all_messages.sort_by_key(|row| row.1);
     }
     let messages: Vec<_> = if options.tail {
         all_messages.iter().collect()
@@ -1124,7 +1125,7 @@ fn search_messages_with_hot_index(
     let has_more = results.len() > options.limit;
     results.truncate(options.limit);
     let displayed = results.len();
-    results.sort_by(|a, b| a.1.cmp(&b.1));
+    results.sort_by_key(|row| row.1);
     Ok((displayed, has_more, results))
 }
 
@@ -1201,11 +1202,11 @@ fn search_messages_by_scanning(
         results.extend(rows);
     }
 
-    results.sort_by(|a, b| b.1.cmp(&a.1));
+    results.sort_by_key(|row| Reverse(row.1));
     let has_more = results.len() > options.limit;
     results.truncate(options.limit);
     let displayed = results.len();
-    results.sort_by(|a, b| a.1.cmp(&b.1));
+    results.sort_by_key(|row| row.1);
 
     (displayed, has_more, results)
 }
@@ -1263,11 +1264,11 @@ fn search_messages_with_telegram_fts(
         results.extend(rows);
     }
 
-    results.sort_by(|a, b| b.1.cmp(&a.1));
+    results.sort_by_key(|row| Reverse(row.1));
     let has_more = results.len() > options.limit;
     results.truncate(options.limit);
     let displayed = results.len();
-    results.sort_by(|a, b| a.1.cmp(&b.1));
+    results.sort_by_key(|row| row.1);
 
     Some((displayed, has_more, results))
 }
