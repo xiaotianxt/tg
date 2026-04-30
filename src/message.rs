@@ -558,7 +558,7 @@ fn decode_quote_content(
         .unwrap_or_default();
 
     match (quoted.is_empty(), reply.is_empty()) {
-        (false, false) => format!("> {}\n        {}", quoted, reply),
+        (false, false) => format!("> {}\n {}", quoted, reply),
         (false, true) => format!("> {}", quoted),
         (true, false) => reply,
         (true, true) => "[引用]".to_string(),
@@ -933,7 +933,7 @@ continues</datadesc></dataitem><dataitem datatype="1" dataid="c"><sourcename>B</
     fn test_decode_quote_message() {
         let xml = r#"<msg><appmsg><title>回复内容</title><type>57</type><refermsg><type>1</type><displayname>Bob</displayname><content>引用内容</content></refermsg></appmsg></msg>"#;
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
-        assert_eq!(d.content, "> Bob: 引用内容\n        回复内容");
+        assert_eq!(d.content, "> Bob: 引用内容\n 回复内容");
     }
 
     #[test]
@@ -947,6 +947,6 @@ continues</datadesc></dataitem><dataitem datatype="1" dataid="c"><sourcename>B</
                 id.into()
             }
         });
-        assert_eq!(d.content, "> Bob: [img]\n        回复图片");
+        assert_eq!(d.content, "> Bob: [img]\n 回复图片");
     }
 }

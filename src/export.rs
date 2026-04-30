@@ -113,9 +113,10 @@ pub fn export_messages(
         let body_col = dictionary::msg_body_column();
         let marker_col = dictionary::msg_compression_marker_column();
         let packed_col = dictionary::msg_packed_meta_column();
+        let table = db::quote_identifier(&table_name);
         let sql = format!(
             "SELECT local_type, create_time, {body_col}, {marker_col}, {packed_col} \
-             FROM {table_name} WHERE create_time > 0 ORDER BY create_time ASC"
+             FROM {table} WHERE create_time > 0 ORDER BY create_time ASC"
         );
 
         let rows: Vec<ExportMessageRow> = match conn.prepare(&sql) {
@@ -647,9 +648,10 @@ fn load_image_messages(
         let body_col = dictionary::msg_body_column();
         let marker_col = dictionary::msg_compression_marker_column();
         let packed_col = dictionary::msg_packed_meta_column();
+        let table = db::quote_identifier(&table_name);
         let sql = format!(
             "SELECT create_time, {body_col}, {marker_col}, {packed_col} \
-             FROM {table_name} WHERE create_time > 0 AND local_type = 3{since_clause} ORDER BY create_time DESC LIMIT {limit}"
+             FROM {table} WHERE create_time > 0 AND local_type = 3{since_clause} ORDER BY create_time DESC LIMIT {limit}"
         );
 
         let rows: Vec<(i64, String, Vec<u8>)> = match conn.prepare(&sql) {

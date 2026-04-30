@@ -1,5 +1,5 @@
 use md5::{Digest, Md5};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -159,7 +159,7 @@ pub(crate) fn msg_table_name(username: &str) -> String {
     format!("Msg_{:x}", hash)
 }
 
-fn quote_identifier(name: &str) -> String {
+pub(crate) fn quote_identifier(name: &str) -> String {
     let mut quoted = String::with_capacity(name.len() + 2);
     quoted.push('"');
     for ch in name.chars() {
@@ -394,9 +394,10 @@ pub fn read_messages(
         .map(|c| c.display.as_str())
         .unwrap_or(&username);
 
+    let search_pattern = options.search_query.map(like_contains_pattern);
     let search_clause = options
         .search_query
-        .map(|q| format!(" AND {}", msg_body_like_clause(q)))
+        .map(|_| format!(" AND {}", msg_body_like_clause()))
         .unwrap_or_default();
 
     let since_clause = options
@@ -414,8 +415,9 @@ pub fn read_messages(
         };
 
         // Check if table exists quickly
+        let table = quote_identifier(&table_name);
         let table_exists = conn
-            .prepare(&format!("SELECT 1 FROM {} LIMIT 1", table_name))
+            .prepare(&format!("SELECT 1 FROM {} LIMIT 1", table))
             .is_ok();
         if !table_exists {
             return (total_count, rows);
@@ -424,11 +426,15 @@ pub fn read_messages(
         // Get total count for this DB
         let count_sql = format!(
             "SELECT COUNT(*) FROM {} WHERE create_time > 0{}{}",
-            table_name, search_clause, since_clause
+            table, search_clause, since_clause
         );
         if let Ok(mut stmt) = conn.prepare(&count_sql) {
-            if let Ok(cnt) = stmt.query_row([], |row| row.get::<_, i64>(0)) {
-                total_count += cnt as usize;
+            let count = match &search_pattern {
+                Some(pattern) => stmt.query_row(params![pattern], |row| row.get::<_, i64>(0)),
+                None => stmt.query_row([], |row| row.get::<_, i64>(0)),
+            };
+            if let Ok(cnt) = count {
+                total_count += cnt.max(0) as usize;
             }
         }
 
@@ -459,7 +465,7 @@ pub fn read_messages(
             marker_col = marker_col,
             sender_col = sender_col,
             packed_col = packed_col,
-            table_name = table_name,
+            table_name = table,
             search_clause = search_clause,
             since_clause = since_clause,
             order_dir = order_dir,
@@ -467,38 +473,46 @@ pub fn read_messages(
                 if options.tail { options.limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default() } else { String::new() }
         );
         rows = match conn.prepare(&sql) {
-            Ok(mut stmt) => match stmt.query_map([], |row| {
-                let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(3)?;
-                let content: String = if wcdb_ct == Some(4) {
-                    if let Ok(b) = row.get::<_, Vec<u8>>(2) {
-                        message::try_decompress(&b).unwrap_or_default()
+            Ok(mut stmt) => {
+                let map_row = |row: &rusqlite::Row<'_>| {
+                    let wcdb_ct: Option<i64> = row.get::<_, Option<i64>>(3)?;
+                    let content: String = if wcdb_ct == Some(4) {
+                        if let Ok(b) = row.get::<_, Vec<u8>>(2) {
+                            message::try_decompress(&b).unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
                     } else {
-                        String::new()
-                    }
-                } else {
-                    match row.get::<_, Option<String>>(2) {
-                        Ok(Some(s)) => s,
-                        _ => match row.get::<_, Option<Vec<u8>>>(2) {
-                            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                            _ => String::new(),
-                        },
-                    }
+                        match row.get::<_, Option<String>>(2) {
+                            Ok(Some(s)) => s,
+                            _ => match row.get::<_, Option<Vec<u8>>>(2) {
+                                Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
+                                _ => String::new(),
+                            },
+                        }
+                    };
+                    let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                    let sender_account_id = name2id.get(&sender_id).cloned().unwrap_or_default();
+                    let packed_info: Vec<u8> =
+                        row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
+                        row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                        content,
+                        wcdb_ct,
+                        sender_account_id,
+                        packed_info,
+                    ))
                 };
-                let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
-                let sender_account_id = name2id.get(&sender_id).cloned().unwrap_or_default();
-                let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
-                Ok((
-                    row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
-                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    content,
-                    wcdb_ct,
-                    sender_account_id,
-                    packed_info,
-                ))
-            }) {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                Err(_) => vec![],
-            },
+                let rows = match &search_pattern {
+                    Some(pattern) => stmt.query_map(params![pattern], map_row),
+                    None => stmt.query_map([], map_row),
+                };
+                match rows {
+                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                    Err(_) => vec![],
+                }
+            }
             Err(_) => vec![],
         };
         (total_count, rows)
@@ -654,7 +668,10 @@ pub(crate) fn probe_session(
             Ok(conn) => conn,
             Err(_) => return None,
         };
-        let sql = format!("SELECT COUNT(*) FROM {} WHERE create_time > 0", table_name);
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE create_time > 0",
+            quote_identifier(&table_name)
+        );
         conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
             .ok()
             .map(|count| count.max(0) as usize)
@@ -701,7 +718,8 @@ fn search_messages_by_scanning(
     message_dbs: Vec<PathBuf>,
     options: &SearchMessagesOptions<'_>,
 ) -> (usize, Vec<SearchRow>) {
-    let search_clause = msg_body_like_clause(options.query);
+    let search_clause = msg_body_like_clause();
+    let search_pattern = like_contains_pattern(options.query);
     let since_clause = options
         .since
         .map(|ts| format!(" AND create_time >= {}", ts))
@@ -728,12 +746,15 @@ fn search_messages_by_scanning(
         };
 
         for table_name in &tables {
+            let table = quote_identifier(table_name);
             let count_sql = format!(
                 "SELECT COUNT(*) FROM {} WHERE {}{}",
-                table_name, search_clause, since_clause
+                table, search_clause, since_clause
             );
             if let Ok(mut stmt) = conn.prepare(&count_sql) {
-                if let Ok(count) = stmt.query_row([], |row| row.get::<_, i64>(0)) {
+                if let Ok(count) =
+                    stmt.query_row(params![&search_pattern], |row| row.get::<_, i64>(0))
+                {
                     total_count += count.max(0) as usize;
                 }
             }
@@ -743,13 +764,13 @@ fn search_messages_by_scanning(
                  FROM {} WHERE {}{} \
                  ORDER BY create_time DESC LIMIT {}",
                 quote_identifier(&dictionary::msg_body_column()),
-                table_name,
+                table,
                 search_clause,
                 since_clause,
                 result_limit
             );
             let rows: Vec<SearchRow> = match conn.prepare(&sql) {
-                Ok(mut q) => match q.query_map([], |row| {
+                Ok(mut q) => match q.query_map(params![&search_pattern], |row| {
                     let content: String = match row.get::<_, Option<String>>(2) {
                         Ok(Some(s)) => s,
                         _ => match row.get::<_, Option<Vec<u8>>>(2) {
@@ -800,7 +821,8 @@ fn search_messages_with_telegram_fts(
     }
 
     let name2id = load_fts_name2id(&conn);
-    let search_clause = fts_content_like_clause(options.query);
+    let search_clause = fts_content_like_clause();
+    let search_pattern = like_contains_pattern(options.query);
     let since_clause = options
         .since
         .map(|ts| format!(" AND c6 >= {}", ts))
@@ -810,12 +832,14 @@ fn search_messages_with_telegram_fts(
     let mut results: Vec<SearchRow> = Vec::new();
 
     for table_name in content_tables {
+        let table = quote_identifier(&table_name);
         let count_sql = format!(
             "SELECT COUNT(*) FROM {} WHERE {}{}",
-            table_name, search_clause, since_clause
+            table, search_clause, since_clause
         );
         if let Ok(mut stmt) = conn.prepare(&count_sql) {
-            if let Ok(count) = stmt.query_row([], |row| row.get::<_, i64>(0)) {
+            if let Ok(count) = stmt.query_row(params![&search_pattern], |row| row.get::<_, i64>(0))
+            {
                 total += count.max(0) as usize;
             }
         }
@@ -824,11 +848,11 @@ fn search_messages_with_telegram_fts(
             "SELECT c1, c6, c0, c4 \
              FROM {} WHERE {}{} \
              ORDER BY c6 DESC LIMIT {}",
-            table_name, search_clause, since_clause, options.limit
+            table, search_clause, since_clause, options.limit
         );
         let rows: Vec<SearchRow> = match conn.prepare(&sql) {
             Ok(mut stmt) => stmt
-                .query_map([], |row| {
+                .query_map(params![&search_pattern], |row| {
                     let session_id = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
                     let session = name2id
                         .get(&session_id)
@@ -964,16 +988,28 @@ fn search_session_display(contacts: &HashMap<String, Contact>, session: &str) ->
         .unwrap_or_else(|| session.to_string())
 }
 
-fn msg_body_like_clause(query: &str) -> String {
+fn msg_body_like_clause() -> String {
     format!(
-        "{} LIKE '%{}%'",
-        quote_identifier(&dictionary::msg_body_column()),
-        query.replace('\'', "''")
+        "{} LIKE ? ESCAPE '\\'",
+        quote_identifier(&dictionary::msg_body_column())
     )
 }
 
-fn fts_content_like_clause(query: &str) -> String {
-    format!("c0 LIKE '%{}%'", query.replace('\'', "''"))
+fn fts_content_like_clause() -> &'static str {
+    "c0 LIKE ? ESCAPE '\\'"
+}
+
+fn like_contains_pattern(query: &str) -> String {
+    let mut pattern = String::with_capacity(query.len() + 2);
+    pattern.push('%');
+    for ch in query.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
 }
 
 fn truncate_preview(content: &str, max_chars: usize) -> String {
@@ -1323,7 +1359,7 @@ fn latest_message_times_for_candidates(
             };
             let sql = format!(
                 "SELECT MAX(create_time) FROM {} WHERE create_time > 0",
-                table_name
+                quote_identifier(&table_name)
             );
             if let Ok(mut stmt) = conn.prepare(&sql) {
                 if let Ok(Some(ts)) = stmt.query_row([], |row| row.get::<_, Option<i64>>(0)) {
@@ -1621,6 +1657,28 @@ mod tests {
     }
 
     #[test]
+    fn search_messages_treats_query_as_bound_text() {
+        let dir = create_decrypted_dir_with_messages(
+            "tgid_search",
+            &["before needle after", "before needle", "no match"],
+        );
+
+        let count = search_messages(
+            dir.path(),
+            SearchMessagesOptions {
+                query: "' OR 1=1 --",
+                limit: 20,
+                since: None,
+                use_telegram_fts: false,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn read_messages_search_matches_query_inside_content() {
         let dir = create_decrypted_dir_with_messages(
             "tgid_search",
@@ -1646,6 +1704,31 @@ mod tests {
     }
 
     #[test]
+    fn read_messages_search_treats_wildcards_as_text() {
+        let dir = create_decrypted_dir_with_messages(
+            "tgid_search",
+            &["before needle after", "before needle", "no match"],
+        );
+
+        let count = read_messages(
+            dir.path(),
+            ReadMessagesOptions {
+                session_query: "tgid_search",
+                limit: None,
+                offset: 0,
+                search_query: Some("%"),
+                since: None,
+                tail: false,
+                time_bucket: time::MessageTimeBucket::PerMessage,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn search_messages_uses_telegram_fts_content_cache() {
         let dir =
             create_decrypted_dir_with_fts(&["before needle after", "before needle", "no match"]);
@@ -1663,6 +1746,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn fts_search_treats_query_as_bound_text() {
+        let dir =
+            create_decrypted_dir_with_fts(&["before needle after", "before needle", "no match"]);
+
+        let count = search_messages(
+            dir.path(),
+            SearchMessagesOptions {
+                query: "' OR 1=1 --",
+                limit: 20,
+                since: None,
+                use_telegram_fts: true,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 0);
     }
 
     #[test]
