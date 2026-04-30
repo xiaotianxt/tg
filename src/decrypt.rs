@@ -59,10 +59,20 @@ pub struct DecryptConfig {
     pub incremental: bool,
     /// If set, only decrypt source files modified after this Unix timestamp.
     pub since: Option<i64>,
+    /// Which source databases are eligible for this run.
+    pub scope: DecryptScope,
+    /// If set, incremental mode skips outputs refreshed within this duration.
+    pub recent_output_grace: Option<Duration>,
     /// If true, suppress progress output.
     pub quiet: bool,
     /// Number of parallel database jobs. 0 means auto.
     pub jobs: usize,
+}
+
+#[derive(Clone, Copy)]
+pub enum DecryptScope {
+    All,
+    Messages,
 }
 
 struct DecryptTask {
@@ -509,6 +519,7 @@ struct ReuseSource {
     cache: PageCache,
     file: BufReader<fs::File>,
     len: u64,
+    next_index: usize,
 }
 
 impl ReuseSource {
@@ -520,6 +531,7 @@ impl ReuseSource {
             cache,
             file: BufReader::with_capacity(IO_BUF_SZ, file),
             len,
+            next_index: 0,
         })
     }
 
@@ -539,14 +551,21 @@ impl ReuseSource {
             return false;
         }
 
-        if self
-            .file
-            .seek(SeekFrom::Start((index * PAGE_SZ) as u64))
-            .is_err()
-        {
-            return false;
+        if self.next_index != index {
+            if self
+                .file
+                .seek(SeekFrom::Start((index * PAGE_SZ) as u64))
+                .is_err()
+            {
+                return false;
+            }
         }
-        self.file.read_exact(out).is_ok()
+        if self.file.read_exact(out).is_ok() {
+            self.next_index = index + 1;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -710,23 +729,31 @@ pub(crate) fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn source_freshness_mtime(db_path: &Path, db_meta: &fs::Metadata) -> Option<SystemTime> {
-    let mut latest = db_meta.modified().ok();
-    // WAL/SHM mtimes make the decrypted cache stale, but this decryptor only reads
-    // the base .db file. Doctor reports hot WAL files so users can see that gap.
-    for suffix in ["-wal", "-shm"] {
-        let sidecar = sqlite_sidecar_path(db_path, suffix);
-        let Ok(sidecar_meta) = fs::metadata(&sidecar) else {
-            continue;
-        };
-        let Ok(modified) = sidecar_meta.modified() else {
-            continue;
-        };
-        if latest.as_ref().map_or(true, |current| modified > *current) {
-            latest = Some(modified);
+fn source_freshness_mtime(_db_path: &Path, db_meta: &fs::Metadata) -> Option<SystemTime> {
+    // The decryptor reads the base .db file only. Treating hot WAL/SHM mtimes as
+    // cache freshness forces expensive no-op decrypts without making WAL content
+    // visible. Doctor reports hot WAL files separately.
+    db_meta.modified().ok()
+}
+
+fn path_in_decrypt_scope(scope: DecryptScope, rel_path: &str) -> bool {
+    match scope {
+        DecryptScope::All => true,
+        DecryptScope::Messages => {
+            rel_path == "contact/contact.db" || is_numbered_message_rel_path(rel_path)
         }
     }
-    latest
+}
+
+fn is_numbered_message_rel_path(rel_path: &str) -> bool {
+    let Some(stem) = rel_path
+        .strip_prefix("message/message_")
+        .and_then(|value| value.strip_suffix(".db"))
+    else {
+        return false;
+    };
+
+    !stem.is_empty() && stem.chars().all(|ch| ch.is_ascii_digit())
 }
 
 /// Collect all .db files in a directory tree.
@@ -820,6 +847,7 @@ pub fn decrypt_all(
 
     let mut plan = Vec::with_capacity(db_files.len());
     let mut tasks = Vec::new();
+    let now = SystemTime::now();
 
     for source in db_files {
         let SourceDbFile {
@@ -828,6 +856,10 @@ pub fn decrypt_all(
             size,
             freshness_mtime,
         } = source;
+
+        if !path_in_decrypt_scope(config.scope, &rel_path) {
+            continue;
+        }
 
         // Look up key for this database
         let enc_key = match database_key_entry(&keys, &rel_path).and_then(|k| k.get("enc_key")) {
@@ -866,6 +898,16 @@ pub fn decrypt_all(
             if let Some(src_mtime) = freshness_mtime {
                 if let Ok(dec_meta) = fs::metadata(&out_path) {
                     if let Ok(dec_mtime) = dec_meta.modified() {
+                        if config.recent_output_grace.is_some_and(|grace| {
+                            now.duration_since(dec_mtime).is_ok_and(|age| age < grace)
+                        }) {
+                            plan.push(DecryptPlanItem::Skipped {
+                                rel_path,
+                                reason: "recently refreshed",
+                                counts_as_failed: false,
+                            });
+                            continue;
+                        }
                         if dec_mtime >= src_mtime {
                             plan.push(DecryptPlanItem::Skipped {
                                 rel_path,
@@ -1052,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_db_files_uses_wal_and_shm_mtime_for_freshness() {
+    fn collect_db_files_ignores_wal_and_shm_mtime_for_freshness() {
         let dir = tempfile::tempdir().unwrap();
         let message_dir = dir.path().join("message");
         fs::create_dir_all(&message_dir).unwrap();
@@ -1060,12 +1102,12 @@ mod tests {
         let wal_path = sqlite_sidecar_path(&db_path, "-wal");
         let shm_path = sqlite_sidecar_path(&db_path, "-shm");
         fs::write(&db_path, b"db").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(&wal_path, b"wal").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(&shm_path, b"shm").unwrap();
 
         let db_mtime = fs::metadata(&db_path).unwrap().modified().unwrap();
-        let wal_mtime = fs::metadata(&wal_path).unwrap().modified().unwrap();
-        let shm_mtime = fs::metadata(&shm_path).unwrap().modified().unwrap();
         let files = collect_db_files(dir.path());
         let source = files
             .iter()
@@ -1073,9 +1115,35 @@ mod tests {
             .unwrap();
         let freshness = source.freshness_mtime.unwrap();
 
-        assert!(freshness >= db_mtime);
-        assert!(freshness >= wal_mtime);
-        assert!(freshness >= shm_mtime);
+        assert_eq!(freshness, db_mtime);
+    }
+
+    #[test]
+    fn message_decrypt_scope_includes_only_contact_and_numbered_message_dbs() {
+        assert!(path_in_decrypt_scope(
+            DecryptScope::Messages,
+            "contact/contact.db"
+        ));
+        assert!(path_in_decrypt_scope(
+            DecryptScope::Messages,
+            "message/message_0.db"
+        ));
+        assert!(path_in_decrypt_scope(
+            DecryptScope::Messages,
+            "message/message_42.db"
+        ));
+        assert!(!path_in_decrypt_scope(
+            DecryptScope::Messages,
+            "message/message_fts.db"
+        ));
+        assert!(!path_in_decrypt_scope(
+            DecryptScope::Messages,
+            "message/message_resource.db"
+        ));
+        assert!(!path_in_decrypt_scope(
+            DecryptScope::Messages,
+            "session/session.db"
+        ));
     }
 
     #[test]

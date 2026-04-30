@@ -72,13 +72,13 @@ fn print_refresh_stats(label: &str, stats: &decrypt::DecryptStats) {
 }
 
 fn ensure_message_cache_ready(decrypted_dir: &Path, jobs: usize) {
-    let refresh = cache::refresh_decrypted(decrypted_dir, jobs);
+    let refresh = cache::refresh_message_decrypted(decrypted_dir, jobs);
     let refresh = if cache::needs_message_key_retry(&refresh) {
         log::warn!(
             "Decrypted message cache is incomplete ({}). Refreshing keys and retrying once.",
             cache::retry_reason(&refresh)
         );
-        cache::refresh_keys_and_decrypted(decrypted_dir, jobs)
+        cache::refresh_keys_and_message_decrypted(decrypted_dir, jobs)
     } else {
         refresh
     };
@@ -92,6 +92,11 @@ fn ensure_message_cache_ready(decrypted_dir: &Path, jobs: usize) {
             std::process::exit(1);
         }
         Ok(_) => {}
+        Err(e) if decrypt::is_refresh_lock_busy_error(&e) => {
+            log::warn!(
+                "Decrypted cache refresh is already running; reading the existing decrypted cache."
+            );
+        }
         Err(e) => {
             log::error!("Cannot refresh decrypted message cache: {}", e);
             std::process::exit(1);
@@ -331,6 +336,8 @@ fn main() {
             let config = decrypt::DecryptConfig {
                 incremental: !full,
                 since: since_ts,
+                scope: decrypt::DecryptScope::All,
+                recent_output_grace: None,
                 quiet: !verbose,
                 jobs,
             };

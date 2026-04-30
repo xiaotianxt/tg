@@ -1,8 +1,9 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use crate::{db, decrypt, scanner};
 
 const KEY_REFRESH_TIMEOUT_SECS: u64 = 30;
+const MESSAGE_AUTO_REFRESH_GRACE: Duration = Duration::from_secs(60);
 
 pub(crate) fn refresh_decrypted(
     decrypted_dir: &Path,
@@ -11,6 +12,28 @@ pub(crate) fn refresh_decrypted(
     let config = decrypt::DecryptConfig {
         incremental: true,
         since: None,
+        scope: decrypt::DecryptScope::All,
+        recent_output_grace: None,
+        quiet: true,
+        jobs,
+    };
+    decrypt::decrypt_all(
+        std::path::Path::new("all_keys.json"),
+        decrypted_dir,
+        None,
+        &config,
+    )
+}
+
+pub(crate) fn refresh_message_decrypted(
+    decrypted_dir: &Path,
+    jobs: usize,
+) -> Result<decrypt::DecryptStats, String> {
+    let config = decrypt::DecryptConfig {
+        incremental: true,
+        since: None,
+        scope: decrypt::DecryptScope::Messages,
+        recent_output_grace: Some(MESSAGE_AUTO_REFRESH_GRACE),
         quiet: true,
         jobs,
     };
@@ -28,6 +51,14 @@ pub(crate) fn refresh_keys_and_decrypted(
 ) -> Result<decrypt::DecryptStats, String> {
     scanner::extract_keys(KEY_REFRESH_TIMEOUT_SECS)?;
     refresh_decrypted(decrypted_dir, jobs)
+}
+
+pub(crate) fn refresh_keys_and_message_decrypted(
+    decrypted_dir: &Path,
+    jobs: usize,
+) -> Result<decrypt::DecryptStats, String> {
+    scanner::extract_keys(KEY_REFRESH_TIMEOUT_SECS)?;
+    refresh_message_decrypted(decrypted_dir, jobs)
 }
 
 pub(crate) fn needs_message_key_retry(refresh: &Result<decrypt::DecryptStats, String>) -> bool {
