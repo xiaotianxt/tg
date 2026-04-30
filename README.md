@@ -1,10 +1,10 @@
 # tg
 
-tg 是一个 macOS 本地Telegram聊天记录读取 CLI。它在你的 Mac 上读取Telegram桌面版本地数据库，提取密钥、解密数据库，然后按联系人或群名查询、搜索、导出聊天记录。
+tg 是一个 macOS 本地 Telegram 聊天记录读取 CLI。它在你的 Mac 上读取 Telegram 桌面版的本地数据库，提取密钥、解密数据库，然后按联系人或群名查询、搜索、导出聊天记录。
 
 适合这些场景：
 
-- 备份自己的Telegram聊天记录，不依赖手机备份。
+- 备份自己的 Telegram 聊天记录，不依赖手机备份。
 - 快速找某个人、某个群、某个关键词的历史消息。
 - 把聊天导出成 `txt`、`csv`、`json`，用于归档、整理或本地分析。
 - 从本地缓存里导出图片、视频、表情等媒体文件。
@@ -65,9 +65,9 @@ exported/images/123456789_chatroom_Image_3_0001.jpg
 
 | 类别 | 当前支持 |
 | --- | --- |
-| 系统 | macOS，本机Telegram桌面版本地数据 |
-| Telegram版本 | 主要面向 macOS Telegram 4.x；Telegram升级后如果数据库结构变化，可能需要跟进适配 |
-| Telegram数据 | 本机 `db_storage` 中的聊天数据库；无需手机备份 |
+| 系统 | macOS，本机 Telegram 桌面版的本地数据 |
+| Telegram 版本 | 主要面向 macOS Telegram 4.x；Telegram 升级后如果数据库结构变化，可能需要跟进适配 |
+| Telegram 数据 | 本机 `db_storage` 中的聊天数据库；无需手机备份 |
 | 会话匹配 | 联系人显示名、备注、别名、`tgid_...`、群 ID |
 | 消息读取 | 文本、群聊发送者、系统提示、撤回提示、引用、链接、小程序、聊天记录卡片展开、位置、文件卡片、图片/视频/语音/表情的可读摘要 |
 | 搜索 | 全局关键词搜索，单个会话内关键词搜索 |
@@ -77,26 +77,26 @@ exported/images/123456789_chatroom_Image_3_0001.jpg
 
 暂不支持或不保证：
 
-- 不支持 Windows、iOS、Android、网页版Telegram。
-- 不恢复Telegram本地数据库里已经没有的消息。
-- 不保证导出所有媒体。Telegram没有缓存、缓存被清理、文件未下载时，只能显示消息摘要。
+- 不支持 Windows、iOS、Android、网页版 Telegram。
+- 不恢复 Telegram 本地数据库里已经没有的消息。
+- 不保证导出所有媒体。Telegram 没有缓存、缓存被清理、文件未下载时，只能显示消息摘要。
 - `export --media-dir` 会尝试导出图片、视频、表情，但不导出语音音频和普通文件附件本体。
 - 表情导出可能根据消息里的 URL 用 `curl` 下载；普通读取、解密、搜索不会上传聊天数据。
 - `tggf` 表情转换需要本机可用的 `ffmpeg`。
 - 不做 OCR、语义搜索、拼音搜索。
-- 多账号或Telegram路径异常时，可能需要手动指定 `--db-dir`。
+- 多账号或 Telegram 路径异常时，可能需要手动指定 `--db-dir`。
 
 ## 安装
 
-### 先重新签名Telegram
+### 先重新签名 Telegram
 
-退出Telegram后执行：
+退出 Telegram 后执行：
 
 ```bash
 sudo codesign --force --deep --sign - /Applications/Telegram.app
 ```
 
-如果你的Telegram路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径，例如 `/Applications/Telegram.app`。
+如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径，例如 `/Applications/Telegram.app`。
 
 ### Homebrew
 
@@ -168,7 +168,7 @@ tg search "关键词"
 tg export "联系人或群名" --format json
 ```
 
-`sessions`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
+`sessions`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
 
 ## 常用命令
 
@@ -189,7 +189,7 @@ tg decrypt --since 1h --verbose
 tg decrypt --db-dir "/path/to/your/db_storage"
 ```
 
-常见 `db_storage` 位置在Telegram容器目录下，例如 `Documents/xtelegram_files/.../db_storage` 或 `Library/Application Support/telegram-container/.../db_storage`。
+常见 `db_storage` 位置在 Telegram 容器目录下，例如 `Documents/xtelegram_files/.../db_storage` 或 `Library/Application Support/telegram-container/.../db_storage`。
 
 查看会话：
 
@@ -301,13 +301,13 @@ rm -rf all_keys.json decrypted exported
 
 ### `task_for_pid failed`
 
-先确认用了 `sudo tg keys`。如果仍失败，退出Telegram后重新签名：
+先确认用了 `sudo tg keys`。如果仍失败，退出 Telegram 后重新签名：
 
 ```bash
 sudo codesign --force --deep --sign - /Applications/Telegram.app
 ```
 
-然后重新打开Telegram，再运行 `sudo tg keys`。
+然后重新打开 Telegram，再运行 `sudo tg keys`。
 
 ### `No sessions found`
 
@@ -319,7 +319,7 @@ tg decrypt --verbose
 tg sessions --top 30
 ```
 
-如果Telegram数据目录不是默认位置，给 `decrypt` 加 `--db-dir`。
+如果 Telegram 数据目录不是默认位置，给 `decrypt` 加 `--db-dir`。
 
 ### 找到了错误联系人
 
@@ -331,7 +331,7 @@ tg messages "tgid_abcd1234" --limit 50
 
 ### 图片或视频导不出来
 
-媒体导出依赖Telegram本地缓存。可以先在Telegram里打开对应图片或视频，让Telegram把文件下载到本机，再重新运行 `tg image` 或 `tg export --media-dir ...`。
+媒体导出依赖 Telegram 本地缓存。可以先在 Telegram 里打开对应图片或视频，让 Telegram 把文件下载到本机，再重新运行 `tg image` 或 `tg export --media-dir ...`。
 
 ### `tggf` 表情转换失败
 
