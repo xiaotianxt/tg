@@ -1,6 +1,8 @@
 # tg
 
-tg 是一个 macOS 本地 Telegram 聊天记录读取 CLI。它在你的 Mac 上读取 Telegram 桌面版的本地数据库，提取密钥、解密数据库，然后按联系人或群名查询、搜索、导出聊天记录。
+tg 是一个 macOS 本地 Telegram 聊天记录读取 CLI。它把本机 Telegram 桌面版的聊天数据整理成几个直接的命令：读一个会话、全局搜索、结构化检索、导出聊天和导出本地缓存媒体。
+
+底层的密钥提取、数据库解密和索引维护仍然可控，但日常使用不需要反复关心这些步骤。`tg refresh` 负责刷新本地解密缓存和近期消息索引；`messages`、`search`、`query`、`export` 会在读取前尽量静默刷新，失败时继续使用已有缓存并给出诊断线索。
 
 适合这些场景：
 
@@ -9,6 +11,7 @@ tg 是一个 macOS 本地 Telegram 聊天记录读取 CLI。它在你的 Mac 上
 - 用包含词、排除词、时间范围和输出字段做更精确的本地检索。
 - 把聊天导出成 `txt`、`csv`、`json`，用于归档、整理或本地分析。
 - 从本地缓存里导出图片、视频、表情等媒体文件。
+- 给本地 AI/自动化助手一个稳定的聊天记录读取工具和 skill 描述。
 
 默认数据只留在本机。`~/.tg/all_keys.json`、`~/.tg/decrypted/`、`exported/` 都是敏感文件，请当作聊天原文保存和处理。
 
@@ -62,6 +65,31 @@ $ tg image "产品讨论群"
 exported/images/123456789_chatroom_Image_3_0001.jpg
 ```
 
+## 日常工作流
+
+第一次初始化后，最常用的是这些命令：
+
+```bash
+tg "张三" --limit 50
+tg "产品讨论群" --since today
+tg search "关键词"
+tg query --session "产品讨论群" --contains "项目" --not "取消" --fields time,sender,body
+tg export "张三" --format json --output exported/zhangsan
+tg image "产品讨论群" --list
+```
+
+`search`、`query`、`export` 默认只处理最近 365 天，这是当前版本为速度和常见需求做的默认路径。需要全量历史时加 `--all-time`；需要更窄范围时用 `--since today`、`--since 30d` 或具体日期。
+
+如果结果看起来不完整，先跑：
+
+```bash
+tg doctor
+tg doctor "联系人或群名"
+tg refresh
+```
+
+`refresh` 会刷新解密缓存并维护 `~/.tg/decrypted/.tg_index.db`。如果发现消息或联系人数据库缺 key，它会自动刷新 keys 并重试一次；也可以用 `tg refresh --keys` 强制先重新提取 keys。
+
 ## 支持与限制
 
 | 类别 | 当前支持 |
@@ -88,16 +116,6 @@ exported/images/123456789_chatroom_Image_3_0001.jpg
 - 多账号或 Telegram 路径异常时，可能需要手动指定 `--db-dir`。
 
 ## 安装
-
-### 先重新签名 Telegram
-
-退出 Telegram 后执行：
-
-```bash
-sudo codesign --force --deep --sign - /Applications/Telegram.app
-```
-
-如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径，例如 `/Applications/Telegram.app`。
 
 ### Homebrew
 
@@ -153,13 +171,13 @@ xcode-select --install
 
    成功后密钥会保存到 `~/.tg/all_keys.json`。
 
-3. 解密数据库：
+3. 刷新本地缓存和近期消息索引：
 
    ```bash
-   tg decrypt --verbose
+   tg refresh
    ```
 
-   成功后解密缓存会保存到 `~/.tg/decrypted/`。
+   成功后解密缓存会保存到 `~/.tg/decrypted/`，近期消息索引会保存到 `~/.tg/decrypted/.tg_index.db`。
 
 4. 看有哪些会话：
 
@@ -185,6 +203,14 @@ tg export "联系人或群名" --format json
 `search`、`query`、`export` 默认只看最近 365 天，这是大多数查询和导出的热路径。需要全量历史时加 `--all-time`；需要更窄窗口时加 `--since today`、`--since 30d` 或具体日期。
 
 `sessions`、`search`、`query`、`schema`、`export` 在读取前会尝试静默增量刷新 `~/.tg/decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
+
+如果 `sudo tg keys` 遇到 `task_for_pid failed` 或权限问题，退出 Telegram 后重新签名一次：
+
+```bash
+sudo codesign --force --deep --sign - /Applications/Telegram.app
+```
+
+如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径。重新打开 Telegram 后再运行 `sudo tg keys` 或 `tg refresh --keys`。
 
 ## 常用命令
 
@@ -353,7 +379,7 @@ sudo codesign --force --deep --sign - /Applications/Telegram.app
 
 ```bash
 ls ~/.tg/all_keys.json
-tg decrypt --verbose
+tg refresh --keys
 tg sessions --top 30
 ```
 
@@ -415,6 +441,12 @@ cargo build
 - `vendor/find_all_keys_macos.c`：链接进 `tg` 的 macOS Telegram 进程扫描器。
 
 面向 AI/自动化助手的能力说明见 [SKILL.md](SKILL.md)。
+
+也可以把随版本打包的 skill 安装到本机 Codex skill 目录：
+
+```bash
+tg skill install
+```
 
 ## License
 
