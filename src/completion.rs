@@ -50,6 +50,7 @@ complete -c tg -l jobs -r -d "Parallel job count"
 complete -c tg -l limit -r -d "Result limit"
 complete -c tg -l since -r -d "Lower time bound"
 complete -c tg -l all-time -d "Search full history"
+complete -c tg -n "__tg_no_subcommand; or __fish_seen_subcommand_from messages" -l anonymous -d "Use group/member public names"
 
 complete -c tg -n "__fish_seen_subcommand_from messages export image doctor sessions" -a "(__tg_complete_sessions)"
 complete -c tg -n "__fish_seen_subcommand_from query" -l session -r -a "(__tg_complete_sessions)" -d "Limit query to one session"
@@ -96,6 +97,7 @@ _tg() {
     '--limit[Result limit]:limit:' \
     '--since[Lower time bound]:time:' \
     '--all-time[Search full history]' \
+    '--anonymous[Use group/member public names]' \
     '--session[Limit query to one session]:session:_tg_sessions' \
     '1:command:->command' \
     '*::arg:->arg'
@@ -133,52 +135,168 @@ __tg_complete_words() {
   done
 }
 
+__tg_is_command() {
+  case "$1" in
+    keys|decrypt|sessions|messages|search|query|schema|export|image|doctor|refresh|skill|completions|help)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+__tg_option_takes_value() {
+  case "$1" in
+    --all-time|--full|--verbose|--keys|--tail|--head|--anonymous|--list|--all|--help|-h)
+      return 1
+      ;;
+    -*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+__tg_options_for_command() {
+  case "$1" in
+    messages)
+      printf '%s\n' "--decrypted-dir --limit --offset --search --since --tail --head --time-bucket --anonymous --jobs --help -h"
+      ;;
+    sessions)
+      printf '%s\n' "--decrypted-dir --top --jobs --help -h"
+      ;;
+    search)
+      printf '%s\n' "--decrypted-dir --limit --since --all-time --jobs --help -h"
+      ;;
+    query)
+      printf '%s\n' "--session --decrypted-dir --contains --not --since --all-time --until --limit --offset --order --match-mode --fields --format --max-cell-chars --jobs --help -h"
+      ;;
+    schema)
+      printf '%s\n' "--db --decrypted-dir --format --max-cell-chars --jobs --help -h"
+      ;;
+    export)
+      printf '%s\n' "--decrypted-dir --format --output --media-dir --since --limit --all-time --jobs --help -h"
+      ;;
+    image)
+      printf '%s\n' "--decrypted-dir --output --list --all --index --id --limit --since --jobs --help -h"
+      ;;
+    doctor)
+      printf '%s\n' "--decrypted-dir --jobs --help -h"
+      ;;
+    refresh)
+      printf '%s\n' "--decrypted-dir --keys --jobs --help -h"
+      ;;
+    decrypt)
+      printf '%s\n' "--keys --output --db-dir --full --since --verbose --jobs --help -h"
+      ;;
+    keys)
+      printf '%s\n' "--timeout --help -h"
+      ;;
+    *)
+      printf '%s\n' "--help -h"
+      ;;
+  esac
+}
+
+__tg_effective_subcommand() {
+  local word skip_next=0
+  for word in "${COMP_WORDS[@]:1:$COMP_CWORD-1}"; do
+    if (( skip_next )); then
+      skip_next=0
+      continue
+    fi
+    case "$word" in
+      --)
+        continue
+        ;;
+      --*=*)
+        continue
+        ;;
+      -*)
+        if __tg_option_takes_value "$word"; then
+          skip_next=1
+        fi
+        continue
+        ;;
+      *)
+        if __tg_is_command "$word"; then
+          printf '%s\n' "$word"
+        else
+          printf '%s\n' "messages"
+        fi
+        return 0
+        ;;
+    esac
+  done
+}
+
 _tg() {
-  local cur prev subcommand word
+  local cur prev subcommand
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
+  subcommand="$(__tg_effective_subcommand)"
 
   case "$prev" in
     --session)
-      mapfile -t COMPREPLY < <(compgen -W "$(__tg_complete_words sessions "$cur")" -- "$cur")
+      COMPREPLY=( $(compgen -W "$(__tg_complete_words sessions "$cur")" -- "$cur") )
+      return 0
+      ;;
+    --time-bucket)
+      COMPREPLY=( $(compgen -W "1m 1min 1h 1d 1mo 1y full none" -- "$cur") )
+      return 0
+      ;;
+    --format)
+      COMPREPLY=( $(compgen -W "table json txt csv" -- "$cur") )
+      return 0
+      ;;
+    --order)
+      COMPREPLY=( $(compgen -W "newest oldest" -- "$cur") )
+      return 0
+      ;;
+    --match-mode)
+      COMPREPLY=( $(compgen -W "all any" -- "$cur") )
       return 0
       ;;
     completions)
-      mapfile -t COMPREPLY < <(compgen -W "fish zsh bash" -- "$cur")
+      COMPREPLY=( $(compgen -W "fish zsh bash" -- "$cur") )
       return 0
       ;;
   esac
 
-  for word in "${COMP_WORDS[@]:1:$COMP_CWORD-1}"; do
-    case "$word" in
-      -*)
-        ;;
-      *)
-        subcommand="$word"
-        break
-        ;;
-    esac
-  done
-
   if [[ -z "$subcommand" ]]; then
     if [[ "$cur" == -* ]]; then
-      mapfile -t COMPREPLY < <(compgen -W "--decrypted-dir --jobs --limit --since --all-time --help -h" -- "$cur")
+      COMPREPLY=( $(compgen -W "--decrypted-dir --jobs --limit --since --all-time --help -h" -- "$cur") )
     else
-      mapfile -t COMPREPLY < <(compgen -W "keys decrypt sessions messages search query schema export image doctor refresh skill completions $(__tg_complete_words sessions "$cur")" -- "$cur")
+      COMPREPLY=( $(compgen -W "keys decrypt sessions messages search query schema export image doctor refresh skill completions $(__tg_complete_words sessions "$cur")" -- "$cur") )
     fi
     return 0
   fi
 
   case "$subcommand" in
-    messages|export|image|doctor|sessions)
-      mapfile -t COMPREPLY < <(compgen -W "$(__tg_complete_words sessions "$cur")" -- "$cur")
+    messages)
+      if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$(__tg_options_for_command messages)" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "$(__tg_complete_words sessions "$cur")" -- "$cur") )
+      fi
+      ;;
+    export|image|doctor|sessions)
+      if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$(__tg_options_for_command "$subcommand")" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "$(__tg_complete_words sessions "$cur")" -- "$cur") )
+      fi
+      ;;
+    search|query|schema|refresh|decrypt|keys)
+      if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$(__tg_options_for_command "$subcommand")" -- "$cur") )
+      fi
       ;;
     completions)
-      mapfile -t COMPREPLY < <(compgen -W "fish zsh bash" -- "$cur")
+      COMPREPLY=( $(compgen -W "fish zsh bash" -- "$cur") )
       ;;
     skill)
-      mapfile -t COMPREPLY < <(compgen -W "install" -- "$cur")
+      COMPREPLY=( $(compgen -W "install" -- "$cur") )
       ;;
   esac
 }
@@ -881,6 +999,14 @@ mod tests {
     #[test]
     fn sanitize_removes_completion_separators() {
         assert_eq!(sanitize("a\tb\nc"), "a b c");
+    }
+
+    #[test]
+    fn shell_completion_scripts_include_anonymous_flag() {
+        assert!(FISH_COMPLETIONS.contains("-l anonymous"));
+        assert!(ZSH_COMPLETIONS.contains("--anonymous["));
+        assert!(BASH_COMPLETIONS.contains("--time-bucket --anonymous"));
+        assert!(!BASH_COMPLETIONS.contains("mapfile"));
     }
 
     #[test]

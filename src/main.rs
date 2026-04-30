@@ -1000,6 +1000,24 @@ mod tests {
     }
 
     #[test]
+    fn default_messages_accepts_anonymous_flag() {
+        let cli = Cli::parse_from(normalize_args_for_default_messages(args(&[
+            "tg",
+            "room",
+            "--anonymous",
+        ])));
+        match cli.command {
+            Commands::Messages {
+                session, anonymous, ..
+            } => {
+                assert_eq!(session, "room");
+                assert!(anonymous);
+            }
+            _ => panic!("expected messages command"),
+        }
+    }
+
+    #[test]
     fn sessions_accepts_optional_query() {
         let cli = Cli::parse_from(args(&["tg", "sessions", "alice"]));
         match cli.command {
