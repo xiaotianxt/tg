@@ -426,9 +426,16 @@ TG_LOG=debug tg messages "张三"
 ## 开发
 
 ```bash
+make check
 make build
+```
+
+`make check` 会依次运行 rustfmt、clippy 和测试：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
 cargo test
-cargo build
 ```
 
 项目入口是 `src/main.rs`。主要模块：

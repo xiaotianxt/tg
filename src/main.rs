@@ -856,16 +856,16 @@ fn main() {
                     cache::retry_reason(&refresh)
                 );
             }
-            match export::export_messages(
-                &decrypted_dir,
-                &session,
-                &format,
-                &output,
-                media_dir.as_deref(),
-                since_ts,
+            match export::export_messages(export::MessageExportConfig {
+                decrypted_dir: &decrypted_dir,
+                session_query: &session,
+                format: &format,
+                output_dir: &output,
+                media_dir: media_dir.as_deref(),
+                since: since_ts,
                 limit,
                 jobs,
-            ) {
+            }) {
                 Ok(paths) => {
                     print_output(format_args!("Exported to:"));
                     for (fmt, path) in paths {

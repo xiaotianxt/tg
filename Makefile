@@ -1,6 +1,21 @@
-.PHONY: all build install install-local clean
+.PHONY: all fmt clippy test check build install install-local clean
 
-all: build
+all: check
+	$(MAKE) build
+
+fmt:
+	cargo fmt --all -- --check
+
+clippy:
+	cargo clippy --all-targets -- -D warnings
+
+test:
+	cargo test
+
+check:
+	cargo fmt --all -- --check
+	cargo clippy --all-targets -- -D warnings
+	cargo test
 
 build:
 	cargo build --release

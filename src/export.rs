@@ -60,6 +60,17 @@ pub struct ImageExportConfig<'a> {
     pub jobs: usize,
 }
 
+pub struct MessageExportConfig<'a> {
+    pub decrypted_dir: &'a Path,
+    pub session_query: &'a str,
+    pub format: &'a str,
+    pub output_dir: &'a Path,
+    pub media_dir: Option<&'a Path>,
+    pub since: Option<i64>,
+    pub limit: Option<usize>,
+    pub jobs: usize,
+}
+
 #[derive(Clone)]
 struct ImageMessage {
     time: String,
@@ -77,15 +88,19 @@ struct ImageCandidate {
 
 /// Export messages for a session.
 pub fn export_messages(
-    decrypted_dir: &Path,
-    session_query: &str,
-    format: &str,
-    output_dir: &Path,
-    media_dir: Option<&Path>,
-    since: Option<i64>,
-    limit: Option<usize>,
-    jobs: usize,
+    config: MessageExportConfig<'_>,
 ) -> Result<Vec<(&'static str, PathBuf)>, String> {
+    let MessageExportConfig {
+        decrypted_dir,
+        session_query,
+        format,
+        output_dir,
+        media_dir,
+        since,
+        limit,
+        jobs,
+    } = config;
+
     let (contact_db, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
     let contact_db_path = contact_db.as_deref();
 
@@ -1167,13 +1182,7 @@ mod tests {
         packed.push(8);
         packed.push(1);
 
-        let mut img = Vec::new();
-        img.push(8);
-        img.push(1);
-        img.push(16);
-        img.push(1);
-        img.push(34);
-        img.push(filename.len() as u8);
+        let mut img = vec![8, 1, 16, 1, 34, filename.len() as u8];
         img.extend_from_slice(filename.as_bytes());
 
         packed.push(26);
@@ -1321,16 +1330,16 @@ mod tests {
         let decrypted = create_export_decrypted_dir();
         let output = tempdir().unwrap();
 
-        let results = export_messages(
-            decrypted.path(),
-            "tgid_export",
-            "json",
-            output.path(),
-            None,
-            None,
-            None,
-            1,
-        )
+        let results = export_messages(MessageExportConfig {
+            decrypted_dir: decrypted.path(),
+            session_query: "tgid_export",
+            format: "json",
+            output_dir: output.path(),
+            media_dir: None,
+            since: None,
+            limit: None,
+            jobs: 1,
+        })
         .unwrap();
 
         assert_eq!(results.len(), 1);
@@ -1354,16 +1363,16 @@ mod tests {
         let decrypted = create_export_decrypted_dir();
         let output = tempdir().unwrap();
 
-        let results = export_messages(
-            decrypted.path(),
-            "tgid_export",
-            "all",
-            output.path(),
-            None,
-            None,
-            None,
-            1,
-        )
+        let results = export_messages(MessageExportConfig {
+            decrypted_dir: decrypted.path(),
+            session_query: "tgid_export",
+            format: "all",
+            output_dir: output.path(),
+            media_dir: None,
+            since: None,
+            limit: None,
+            jobs: 1,
+        })
         .unwrap();
 
         assert_eq!(
@@ -1385,16 +1394,16 @@ mod tests {
         let decrypted = create_export_decrypted_dir();
         let output = tempdir().unwrap();
 
-        export_messages(
-            decrypted.path(),
-            "tgid_export",
-            "json",
-            output.path(),
-            None,
-            Some(1000),
-            Some(1),
-            1,
-        )
+        export_messages(MessageExportConfig {
+            decrypted_dir: decrypted.path(),
+            session_query: "tgid_export",
+            format: "json",
+            output_dir: output.path(),
+            media_dir: None,
+            since: Some(1000),
+            limit: Some(1),
+            jobs: 1,
+        })
         .unwrap();
 
         let data: serde_json::Value = serde_json::from_str(

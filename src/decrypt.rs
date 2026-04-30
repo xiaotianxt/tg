@@ -551,14 +551,13 @@ impl ReuseSource {
             return false;
         }
 
-        if self.next_index != index {
-            if self
+        if self.next_index != index
+            && self
                 .file
                 .seek(SeekFrom::Start((index * PAGE_SZ) as u64))
                 .is_err()
-            {
-                return false;
-            }
+        {
+            return false;
         }
         if self.file.read_exact(out).is_ok() {
             self.next_index = index + 1;
@@ -633,47 +632,48 @@ fn decrypt_database(
         None
     };
 
-    let mut write_page =
-        |pgno: usize, page_data: &[u8], out_buf: &mut [u8]| -> Result<(), String> {
-            let index = pgno - 1;
-            let fingerprint = page_fingerprint(page_data);
-            fingerprints.push(fingerprint);
+    {
+        let mut write_page =
+            |pgno: usize, page_data: &[u8], out_buf: &mut [u8]| -> Result<(), String> {
+                let index = pgno - 1;
+                let fingerprint = page_fingerprint(page_data);
+                fingerprints.push(fingerprint);
 
-            if let Some(reuse) = reuse_source.as_mut() {
-                if reuse.read_page_if_fresh(index, fingerprint, out_buf) {
-                    out_file
-                        .write_all(out_buf)
-                        .map_err(|e| format!("Write error at page {}: {}", pgno, e))?;
-                    reused_pages += 1;
-                    return Ok(());
+                if let Some(reuse) = reuse_source.as_mut() {
+                    if reuse.read_page_if_fresh(index, fingerprint, out_buf) {
+                        out_file
+                            .write_all(out_buf)
+                            .map_err(|e| format!("Write error at page {}: {}", pgno, e))?;
+                        reused_pages += 1;
+                        return Ok(());
+                    }
                 }
+
+                decrypt_page_into(&enc_key, page_data, pgno as u32, out_buf)
+                    .ok_or_else(|| format!("Decryption failed at page {}", pgno))?;
+
+                out_file
+                    .write_all(out_buf)
+                    .map_err(|e| format!("Write error at page {}: {}", pgno, e))?;
+                decrypted_pages += 1;
+                Ok(())
+            };
+
+        write_page(1, &page1, &mut out_buf)?;
+
+        for pgno in 2..=total_pages {
+            let bytes_remaining = file_size as usize - ((pgno - 1) * PAGE_SZ);
+            let bytes_to_read = bytes_remaining.min(PAGE_SZ);
+
+            file.read_exact(&mut page_buf[..bytes_to_read])
+                .map_err(|e| format!("Read error at page {}: {}", pgno, e))?;
+            if bytes_to_read < PAGE_SZ {
+                page_buf[bytes_to_read..].fill(0);
             }
 
-            decrypt_page_into(&enc_key, page_data, pgno as u32, out_buf)
-                .ok_or_else(|| format!("Decryption failed at page {}", pgno))?;
-
-            out_file
-                .write_all(out_buf)
-                .map_err(|e| format!("Write error at page {}: {}", pgno, e))?;
-            decrypted_pages += 1;
-            Ok(())
-        };
-
-    write_page(1, &page1, &mut out_buf)?;
-
-    for pgno in 2..=total_pages {
-        let bytes_remaining = file_size as usize - ((pgno - 1) * PAGE_SZ);
-        let bytes_to_read = bytes_remaining.min(PAGE_SZ);
-
-        file.read_exact(&mut page_buf[..bytes_to_read])
-            .map_err(|e| format!("Read error at page {}: {}", pgno, e))?;
-        if bytes_to_read < PAGE_SZ {
-            page_buf[bytes_to_read..].fill(0);
+            write_page(pgno, &page_buf, &mut out_buf)?;
         }
-
-        write_page(pgno, &page_buf, &mut out_buf)?;
     }
-    drop(write_page);
 
     finish_temp_writer(out_file, &tmp_path)?;
     let tables = verify_sqlite(&tmp_path).map_err(|e| format!("SQLite verify failed: {}", e))?;

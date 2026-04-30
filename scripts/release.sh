@@ -6,7 +6,7 @@ TAP_NAME="${TAP_NAME:-xiaotianxt/tap}"
 FORMULA_REF="${FORMULA_REF:-xiaotianxt/tap/tg}"
 WORKFLOW="${WORKFLOW:-release.yml}"
 
-RUN_TESTS=1
+RUN_CHECKS=1
 UPDATE_TAP=1
 BREW_VERIFY=1
 WATCH_RELEASE=1
@@ -25,7 +25,8 @@ Options:
                        another commit.
                        One of: patch, minor, major. Default: patch.
   --version VERSION    Release this exact version, updating Cargo files first.
-  --skip-tests         Do not run cargo test before tagging.
+  --skip-checks        Do not run local checks before tagging.
+  --skip-tests         Alias for --skip-checks.
   --skip-tap           Do not update the Homebrew tap formula.
   --skip-brew-verify   Do not run brew update/upgrade/test after tap update.
   --no-watch           Push the tag but do not wait for the release workflow.
@@ -184,8 +185,8 @@ while [[ $# -gt 0 ]]; do
       [[ "$VERSION_OVERRIDE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--version must be x.y.z"
       shift
       ;;
-    --skip-tests)
-      RUN_TESTS=0
+    --skip-checks|--skip-tests)
+      RUN_CHECKS=0
       ;;
     --skip-tap)
       UPDATE_TAP=0
@@ -212,6 +213,9 @@ need_cmd cargo
 need_cmd git
 need_cmd gh
 need_cmd python3
+if [[ "$RUN_CHECKS" -eq 1 ]]; then
+  need_cmd make
+fi
 if [[ "$UPDATE_TAP" -eq 1 || "$BREW_VERIFY" -eq 1 ]]; then
   need_cmd brew
 fi
@@ -274,9 +278,9 @@ if [[ -n "$TAG_SHA" && "$TAG_SHA" != "$HEAD_SHA" ]]; then
   die "tag ${TAG} points to ${TAG_SHA}, not HEAD ${HEAD_SHA}; choose a different version"
 fi
 
-if [[ "$RUN_TESTS" -eq 1 ]]; then
-  log "running cargo test"
-  cargo test
+if [[ "$RUN_CHECKS" -eq 1 ]]; then
+  log "running make check"
+  make check
 fi
 
 if ! git diff --quiet -- Cargo.toml Cargo.lock; then

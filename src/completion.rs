@@ -432,7 +432,7 @@ fn session_candidates_from_contact_db(
     limit: usize,
     query: &str,
 ) -> Result<Vec<Candidate>, String> {
-    let contacts = db::load_contacts(&contact_db)?;
+    let contacts = db::load_contacts(contact_db)?;
     let rows = contacts
         .into_values()
         .filter(|contact| !contact.username.trim().is_empty())
