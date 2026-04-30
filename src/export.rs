@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::db;
+use crate::dictionary;
 use crate::media;
 use crate::media_index::MediaIndex;
 use crate::message;
@@ -109,10 +110,12 @@ pub fn export_messages(
             Err(_) => return messages,
         };
 
+        let body_col = dictionary::msg_body_column();
+        let marker_col = dictionary::msg_compression_marker_column();
+        let packed_col = dictionary::msg_packed_meta_column();
         let sql = format!(
-            "SELECT local_type, create_time, message_content, WCDB_CT_message_content, packed_info_data \
-             FROM {} WHERE create_time > 0 ORDER BY create_time ASC",
-            table_name
+            "SELECT local_type, create_time, {body_col}, {marker_col}, {packed_col} \
+             FROM {table_name} WHERE create_time > 0 ORDER BY create_time ASC"
         );
 
         let rows: Vec<ExportMessageRow> = match conn.prepare(&sql) {
@@ -641,10 +644,12 @@ fn load_image_messages(
             Err(_) => return messages,
         };
 
+        let body_col = dictionary::msg_body_column();
+        let marker_col = dictionary::msg_compression_marker_column();
+        let packed_col = dictionary::msg_packed_meta_column();
         let sql = format!(
-            "SELECT create_time, message_content, WCDB_CT_message_content, packed_info_data \
-             FROM {} WHERE create_time > 0 AND local_type = 3{} ORDER BY create_time DESC LIMIT {}",
-            table_name, since_clause, limit
+            "SELECT create_time, {body_col}, {marker_col}, {packed_col} \
+             FROM {table_name} WHERE create_time > 0 AND local_type = 3{since_clause} ORDER BY create_time DESC LIMIT {limit}"
         );
 
         let rows: Vec<(i64, String, Vec<u8>)> = match conn.prepare(&sql) {

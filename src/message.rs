@@ -87,15 +87,15 @@ pub struct DecodedMessage {
 /// - `msg_type` — 原始消息类型值
 /// - `raw_content` — 原始消息内容（可能为 TEXT 或 BLOB 转 String）
 /// - `session_display_name` — 会话的显示名（私聊即对方昵称，群聊即群名）
-/// - `wcdb_ct` — `WCDB_CT_message_content` 字段值
-/// - `packed_info_data` — `packed_info_data` 字段二进制数据（Telegram 4.x 媒体元信息）
+/// - `wcdb_ct` — message compression marker from the source row
+/// - `packed_info` — packed media metadata bytes
 /// - `resolve_display_name` — 将账号 ID 解析为显示名的函数
 pub fn decode_message(
     msg_type: i32,
     raw_content: &str,
     session_display_name: &str,
     _wcdb_ct: Option<i64>,
-    packed_info_data: &[u8],
+    packed_info: &[u8],
     resolve_display_name: impl Fn(&str) -> String,
 ) -> DecodedMessage {
     decode_message_with_time_bucket(
@@ -103,7 +103,7 @@ pub fn decode_message(
         raw_content,
         session_display_name,
         _wcdb_ct,
-        packed_info_data,
+        packed_info,
         time::MessageTimeBucket::Minute(1),
         resolve_display_name,
     )
@@ -114,7 +114,7 @@ pub(crate) fn decode_message_with_time_bucket(
     raw_content: &str,
     session_display_name: &str,
     _wcdb_ct: Option<i64>,
-    packed_info_data: &[u8],
+    packed_info: &[u8],
     time_bucket: time::MessageTimeBucket,
     resolve_display_name: impl Fn(&str) -> String,
 ) -> DecodedMessage {
@@ -134,7 +134,7 @@ pub(crate) fn decode_message_with_time_bucket(
             Some(id) => resolve_display_name(id),
             None => session_display_name.to_string(),
         };
-        let content = decode_media_content(msg_type, clean_content, packed_info_data);
+        let content = decode_media_content(msg_type, clean_content, packed_info);
         return DecodedMessage {
             msg_type: msg_type_enum,
             content,
@@ -169,7 +169,7 @@ fn is_media_type(t: i32) -> bool {
     matches!(t, 3 | 34 | 43 | 47)
 }
 
-/// 解码媒体类消息：优先使用 packed_info_data 的 protobuf 元信息，回退到 XML 解析。
+/// 解码媒体类消息：优先使用 packed media metadata 的 protobuf 元信息，回退到 XML 解析。
 fn decode_media_content(msg_type: i32, raw_content: &str, packed_info: &[u8]) -> String {
     match msg_type {
         34 => {

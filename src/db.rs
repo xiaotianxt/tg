@@ -396,7 +396,7 @@ pub fn read_messages(
 
     let search_clause = options
         .search_query
-        .map(|q| format!(" AND {}", message_content_like_clause(q)))
+        .map(|q| format!(" AND {}", msg_body_like_clause(q)))
         .unwrap_or_default();
 
     let since_clause = options
@@ -448,14 +448,23 @@ pub fn read_messages(
         let order_dir = if options.tail { "DESC" } else { "ASC" };
 
         // Query messages - collect eagerly to avoid borrow issues
+        let body_col = quote_identifier(&dictionary::msg_body_column());
+        let marker_col = quote_identifier(&dictionary::msg_compression_marker_column());
+        let sender_col = quote_identifier(&dictionary::msg_sender_column());
+        let packed_col = quote_identifier(&dictionary::msg_packed_meta_column());
         let sql = format!(
-            "SELECT local_type, create_time, message_content, WCDB_CT_message_content, real_sender_id, packed_info_data \
-             FROM {} WHERE create_time > 0{}{} ORDER BY create_time {}{}",
-            table_name,
-            search_clause,
-            since_clause,
-            order_dir,
-            if options.tail { options.limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default() } else { String::new() }
+            "SELECT local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col} \
+             FROM {table_name} WHERE create_time > 0{search_clause}{since_clause} ORDER BY create_time {order_dir}{limit_clause}",
+            body_col = body_col,
+            marker_col = marker_col,
+            sender_col = sender_col,
+            packed_col = packed_col,
+            table_name = table_name,
+            search_clause = search_clause,
+            since_clause = since_clause,
+            order_dir = order_dir,
+            limit_clause =
+                if options.tail { options.limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default() } else { String::new() }
         );
         rows = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
@@ -692,7 +701,7 @@ fn search_messages_by_scanning(
     message_dbs: Vec<PathBuf>,
     options: &SearchMessagesOptions<'_>,
 ) -> (usize, Vec<SearchRow>) {
-    let search_clause = message_content_like_clause(options.query);
+    let search_clause = msg_body_like_clause(options.query);
     let since_clause = options
         .since
         .map(|ts| format!(" AND create_time >= {}", ts))
@@ -730,10 +739,14 @@ fn search_messages_by_scanning(
             }
 
             let sql = format!(
-                "SELECT local_type, create_time, message_content \
+                "SELECT local_type, create_time, {} \
                  FROM {} WHERE {}{} \
                  ORDER BY create_time DESC LIMIT {}",
-                table_name, search_clause, since_clause, result_limit
+                quote_identifier(&dictionary::msg_body_column()),
+                table_name,
+                search_clause,
+                since_clause,
+                result_limit
             );
             let rows: Vec<SearchRow> = match conn.prepare(&sql) {
                 Ok(mut q) => match q.query_map([], |row| {
@@ -951,8 +964,12 @@ fn search_session_display(contacts: &HashMap<String, Contact>, session: &str) ->
         .unwrap_or_else(|| session.to_string())
 }
 
-fn message_content_like_clause(query: &str) -> String {
-    format!("message_content LIKE '%{}%'", query.replace('\'', "''"))
+fn msg_body_like_clause(query: &str) -> String {
+    format!(
+        "{} LIKE '%{}%'",
+        quote_identifier(&dictionary::msg_body_column()),
+        query.replace('\'', "''")
+    )
 }
 
 fn fts_content_like_clause(query: &str) -> String {
@@ -1389,14 +1406,15 @@ mod tests {
 
         for (username, count, latest_time) in rows {
             let table_name = msg_table_name(username);
+            let body_col = quote_identifier(&dictionary::msg_body_column());
             conn.execute(
                 &format!(
                     "CREATE TABLE {} (
                         local_type INTEGER,
                         create_time INTEGER,
-                        message_content TEXT
+                        {} TEXT
                     )",
-                    table_name
+                    table_name, body_col
                 ),
                 [],
             )
@@ -1406,11 +1424,12 @@ mod tests {
                 let create_time = latest_time - (*count - i - 1) as i64;
                 conn.execute(
                     &format!(
-                        "INSERT INTO {} (local_type, create_time, message_content) VALUES (1, ?1, 'hello')",
-                        table_name
+                        "INSERT INTO {} (local_type, create_time, {}) VALUES (1, ?1, 'hello')",
+                        table_name, body_col
                     ),
                     params![create_time],
-                ).unwrap();
+                )
+                .unwrap();
             }
         }
 
@@ -1425,17 +1444,21 @@ mod tests {
         let path = message_dir.join("message_0.db");
         let conn = Connection::open(&path).unwrap();
         let table_name = msg_table_name(username);
+        let body_col = quote_identifier(&dictionary::msg_body_column());
+        let marker_col = quote_identifier(&dictionary::msg_compression_marker_column());
+        let sender_col = quote_identifier(&dictionary::msg_sender_column());
+        let packed_col = quote_identifier(&dictionary::msg_packed_meta_column());
         conn.execute(
             &format!(
                 "CREATE TABLE {} (
                     local_type INTEGER,
                     create_time INTEGER,
-                    message_content TEXT,
-                    WCDB_CT_message_content INTEGER,
-                    real_sender_id INTEGER,
-                    packed_info_data BLOB
+                    {} TEXT,
+                    {} INTEGER,
+                    {} INTEGER,
+                    {} BLOB
                 )",
-                table_name
+                table_name, body_col, marker_col, sender_col, packed_col
             ),
             [],
         )
@@ -1447,12 +1470,12 @@ mod tests {
                     "INSERT INTO {} (
                         local_type,
                         create_time,
-                        message_content,
-                        WCDB_CT_message_content,
-                        real_sender_id,
-                        packed_info_data
+                        {},
+                        {},
+                        {},
+                        {}
                     ) VALUES (1, ?1, ?2, NULL, 0, x'')",
-                    table_name
+                    table_name, body_col, marker_col, sender_col, packed_col
                 ),
                 params![1000 + i as i64, content],
             )
@@ -1545,18 +1568,25 @@ mod tests {
     #[test]
     fn session_stats_falls_back_without_sort_seq() {
         let conn = Connection::open_in_memory().unwrap();
+        let body_col = quote_identifier(&dictionary::msg_body_column());
         conn.execute(
-            "CREATE TABLE Msg_test (
+            &format!(
+                "CREATE TABLE Msg_test (
                 local_type INTEGER,
                 create_time INTEGER,
-                message_content TEXT
+                {} TEXT
             )",
+                body_col
+            ),
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO Msg_test (local_type, create_time, message_content) VALUES
+            &format!(
+                "INSERT INTO Msg_test (local_type, create_time, {}) VALUES
              (1, 2000, 'newer'), (1, 1000, 'older')",
+                body_col
+            ),
             [],
         )
         .unwrap();

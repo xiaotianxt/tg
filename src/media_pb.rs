@@ -1,4 +1,4 @@
-//! Protobuf decoding for Telegram 4.x `packed_info_data` column.
+//! Protobuf decoding for packed media metadata.
 
 pub mod wire {
     //! Minimal protobuf wire format decoder.
@@ -65,7 +65,7 @@ pub mod wire {
     }
 }
 
-/// Metadata from `packed_info_data` — image (type 3), Telegram 4.0.3+.
+/// Packed metadata for image messages.
 #[derive(Debug, Clone, Default)]
 pub struct ImageMeta {
     pub width: i32,
@@ -73,7 +73,7 @@ pub struct ImageMeta {
     pub filename: String,
 }
 
-/// Metadata from `packed_info_data` — video (type 43), Telegram 4.0.3+.
+/// Packed metadata for video messages.
 #[derive(Debug, Clone, Default)]
 pub struct VideoMeta {
     pub width: i32,
@@ -81,19 +81,19 @@ pub struct VideoMeta {
     pub filename: String,
 }
 
-/// Metadata from `packed_info_data` — audio (type 34), Telegram 4.0.3+.
+/// Packed metadata for audio messages.
 #[derive(Debug, Clone, Default)]
 pub struct AudioMeta {
     pub audio_text: String,
 }
 
-/// Metadata from `packed_info_data` — file (type 62), Telegram 4.0.3+.
+/// Packed metadata for file messages.
 #[derive(Debug, Clone, Default)]
 pub struct FileMeta {
     pub filename: String,
 }
 
-/// Top-level protobuf for `packed_info_data` (Telegram 4.0.3+).
+/// Top-level protobuf for packed media metadata.
 #[derive(Debug, Clone, Default)]
 pub struct PackedInfoDataImg2 {
     pub field1: i32,

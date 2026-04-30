@@ -32,12 +32,12 @@ tg export "名称" -f txt # 导出
 
 1. **密钥提取**: `sudo tg keys` → C 扫描器遍历Telegram内存 → 查找 `x'<96hex>'` 模式 → 输出 `all_keys.json`
 2. **数据库解密**: `tg decrypt` → 读取 `all_keys.json` → 默认静默增量刷新 → 逐页 AES-256-CBC 解密变化内容 → 验证 SQLite → 输出到 `decrypted/`
-3. **消息查询**: `tg messages` → 先静默刷新 `decrypted/` 缓存 → 打开解密后的 `message/message_0.db` → 通过 MD5(username) 定位 `Msg_<hash>` 表 → 解析 tgid 前缀为联系人昵称 → 展示
+3. **消息查询**: `tg messages` → 先静默刷新 `decrypted/` 缓存 → 打开解密后的 numbered message DB → 通过 MD5(username) 定位 `Msg_<hash>` 表 → 解析 tgid 前缀为联系人昵称 → 展示
 
 ## 数据库结构
 
 - **contact/contact.db**: `contact` 表 (username, nick_name, remark, alias)
-- **message/message_0.db**: `Msg_<md5(username)>` 表 (local_type, create_time, message_content, WCDB_CT_message_content)
+- **numbered message DB**: `Msg_<md5(username)>` 表，包含消息类型、时间、正文、压缩标记和媒体元信息字段
 - **session/session.db**: `SessionTable` 会话列表
 - **表名**: `Msg_` + MD5(用户名/群 ID)
 
@@ -56,9 +56,8 @@ tg export "名称" -f txt # 导出
 
 ## 注意事项
 
-- 群聊消息 content 格式: `tgid_xxx:\n消息内容`（冒号后换行）
-- `message_content` 可能是 TEXT 或 BLOB（BLOB 用 `String::from_utf8` 兜底）
-- `WCDB_CT_message_content` 为 4 表示压缩内容
+- 群聊消息正文格式: `tgid_xxx:\n消息内容`（冒号后换行）
+- 正文字段可能是 TEXT 或 BLOB；压缩标记为特定值时需要先解压
 - 解密后的数据库可能有索引损坏，用 `.recover` 恢复
 
 ## AI 辅助规则
