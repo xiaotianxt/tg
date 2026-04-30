@@ -33,7 +33,7 @@ pub(crate) fn refresh_keys_and_decrypted(
 pub(crate) fn needs_message_key_retry(refresh: &Result<decrypt::DecryptStats, String>) -> bool {
     match refresh {
         Ok(stats) => failures_can_affect_messages(stats),
-        Err(_) => true,
+        Err(e) => !decrypt::is_refresh_lock_busy_error(e),
     }
 }
 
@@ -143,6 +143,12 @@ mod tests {
         assert!(!failures_can_affect_messages(&stats_with_failed_paths(&[
             "message/message_fts.db"
         ])));
+    }
+
+    #[test]
+    fn message_retry_ignores_refresh_lock_contention() {
+        let refresh = Err("Decrypted cache refresh is already running for decrypted".to_string());
+        assert!(!needs_message_key_retry(&refresh));
     }
 
     #[test]

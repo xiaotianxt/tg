@@ -27,7 +27,7 @@ const IO_BUF_SZ: usize = 1024 * 1024;
 const PAGE_CACHE_MAGIC: &[u8; 8] = b"TGRPG001";
 const SQLITE_HDR: &[u8] = b"SQLite format 3\0";
 const REFRESH_LOCK_FILE: &str = ".tg-refresh.lock";
-// No heartbeat is maintained while decrypting, so keep stale-lock takeover conservative.
+// Used only when an old lock has no usable pid; live pids are not stolen.
 const REFRESH_LOCK_STALE_AFTER: Duration = Duration::from_secs(12 * 60 * 60);
 
 pub struct DecryptStats {
@@ -99,11 +99,14 @@ pub(crate) struct SourceDbFile {
 
 struct RefreshLock {
     path: PathBuf,
+    owner: String,
 }
 
 impl Drop for RefreshLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if refresh_lock_owner(&self.path).as_deref() == Some(self.owner.as_str()) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -131,43 +134,61 @@ fn acquire_refresh_lock(output_dir: &Path) -> Result<RefreshLock, String> {
         .map_err(|e| format!("Cannot create output dir {}: {}", output_dir.display(), e))?;
 
     let lock_path = output_dir.join(REFRESH_LOCK_FILE);
-    match create_refresh_lock_file(&lock_path) {
-        Ok(()) => Ok(RefreshLock { path: lock_path }),
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-            if refresh_lock_is_stale(&lock_path)? {
-                fs::remove_file(&lock_path).map_err(|remove_err| {
-                    format!(
-                        "Cannot remove stale refresh lock {}: {}",
-                        lock_path.display(),
-                        remove_err
-                    )
-                })?;
-                create_refresh_lock_file(&lock_path).map_err(|create_err| {
-                    format!(
-                        "Cannot acquire refresh lock {} after removing stale lock: {}",
-                        lock_path.display(),
-                        create_err
-                    )
-                })?;
-                Ok(RefreshLock { path: lock_path })
-            } else {
-                Err(format!(
-                    "Decrypted cache refresh is already running for {} (lock: {}). \
-                     If no tg process is refreshing, remove the lock file.",
-                    output_dir.display(),
-                    lock_path.display()
-                ))
+
+    for _ in 0..3 {
+        match create_refresh_lock_file(&lock_path) {
+            Ok(owner) => {
+                return Ok(RefreshLock {
+                    path: lock_path,
+                    owner,
+                });
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                if !refresh_lock_is_stale(&lock_path)? {
+                    return Err(format!(
+                        "{} for {} (lock: {}). \
+                         If no tg process is refreshing, remove the lock file.",
+                        REFRESH_LOCK_BUSY_PREFIX,
+                        output_dir.display(),
+                        lock_path.display()
+                    ));
+                }
+
+                match fs::remove_file(&lock_path) {
+                    Ok(()) => continue,
+                    Err(remove_err) if remove_err.kind() == ErrorKind::NotFound => continue,
+                    Err(remove_err) => {
+                        return Err(format!(
+                            "Cannot remove stale refresh lock {}: {}",
+                            lock_path.display(),
+                            remove_err
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Cannot acquire refresh lock {}: {}",
+                    lock_path.display(),
+                    e
+                ));
             }
         }
-        Err(e) => Err(format!(
-            "Cannot acquire refresh lock {}: {}",
-            lock_path.display(),
-            e
-        )),
     }
+
+    Err(format!(
+        "Cannot acquire refresh lock {} after removing stale lock",
+        lock_path.display()
+    ))
 }
 
-fn create_refresh_lock_file(lock_path: &Path) -> std::io::Result<()> {
+const REFRESH_LOCK_BUSY_PREFIX: &str = "Decrypted cache refresh is already running";
+
+pub(crate) fn is_refresh_lock_busy_error(error: &str) -> bool {
+    error.contains(REFRESH_LOCK_BUSY_PREFIX)
+}
+
+fn create_refresh_lock_file(lock_path: &Path) -> std::io::Result<String> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -176,12 +197,33 @@ fn create_refresh_lock_file(lock_path: &Path) -> std::io::Result<()> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    writeln!(file, "pid={}", std::process::id())?;
-    writeln!(file, "created_unix={}", created)?;
-    file.flush()
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let owner = format!("{}-{}-{}", std::process::id(), created, nonce);
+    let write_result = (|| -> std::io::Result<()> {
+        writeln!(file, "pid={}", std::process::id())?;
+        writeln!(file, "created_unix={}", created)?;
+        writeln!(file, "owner={}", owner)?;
+        file.flush()
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(lock_path);
+        return Err(e);
+    }
+    Ok(owner)
 }
 
 fn refresh_lock_is_stale(lock_path: &Path) -> Result<bool, String> {
+    if let Some(pid) = refresh_lock_pid(lock_path) {
+        match process_is_running(pid) {
+            Some(false) => return Ok(true),
+            Some(true) => return Ok(false),
+            None => {}
+        }
+    }
+
     let meta = fs::metadata(lock_path)
         .map_err(|e| format!("Cannot inspect refresh lock {}: {}", lock_path.display(), e))?;
     let modified = meta.modified().map_err(|e| {
@@ -195,6 +237,51 @@ fn refresh_lock_is_stale(lock_path: &Path) -> Result<bool, String> {
         Ok(age) => age >= REFRESH_LOCK_STALE_AFTER,
         Err(_) => false,
     })
+}
+
+fn refresh_lock_pid(lock_path: &Path) -> Option<u32> {
+    refresh_lock_value(lock_path, "pid").and_then(|value| value.parse().ok())
+}
+
+fn refresh_lock_owner(lock_path: &Path) -> Option<String> {
+    refresh_lock_value(lock_path, "owner")
+}
+
+fn refresh_lock_value(lock_path: &Path, key: &str) -> Option<String> {
+    let content = fs::read_to_string(lock_path).ok()?;
+    let prefix = format!("{}=", key);
+    content.lines().find_map(|line| {
+        line.strip_prefix(&prefix)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> Option<bool> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Some(false);
+    }
+
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    let rc = unsafe { kill(pid as i32, 0) };
+    if rc == 0 {
+        return Some(true);
+    }
+
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(1) => Some(true),
+        Some(3) => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_is_running(_pid: u32) -> Option<bool> {
+    None
 }
 
 fn create_temp_file_for(dest: &Path) -> Result<(PathBuf, fs::File, TempPathGuard), String> {
@@ -921,6 +1008,47 @@ mod tests {
 
         drop(lock);
         assert!(acquire_refresh_lock(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn refresh_lock_reclaims_dead_pid_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(REFRESH_LOCK_FILE);
+        let dead_pid = (900_000..1_000_000)
+            .find(|pid| process_is_running(*pid) == Some(false))
+            .expect("expected an unused pid in high test range");
+        fs::write(
+            &lock_path,
+            format!("pid={}\ncreated_unix=1\nowner=dead-owner\n", dead_pid),
+        )
+        .unwrap();
+
+        let lock = acquire_refresh_lock(dir.path()).unwrap();
+        assert_ne!(lock.owner, "dead-owner");
+        assert_eq!(refresh_lock_pid(&lock_path), Some(std::process::id()));
+    }
+
+    #[test]
+    fn refresh_lock_drop_does_not_remove_another_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(REFRESH_LOCK_FILE);
+        let lock = acquire_refresh_lock(dir.path()).unwrap();
+
+        fs::write(
+            &lock_path,
+            format!(
+                "pid={}\ncreated_unix=1\nowner=other-owner\n",
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        drop(lock);
+
+        assert!(lock_path.exists());
+        assert_eq!(
+            refresh_lock_owner(&lock_path).as_deref(),
+            Some("other-owner")
+        );
     }
 
     #[test]
