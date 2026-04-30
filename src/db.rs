@@ -1,5 +1,5 @@
 use md5::{Digest, Md5};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,9 +11,33 @@ use crate::time;
 
 /// Resolve a sender ID to a display name from contacts.
 pub fn resolve_sender_name(sender_id: &str, contacts: &HashMap<String, Contact>) -> String {
+    resolve_sender_name_with_mode(
+        sender_id,
+        contacts,
+        DisplayNameMode::PersonalRemark,
+        &HashMap::new(),
+    )
+}
+
+fn resolve_sender_name_with_mode(
+    sender_id: &str,
+    contacts: &HashMap<String, Contact>,
+    mode: DisplayNameMode,
+    room_member_names: &HashMap<String, String>,
+) -> String {
+    if mode == DisplayNameMode::Anonymous {
+        if let Some(name) = room_member_names
+            .get(sender_id)
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+        {
+            return name.to_string();
+        }
+    }
+
     contacts
         .get(sender_id)
-        .map(|c| c.display.as_str())
+        .map(|c| c.display_name(mode))
         .unwrap_or(sender_id)
         .to_string()
 }
@@ -74,6 +98,21 @@ pub(crate) struct Contact {
     pub display: String,
 }
 
+impl Contact {
+    fn display_name(&self, mode: DisplayNameMode) -> &str {
+        match mode {
+            DisplayNameMode::PersonalRemark => first_non_empty([&self.display, &self.username]),
+            DisplayNameMode::Anonymous => first_non_empty([&self.nick_name, &self.username]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisplayNameMode {
+    PersonalRemark,
+    Anonymous,
+}
+
 #[derive(Default)]
 struct SessionInfo {
     count: i64,
@@ -96,6 +135,7 @@ pub(crate) struct ReadMessagesOptions<'a> {
     pub since: Option<i64>,
     pub tail: bool,
     pub time_bucket: time::MessageTimeBucket,
+    pub name_mode: DisplayNameMode,
     pub jobs: usize,
 }
 
@@ -150,6 +190,95 @@ pub(crate) fn load_contacts(contact_db: &Path) -> Result<HashMap<String, Contact
         .collect();
 
     Ok(contacts)
+}
+
+fn first_non_empty<const N: usize>(values: [&str; N]) -> &str {
+    values
+        .into_iter()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or("")
+}
+
+fn load_chat_room_member_names(
+    contact_db: &Path,
+    room_username: &str,
+) -> Result<HashMap<String, String>, String> {
+    let conn =
+        Connection::open(contact_db).map_err(|e| format!("Cannot open contact DB: {}", e))?;
+    let ext_buffer: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT ext_buffer FROM chat_room WHERE username = ?1",
+            params![room_username],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()
+        .map_err(|e| format!("Chat room member query error: {}", e))?
+        .flatten();
+
+    Ok(ext_buffer
+        .as_deref()
+        .map(parse_chat_room_member_names)
+        .unwrap_or_default())
+}
+
+fn parse_chat_room_member_names(data: &[u8]) -> HashMap<String, String> {
+    use crate::media_pb::wire::{decode_varint, skip_field, tag_field};
+
+    let mut names = HashMap::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some(tag) = decode_varint(data, &mut pos) else {
+            break;
+        };
+        let (field, wire) = tag_field(tag);
+        if (field, wire) != (1, 2) {
+            if skip_field(data, &mut pos, wire).is_none() {
+                break;
+            }
+            continue;
+        }
+
+        let Some(len) = decode_varint(data, &mut pos).map(|len| len as usize) else {
+            break;
+        };
+        let Some(end) = pos.checked_add(len) else {
+            break;
+        };
+        let Some(member) = data.get(pos..end) else {
+            break;
+        };
+        pos = end;
+
+        if let Some((username, display_name)) = parse_chat_room_member_name(member) {
+            names.insert(username, display_name);
+        }
+    }
+    names
+}
+
+fn parse_chat_room_member_name(data: &[u8]) -> Option<(String, String)> {
+    use crate::media_pb::wire::{decode_string, decode_varint, skip_field, tag_field};
+
+    let mut username = String::new();
+    let mut display_name = String::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let tag = decode_varint(data, &mut pos)?;
+        let (field, wire) = tag_field(tag);
+        match (field, wire) {
+            (1, 2) => username = decode_string(data, &mut pos)?,
+            (2, 2) => display_name = decode_string(data, &mut pos)?,
+            _ => skip_field(data, &mut pos, wire)?,
+        }
+    }
+
+    let username = username.trim();
+    let display_name = display_name.trim();
+    if username.is_empty() || display_name.is_empty() {
+        return None;
+    }
+    Some((username.to_string(), display_name.to_string()))
 }
 
 pub(crate) fn msg_table_name(username: &str) -> String {
@@ -391,8 +520,18 @@ pub fn read_messages(
 
     let display_name = contacts
         .get(&username)
-        .map(|c| c.display.as_str())
-        .unwrap_or(&username);
+        .map(|c| c.display_name(options.name_mode))
+        .unwrap_or(&username)
+        .to_string();
+
+    let room_member_names = if options.name_mode == DisplayNameMode::Anonymous {
+        contact_db
+            .as_ref()
+            .and_then(|p| load_chat_room_member_names(p, &username).ok())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
 
     let search_pattern = options.search_query.map(like_contains_pattern);
     let search_clause = options
@@ -593,7 +732,7 @@ pub fn read_messages(
     for (local_type, create_time, content, wcdb_ct, sender_account_id, packed_info) in &messages {
         // 1-on-1 chat: if the sender is not the chat partner, it's "me"
         let sender_display = if sender_account_id.is_empty() || sender_account_id == &username {
-            display_name
+            display_name.as_str()
         } else {
             "我"
         };
@@ -605,7 +744,9 @@ pub fn read_messages(
             *wcdb_ct,
             packed_info,
             options.time_bucket,
-            |id| resolve_sender_name(id, &contacts),
+            |id| {
+                resolve_sender_name_with_mode(id, &contacts, options.name_mode, &room_member_names)
+            },
         );
 
         if options.time_bucket == time::MessageTimeBucket::PerMessage {
@@ -1564,6 +1705,51 @@ mod tests {
         dir
     }
 
+    fn push_proto_varint(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn push_proto_len_field(out: &mut Vec<u8>, field: u32, value: &[u8]) {
+        push_proto_varint(out, ((field as u64) << 3) | 2);
+        push_proto_varint(out, value.len() as u64);
+        out.extend_from_slice(value);
+    }
+
+    fn push_proto_varint_field(out: &mut Vec<u8>, field: u32, value: u64) {
+        push_proto_varint(out, (field as u64) << 3);
+        push_proto_varint(out, value);
+    }
+
+    fn chat_room_member_record(username: &str, display_name: &str) -> Vec<u8> {
+        let mut record = Vec::new();
+        push_proto_len_field(&mut record, 1, username.as_bytes());
+        push_proto_len_field(&mut record, 2, display_name.as_bytes());
+        push_proto_varint_field(&mut record, 3, 1);
+        record
+    }
+
+    fn chat_room_ext_buffer(members: &[(&str, &str)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for (username, display_name) in members {
+            push_proto_len_field(
+                &mut data,
+                1,
+                &chat_room_member_record(username, display_name),
+            );
+        }
+        data
+    }
+
     #[test]
     fn filters_only_numbered_message_dbs() {
         assert!(is_message_db_name("message_0.db"));
@@ -1571,6 +1757,100 @@ mod tests {
         assert!(!is_message_db_name("message_fts.db"));
         assert!(!is_message_db_name("message_resource.db"));
         assert!(!is_message_db_name("biz_message_0.db"));
+    }
+
+    #[test]
+    fn parses_chat_room_member_names_from_ext_buffer() {
+        let names = parse_chat_room_member_names(&chat_room_ext_buffer(&[
+            ("tgid_alice", "Alice In Group"),
+            ("tgid_bob", ""),
+            ("tgid_cara", "Cara"),
+        ]));
+
+        assert_eq!(
+            names.get("tgid_alice").map(String::as_str),
+            Some("Alice In Group")
+        );
+        assert_eq!(names.get("tgid_cara").map(String::as_str), Some("Cara"));
+        assert!(!names.contains_key("tgid_bob"));
+    }
+
+    #[test]
+    fn loads_chat_room_member_names_for_room() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("contact.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "CREATE TABLE chat_room (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                owner TEXT,
+                ext_buffer BLOB
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_room (username, ext_buffer) VALUES (?1, ?2)",
+            params![
+                "room@chatroom",
+                chat_room_ext_buffer(&[("tgid_alice", "Alice In Group")])
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let names = load_chat_room_member_names(&path, "room@chatroom").unwrap();
+
+        assert_eq!(
+            names.get("tgid_alice").map(String::as_str),
+            Some("Alice In Group")
+        );
+    }
+
+    #[test]
+    fn sender_name_modes_choose_expected_display_source() {
+        let mut contacts = HashMap::new();
+        contacts.insert(
+            "tgid_alice".to_string(),
+            Contact {
+                username: "tgid_alice".to_string(),
+                nick_name: "Alice Default".to_string(),
+                remark: "Alice Remark".to_string(),
+                alias: String::new(),
+                display: "Alice Remark".to_string(),
+            },
+        );
+        let mut room_names = HashMap::new();
+        room_names.insert("tgid_alice".to_string(), "Alice In Group".to_string());
+
+        assert_eq!(
+            resolve_sender_name_with_mode(
+                "tgid_alice",
+                &contacts,
+                DisplayNameMode::PersonalRemark,
+                &room_names,
+            ),
+            "Alice Remark"
+        );
+        assert_eq!(
+            resolve_sender_name_with_mode(
+                "tgid_alice",
+                &contacts,
+                DisplayNameMode::Anonymous,
+                &room_names,
+            ),
+            "Alice In Group"
+        );
+        assert_eq!(
+            resolve_sender_name_with_mode(
+                "tgid_alice",
+                &contacts,
+                DisplayNameMode::Anonymous,
+                &HashMap::new(),
+            ),
+            "Alice Default"
+        );
     }
 
     #[test]
@@ -1695,6 +1975,7 @@ mod tests {
                 since: None,
                 tail: false,
                 time_bucket: time::MessageTimeBucket::PerMessage,
+                name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
             },
         )
@@ -1720,6 +2001,7 @@ mod tests {
                 since: None,
                 tail: false,
                 time_bucket: time::MessageTimeBucket::PerMessage,
+                name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
             },
         )

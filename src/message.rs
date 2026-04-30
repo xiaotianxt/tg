@@ -603,22 +603,26 @@ fn decode_refermsg_sender(
     content_sender: Option<&str>,
     resolve_display_name: &impl Fn(&str) -> String,
 ) -> Option<String> {
-    if let Some(name) = crate::media::extract_xml_tag(refermsg, "displayname") {
-        return Some(name);
-    }
+    let embedded_name = crate::media::extract_xml_tag(refermsg, "displayname")
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
 
     let sender_id = crate::media::extract_xml_tag(refermsg, "chatusr")
         .or_else(|| content_sender.map(|id| id.to_string()))
         .or_else(|| {
             crate::media::extract_xml_tag(refermsg, "fromusr")
                 .filter(|id| !id.contains("@chatroom"))
-        })?;
-    let sender = resolve_display_name(&sender_id);
-    if sender.is_empty() {
-        None
-    } else {
-        Some(sender)
+        });
+
+    if let Some(sender_id) = sender_id {
+        let sender = resolve_display_name(&sender_id);
+        if !sender.trim().is_empty() && sender != sender_id {
+            return Some(sender);
+        }
+        return embedded_name.or_else(|| (!sender.trim().is_empty()).then_some(sender));
     }
+
+    embedded_name
 }
 
 fn decode_location_content(content: &str) -> String {
@@ -934,6 +938,26 @@ continues</datadesc></dataitem><dataitem datatype="1" dataid="c"><sourcename>B</
         let xml = r#"<msg><appmsg><title>回复内容</title><type>57</type><refermsg><type>1</type><displayname>Bob</displayname><content>引用内容</content></refermsg></appmsg></msg>"#;
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
         assert_eq!(d.content, "> Bob: 引用内容\n 回复内容");
+    }
+
+    #[test]
+    fn test_decode_quote_prefers_resolved_sender_over_embedded_name() {
+        let xml = r#"<msg><appmsg><title>回复内容</title><type>57</type><refermsg><type>1</type><displayname>Group Bob</displayname><chatusr>tgid_bob</chatusr><content>引用内容</content></refermsg></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| {
+            if id == "tgid_bob" {
+                "Remark Bob".into()
+            } else {
+                id.into()
+            }
+        });
+        assert_eq!(d.content, "> Remark Bob: 引用内容\n 回复内容");
+    }
+
+    #[test]
+    fn test_decode_quote_uses_embedded_name_when_sender_is_unknown() {
+        let xml = r#"<msg><appmsg><title>回复内容</title><type>57</type><refermsg><type>1</type><displayname>Group Bob</displayname><chatusr>tgid_bob</chatusr><content>引用内容</content></refermsg></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "> Group Bob: 引用内容\n 回复内容");
     }
 
     #[test]

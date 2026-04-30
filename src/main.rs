@@ -213,6 +213,9 @@ enum Commands {
         /// Timestamp grouping for output: 1m/1min, 1h, 1d, 1mo, 1y, full, or none
         #[arg(long, default_value = "1m")]
         time_bucket: String,
+        /// Use group/member public names instead of your contact remarks
+        #[arg(long)]
+        anonymous: bool,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
@@ -435,6 +438,7 @@ fn main() {
             tail,
             head,
             time_bucket,
+            anonymous,
             jobs,
         } => {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
@@ -465,6 +469,11 @@ fn main() {
                         since: since_ts,
                         tail: use_tail,
                         time_bucket,
+                        name_mode: if anonymous {
+                            db::DisplayNameMode::Anonymous
+                        } else {
+                            db::DisplayNameMode::PersonalRemark
+                        },
                         jobs,
                     },
                 )
@@ -650,5 +659,14 @@ mod tests {
             normalize_args_for_default_messages(args(&["tg", "help", "messages"])),
             args(&["tg", "help", "messages"])
         );
+    }
+
+    #[test]
+    fn messages_accepts_anonymous_flag() {
+        let cli = Cli::parse_from(args(&["tg", "messages", "room", "--anonymous"]));
+        match cli.command {
+            Commands::Messages { anonymous, .. } => assert!(anonymous),
+            _ => panic!("expected messages command"),
+        }
     }
 }

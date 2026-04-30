@@ -4,7 +4,9 @@ pub mod wire {
     //! Minimal protobuf wire format decoder.
 
     const WIRE_VARINT: u8 = 0;
+    const WIRE_64BIT: u8 = 1;
     const WIRE_LEN: u8 = 2;
+    const WIRE_32BIT: u8 = 5;
 
     pub fn decode_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
         let mut result: u64 = 0;
@@ -31,7 +33,19 @@ pub mod wire {
             }
             WIRE_LEN => {
                 let len = decode_varint(data, pos)? as usize;
-                *pos = pos.checked_add(len)?;
+                let end = pos.checked_add(len)?;
+                data.get(*pos..end)?;
+                *pos = end;
+            }
+            WIRE_64BIT => {
+                let end = pos.checked_add(8)?;
+                data.get(*pos..end)?;
+                *pos = end;
+            }
+            WIRE_32BIT => {
+                let end = pos.checked_add(4)?;
+                data.get(*pos..end)?;
+                *pos = end;
             }
             _ => return None,
         }
