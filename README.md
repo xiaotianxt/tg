@@ -36,10 +36,10 @@ Showing latest 4 of 12843 messages
 [2026-04-28 09:37]
 我: 今天先把导出格式定下来
 [2026-04-28 09:38]
-李四: [图片 1280x720 245KB]
+李四: [img:abc123]
  这张是最新版
 [2026-04-28 09:41]
-王五: > 李四: [图片]
+王五: > 李四: [img:abc123]
         这张可以放到 README 里
 
 --- End of messages ---
@@ -252,8 +252,11 @@ tg export "张三" --format json --output exported/zhangsan --media-dir exported
 tg image "张三"
 tg image "张三" --list --limit 20
 tg image "张三" --index 3
+tg image "张三" --id abc123
 tg image "张三" --all --limit 10 --output exported/images
 ```
+
+`messages` 默认把图片显示成紧凑标签：有可用标识时是 `[img:<id>]`，没有时是 `[img]`。这里的 `id` 是本地媒体定位标识，不保证是哈希；它可能来自 protobuf 文件名、XML `aeskey` 或 `cdnthumburl`。可以把这个值传给 `image --id`，直接从本地缓存导出对应图片。
 
 `image --list` 会先列出最近图片是否还在本地缓存里：
 

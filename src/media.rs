@@ -16,7 +16,16 @@ pub struct ImageInfo {
 }
 
 impl ImageInfo {
+    pub fn identifier(&self) -> Option<&str> {
+        non_empty(&self.aes_key).or_else(|| non_empty(&self.cdn_thumb_url))
+    }
+
     pub fn display(&self) -> String {
+        image_tag(self.identifier())
+    }
+
+    #[allow(dead_code)]
+    pub fn display_verbose(&self) -> String {
         let dims = if self.thumb_width > 0 && self.thumb_height > 0 {
             format!(" {}x{}", self.thumb_width, self.thumb_height)
         } else {
@@ -34,6 +43,22 @@ impl ImageInfo {
             String::new()
         };
         format!("[图片{}{}]", dims, size)
+    }
+}
+
+pub(crate) fn image_tag(identifier: Option<&str>) -> String {
+    match identifier.and_then(non_empty) {
+        Some(id) => format!("[img:{}]", id),
+        None => "[img]".to_string(),
+    }
+}
+
+fn non_empty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
     }
 }
 
@@ -515,5 +540,22 @@ mod tests {
         assert_eq!(info.len, 4963);
         assert_eq!(info.width, 48);
         assert_eq!(info.height, 47);
+    }
+
+    #[test]
+    fn test_image_display_compact_identifier_and_verbose_details() {
+        let xml = r#"<msg><img aeskey="abc123" cdnthumbwidth="180" cdnthumbheight="153" rawlength="38186" /></msg>"#;
+        let info = parse_image_info(xml);
+        assert_eq!(info.identifier(), Some("abc123"));
+        assert_eq!(info.display(), "[img:abc123]");
+        assert_eq!(info.display_verbose(), "[图片 180x153 37KB]");
+    }
+
+    #[test]
+    fn test_image_display_without_identifier() {
+        let info =
+            parse_image_info(r#"<msg><img cdnthumbwidth="180" cdnthumbheight="153" /></msg>"#);
+        assert_eq!(info.identifier(), None);
+        assert_eq!(info.display(), "[img]");
     }
 }

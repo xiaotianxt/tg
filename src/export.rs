@@ -52,6 +52,7 @@ pub struct ImageExportConfig<'a> {
     pub list: bool,
     pub all: bool,
     pub index: Option<usize>,
+    pub id: Option<&'a str>,
     pub limit: usize,
     pub since: Option<i64>,
     pub jobs: usize,
@@ -360,10 +361,16 @@ pub fn export_images(
     if config.limit == 0 {
         return Err("--limit must be greater than 0".to_string());
     }
+    if config.id.is_some() && (config.list || config.all || config.index.is_some()) {
+        return Err("--id cannot be used with --list, --all, or --index".to_string());
+    }
     if let Some(index) = config.index {
         if index == 0 {
             return Err("--index is 1-based and must be greater than 0".to_string());
         }
+    }
+    if let Some(identifier) = config.id {
+        return export_image_by_identifier(decrypted_dir, session_query, identifier, &config);
     }
 
     let scan_limit = config.limit.max(config.index.unwrap_or(1));
@@ -472,24 +479,80 @@ pub fn export_images(
         ));
     }
 
-    let media_keys = crate::media_key::find_media_keys(&telegram_base);
+    let images = selected
+        .into_iter()
+        .filter_map(|candidate| {
+            candidate.source.map(|src| CachedImageSource {
+                index: candidate.index,
+                src,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    export_cached_images(
+        &telegram_base,
+        &username,
+        config.output_dir,
+        config.jobs,
+        images,
+    )
+}
+
+fn export_image_by_identifier(
+    decrypted_dir: &Path,
+    session_query: &str,
+    identifier: &str,
+    config: &ImageExportConfig<'_>,
+) -> Result<Vec<PathBuf>, String> {
+    let identifier = normalize_image_id(identifier)?;
+    let (username, _) = resolve_image_session(decrypted_dir, session_query, config.jobs)?;
+    let telegram_base = media::find_telegram_base_path()
+        .ok_or_else(|| "Telegram data directory not found".to_string())?;
+    let media_index = MediaIndex::load(&telegram_base, &username, &["Image"], config.jobs);
+    let Some(src) = media_index.find("Image", &identifier) else {
+        return Err(format!(
+            "Image id '{}' is not available in local Telegram cache",
+            identifier
+        ));
+    };
+
+    export_cached_images(
+        &telegram_base,
+        &username,
+        config.output_dir,
+        config.jobs,
+        vec![CachedImageSource { index: 1, src }],
+    )
+}
+
+struct CachedImageSource {
+    index: usize,
+    src: PathBuf,
+}
+
+fn export_cached_images(
+    telegram_base: &Path,
+    username: &str,
+    output_dir: &Path,
+    jobs: usize,
+    images: Vec<CachedImageSource>,
+) -> Result<Vec<PathBuf>, String> {
+    let media_keys = crate::media_key::find_media_keys(telegram_base);
     if let Err(ref e) = media_keys {
         log::warn!("Cannot derive media decryption keys: {}", e);
     }
     let media_keys = media_keys.ok();
 
-    let image_jobs = selected
+    let image_jobs = images
         .into_iter()
-        .filter_map(|candidate| {
-            candidate.source.map(|src| MediaExportJob::Cached {
-                index: candidate.index,
-                src,
-                category: "Image",
-                msg_type: 3,
-            })
+        .map(|image| MediaExportJob::Cached {
+            index: image.index,
+            src: image.src,
+            category: "Image",
+            msg_type: 3,
         })
         .collect::<Vec<_>>();
-    let image_job_count = parallel::job_count(config.jobs, 4);
+    let image_job_count = parallel::job_count(jobs, 4);
     let image_results = parallel::map_ordered(image_jobs, image_job_count, |job| match job {
         MediaExportJob::Cached {
             index,
@@ -501,8 +564,8 @@ pub fn export_images(
             is_sticker: false,
             result: export_media_with_decrypt(
                 &src,
-                config.output_dir,
-                &username,
+                output_dir,
+                username,
                 category,
                 msg_type,
                 index,
@@ -512,6 +575,8 @@ pub fn export_images(
         MediaExportJob::Sticker { .. } => unreachable!("image command only exports images"),
     });
 
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
     let mut paths = Vec::new();
     for image_result in image_results {
         match image_result.result {
@@ -531,13 +596,20 @@ pub fn export_images(
     Ok(paths)
 }
 
-fn load_image_messages(
+fn normalize_image_id(identifier: &str) -> Result<String, String> {
+    let identifier = identifier.trim();
+    if identifier.is_empty() {
+        Err("--id must not be empty".to_string())
+    } else {
+        Ok(identifier.to_string())
+    }
+}
+
+fn resolve_image_session(
     decrypted_dir: &Path,
     session_query: &str,
-    since: Option<i64>,
-    limit: usize,
     jobs: usize,
-) -> Result<(String, Vec<ImageMessage>), String> {
+) -> Result<(String, Vec<PathBuf>), String> {
     let (contact_db, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
     let username = db::resolve_username_for_messages(
         session_query,
@@ -545,6 +617,17 @@ fn load_image_messages(
         &message_dbs,
         jobs,
     )?;
+    Ok((username, message_dbs))
+}
+
+fn load_image_messages(
+    decrypted_dir: &Path,
+    session_query: &str,
+    since: Option<i64>,
+    limit: usize,
+    jobs: usize,
+) -> Result<(String, Vec<ImageMessage>), String> {
+    let (username, message_dbs) = resolve_image_session(decrypted_dir, session_query, jobs)?;
     let table_name = db::msg_table_name(&username);
     let since_clause = since
         .map(|ts| format!(" AND create_time >= {}", ts))
@@ -953,5 +1036,89 @@ fn escape_csv(s: &str) -> String {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packed_image(filename: &str) -> Vec<u8> {
+        let mut packed = Vec::new();
+        packed.push(8);
+        packed.push(1);
+
+        let mut img = Vec::new();
+        img.push(8);
+        img.push(1);
+        img.push(16);
+        img.push(1);
+        img.push(34);
+        img.push(filename.len() as u8);
+        img.extend_from_slice(filename.as_bytes());
+
+        packed.push(26);
+        packed.push(img.len() as u8);
+        packed.extend_from_slice(&img);
+        packed
+    }
+
+    fn image_message(raw_content: &str, packed_info: Vec<u8>) -> ImageMessage {
+        ImageMessage {
+            time: "2026-04-28 09:38:44".to_string(),
+            timestamp: 1,
+            raw_content: raw_content.to_string(),
+            packed_info,
+        }
+    }
+
+    #[test]
+    fn image_identifier_prefers_protobuf_filename() {
+        let message = image_message(
+            r#"<msg><img aeskey="xml-key" cdnthumburl="thumb-id" /></msg>"#,
+            packed_image("proto-file.dat"),
+        );
+
+        assert_eq!(
+            image_identifier(&message).as_deref(),
+            Some("proto-file.dat")
+        );
+    }
+
+    #[test]
+    fn image_identifier_uses_xml_fallbacks() {
+        let message = image_message(r#"<msg><img aeskey="xml-key" /></msg>"#, Vec::new());
+        assert_eq!(image_identifier(&message).as_deref(), Some("xml-key"));
+
+        let message = image_message(r#"<msg><img cdnthumburl="thumb-id" /></msg>"#, Vec::new());
+        assert_eq!(image_identifier(&message).as_deref(), Some("thumb-id"));
+    }
+
+    #[test]
+    fn normalize_image_id_rejects_empty_value() {
+        assert_eq!(normalize_image_id("  abc  ").as_deref(), Ok("abc"));
+        assert!(normalize_image_id("   ").unwrap_err().contains("--id"));
+    }
+
+    #[test]
+    fn image_id_conflicts_with_window_selection_modes() {
+        let output_dir = Path::new("out");
+        let err = export_images(
+            Path::new("decrypted"),
+            "session",
+            ImageExportConfig {
+                output_dir,
+                list: true,
+                all: false,
+                index: None,
+                id: Some("abc"),
+                limit: 1,
+                since: None,
+                jobs: 1,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("--id cannot be used"));
     }
 }

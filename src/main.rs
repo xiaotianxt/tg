@@ -268,6 +268,9 @@ enum Commands {
         /// Export the Nth image shown by --list (newest first)
         #[arg(long)]
         index: Option<usize>,
+        /// Export an image by compact message identifier
+        #[arg(long, conflicts_with_all = ["list", "all", "index"])]
+        id: Option<String>,
         /// Number of recent image messages to scan
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -557,6 +560,7 @@ fn main() {
             list,
             all,
             index,
+            id,
             limit,
             since,
             jobs,
@@ -574,6 +578,7 @@ fn main() {
                 list,
                 all,
                 index,
+                id: id.as_deref(),
                 limit,
                 since: since_ts,
                 jobs,

@@ -183,12 +183,14 @@ fn extract_image_display(data: &[u8]) -> Option<String> {
     }
     if let Some(v2) = media_pb::parse_img2(data) {
         if let Some(img) = v2.image {
-            return Some(media_pb::display_image(&img));
+            if media_pb::image_identifier(&img).is_some() {
+                return Some(media_pb::display_image(&img));
+            }
         }
     }
     if let Some(v1) = media_pb::parse_img(data) {
         if !v1.filename.is_empty() {
-            return Some(format!("[图片] {}", v1.filename));
+            return Some(media::image_tag(Some(&v1.filename)));
         }
     }
     None
@@ -572,8 +574,37 @@ mod tests {
         packed.extend_from_slice(&img);
         let d = decode_message(3, "", "Alice", None, &packed, |id| id.to_string());
         assert_eq!(d.msg_type, MessageType::Image);
-        assert!(d.content.contains("1920"));
-        assert!(d.content.contains("1080"));
+        assert_eq!(d.content, "[img:test.jpg]");
+    }
+
+    #[test]
+    fn test_decode_image_with_xml_identifier() {
+        let xml = r#"<msg><img aeskey="abc123" cdnthumbwidth="180" cdnthumbheight="153" rawlength="38186" /></msg>"#;
+        let d = decode_message(3, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "[img:abc123]");
+    }
+
+    #[test]
+    fn test_decode_image_falls_back_to_xml_identifier() {
+        let mut packed = Vec::new();
+        packed.push(8);
+        packed.push(1);
+        let img = [8, 0xb8, 0x08, 16, 0x80, 0x0f];
+        packed.push(26);
+        packed.push(img.len() as u8);
+        packed.extend_from_slice(&img);
+
+        let xml = r#"<msg><img aeskey="xml-key" /></msg>"#;
+        let d = decode_message(3, xml, "Alice", None, &packed, |id| id.to_string());
+        assert_eq!(d.content, "[img:xml-key]");
+    }
+
+    #[test]
+    fn test_decode_image_without_identifier() {
+        let xml =
+            r#"<msg><img cdnthumbwidth="180" cdnthumbheight="153" rawlength="38186" /></msg>"#;
+        let d = decode_message(3, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "[img]");
     }
 
     #[test]
@@ -637,6 +668,6 @@ mod tests {
                 id.into()
             }
         });
-        assert_eq!(d.content, "> Bob: [图片 180x153]\n        回复图片");
+        assert_eq!(d.content, "> Bob: [img]\n        回复图片");
     }
 }
