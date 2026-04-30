@@ -6,6 +6,7 @@ tg 是一个 macOS 本地 Telegram 聊天记录读取 CLI。它在你的 Mac 上
 
 - 备份自己的 Telegram 聊天记录，不依赖手机备份。
 - 快速找某个人、某个群、某个关键词的历史消息。
+- 用包含词、排除词、时间范围和输出字段做更精确的本地检索。
 - 把聊天导出成 `txt`、`csv`、`json`，用于归档、整理或本地分析。
 - 从本地缓存里导出图片、视频、表情等媒体文件。
 
@@ -70,7 +71,7 @@ exported/images/123456789_chatroom_Image_3_0001.jpg
 | Telegram 数据 | 本机 `db_storage` 中的聊天数据库；无需手机备份 |
 | 会话匹配 | 联系人显示名、备注、别名、`tgid_...`、群 ID |
 | 消息读取 | 文本、群聊发送者、系统提示、撤回提示、引用、链接、小程序、聊天记录卡片展开、位置、文件卡片、图片/视频/语音/表情的可读摘要 |
-| 搜索 | 全局关键词搜索，单个会话内关键词搜索 |
+| 搜索 | 全局关键词搜索，单个会话内关键词搜索，结构化检索；支持包含词、排除词、时间范围、字段选择和 JSON 行输出 |
 | 导出 | `txt`、`csv`、`json` |
 | 媒体 | 尝试导出本地缓存图片、视频、表情；`.dat` 图片/视频会尝试解密 |
 | 增量更新 | 默认只解密变化过的数据库 |
@@ -165,10 +166,11 @@ xcode-select --install
 ```bash
 tg "联系人或群名" --limit 50
 tg search "关键词"
+tg query --session "联系人或群名" --contains "关键词" --fields time,sender,body --limit 20
 tg export "联系人或群名" --format json
 ```
 
-`sessions`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
+`sessions`、`search`、`query`、`schema`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
 
 ## 常用命令
 
@@ -227,6 +229,20 @@ tg search "关键词"
 tg search "关键词" --limit 50
 tg search "关键词" --since today
 ```
+
+结构化检索：
+
+```bash
+tg query --contains "项目" --limit 50
+tg query --session "张三" --contains "项目" --fields time,sender,body --limit 20
+tg query --contains "项目" --contains "上线" --match-mode all --since today
+tg query --contains "项目" --not "已取消" --format json --fields timestamp,session,body
+tg schema --db message_0
+```
+
+`query` 适合在本机做精确检索：限定某个会话、同时要求多个关键词、排除某些词、按时间收窄结果，或者只输出后续脚本需要的字段。`--fields` 支持 `time,session,sender,type,body,timestamp`，`--format json` 会按 JSON lines 输出，便于继续处理。
+
+`query` 不接受原始 SQL。用户只传会话、关键词、排除词、时间、排序和输出字段，tg 内部生成固定的参数化数据库查询，并以只读方式打开消息数据库。为了避免误扫全库，必须至少传 `--contains` 或 `--since` 之一；空关键词会被拒绝；单次 `--limit + --offset` 最多 10000。table 输出会转义终端控制字符，避免聊天正文影响终端显示。`schema` 展示的是公开查询字段和过滤器，不输出原始表名、列名或建表语句。
 
 诊断：
 

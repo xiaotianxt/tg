@@ -13,6 +13,7 @@ mod media_pb;
 mod message;
 mod output;
 mod parallel;
+mod query;
 mod scanner;
 mod skill;
 mod time;
@@ -55,6 +56,9 @@ fn is_known_subcommand(value: &str) -> bool {
             | "sessions"
             | "messages"
             | "search"
+            | "query"
+            | "schema"
+            | "sql"
             | "export"
             | "image"
             | "doctor"
@@ -233,6 +237,69 @@ enum Commands {
         /// Show matches after this time (ISO 8601 or relative: 5min, 1h, today)
         #[arg(long)]
         since: Option<String>,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+    },
+    /// Search message tables with fixed, parameterized query templates
+    Query {
+        /// Optional session username (tgid_xxx) or display name to search within
+        #[arg(long)]
+        session: Option<String>,
+        /// Path to decrypted databases
+        #[arg(long, default_value = "decrypted")]
+        decrypted_dir: PathBuf,
+        /// Keyword that must appear in message text; repeat for multiple keywords
+        #[arg(long = "contains")]
+        contains: Vec<String>,
+        /// Keyword that must not appear in message text; repeat for multiple keywords
+        #[arg(long = "not")]
+        not_contains: Vec<String>,
+        /// Show messages after this time (ISO 8601 or relative: 5min, 1h, today)
+        #[arg(long)]
+        since: Option<String>,
+        /// Show messages before this time (ISO 8601 or relative: 5min, 1h, today)
+        #[arg(long)]
+        until: Option<String>,
+        /// Maximum rows to print
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Offset for pagination after global sorting
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Sort order: newest or oldest
+        #[arg(long, default_value = "newest")]
+        order: String,
+        /// Keyword matching mode when --contains is repeated: all or any
+        #[arg(long, default_value = "all")]
+        match_mode: String,
+        /// Output fields: time,session,sender,type,body,timestamp
+        #[arg(long, default_value = "time,session,sender,body")]
+        fields: String,
+        /// Output format: table or json
+        #[arg(long, default_value = "table")]
+        format: String,
+        /// Maximum displayed characters per text cell
+        #[arg(long, default_value_t = 500)]
+        max_cell_chars: usize,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+    },
+    /// Show public query fields and filters without dumping raw database schema
+    Schema {
+        /// Cache target to check: messages, contact, fts, or message_N
+        #[arg(long, default_value = "messages")]
+        db: String,
+        /// Path to decrypted databases
+        #[arg(long, default_value = "decrypted")]
+        decrypted_dir: PathBuf,
+        /// Output format: table or json
+        #[arg(long, default_value = "table")]
+        format: String,
+        /// Maximum displayed characters per text cell
+        #[arg(long, default_value_t = 500)]
+        max_cell_chars: usize,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
@@ -540,6 +607,130 @@ fn main() {
                 }
             }
         }
+        Commands::Query {
+            session,
+            decrypted_dir,
+            contains,
+            not_contains,
+            since,
+            until,
+            limit,
+            offset,
+            order,
+            match_mode,
+            fields,
+            format,
+            max_cell_chars,
+            jobs,
+        } => {
+            let since_ts = match time::parse_since_opt(since.as_deref()) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    log::error!("Error parsing --since: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let until_ts = match time::parse_since_opt(until.as_deref()) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    log::error!("Error parsing --until: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let sort = match query::QuerySort::parse(&order) {
+                Ok(sort) => sort,
+                Err(e) => {
+                    log::error!("Error parsing --order: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let match_mode = match query::QueryMatchMode::parse(&match_mode) {
+                Ok(mode) => mode,
+                Err(e) => {
+                    log::error!("Error parsing --match-mode: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let fields = match query::QueryFields::parse(&fields) {
+                Ok(fields) => fields,
+                Err(e) => {
+                    log::error!("Error parsing --fields: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let format = match query::QueryOutputFormat::parse(&format) {
+                Ok(format) => format,
+                Err(e) => {
+                    log::error!("Error parsing --format: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
+            if cache::needs_search_refresh_warning(&refresh) {
+                log::warn!(
+                    "Decrypted cache refresh had issues ({}). Query results may be stale.",
+                    cache::search_refresh_reason(&refresh)
+                );
+            }
+            match query::run(query::QueryOptions {
+                decrypted_dir: &decrypted_dir,
+                session: session.as_deref(),
+                contains: &contains,
+                not_contains: &not_contains,
+                since: since_ts,
+                until: until_ts,
+                limit,
+                offset,
+                sort,
+                match_mode,
+                fields,
+                format,
+                max_cell_chars,
+                jobs,
+            }) {
+                Ok(0) => print_output(format_args!("No rows returned.")),
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Schema {
+            db,
+            decrypted_dir,
+            format,
+            max_cell_chars,
+            jobs,
+        } => {
+            let format = match query::QueryOutputFormat::parse(&format) {
+                Ok(format) => format,
+                Err(e) => {
+                    log::error!("Error parsing --format: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
+            if cache::needs_search_refresh_warning(&refresh) {
+                log::warn!(
+                    "Decrypted cache refresh had issues ({}). Schema may be stale.",
+                    cache::search_refresh_reason(&refresh)
+                );
+            }
+            match query::run_schema(query::SchemaOptions {
+                decrypted_dir: &decrypted_dir,
+                db_target: &db,
+                format,
+                max_cell_chars,
+            }) {
+                Ok(0) => print_output(format_args!("No rows returned.")),
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::Export {
             session,
             decrypted_dir,
@@ -639,8 +830,8 @@ mod tests {
     #[test]
     fn known_subcommands_are_not_rewritten() {
         for command in [
-            "keys", "decrypt", "sessions", "messages", "search", "export", "image", "doctor",
-            "refresh", "skill",
+            "keys", "decrypt", "sessions", "messages", "search", "query", "schema", "sql",
+            "export", "image", "doctor", "refresh", "skill",
         ] {
             assert_eq!(
                 normalize_args_for_default_messages(args(&["tg", command])),
@@ -667,6 +858,27 @@ mod tests {
         match cli.command {
             Commands::Messages { anonymous, .. } => assert!(anonymous),
             _ => panic!("expected messages command"),
+        }
+    }
+
+    #[test]
+    fn query_accepts_structured_filters() {
+        let cli = Cli::parse_from(args(&[
+            "tg",
+            "query",
+            "--contains",
+            "needle",
+            "--fields",
+            "time,body",
+        ]));
+        match cli.command {
+            Commands::Query {
+                contains, fields, ..
+            } => {
+                assert_eq!(contains, vec!["needle"]);
+                assert_eq!(fields, "time,body");
+            }
+            _ => panic!("expected query command"),
         }
     }
 }
