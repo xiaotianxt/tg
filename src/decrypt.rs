@@ -6,12 +6,15 @@ use pbkdf2::pbkdf2_hmac;
 use sha2::Sha512;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::{dictionary, parallel};
 
 type Aes256CbcDec = Decryptor<Aes256>;
+pub(crate) type DatabaseKeys = HashMap<String, HashMap<String, String>>;
 
 const PAGE_SZ: usize = 4096;
 const SALT_SZ: usize = 16;
@@ -23,6 +26,9 @@ const PAGE_FINGERPRINT_SZ: usize = 16;
 const IO_BUF_SZ: usize = 1024 * 1024;
 const PAGE_CACHE_MAGIC: &[u8; 8] = b"TGRPG001";
 const SQLITE_HDR: &[u8] = b"SQLite format 3\0";
+const REFRESH_LOCK_FILE: &str = ".tg-refresh.lock";
+// No heartbeat is maintained while decrypting, so keep stale-lock takeover conservative.
+const REFRESH_LOCK_STALE_AFTER: Duration = Duration::from_secs(12 * 60 * 60);
 
 pub struct DecryptStats {
     pub success: usize,
@@ -36,6 +42,11 @@ struct DecryptFileStats {
     total_pages: usize,
     decrypted_pages: usize,
     reused_pages: usize,
+}
+
+struct DecryptFileResult {
+    stats: DecryptFileStats,
+    tables: Vec<String>,
 }
 
 struct PageCache {
@@ -67,7 +78,6 @@ enum DecryptOutcome {
         file_stats: DecryptFileStats,
         tables: Vec<String>,
     },
-    VerifyFailed(String),
     Failed(String),
 }
 
@@ -78,6 +88,191 @@ enum DecryptPlanItem {
         counts_as_failed: bool,
     },
     Task(usize),
+}
+
+pub(crate) struct SourceDbFile {
+    pub(crate) rel_path: String,
+    pub(crate) full_path: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) freshness_mtime: Option<SystemTime>,
+}
+
+struct RefreshLock {
+    path: PathBuf,
+}
+
+impl Drop for RefreshLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct TempPathGuard {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl TempPathGuard {
+    fn disarm(&mut self) {
+        self.remove_on_drop = false;
+    }
+}
+
+impl Drop for TempPathGuard {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn acquire_refresh_lock(output_dir: &Path) -> Result<RefreshLock, String> {
+    fs::create_dir_all(output_dir)
+        .map_err(|e| format!("Cannot create output dir {}: {}", output_dir.display(), e))?;
+
+    let lock_path = output_dir.join(REFRESH_LOCK_FILE);
+    match create_refresh_lock_file(&lock_path) {
+        Ok(()) => Ok(RefreshLock { path: lock_path }),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            if refresh_lock_is_stale(&lock_path)? {
+                fs::remove_file(&lock_path).map_err(|remove_err| {
+                    format!(
+                        "Cannot remove stale refresh lock {}: {}",
+                        lock_path.display(),
+                        remove_err
+                    )
+                })?;
+                create_refresh_lock_file(&lock_path).map_err(|create_err| {
+                    format!(
+                        "Cannot acquire refresh lock {} after removing stale lock: {}",
+                        lock_path.display(),
+                        create_err
+                    )
+                })?;
+                Ok(RefreshLock { path: lock_path })
+            } else {
+                Err(format!(
+                    "Decrypted cache refresh is already running for {} (lock: {}). \
+                     If no tg process is refreshing, remove the lock file.",
+                    output_dir.display(),
+                    lock_path.display()
+                ))
+            }
+        }
+        Err(e) => Err(format!(
+            "Cannot acquire refresh lock {}: {}",
+            lock_path.display(),
+            e
+        )),
+    }
+}
+
+fn create_refresh_lock_file(lock_path: &Path) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock_path)?;
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    writeln!(file, "pid={}", std::process::id())?;
+    writeln!(file, "created_unix={}", created)?;
+    file.flush()
+}
+
+fn refresh_lock_is_stale(lock_path: &Path) -> Result<bool, String> {
+    let meta = fs::metadata(lock_path)
+        .map_err(|e| format!("Cannot inspect refresh lock {}: {}", lock_path.display(), e))?;
+    let modified = meta.modified().map_err(|e| {
+        format!(
+            "Cannot read refresh lock mtime {}: {}",
+            lock_path.display(),
+            e
+        )
+    })?;
+    Ok(match SystemTime::now().duration_since(modified) {
+        Ok(age) => age >= REFRESH_LOCK_STALE_AFTER,
+        Err(_) => false,
+    })
+}
+
+fn create_temp_file_for(dest: &Path) -> Result<(PathBuf, fs::File, TempPathGuard), String> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| format!("Cannot determine parent dir for {}", dest.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("Cannot create output dir {}: {}", parent.display(), e))?;
+
+    let file_name = dest
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "database".into());
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    for attempt in 0..100 {
+        let tmp_path = parent.join(format!(
+            ".{}.{}.{}.{}.tmp",
+            file_name,
+            std::process::id(),
+            nonce,
+            attempt
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(file) => {
+                return Ok((
+                    tmp_path.clone(),
+                    file,
+                    TempPathGuard {
+                        path: tmp_path,
+                        remove_on_drop: true,
+                    },
+                ));
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "Cannot create temp output for {}: {}",
+                    dest.display(),
+                    e
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "Cannot create unique temp output for {}",
+        dest.display()
+    ))
+}
+
+fn finish_temp_writer(writer: BufWriter<fs::File>, tmp_path: &Path) -> Result<(), String> {
+    let file = writer
+        .into_inner()
+        .map_err(|e| format!("Flush error for {}: {}", tmp_path.display(), e.into_error()))?;
+    file.sync_all()
+        .map_err(|e| format!("Sync error for {}: {}", tmp_path.display(), e))
+}
+
+fn replace_with_temp(tmp_path: &Path, dest: &Path, mut guard: TempPathGuard) -> Result<(), String> {
+    fs::rename(tmp_path, dest).map_err(|e| {
+        format!(
+            "Cannot replace {} with temp output {}: {}",
+            dest.display(),
+            tmp_path.display(),
+            e
+        )
+    })?;
+    guard.disarm();
+    Ok(())
 }
 
 /// Derive the HMAC key from the encryption key and salt.
@@ -207,7 +402,65 @@ fn write_page_cache(
     for fingerprint in fingerprints {
         data.extend_from_slice(fingerprint);
     }
-    fs::write(path, data).map_err(|e| format!("Cannot write page cache {}: {}", path.display(), e))
+    write_bytes_atomic(path, &data)
+        .map_err(|e| format!("Cannot write page cache {}: {}", path.display(), e))
+}
+
+fn write_bytes_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
+    let (tmp_path, mut file, guard) = create_temp_file_for(path)?;
+    file.write_all(data)
+        .map_err(|e| format!("Write error for {}: {}", tmp_path.display(), e))?;
+    file.flush()
+        .map_err(|e| format!("Flush error for {}: {}", tmp_path.display(), e))?;
+    file.sync_all()
+        .map_err(|e| format!("Sync error for {}: {}", tmp_path.display(), e))?;
+    drop(file);
+    replace_with_temp(&tmp_path, path, guard)
+}
+
+struct ReuseSource {
+    cache: PageCache,
+    file: BufReader<fs::File>,
+    len: u64,
+}
+
+impl ReuseSource {
+    fn open(out_path: &Path, cache_path: &Path) -> Option<Self> {
+        let cache = read_page_cache(cache_path)?;
+        let file = fs::File::open(out_path).ok()?;
+        let len = file.metadata().ok()?.len();
+        Some(Self {
+            cache,
+            file: BufReader::with_capacity(IO_BUF_SZ, file),
+            len,
+        })
+    }
+
+    fn read_page_if_fresh(
+        &mut self,
+        index: usize,
+        fingerprint: [u8; PAGE_FINGERPRINT_SZ],
+        out: &mut [u8],
+    ) -> bool {
+        let page_end = ((index + 1) * PAGE_SZ) as u64;
+        let cache_matches = self
+            .cache
+            .fingerprints
+            .get(index)
+            .is_some_and(|old| *old == fingerprint);
+        if self.len < page_end || !cache_matches {
+            return false;
+        }
+
+        if self
+            .file
+            .seek(SeekFrom::Start((index * PAGE_SZ) as u64))
+            .is_err()
+        {
+            return false;
+        }
+        self.file.read_exact(out).is_ok()
+    }
 }
 
 /// Decrypt a single database file using the given encryption key.
@@ -216,7 +469,7 @@ fn decrypt_database(
     out_path: &Path,
     enc_key_hex: &str,
     incremental: bool,
-) -> Result<DecryptFileStats, String> {
+) -> Result<DecryptFileResult, String> {
     let enc_key = hex::decode(enc_key_hex).map_err(|e| format!("Invalid key hex: {}", e))?;
 
     if enc_key.len() != KEY_SZ {
@@ -252,112 +505,47 @@ fn decrypt_database(
         fs::create_dir_all(parent).map_err(|e| format!("Cannot create output dir: {}", e))?;
     }
 
+    let (tmp_path, tmp_file, temp_guard) = create_temp_file_for(out_path)?;
+    let mut out_file = BufWriter::with_capacity(IO_BUF_SZ, tmp_file);
+    let mut fingerprints = Vec::with_capacity(total_pages);
     let mut page_buf = vec![0u8; PAGE_SZ];
     let mut out_buf = vec![0u8; PAGE_SZ];
+    let mut decrypted_pages = 0usize;
+    let mut reused_pages = 0usize;
     let cache_path = page_cache_path(out_path);
-    let old_cache = if incremental && out_path.exists() {
-        read_page_cache(&cache_path)
+    let mut reuse_source = if incremental && out_path.exists() {
+        ReuseSource::open(out_path, &cache_path)
     } else {
         None
     };
 
-    if let Some(old_cache) = old_cache {
-        let mut out_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(out_path)
-            .map_err(|e| format!("Cannot update {}: {}", out_path.display(), e))?;
-        let old_out_len = fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
-        out_file
-            .set_len((total_pages * PAGE_SZ) as u64)
-            .map_err(|e| format!("Cannot resize {}: {}", out_path.display(), e))?;
+    let mut write_page =
+        |pgno: usize, page_data: &[u8], out_buf: &mut [u8]| -> Result<(), String> {
+            let index = pgno - 1;
+            let fingerprint = page_fingerprint(page_data);
+            fingerprints.push(fingerprint);
 
-        let mut fingerprints = Vec::with_capacity(total_pages);
-        let mut decrypted_pages = 0usize;
-        let mut reused_pages = 0usize;
-
-        let mut handle_page =
-            |pgno: usize, page_data: &[u8], out_buf: &mut [u8]| -> Result<(), String> {
-                let index = pgno - 1;
-                let fingerprint = page_fingerprint(page_data);
-                fingerprints.push(fingerprint);
-
-                let page_end = (pgno * PAGE_SZ) as u64;
-                let can_reuse = old_out_len >= page_end
-                    && old_cache
-                        .fingerprints
-                        .get(index)
-                        .is_some_and(|old| *old == fingerprint);
-
-                if can_reuse {
+            if let Some(reuse) = reuse_source.as_mut() {
+                if reuse.read_page_if_fresh(index, fingerprint, out_buf) {
+                    out_file
+                        .write_all(out_buf)
+                        .map_err(|e| format!("Write error at page {}: {}", pgno, e))?;
                     reused_pages += 1;
                     return Ok(());
                 }
-
-                decrypt_page_into(&enc_key, page_data, pgno as u32, out_buf)
-                    .ok_or_else(|| format!("Decryption failed at page {}", pgno))?;
-                out_file
-                    .seek(SeekFrom::Start((index * PAGE_SZ) as u64))
-                    .map_err(|e| format!("Seek error at page {}: {}", pgno, e))?;
-                out_file
-                    .write_all(out_buf)
-                    .map_err(|e| format!("Write error at page {}: {}", pgno, e))?;
-                decrypted_pages += 1;
-                Ok(())
-            };
-
-        handle_page(1, &page1, &mut out_buf)?;
-
-        for pgno in 2..=total_pages {
-            let bytes_remaining = file_size as usize - ((pgno - 1) * PAGE_SZ);
-            let bytes_to_read = bytes_remaining.min(PAGE_SZ);
-
-            file.read_exact(&mut page_buf[..bytes_to_read])
-                .map_err(|e| format!("Read error at page {}: {}", pgno, e))?;
-            if bytes_to_read < PAGE_SZ {
-                page_buf[bytes_to_read..].fill(0);
             }
 
-            handle_page(pgno, &page_buf, &mut out_buf)?;
-        }
+            decrypt_page_into(&enc_key, page_data, pgno as u32, out_buf)
+                .ok_or_else(|| format!("Decryption failed at page {}", pgno))?;
 
-        if decrypted_pages == 0 {
-            decrypt_page_into(&enc_key, &page1, 1, &mut out_buf)
-                .ok_or_else(|| "Decryption failed at page 1".to_string())?;
             out_file
-                .seek(SeekFrom::Start(0))
-                .map_err(|e| format!("Seek error at page 1: {}", e))?;
-            out_file
-                .write_all(&out_buf)
-                .map_err(|e| format!("Write error at page 1: {}", e))?;
-        }
+                .write_all(out_buf)
+                .map_err(|e| format!("Write error at page {}: {}", pgno, e))?;
+            decrypted_pages += 1;
+            Ok(())
+        };
 
-        out_file
-            .flush()
-            .map_err(|e| format!("Flush error: {}", e))?;
-        write_page_cache(&cache_path, file_size, &fingerprints)?;
-
-        return Ok(DecryptFileStats {
-            total_pages,
-            decrypted_pages,
-            reused_pages,
-        });
-    }
-
-    let mut out_file = BufWriter::with_capacity(
-        IO_BUF_SZ,
-        fs::File::create(out_path)
-            .map_err(|e| format!("Cannot create {}: {}", out_path.display(), e))?,
-    );
-    let mut fingerprints = Vec::with_capacity(total_pages);
-
-    decrypt_page_into(&enc_key, &page1, 1, &mut out_buf)
-        .ok_or_else(|| "Decryption failed at page 1".to_string())?;
-    fingerprints.push(page_fingerprint(&page1));
-
-    out_file
-        .write_all(&out_buf)
-        .map_err(|e| format!("Write error at page 1: {}", e))?;
+    write_page(1, &page1, &mut out_buf)?;
 
     for pgno in 2..=total_pages {
         let bytes_remaining = file_size as usize - ((pgno - 1) * PAGE_SZ);
@@ -368,29 +556,28 @@ fn decrypt_database(
         if bytes_to_read < PAGE_SZ {
             page_buf[bytes_to_read..].fill(0);
         }
-        fingerprints.push(page_fingerprint(&page_buf));
 
-        decrypt_page_into(&enc_key, &page_buf, pgno as u32, &mut out_buf)
-            .ok_or_else(|| format!("Decryption failed at page {}", pgno))?;
-
-        out_file
-            .write_all(&out_buf)
-            .map_err(|e| format!("Write error at page {}: {}", pgno, e))?;
+        write_page(pgno, &page_buf, &mut out_buf)?;
     }
-    out_file
-        .flush()
-        .map_err(|e| format!("Flush error: {}", e))?;
+    drop(write_page);
+
+    finish_temp_writer(out_file, &tmp_path)?;
+    let tables = verify_sqlite(&tmp_path).map_err(|e| format!("SQLite verify failed: {}", e))?;
+    replace_with_temp(&tmp_path, out_path, temp_guard)?;
     write_page_cache(&cache_path, file_size, &fingerprints)?;
 
-    Ok(DecryptFileStats {
-        total_pages,
-        decrypted_pages: total_pages,
-        reused_pages: 0,
+    Ok(DecryptFileResult {
+        stats: DecryptFileStats {
+            total_pages,
+            decrypted_pages,
+            reused_pages,
+        },
+        tables,
     })
 }
 
 /// Auto-detect Telegram db_storage directory.
-fn auto_detect_db_dir() -> Option<PathBuf> {
+pub(crate) fn auto_detect_db_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let home = PathBuf::from(home);
 
@@ -430,14 +617,39 @@ fn auto_detect_db_dir() -> Option<PathBuf> {
     None
 }
 
+pub(crate) fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = db_path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn source_freshness_mtime(db_path: &Path, db_meta: &fs::Metadata) -> Option<SystemTime> {
+    let mut latest = db_meta.modified().ok();
+    // WAL/SHM mtimes make the decrypted cache stale, but this decryptor only reads
+    // the base .db file. Doctor reports hot WAL files so users can see that gap.
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(db_path, suffix);
+        let Ok(sidecar_meta) = fs::metadata(&sidecar) else {
+            continue;
+        };
+        let Ok(modified) = sidecar_meta.modified() else {
+            continue;
+        };
+        if latest.as_ref().map_or(true, |current| modified > *current) {
+            latest = Some(modified);
+        }
+    }
+    latest
+}
+
 /// Collect all .db files in a directory tree.
-fn collect_db_files(dir: &Path) -> Vec<(String, PathBuf, u64)> {
+pub(crate) fn collect_db_files(dir: &Path) -> Vec<SourceDbFile> {
     let mut files = Vec::new();
     if !dir.is_dir() {
         return files;
     }
 
-    fn walk(dir: &Path, base: &Path, files: &mut Vec<(String, PathBuf, u64)>) {
+    fn walk(dir: &Path, base: &Path, files: &mut Vec<SourceDbFile>) {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -454,7 +666,12 @@ fn collect_db_files(dir: &Path) -> Vec<(String, PathBuf, u64)> {
                             .strip_prefix(base)
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_else(|_| name.to_string());
-                        files.push((rel, path.clone(), meta.len()));
+                        files.push(SourceDbFile {
+                            rel_path: rel,
+                            full_path: path.clone(),
+                            size: meta.len(),
+                            freshness_mtime: source_freshness_mtime(&path, &meta),
+                        });
                     }
                 }
             }
@@ -462,8 +679,23 @@ fn collect_db_files(dir: &Path) -> Vec<(String, PathBuf, u64)> {
     }
 
     walk(dir, dir, &mut files);
-    files.sort_by_key(|(_, _, size)| *size);
+    files.sort_by_key(|file| file.size);
     files
+}
+
+pub(crate) fn database_key_entry<'a>(
+    keys: &'a DatabaseKeys,
+    rel_path: &str,
+) -> Option<&'a HashMap<String, String>> {
+    keys.get(rel_path).or_else(|| {
+        let basename = Path::new(rel_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        keys.keys()
+            .find(|key_path| key_path.ends_with(basename))
+            .and_then(|key_path| keys.get(key_path))
+    })
 }
 
 /// Decrypt all databases in the Telegram db_storage directory.
@@ -476,7 +708,7 @@ pub fn decrypt_all(
     // Load keys
     let keys_json = fs::read_to_string(keys_path)
         .map_err(|e| format!("Cannot read {}: {}", keys_path.display(), e))?;
-    let keys: HashMap<String, HashMap<String, String>> =
+    let keys: DatabaseKeys =
         serde_json::from_str(&keys_json).map_err(|e| format!("Invalid keys JSON: {}", e))?;
 
     // Determine db_storage path
@@ -491,6 +723,8 @@ pub fn decrypt_all(
         log::info!("Loaded {} database keys", keys.len());
     }
 
+    let _refresh_lock = acquire_refresh_lock(output_dir)?;
+
     // Collect all .db files
     let db_files = collect_db_files(&db_storage);
     if !config.quiet {
@@ -500,20 +734,16 @@ pub fn decrypt_all(
     let mut plan = Vec::with_capacity(db_files.len());
     let mut tasks = Vec::new();
 
-    for (rel_path, full_path, size) in db_files {
-        // Look up key for this database
-        let enc_key = keys.get(rel_path.as_str()).or_else(|| {
-            // Also try without directory prefix
-            let basename = Path::new(&rel_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            keys.keys()
-                .find(|k| k.ends_with(basename))
-                .and_then(|k| keys.get(k))
-        });
+    for source in db_files {
+        let SourceDbFile {
+            rel_path,
+            full_path,
+            size,
+            freshness_mtime,
+        } = source;
 
-        let enc_key = match enc_key.and_then(|k| k.get("enc_key")) {
+        // Look up key for this database
+        let enc_key = match database_key_entry(&keys, &rel_path).and_then(|k| k.get("enc_key")) {
             Some(enc_key) => enc_key.clone(),
             None => {
                 plan.push(DecryptPlanItem::Skipped {
@@ -529,18 +759,16 @@ pub fn decrypt_all(
 
         // --since filter: skip source files not modified since the requested time
         if let Some(since_ts) = config.since {
-            if let Ok(meta) = fs::metadata(&full_path) {
-                if let Ok(mtime) = meta.modified() {
-                    if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                        let mtime_ts = duration.as_secs() as i64;
-                        if mtime_ts < since_ts {
-                            plan.push(DecryptPlanItem::Skipped {
-                                rel_path,
-                                reason: "not modified since requested time",
-                                counts_as_failed: false,
-                            });
-                            continue;
-                        }
+            if let Some(mtime) = freshness_mtime {
+                if let Ok(duration) = mtime.duration_since(UNIX_EPOCH) {
+                    let mtime_ts = duration.as_secs() as i64;
+                    if mtime_ts < since_ts {
+                        plan.push(DecryptPlanItem::Skipped {
+                            rel_path,
+                            reason: "not modified since requested time",
+                            counts_as_failed: false,
+                        });
+                        continue;
                     }
                 }
             }
@@ -548,18 +776,16 @@ pub fn decrypt_all(
 
         // --incremental filter: skip if decrypted file is already up to date
         if config.incremental {
-            if let Ok(src_meta) = fs::metadata(&full_path) {
-                if let Ok(src_mtime) = src_meta.modified() {
-                    if let Ok(dec_meta) = fs::metadata(&out_path) {
-                        if let Ok(dec_mtime) = dec_meta.modified() {
-                            if dec_mtime >= src_mtime {
-                                plan.push(DecryptPlanItem::Skipped {
-                                    rel_path,
-                                    reason: "up to date",
-                                    counts_as_failed: false,
-                                });
-                                continue;
-                            }
+            if let Some(src_mtime) = freshness_mtime {
+                if let Ok(dec_meta) = fs::metadata(&out_path) {
+                    if let Ok(dec_mtime) = dec_meta.modified() {
+                        if dec_mtime >= src_mtime {
+                            plan.push(DecryptPlanItem::Skipped {
+                                rel_path,
+                                reason: "up to date",
+                                counts_as_failed: false,
+                            });
+                            continue;
                         }
                     }
                 }
@@ -585,9 +811,9 @@ pub fn decrypt_all(
             &task.enc_key,
             config.incremental,
         ) {
-            Ok(file_stats) => match verify_sqlite(&task.out_path) {
-                Ok(tables) => DecryptOutcome::Success { file_stats, tables },
-                Err(e) => DecryptOutcome::VerifyFailed(format!("SQLite verify failed: {}", e)),
+            Ok(result) => DecryptOutcome::Success {
+                file_stats: result.stats,
+                tables: result.tables,
             },
             Err(e) => DecryptOutcome::Failed(format!("FAILED: {}", e)),
         };
@@ -649,13 +875,6 @@ pub fn decrypt_all(
                         }
                         stats.success += 1;
                     }
-                    DecryptOutcome::VerifyFailed(message) => {
-                        if !config.quiet {
-                            log::warn!("{}", message);
-                        }
-                        stats.failed += 1;
-                        stats.failed_paths.push(task.rel_path.clone());
-                    }
                     DecryptOutcome::Failed(message) => {
                         if !config.quiet {
                             log::error!("{}", message);
@@ -685,4 +904,73 @@ fn verify_sqlite(db_path: &Path) -> Result<Vec<String>, String> {
         .collect();
 
     Ok(tables)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_lock_blocks_second_owner_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = acquire_refresh_lock(dir.path()).unwrap();
+
+        let second = acquire_refresh_lock(dir.path());
+        assert!(second.is_err());
+        assert!(second.err().unwrap().contains("already running"));
+
+        drop(lock);
+        assert!(acquire_refresh_lock(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn collect_db_files_uses_wal_and_shm_mtime_for_freshness() {
+        let dir = tempfile::tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        fs::create_dir_all(&message_dir).unwrap();
+        let db_path = message_dir.join("message_0.db");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        fs::write(&db_path, b"db").unwrap();
+        fs::write(&wal_path, b"wal").unwrap();
+        fs::write(&shm_path, b"shm").unwrap();
+
+        let db_mtime = fs::metadata(&db_path).unwrap().modified().unwrap();
+        let wal_mtime = fs::metadata(&wal_path).unwrap().modified().unwrap();
+        let shm_mtime = fs::metadata(&shm_path).unwrap().modified().unwrap();
+        let files = collect_db_files(dir.path());
+        let source = files
+            .iter()
+            .find(|file| file.rel_path == "message/message_0.db")
+            .unwrap();
+        let freshness = source.freshness_mtime.unwrap();
+
+        assert!(freshness >= db_mtime);
+        assert!(freshness >= wal_mtime);
+        assert!(freshness >= shm_mtime);
+    }
+
+    #[test]
+    fn database_key_entry_matches_exact_path_or_basename() {
+        let mut keys = DatabaseKeys::new();
+        let mut exact = HashMap::new();
+        exact.insert("enc_key".to_string(), "exact".to_string());
+        keys.insert("message/message_0.db".to_string(), exact);
+        let mut basename = HashMap::new();
+        basename.insert("enc_key".to_string(), "basename".to_string());
+        keys.insert("other/message_1.db".to_string(), basename);
+
+        assert_eq!(
+            database_key_entry(&keys, "message/message_0.db")
+                .unwrap()
+                .get("enc_key"),
+            Some(&"exact".to_string())
+        );
+        assert_eq!(
+            database_key_entry(&keys, "message/message_1.db")
+                .unwrap()
+                .get("enc_key"),
+            Some(&"basename".to_string())
+        );
+    }
 }
