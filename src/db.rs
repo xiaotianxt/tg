@@ -46,18 +46,7 @@ fn resolve_sender_name_with_mode(
 
 /// Find decrypted databases.
 pub(crate) fn find_decrypted_dbs(decrypted_dir: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
-    // Find contact.db
-    let contact_db = decrypted_dir.join("contact/contact.db");
-    let contact_db = if contact_db.exists() {
-        Some(contact_db)
-    } else {
-        // Try alternative location
-        let alt = decrypted_dir
-            .parent()
-            .map(|p| p.join("decrypted/contact/contact.db"))
-            .filter(|p| p.exists());
-        alt
-    };
+    let contact_db = find_decrypted_contact_db(decrypted_dir);
 
     // Find message databases
     let msg_dir = decrypted_dir.join("message");
@@ -80,6 +69,18 @@ pub(crate) fn find_decrypted_dbs(decrypted_dir: &Path) -> (Option<PathBuf>, Vec<
     (contact_db, message_dbs)
 }
 
+pub(crate) fn find_decrypted_contact_db(decrypted_dir: &Path) -> Option<PathBuf> {
+    let contact_db = decrypted_dir.join("contact/contact.db");
+    if contact_db.exists() {
+        return Some(contact_db);
+    }
+
+    decrypted_dir
+        .parent()
+        .map(|p| p.join("decrypted/contact/contact.db"))
+        .filter(|p| p.exists())
+}
+
 pub(crate) fn is_message_db_name(name: &str) -> bool {
     let Some(stem) = name
         .strip_prefix("message_")
@@ -98,6 +99,7 @@ pub(crate) struct Contact {
     pub remark: String,
     pub alias: String,
     pub display: String,
+    pub is_stranger: bool,
 }
 
 impl Contact {
@@ -177,11 +179,29 @@ pub(crate) fn load_contacts(contact_db: &Path) -> Result<HashMap<String, Contact
     let conn =
         Connection::open(contact_db).map_err(|e| format!("Cannot open contact DB: {}", e))?;
 
-    let mut stmt = conn
-        .prepare("SELECT username, nick_name, remark, alias FROM contact")
-        .map_err(|e| format!("Contact query error: {}", e))?;
+    let mut contacts = load_contact_table(&conn, "contact", false)
+        .map_err(|e| format!("Contact read error: {}", e))?;
+    for (username, stranger) in load_contact_table(&conn, "stranger", true).unwrap_or_default() {
+        contacts
+            .entry(username)
+            .and_modify(|contact| contact.is_stranger = true)
+            .or_insert(stranger);
+    }
 
-    let contacts: HashMap<String, Contact> = stmt
+    Ok(contacts)
+}
+
+fn load_contact_table(
+    conn: &Connection,
+    table: &str,
+    is_stranger: bool,
+) -> rusqlite::Result<HashMap<String, Contact>> {
+    let sql = format!(
+        "SELECT username, nick_name, remark, alias FROM {}",
+        quote_identifier(table)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let contacts = stmt
         .query_map([], |row| {
             let username: String = row.get(0)?;
             let nick_name: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
@@ -200,13 +220,12 @@ pub(crate) fn load_contacts(contact_db: &Path) -> Result<HashMap<String, Contact
                     remark,
                     alias,
                     display,
+                    is_stranger,
                 },
             ))
-        })
-        .map_err(|e| format!("Contact read error: {}", e))?
+        })?
         .filter_map(|r| r.ok())
         .collect();
-
     Ok(contacts)
 }
 
@@ -582,14 +601,12 @@ fn session_match_info(
     query: &str,
 ) -> Option<SessionMatchInfo> {
     if let Some(contact) = contacts.get(username) {
-        return best_contact_score(contact, query).map(
-            |(score, field_priority, distance, field_len)| SessionMatchInfo {
-                score,
-                field_priority,
-                distance,
-                field_len,
-            },
-        );
+        return best_contact_score(contact, query).map(|score| SessionMatchInfo {
+            score: score.score,
+            field_priority: score.field_priority,
+            distance: score.distance,
+            field_len: score.field_len,
+        });
     }
 
     let normalized_query = normalize_match_text(query);
@@ -1492,6 +1509,14 @@ const TOKEN_MATCH_SCORE: i64 = 280;
 const DIRECT_MATCH_SCORE_FLOOR: i64 = TOKEN_MATCH_SCORE;
 const FUZZY_MATCH_SCORE: i64 = 100;
 
+#[derive(Clone, Copy)]
+pub(crate) struct ContactFieldScore {
+    pub score: i64,
+    pub field_priority: usize,
+    pub distance: usize,
+    pub field_len: usize,
+}
+
 struct ContactMatch<'a> {
     contact: &'a Contact,
     score: i64,
@@ -1510,13 +1535,13 @@ fn contact_match_candidates<'a>(
     let mut candidates: Vec<_> = contacts
         .values()
         .filter_map(|contact| {
-            let (score, field_priority, distance, field_len) = best_contact_score(contact, query)?;
+            let score = best_contact_score(contact, query)?;
             Some(ContactMatch {
                 contact,
-                score,
-                field_priority,
-                distance,
-                field_len,
+                score: score.score,
+                field_priority: score.field_priority,
+                distance: score.distance,
+                field_len: score.field_len,
                 latest_message_time: None,
             })
         })
@@ -1555,24 +1580,39 @@ fn contact_match_candidates<'a>(
     candidates
 }
 
-fn best_contact_score(contact: &Contact, query: &str) -> Option<(i64, usize, usize, usize)> {
+fn best_contact_score(contact: &Contact, query: &str) -> Option<ContactFieldScore> {
+    let fields = contact_match_fields(contact);
+    best_contact_field_score(&fields, query)
+}
+
+pub(crate) fn best_contact_field_score(
+    fields: &[(usize, &str)],
+    query: &str,
+) -> Option<ContactFieldScore> {
     let normalized_query = normalize_match_text(query);
     if normalized_query.is_empty() {
         return None;
     }
     let query_tokens = tokenize_match_text(query);
 
-    contact_match_fields(contact)
+    fields
         .iter()
         .filter_map(|(priority, field)| {
-            field_score(field, query, &normalized_query, &query_tokens)
-                .map(|(score, distance, field_len)| (score, *priority, distance, field_len))
+            field_score(field, query, &normalized_query, &query_tokens).map(
+                |(score, distance, field_len)| ContactFieldScore {
+                    score,
+                    field_priority: *priority,
+                    distance,
+                    field_len,
+                },
+            )
         })
         .max_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| a.0.cmp(&b.0))
-                .then_with(|| b.2.cmp(&a.2))
-                .then_with(|| b.3.cmp(&a.3))
+            b.field_priority
+                .cmp(&a.field_priority)
+                .then_with(|| a.score.cmp(&b.score))
+                .then_with(|| b.distance.cmp(&a.distance))
+                .then_with(|| b.field_len.cmp(&a.field_len))
         })
 }
 
@@ -2128,6 +2168,7 @@ mod tests {
                 remark: "Alice Remark".to_string(),
                 alias: String::new(),
                 display: "Alice Remark".to_string(),
+                is_stranger: false,
             },
         );
         let mut room_names = HashMap::new();

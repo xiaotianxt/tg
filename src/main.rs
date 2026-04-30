@@ -391,6 +391,8 @@ enum Commands {
     Complete {
         /// Dynamic candidate kind
         kind: CompleteKind,
+        /// Current shell token to match
+        query: Option<String>,
         /// Path to decrypted databases
         #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
         decrypted_dir: PathBuf,
@@ -920,10 +922,13 @@ fn main() {
         }
         Commands::Complete {
             kind,
+            query,
             decrypted_dir,
             limit,
         } => {
-            if let Err(e) = completion::print_candidates(kind, &decrypted_dir, limit) {
+            if let Err(e) =
+                completion::print_candidates(kind, &decrypted_dir, limit, query.as_deref())
+            {
                 log::error!("Error: {}", e);
                 std::process::exit(1);
             }
