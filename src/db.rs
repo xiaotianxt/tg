@@ -120,6 +120,21 @@ struct SessionInfo {
     latest: Option<i64>,
 }
 
+struct SessionListEntry {
+    username: String,
+    info: SessionInfo,
+    display: String,
+    match_info: Option<SessionMatchInfo>,
+}
+
+#[derive(Clone, Copy)]
+struct SessionMatchInfo {
+    score: i64,
+    field_priority: usize,
+    distance: usize,
+    field_len: usize,
+}
+
 type MessageRow = (i64, i64, String, Option<i64>, String, Vec<u8>);
 type SearchRow = (i64, i64, String, String);
 const SESSION_TIME_BOUNDARY_ROWS: usize = 128;
@@ -354,6 +369,7 @@ fn session_stats_for_table(conn: &Connection, table_name: &str) -> Option<Sessio
 pub fn list_sessions(
     decrypted_dir: &Path,
     top_n: usize,
+    query: Option<&str>,
     jobs: usize,
 ) -> Result<Vec<(String, i64, String, String)>, String> {
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
@@ -444,6 +460,66 @@ pub fn list_sessions(
     if sorted.is_empty() {
         return Ok(Vec::new());
     }
+    let total_sessions = sorted.len();
+
+    let mut entries: Vec<_> = sorted
+        .into_iter()
+        .map(|(table, info)| {
+            let username = table_to_username
+                .get(&table)
+                .cloned()
+                .unwrap_or_else(|| table.clone());
+            let display = contacts
+                .get(&username)
+                .map(|c| c.display.clone())
+                .unwrap_or_else(|| "(?)".to_string());
+
+            SessionListEntry {
+                username,
+                info,
+                display,
+                match_info: None,
+            }
+        })
+        .collect();
+
+    let query = query.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(query) = query {
+        entries = entries
+            .into_iter()
+            .filter_map(|mut entry| {
+                let match_info =
+                    session_match_info(&contacts, &entry.username, &entry.display, query)?;
+                entry.match_info = Some(match_info);
+                Some(entry)
+            })
+            .collect();
+
+        entries.sort_by(|a, b| {
+            let a_match = a.match_info.expect("filtered session entry has match info");
+            let b_match = b.match_info.expect("filtered session entry has match info");
+            a_match
+                .field_priority
+                .cmp(&b_match.field_priority)
+                .then_with(|| b_match.score.cmp(&a_match.score))
+                .then_with(|| {
+                    b.info
+                        .latest
+                        .unwrap_or_default()
+                        .cmp(&a.info.latest.unwrap_or_default())
+                })
+                .then_with(|| a_match.distance.cmp(&b_match.distance))
+                .then_with(|| a_match.field_len.cmp(&b_match.field_len))
+                .then_with(|| b.info.count.cmp(&a.info.count))
+                .then_with(|| a.display.cmp(&b.display))
+                .then_with(|| a.username.cmp(&b.username))
+        });
+    }
+
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let matched_sessions = entries.len();
 
     let stdout = std::io::stdout();
     let mut out = crate::output::Output::new(stdout.lock());
@@ -456,17 +532,8 @@ pub fn list_sessions(
 
     let mut result = Vec::new();
 
-    for (i, (table, info)) in sorted.iter().enumerate().take(top_n) {
-        let username = table_to_username
-            .get(table)
-            .cloned()
-            .unwrap_or_else(|| table.clone());
-        let display = contacts
-            .get(&username)
-            .map(|c| c.display.as_str())
-            .unwrap_or("(?)");
-
-        let time_range = match (info.earliest, info.latest) {
+    for (i, entry) in entries.iter().enumerate().take(top_n) {
+        let time_range = match (entry.info.earliest, entry.info.latest) {
             (Some(e), Some(l)) => {
                 let e_ts = time::format_local_timestamp_minutes(e);
                 let l_ts = time::format_local_timestamp_minutes(l);
@@ -478,24 +545,75 @@ pub fn list_sessions(
         out.line(format_args!(
             "{:<4} {:<8} {:<46} {:<22} {}",
             i + 1,
-            info.count,
+            entry.info.count,
             time_range,
-            display,
-            username
+            entry.display,
+            entry.username
         ))?;
 
         result.push((
-            username.clone(),
-            info.count,
+            entry.username.clone(),
+            entry.info.count,
             time_range,
-            display.to_string(),
+            entry.display.clone(),
         ));
     }
 
     out.blank_line()?;
-    out.line(format_args!("Total: {} sessions", sorted.len()))?;
+    if query.is_some() {
+        out.line(format_args!(
+            "Matched: {} of {} sessions",
+            matched_sessions, total_sessions
+        ))?;
+    } else {
+        out.line(format_args!("Total: {} sessions", total_sessions))?;
+    }
     out.flush()?;
     Ok(result)
+}
+
+fn session_match_info(
+    contacts: &HashMap<String, Contact>,
+    username: &str,
+    display: &str,
+    query: &str,
+) -> Option<SessionMatchInfo> {
+    if let Some(contact) = contacts.get(username) {
+        return best_contact_score(contact, query).map(
+            |(score, field_priority, distance, field_len)| SessionMatchInfo {
+                score,
+                field_priority,
+                distance,
+                field_len,
+            },
+        );
+    }
+
+    let normalized_query = normalize_match_text(query);
+    if normalized_query.is_empty() {
+        return None;
+    }
+    let query_tokens = tokenize_match_text(query);
+
+    [(0, display), (4, username)]
+        .iter()
+        .filter_map(|(priority, field)| {
+            field_score(field, query, &normalized_query, &query_tokens).map(
+                |(score, distance, field_len)| SessionMatchInfo {
+                    score,
+                    field_priority: *priority,
+                    distance,
+                    field_len,
+                },
+            )
+        })
+        .max_by(|a, b| {
+            b.field_priority
+                .cmp(&a.field_priority)
+                .then_with(|| a.score.cmp(&b.score))
+                .then_with(|| b.distance.cmp(&a.distance))
+                .then_with(|| b.field_len.cmp(&a.field_len))
+        })
 }
 
 /// Read messages from a specific session.
@@ -1994,7 +2112,7 @@ mod tests {
             &[("tgid_low", 1, 1000), ("tgid_high", 3, 2000)],
         );
 
-        let sessions = list_sessions(dir.path(), 10, 1).unwrap();
+        let sessions = list_sessions(dir.path(), 10, None, 1).unwrap();
 
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].0, "tgid_high");
@@ -2003,6 +2121,24 @@ mod tests {
         assert_eq!(sessions[1].0, "tgid_low");
         assert_eq!(sessions[1].1, 1);
         assert_eq!(sessions[1].3, "Low Remark");
+    }
+
+    #[test]
+    fn list_sessions_filters_by_fuzzy_contact_query() {
+        let dir = create_decrypted_dir_with_session_counts(
+            &[
+                ("tgid_alice", "Alice Zhang", "", ""),
+                ("tgid_bob", "Bob Lee", "", ""),
+                ("tgid_inactive", "Alice Archive", "", ""),
+            ],
+            &[("tgid_alice", 2, 1000), ("tgid_bob", 5, 2000)],
+        );
+
+        let sessions = list_sessions(dir.path(), 10, Some("Alic Zhang"), 1).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0, "tgid_alice");
+        assert_eq!(sessions[0].3, "Alice Zhang");
     }
 
     #[test]

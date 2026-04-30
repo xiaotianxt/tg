@@ -156,6 +156,8 @@ enum Commands {
     },
     /// List all chat sessions/conversations
     Sessions {
+        /// Optional display name or username query to filter sessions
+        query: Option<String>,
         /// Path to decrypted databases
         #[arg(long, default_value = "decrypted")]
         decrypted_dir: PathBuf,
@@ -434,17 +436,24 @@ fn main() {
             }
         }
         Commands::Sessions {
+            query,
             decrypted_dir,
             top,
             jobs,
         } => {
             let _ = cache::refresh_decrypted(&decrypted_dir, jobs);
-            match db::list_sessions(&decrypted_dir, top, jobs) {
+            match db::list_sessions(&decrypted_dir, top, query.as_deref(), jobs) {
                 Ok(sessions) => {
                     if sessions.is_empty() {
-                        print_output(format_args!(
-                            "No sessions found. Try running 'decrypt' first."
-                        ));
+                        if let Some(query) =
+                            query.as_deref().filter(|value| !value.trim().is_empty())
+                        {
+                            print_output(format_args!("No sessions matched '{}'.", query));
+                        } else {
+                            print_output(format_args!(
+                                "No sessions found. Try running 'decrypt' first."
+                            ));
+                        }
                     }
                 }
                 Err(e) => {
@@ -858,6 +867,15 @@ mod tests {
         match cli.command {
             Commands::Messages { anonymous, .. } => assert!(anonymous),
             _ => panic!("expected messages command"),
+        }
+    }
+
+    #[test]
+    fn sessions_accepts_optional_query() {
+        let cli = Cli::parse_from(args(&["tg", "sessions", "alice"]));
+        match cli.command {
+            Commands::Sessions { query, .. } => assert_eq!(query.as_deref(), Some("alice")),
+            _ => panic!("expected sessions command"),
         }
     }
 

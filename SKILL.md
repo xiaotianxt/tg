@@ -56,6 +56,7 @@ tg --version
 Find a chat:
 
 ```bash
+tg sessions "张三"
 tg sessions --top 50
 ```
 

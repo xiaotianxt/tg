@@ -197,6 +197,7 @@ tg decrypt --db-dir "/path/to/your/db_storage"
 
 ```bash
 tg sessions
+tg sessions "张三"
 tg sessions --top 50
 ```
 
