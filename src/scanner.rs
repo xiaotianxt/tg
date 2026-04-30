@@ -196,15 +196,15 @@ pub fn extract_keys(timeout_secs: u64) -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if !stderr.is_empty() {
+    if output.status.success() && !stderr.is_empty() {
         log::warn!("[stderr] {}", stderr.trim_end());
     }
 
     if !output.status.success() {
-        return Err(format!(
-            "Scanner failed with exit code {:?}.\nOutput: {}",
+        return Err(scanner_failure_message(
             output.status.code(),
-            stdout
+            &stdout,
+            &stderr,
         ));
     }
 
@@ -239,3 +239,45 @@ fn restrict_key_file_permissions(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn restrict_key_file_permissions(_path: &std::path::Path) {}
+
+fn scanner_failure_message(code: Option<i32>, stdout: &str, stderr: &str) -> String {
+    let mut message = format!("Scanner failed with exit code {:?}.", code);
+    append_labeled_output(&mut message, "Output", stdout);
+    append_labeled_output(&mut message, "Error output", stderr);
+    message.push_str("\n\nIf key extraction failed with `task_for_pid failed` or another macOS process permission error, quit Telegram, re-sign it, reopen it, then retry:\n\n");
+    message.push_str("  sudo codesign --force --deep --sign - /Applications/Telegram.app\n");
+    message.push_str("  sudo tg keys\n\n");
+    message.push_str("If Telegram is installed somewhere else, use that `.app` path instead.");
+    message
+}
+
+fn append_labeled_output(message: &mut String, label: &str, output: &str) {
+    let output = output.trim_end();
+    if output.is_empty() {
+        return;
+    }
+
+    message.push('\n');
+    message.push_str(label);
+    message.push_str(":\n");
+    message.push_str(output);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scanner_failure_message_includes_permission_recovery_hint() {
+        let message =
+            scanner_failure_message(Some(1), "Telegram PID: 123\n", "task_for_pid failed: 5\n");
+
+        assert!(message.contains("Scanner failed with exit code Some(1)."));
+        assert!(message.contains("Output:\nTelegram PID: 123"));
+        assert!(message.contains("Error output:\ntask_for_pid failed: 5"));
+        assert!(
+            message.contains("sudo codesign --force --deep --sign - /Applications/Telegram.app")
+        );
+        assert!(message.contains("sudo tg keys"));
+    }
+}
