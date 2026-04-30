@@ -51,6 +51,14 @@ fn should_default_to_messages(args: &[OsString]) -> bool {
     !first_arg.starts_with('-') && !is_known_subcommand(first_arg)
 }
 
+fn messages_limit_or_default(
+    limit: Option<usize>,
+    since: Option<i64>,
+    all_time: bool,
+) -> Option<usize> {
+    limit.or_else(|| (since.is_none() && !all_time).then_some(50))
+}
+
 fn is_known_subcommand(value: &str) -> bool {
     matches!(
         value,
@@ -201,7 +209,7 @@ enum Commands {
         /// Path to decrypted databases
         #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
         decrypted_dir: PathBuf,
-        /// Number of messages to show (defaults to 50 unless --since is used)
+        /// Number of messages to show (defaults to 50 unless --since or --all-time is used)
         #[arg(long)]
         limit: Option<usize>,
         /// Offset for pagination
@@ -211,8 +219,11 @@ enum Commands {
         #[arg(long)]
         search: Option<String>,
         /// Show messages after this time (ISO 8601 or relative: 5min, 1h, today)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all_time")]
         since: Option<String>,
+        /// Show the full history instead of the default latest 50 messages
+        #[arg(long)]
+        all_time: bool,
         /// Show the latest N messages (newest appears last; uses --limit for count)
         #[arg(long)]
         tail: bool,
@@ -565,6 +576,7 @@ fn main() {
             offset,
             search,
             since,
+            all_time,
             tail,
             head,
             time_bucket,
@@ -585,7 +597,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let limit = limit.or_else(|| since_ts.is_none().then_some(50));
+            let limit = messages_limit_or_default(limit, since_ts, all_time);
             let use_tail = tail || (!head && offset == 0);
             ensure_message_cache_ready(&decrypted_dir, jobs);
             let read_messages = || {
@@ -997,6 +1009,36 @@ mod tests {
             Commands::Messages { anonymous, .. } => assert!(anonymous),
             _ => panic!("expected messages command"),
         }
+    }
+
+    #[test]
+    fn messages_accepts_all_time_flag() {
+        let cli = Cli::parse_from(args(&["tg", "messages", "room", "--all-time"]));
+        match cli.command {
+            Commands::Messages { all_time, .. } => assert!(all_time),
+            _ => panic!("expected messages command"),
+        }
+    }
+
+    #[test]
+    fn messages_rejects_all_time_with_since() {
+        assert!(Cli::try_parse_from(args(&[
+            "tg",
+            "messages",
+            "room",
+            "--all-time",
+            "--since",
+            "today",
+        ]))
+        .is_err());
+    }
+
+    #[test]
+    fn messages_all_time_disables_default_limit() {
+        assert_eq!(messages_limit_or_default(None, None, false), Some(50));
+        assert_eq!(messages_limit_or_default(None, None, true), None);
+        assert_eq!(messages_limit_or_default(None, Some(1), false), None);
+        assert_eq!(messages_limit_or_default(Some(20), None, true), Some(20));
     }
 
     #[test]

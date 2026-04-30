@@ -68,6 +68,7 @@ tg "张三"
 tg "张三" --limit 100
 tg messages "张三" --limit 100
 tg messages "张三" --since today
+tg messages "张三" --all-time
 tg messages "张三" --search "关键词"
 tg messages "张三" --head --limit 20
 tg messages "张三" --tail --limit 20

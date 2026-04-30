@@ -159,7 +159,7 @@ __tg_option_takes_value() {
 __tg_options_for_command() {
   case "$1" in
     messages)
-      printf '%s\n' "--decrypted-dir --limit --offset --search --since --tail --head --time-bucket --anonymous --jobs --help -h"
+      printf '%s\n' "--decrypted-dir --limit --offset --search --since --all-time --tail --head --time-bucket --anonymous --jobs --help -h"
       ;;
     sessions)
       printf '%s\n' "--decrypted-dir --top --jobs --help -h"

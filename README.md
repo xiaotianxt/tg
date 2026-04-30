@@ -250,6 +250,7 @@ tg messages "张三"
 tg messages "张三" --limit 100
 tg messages "张三" --since today
 tg messages "张三" --since yesterday
+tg messages "张三" --all-time
 tg messages "张三" --search "项目"
 tg messages "张三" --head --limit 20
 tg messages "张三" --tail --limit 20
@@ -259,7 +260,7 @@ tg messages "张三" --time-bucket 1h
 tg messages "产品讨论群" --anonymous
 ```
 
-`messages` 默认按 `1m` 分组显示时间，同一分钟内不重复打印时间。同一个时间分组里，如果连续消息来自同一发送者，后续消息只打印一个前导空格，不重复打印发送者名。`--time-bucket` 支持 `1m`/`1min`、`1h`、`1d`、`1mo`、`1y`、`full`、`none`。
+`messages` 默认显示最新 50 条；加 `--since` 会显示指定时间之后的消息，加 `--all-time` 会显示整个会话历史。默认按 `1m` 分组显示时间，同一分钟内不重复打印时间。同一个时间分组里，如果连续消息来自同一发送者，后续消息只打印一个前导空格，不重复打印发送者名。`--time-bucket` 支持 `1m`/`1min`、`1h`、`1d`、`1mo`、`1y`、`full`、`none`。
 
 默认显示名使用你的个人备注，引用消息里的发送者也保持一致。加 `--anonymous` 后，群消息优先使用群内展示名，找不到时回退到联系人默认名，不使用你的个人备注。
 
