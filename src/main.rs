@@ -19,7 +19,7 @@ mod time;
 
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn print_output(args: std::fmt::Arguments<'_>) {
     if let Err(e) = output::stdout_line(args) {
@@ -69,6 +69,34 @@ fn print_refresh_stats(label: &str, stats: &decrypt::DecryptStats) {
         "{}: {} succeeded, {} failed, {} skipped, {} total",
         label, stats.success, stats.failed, stats.skipped, stats.total
     ));
+}
+
+fn ensure_message_cache_ready(decrypted_dir: &Path, jobs: usize) {
+    let refresh = cache::refresh_decrypted(decrypted_dir, jobs);
+    let refresh = if cache::needs_message_key_retry(&refresh) {
+        log::warn!(
+            "Decrypted message cache is incomplete ({}). Refreshing keys and retrying once.",
+            cache::retry_reason(&refresh)
+        );
+        cache::refresh_keys_and_decrypted(decrypted_dir, jobs)
+    } else {
+        refresh
+    };
+
+    match refresh {
+        Ok(stats) if cache::failures_can_affect_messages(&stats) => {
+            log::error!(
+                "Cannot read messages because the decrypted cache is still incomplete after refreshing keys. Failed: {}",
+                cache::message_failure_summary(&stats)
+            );
+            std::process::exit(1);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::error!("Cannot refresh decrypted message cache: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -177,6 +205,9 @@ enum Commands {
         /// Show earliest messages instead of the default latest messages
         #[arg(long, conflicts_with = "tail")]
         head: bool,
+        /// Timestamp grouping for output: 1m/1min, 1h, 1d, 1mo, 1y, full, or none
+        #[arg(long, default_value = "1m")]
+        time_bucket: String,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
@@ -393,6 +424,7 @@ fn main() {
             since,
             tail,
             head,
+            time_bucket,
             jobs,
         } => {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
@@ -402,9 +434,16 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            let time_bucket = match time::parse_message_time_bucket(&time_bucket) {
+                Ok(bucket) => bucket,
+                Err(e) => {
+                    log::error!("Error parsing --time-bucket: {}", e);
+                    std::process::exit(1);
+                }
+            };
             let limit = limit.or_else(|| since_ts.is_none().then_some(50));
             let use_tail = tail || (!head && offset == 0);
-            let refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
+            ensure_message_cache_ready(&decrypted_dir, jobs);
             let read_messages = || {
                 db::read_messages(
                     &decrypted_dir,
@@ -415,44 +454,19 @@ fn main() {
                         search_query: search.as_deref(),
                         since: since_ts,
                         tail: use_tail,
+                        time_bucket,
                         jobs,
                     },
                 )
             };
 
-            let mut msg_count = match read_messages() {
+            let msg_count = match read_messages() {
                 Ok(count) => count,
                 Err(e) => {
                     log::error!("Error: {}", e);
                     std::process::exit(1);
                 }
             };
-
-            if msg_count == 0 && cache::needs_message_key_retry(&refresh) {
-                log::warn!(
-                    "No messages found and decrypted cache refresh had issues ({}). Refreshing keys and retrying once.",
-                    cache::retry_reason(&refresh)
-                );
-                match cache::refresh_keys_and_decrypted(&decrypted_dir, jobs) {
-                    Ok(stats) => {
-                        if cache::failures_can_affect_messages(&stats) {
-                            log::warn!(
-                                "Some contact/message databases still failed to decrypt after refreshing keys."
-                            );
-                        }
-                        msg_count = match read_messages() {
-                            Ok(count) => count,
-                            Err(e) => {
-                                log::error!("Error: {}", e);
-                                std::process::exit(1);
-                            }
-                        };
-                    }
-                    Err(e) => {
-                        log::warn!("Automatic key refresh failed: {}", e);
-                    }
-                }
-            }
 
             if msg_count == 0 {
                 print_output(format_args!(

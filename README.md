@@ -29,13 +29,17 @@ Total: 37 sessions
 读取最近消息：
 
 ```bash
-$ tg messages "产品讨论群" --limit 3
+$ tg messages "产品讨论群" --limit 4
 Chat with: 产品讨论群 (123456789@chatroom)
-Showing latest 3 of 12843 messages
+Showing latest 4 of 12843 messages
 
-[2026-04-28 09:37:12] 我: 今天先把导出格式定下来
-[2026-04-28 09:38:44] 李四: [图片 1280x720 245KB]
-[2026-04-28 09:41:05] 王五: > 李四: [图片]
+[2026-04-28 09:37]
+我: 今天先把导出格式定下来
+[2026-04-28 09:38]
+李四: [图片 1280x720 245KB]
+ 这张是最新版
+[2026-04-28 09:41]
+王五: > 李四: [图片]
         这张可以放到 README 里
 
 --- End of messages ---
@@ -164,7 +168,7 @@ tg search "关键词"
 tg export "联系人或群名" --format json
 ```
 
-`sessions`、`messages`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 如果没有读到结果，并且刚才的 contact/message 数据库刷新失败，会自动重新提取 keys、刷新解密缓存，然后重试一次。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
+`sessions`、`search`、`export` 在读取前会尝试静默增量刷新 `decrypted/`。如果当前无法访问Telegram数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
 
 ## 常用命令
 
@@ -207,7 +211,11 @@ tg messages "张三" --search "项目"
 tg messages "张三" --head --limit 20
 tg messages "张三" --tail --limit 20
 tg messages "张三" --offset 100 --limit 50
+tg messages "张三" --time-bucket full
+tg messages "张三" --time-bucket 1h
 ```
+
+`messages` 默认按 `1m` 分组显示时间，同一分钟内不重复打印时间。同一个时间分组里，如果连续消息来自同一发送者，后续消息只打印一个前导空格，不重复打印发送者名。`--time-bucket` 支持 `1m`/`1min`、`1h`、`1d`、`1mo`、`1y`、`full`、`none`。
 
 搜索：
 

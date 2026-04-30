@@ -95,6 +95,7 @@ pub(crate) struct ReadMessagesOptions<'a> {
     pub search_query: Option<&'a str>,
     pub since: Option<i64>,
     pub tail: bool,
+    pub time_bucket: time::MessageTimeBucket,
     pub jobs: usize,
 }
 
@@ -564,9 +565,9 @@ pub fn read_messages(
     }
     out.blank_line()?;
 
+    let mut last_time_key = None;
+    let mut last_sender: Option<String> = None;
     for (local_type, create_time, content, wcdb_ct, sender_account_id, packed_info) in &messages {
-        let time_str = time::format_local_timestamp(*create_time);
-
         // 1-on-1 chat: if the sender is not the chat partner, it's "me"
         let sender_display = if sender_account_id.is_empty() || sender_account_id == &username {
             display_name
@@ -583,10 +584,34 @@ pub fn read_messages(
             |id| resolve_sender_name(id, &contacts),
         );
 
-        out.line(format_args!(
-            "[{}] {}: {}",
-            time_str, decoded.display_name, decoded.content
-        ))?;
+        if options.time_bucket == time::MessageTimeBucket::PerMessage {
+            out.line(format_args!(
+                "[{}] {}: {}",
+                time::format_local_timestamp(*create_time),
+                decoded.display_name,
+                decoded.content
+            ))?;
+        } else {
+            if let Some(time_key) = time::message_time_key(*create_time, options.time_bucket) {
+                if last_time_key != Some(time_key) {
+                    out.line(format_args!(
+                        "[{}]",
+                        time::format_message_time_bucket(*create_time, options.time_bucket)
+                    ))?;
+                    last_time_key = Some(time_key);
+                    last_sender = None;
+                }
+            }
+            if last_sender.as_deref() == Some(decoded.display_name.as_str()) {
+                out.line(format_args!(" {}", decoded.content))?;
+            } else {
+                out.line(format_args!(
+                    "{}: {}",
+                    decoded.display_name, decoded.content
+                ))?;
+                last_sender = Some(decoded.display_name);
+            }
+        }
     }
 
     out.blank_line()?;
@@ -1580,6 +1605,7 @@ mod tests {
                 search_query: Some("needle"),
                 since: None,
                 tail: false,
+                time_bucket: time::MessageTimeBucket::PerMessage,
                 jobs: 1,
             },
         )

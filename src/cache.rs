@@ -67,6 +67,25 @@ pub(crate) fn failures_can_affect_messages(stats: &decrypt::DecryptStats) -> boo
         .any(|path| failure_can_affect_messages(path))
 }
 
+pub(crate) fn message_failure_summary(stats: &decrypt::DecryptStats) -> String {
+    let paths: Vec<&str> = stats
+        .failed_paths
+        .iter()
+        .filter(|path| failure_can_affect_messages(path))
+        .map(String::as_str)
+        .collect();
+
+    if paths.is_empty() {
+        return "none".to_string();
+    }
+
+    let mut summary = paths.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+    if paths.len() > 5 {
+        summary.push_str(&format!(" ... {} total", paths.len()));
+    }
+    summary
+}
+
 pub(crate) fn failures_can_affect_search(stats: &decrypt::DecryptStats) -> bool {
     stats
         .failed_paths
@@ -124,6 +143,19 @@ mod tests {
         assert!(!failures_can_affect_messages(&stats_with_failed_paths(&[
             "message/message_fts.db"
         ])));
+    }
+
+    #[test]
+    fn message_failure_summary_lists_relevant_paths_only() {
+        assert_eq!(
+            message_failure_summary(&stats_with_failed_paths(&[
+                "favorite/favorite.db",
+                "message/message_1.db",
+                "message/message_fts.db",
+                "contact/contact.db",
+            ])),
+            "message/message_1.db, contact/contact.db"
+        );
     }
 
     #[test]

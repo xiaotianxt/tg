@@ -1,7 +1,22 @@
-use chrono::{DateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{DateTime, Datelike, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone};
 
 const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 const MINUTE_FORMAT: &str = "%Y-%m-%d %H:%M";
+const HOUR_FORMAT: &str = "%Y-%m-%d %H:00";
+const DATE_FORMAT: &str = "%Y-%m-%d";
+const MONTH_FORMAT: &str = "%Y-%m";
+const YEAR_FORMAT: &str = "%Y";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MessageTimeBucket {
+    PerMessage,
+    None,
+    Minute(i64),
+    Hour(i64),
+    Day,
+    Month,
+    Year,
+}
 
 /// Parse a time expression into a Unix timestamp.
 ///
@@ -79,6 +94,41 @@ pub fn parse_since_opt(since: Option<&str>) -> Result<Option<i64>, String> {
     since.map(parse_relative_time).transpose()
 }
 
+pub(crate) fn parse_message_time_bucket(s: &str) -> Result<MessageTimeBucket, String> {
+    let value = s.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "full" | "always" => return Ok(MessageTimeBucket::PerMessage),
+        "none" | "off" => return Ok(MessageTimeBucket::None),
+        _ => {}
+    }
+
+    let split_at = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .ok_or_else(|| format!("Missing time unit in '{}'", s))?;
+    let (num_str, unit) = value.split_at(split_at);
+    let num: i64 = num_str
+        .parse()
+        .map_err(|_| format!("Invalid number in '{}'", s))?;
+    if num <= 0 {
+        return Err(format!("Time bucket must be positive in '{}'", s));
+    }
+
+    match unit {
+        "m" | "min" | "mins" | "minute" | "minutes" => Ok(MessageTimeBucket::Minute(num)),
+        "h" | "hour" | "hours" => Ok(MessageTimeBucket::Hour(num)),
+        "d" | "day" | "days" if num == 1 => Ok(MessageTimeBucket::Day),
+        "mo" | "mon" | "month" | "months" if num == 1 => Ok(MessageTimeBucket::Month),
+        "y" | "year" | "years" if num == 1 => Ok(MessageTimeBucket::Year),
+        "d" | "day" | "days" | "mo" | "mon" | "month" | "months" | "y" | "year" | "years" => {
+            Err(format!("Only 1{} is supported for calendar buckets.", unit))
+        }
+        _ => Err(format!(
+            "Unknown time bucket '{}'. Use 1m, 1min, 1h, 1d, 1mo, 1y, full, or none.",
+            s
+        )),
+    }
+}
+
 pub fn format_local_timestamp(timestamp: i64) -> String {
     format_local_timestamp_with(timestamp, DATETIME_FORMAT)
 }
@@ -91,6 +141,44 @@ fn format_local_timestamp_with(timestamp: i64, format: &str) -> String {
     DateTime::from_timestamp(timestamp, 0)
         .map(|t| t.with_timezone(&Local).format(format).to_string())
         .unwrap_or_else(|| timestamp.to_string())
+}
+
+pub(crate) fn message_time_key(timestamp: i64, bucket: MessageTimeBucket) -> Option<i64> {
+    match bucket {
+        MessageTimeBucket::PerMessage => Some(timestamp),
+        MessageTimeBucket::None => None,
+        MessageTimeBucket::Minute(minutes) => Some(timestamp.div_euclid(minutes * 60)),
+        MessageTimeBucket::Hour(hours) => Some(timestamp.div_euclid(hours * 3600)),
+        MessageTimeBucket::Day => DateTime::from_timestamp(timestamp, 0).map(|dt| {
+            let local = dt.with_timezone(&Local);
+            local.year() as i64 * 400 + local.ordinal() as i64
+        }),
+        MessageTimeBucket::Month => DateTime::from_timestamp(timestamp, 0).map(|dt| {
+            let local = dt.with_timezone(&Local);
+            local.year() as i64 * 12 + local.month0() as i64
+        }),
+        MessageTimeBucket::Year => {
+            DateTime::from_timestamp(timestamp, 0).map(|dt| dt.with_timezone(&Local).year() as i64)
+        }
+    }
+}
+
+pub(crate) fn format_message_time_bucket(timestamp: i64, bucket: MessageTimeBucket) -> String {
+    match bucket {
+        MessageTimeBucket::PerMessage => format_local_timestamp(timestamp),
+        MessageTimeBucket::None => String::new(),
+        MessageTimeBucket::Minute(minutes) => format_local_timestamp_with(
+            timestamp.div_euclid(minutes * 60) * minutes * 60,
+            MINUTE_FORMAT,
+        ),
+        MessageTimeBucket::Hour(hours) => format_local_timestamp_with(
+            timestamp.div_euclid(hours * 3600) * hours * 3600,
+            HOUR_FORMAT,
+        ),
+        MessageTimeBucket::Day => format_local_timestamp_with(timestamp, DATE_FORMAT),
+        MessageTimeBucket::Month => format_local_timestamp_with(timestamp, MONTH_FORMAT),
+        MessageTimeBucket::Year => format_local_timestamp_with(timestamp, YEAR_FORMAT),
+    }
 }
 
 fn local_timestamp(dt: NaiveDateTime) -> Result<i64, String> {
@@ -135,5 +223,51 @@ mod tests {
             .to_string();
 
         assert_eq!(format_local_timestamp(timestamp), expected);
+    }
+
+    #[test]
+    fn parses_message_time_buckets() {
+        assert_eq!(
+            parse_message_time_bucket("1m"),
+            Ok(MessageTimeBucket::Minute(1))
+        );
+        assert_eq!(
+            parse_message_time_bucket("1min"),
+            Ok(MessageTimeBucket::Minute(1))
+        );
+        assert_eq!(
+            parse_message_time_bucket("2h"),
+            Ok(MessageTimeBucket::Hour(2))
+        );
+        assert_eq!(parse_message_time_bucket("1d"), Ok(MessageTimeBucket::Day));
+        assert_eq!(
+            parse_message_time_bucket("1mo"),
+            Ok(MessageTimeBucket::Month)
+        );
+        assert_eq!(parse_message_time_bucket("1y"), Ok(MessageTimeBucket::Year));
+        assert_eq!(
+            parse_message_time_bucket("full"),
+            Ok(MessageTimeBucket::PerMessage)
+        );
+        assert_eq!(
+            parse_message_time_bucket("none"),
+            Ok(MessageTimeBucket::None)
+        );
+        assert!(parse_message_time_bucket("2d").is_err());
+    }
+
+    #[test]
+    fn message_time_key_coalesces_minutes_without_formatting() {
+        let bucket = MessageTimeBucket::Minute(1);
+        let timestamp = 1_775_000_000;
+
+        assert_eq!(
+            message_time_key(timestamp, bucket),
+            message_time_key(timestamp + 30, bucket)
+        );
+        assert_ne!(
+            message_time_key(timestamp, bucket),
+            message_time_key(timestamp + 60, bucket)
+        );
     }
 }
