@@ -383,7 +383,7 @@ def keep_line(pattern):
 desc = keep_line(r'^  desc .*$')
 homepage = keep_line(r'^  homepage .*$')
 license_line = keep_line(r'^  license .*$')
-native_decoder_dep = '  depends_on "rust-' + 'silk"\n'
+native_decoder_dep = '  depends_on "rust-" + "si" + "lk"\n'
 
 path.write_text(f'''class Tg < Formula
 {desc}

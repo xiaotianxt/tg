@@ -56,16 +56,16 @@ fn extract_clean_account_id(base: &Path) -> Result<String, String> {
 
     // The directory name ends with `_<random>` suffix; strip it
     let account_prefix = dictionary::account_id_prefix();
-    if dir_name.starts_with(&account_prefix) || dir_name.starts_with("gh_") {
+    if dir_name.starts_with(account_prefix) || dir_name.starts_with("gh_") {
         if let Some(pos) = dir_name.rfind('_') {
             let clean = &dir_name[..pos];
-            if clean.starts_with(&account_prefix) || clean.starts_with("gh_") {
+            if clean.starts_with(account_prefix) || clean.starts_with("gh_") {
                 return Ok(clean.to_string());
             }
         }
     }
     // If no suffix pattern, use as-is
-    if dir_name.starts_with(&account_prefix) || dir_name.starts_with("gh_") {
+    if dir_name.starts_with(account_prefix) || dir_name.starts_with("gh_") {
         return Ok(dir_name.to_string());
     }
 

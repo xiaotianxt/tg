@@ -438,9 +438,9 @@ fn query_message_table(
     context: &MessageQueryContext,
     options: &QueryOptions<'_>,
 ) -> Result<Vec<MessageRow>, String> {
-    let body_col = db::quote_identifier(&dictionary::msg_body_column());
-    let marker_col = db::quote_identifier(&dictionary::msg_compression_marker_column());
-    let sender_col = db::quote_identifier(&dictionary::msg_sender_column());
+    let body_col = db::quote_identifier(dictionary::msg_body_column());
+    let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+    let sender_col = db::quote_identifier(dictionary::msg_sender_column());
     let quoted_table = db::quote_identifier(table);
     let result_window = message_query_window(options)?;
 

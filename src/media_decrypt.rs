@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(detect_ext(b"RIFF\x00\x00\x00\x00WEBP"), "webp");
         assert_eq!(detect_ext(b"\x00\x00\x00\x18ftypmp42"), "mp4");
         assert_eq!(detect_ext(b"\x00\x00\x00\x18ftypavif"), "avif");
-        let mut data = dictionary::sticker_magic();
+        let mut data = dictionary::sticker_magic().to_vec();
         data.extend_from_slice(b"\x13\x00\x00\x00");
         assert_eq!(detect_ext(&data), "tggf");
     }
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn test_find_tggf_hevc_partition() {
         let hevc = b"\x00\x00\x00\x01\x40\x01\x0c\x01";
-        let mut data = dictionary::sticker_magic();
+        let mut data = dictionary::sticker_magic().to_vec();
         data.extend_from_slice(b"\x08abc");
         data.extend_from_slice(&(hevc.len() as u32).to_be_bytes());
         data.extend_from_slice(hevc);

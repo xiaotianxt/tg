@@ -1982,9 +1982,9 @@ mod tests {
 
         let message_conn = Connection::open(message_dir.join("message_0.db")).unwrap();
         let table_name = db::msg_table_name("tgid_export");
-        let body_col = db::quote_identifier(&dictionary::msg_body_column());
-        let marker_col = db::quote_identifier(&dictionary::msg_compression_marker_column());
-        let packed_col = db::quote_identifier(&dictionary::msg_packed_meta_column());
+        let body_col = db::quote_identifier(dictionary::msg_body_column());
+        let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+        let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
         message_conn
             .execute(
                 &format!(
@@ -2027,9 +2027,9 @@ mod tests {
 
         let message_conn = Connection::open(message_dir.join("message_0.db")).unwrap();
         let table_name = db::msg_table_name("tgid_images");
-        let body_col = db::quote_identifier(&dictionary::msg_body_column());
-        let marker_col = db::quote_identifier(&dictionary::msg_compression_marker_column());
-        let packed_col = db::quote_identifier(&dictionary::msg_packed_meta_column());
+        let body_col = db::quote_identifier(dictionary::msg_body_column());
+        let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+        let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
         message_conn
             .execute(
                 &format!(

@@ -273,10 +273,14 @@ fn process_is_running(pid: u32) -> Option<bool> {
         return Some(false);
     }
 
+    // SAFETY: This declares the libc `kill` symbol for a signal-0 liveness
+    // probe. Calls validate the pid range before crossing the FFI boundary.
     unsafe extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
     }
 
+    // SAFETY: `pid` is nonzero and within `i32`; signal 0 performs permission
+    // and existence checks without sending a signal.
     let rc = unsafe { kill(pid as i32, 0) };
     if rc == 0 {
         return Some(true);

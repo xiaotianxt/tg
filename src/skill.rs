@@ -60,7 +60,7 @@ pub(crate) fn render_skill_template(template: &str) -> String {
     }
 
     rendered
-        .replace("Telegram", &app_name)
+        .replace("Telegram", app_name)
         .replace("telegram", &lower_app_name)
 }
 
@@ -75,8 +75,8 @@ mod tests {
             "macOS Telegram Telegram聊天记录 telegram /Applications/Telegram.app",
         );
 
-        assert!(rendered.contains(&dictionary::desktop_app_name()));
-        assert!(rendered.contains(&dictionary::desktop_app_localized_name()));
+        assert!(rendered.contains(dictionary::desktop_app_name()));
+        assert!(rendered.contains(dictionary::desktop_app_localized_name()));
         assert!(!rendered.contains("Telegram"));
         assert!(!rendered.contains("telegram"));
     }
@@ -94,7 +94,7 @@ mod tests {
             path.file_name().and_then(|name| name.to_str()),
             Some("SKILL.md")
         );
-        assert!(contents.contains(&dictionary::desktop_app_name()));
+        assert!(contents.contains(dictionary::desktop_app_name()));
         assert!(!contents.contains("Telegram"));
     }
 }

@@ -891,7 +891,7 @@ pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
             break;
         }
         let prefix = &content[..i];
-        let is_id = prefix.starts_with(&account_prefix)
+        let is_id = prefix.starts_with(account_prefix)
             || prefix.starts_with("gh_")
             || prefix.contains('@')
             || prefix

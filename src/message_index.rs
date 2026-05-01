@@ -365,10 +365,10 @@ fn collect_source_messages(
         .map_err(|e| format!("Cannot open {}: {}", source.path.display(), e))?;
     let tables = list_message_tables(&conn)?;
     let name2id = load_name2id(&conn);
-    let body_col = db::quote_identifier(&dictionary::msg_body_column());
-    let marker_col = db::quote_identifier(&dictionary::msg_compression_marker_column());
-    let sender_col = db::quote_identifier(&dictionary::msg_sender_column());
-    let packed_col = db::quote_identifier(&dictionary::msg_packed_meta_column());
+    let body_col = db::quote_identifier(dictionary::msg_body_column());
+    let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+    let sender_col = db::quote_identifier(dictionary::msg_sender_column());
+    let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
     let mut messages = Vec::new();
 
     for table_name in tables {
@@ -606,10 +606,10 @@ mod tests {
         std::fs::create_dir_all(&message_dir).unwrap();
         let conn = Connection::open(message_dir.join("message_0.db")).unwrap();
         let table = db::msg_table_name("tgid_indexed");
-        let body_col = db::quote_identifier(&dictionary::msg_body_column());
-        let marker_col = db::quote_identifier(&dictionary::msg_compression_marker_column());
-        let sender_col = db::quote_identifier(&dictionary::msg_sender_column());
-        let packed_col = db::quote_identifier(&dictionary::msg_packed_meta_column());
+        let body_col = db::quote_identifier(dictionary::msg_body_column());
+        let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+        let sender_col = db::quote_identifier(dictionary::msg_sender_column());
+        let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
         conn.execute(
             &format!(
                 "CREATE TABLE {} (

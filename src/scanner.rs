@@ -9,6 +9,8 @@ use crate::{dictionary, paths};
 const INTERNAL_SCAN_ARG: &str = "__tg-scan-keys";
 
 #[cfg(target_os = "macos")]
+// SAFETY: This declares the scanner entry point provided by the checked-in C
+// source linked in build.rs. The call site builds a stable argv for the call.
 unsafe extern "C" {
     fn tg_scan_keys_macos(argc: c_int, argv: *const *const c_char) -> c_int;
 }
@@ -45,6 +47,8 @@ fn run_internal_scanner(args: Vec<OsString>) -> i32 {
     }
 
     let argv: Vec<*const c_char> = cstrings.iter().map(|arg| arg.as_ptr()).collect();
+    // SAFETY: `cstrings` owns every NUL-terminated argument for the duration
+    // of the call, and `argc` matches the number of pointers in `argv`.
     unsafe { tg_scan_keys_macos(argv.len() as c_int, argv.as_ptr()) }
 }
 

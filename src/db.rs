@@ -554,10 +554,10 @@ pub fn read_messages(
             let order_dir = if options.tail { "DESC" } else { "ASC" };
 
             // Query messages - collect eagerly to avoid borrow issues
-            let body_col = quote_identifier(&dictionary::msg_body_column());
-            let marker_col = quote_identifier(&dictionary::msg_compression_marker_column());
-            let sender_col = quote_identifier(&dictionary::msg_sender_column());
-            let packed_col = quote_identifier(&dictionary::msg_packed_meta_column());
+            let body_col = quote_identifier(dictionary::msg_body_column());
+            let marker_col = quote_identifier(dictionary::msg_compression_marker_column());
+            let sender_col = quote_identifier(dictionary::msg_sender_column());
+            let packed_col = quote_identifier(dictionary::msg_packed_meta_column());
             let local_id_col = if table_has_column(&conn, &table_name, "local_id") {
                 quote_identifier("local_id")
             } else {
@@ -1014,7 +1014,7 @@ fn search_messages_by_scanning(
                 "SELECT local_type, create_time, {} \
                  FROM {} WHERE {}{} \
                  ORDER BY create_time DESC LIMIT {}",
-                quote_identifier(&dictionary::msg_body_column()),
+                quote_identifier(dictionary::msg_body_column()),
                 table,
                 search_clause,
                 since_clause,
@@ -1238,7 +1238,7 @@ fn search_session_display(contacts: &HashMap<String, Contact>, session: &str) ->
 fn msg_body_like_clause() -> String {
     format!(
         "{} LIKE ? ESCAPE '\\'",
-        quote_identifier(&dictionary::msg_body_column())
+        quote_identifier(dictionary::msg_body_column())
     )
 }
 
@@ -1295,7 +1295,7 @@ fn resolve_username_with_context(
     }
 
     // If it looks like a native account id, use it directly.
-    if query.starts_with(&dictionary::account_id_prefix())
+    if query.starts_with(dictionary::account_id_prefix())
         || query.starts_with("gh_")
         || query.contains("@chatroom")
     {
@@ -1716,7 +1716,7 @@ mod tests {
 
         for (username, count, latest_time) in rows {
             let table_name = msg_table_name(username);
-            let body_col = quote_identifier(&dictionary::msg_body_column());
+            let body_col = quote_identifier(dictionary::msg_body_column());
             conn.execute(
                 &format!(
                     "CREATE TABLE {} (
@@ -1781,7 +1781,7 @@ mod tests {
         drop(contact_conn);
 
         let message_conn = Connection::open(message_dir.join("message_0.db")).unwrap();
-        let body_col = quote_identifier(&dictionary::msg_body_column());
+        let body_col = quote_identifier(dictionary::msg_body_column());
         for (username, count, latest_time) in rows {
             let table_name = msg_table_name(username);
             message_conn
@@ -1824,10 +1824,10 @@ mod tests {
         let path = message_dir.join("message_0.db");
         let conn = Connection::open(&path).unwrap();
         let table_name = msg_table_name(username);
-        let body_col = quote_identifier(&dictionary::msg_body_column());
-        let marker_col = quote_identifier(&dictionary::msg_compression_marker_column());
-        let sender_col = quote_identifier(&dictionary::msg_sender_column());
-        let packed_col = quote_identifier(&dictionary::msg_packed_meta_column());
+        let body_col = quote_identifier(dictionary::msg_body_column());
+        let marker_col = quote_identifier(dictionary::msg_compression_marker_column());
+        let sender_col = quote_identifier(dictionary::msg_sender_column());
+        let packed_col = quote_identifier(dictionary::msg_packed_meta_column());
         conn.execute(
             &format!(
                 "CREATE TABLE {} (
@@ -1948,7 +1948,7 @@ mod tests {
     #[test]
     fn session_stats_falls_back_without_sort_seq() {
         let conn = Connection::open_in_memory().unwrap();
-        let body_col = quote_identifier(&dictionary::msg_body_column());
+        let body_col = quote_identifier(dictionary::msg_body_column());
         conn.execute(
             &format!(
                 "CREATE TABLE Msg_test (

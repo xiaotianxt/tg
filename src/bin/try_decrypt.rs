@@ -175,10 +175,10 @@ fn find_account_id() -> Option<String> {
     let account_prefix = dictionary::account_id_prefix();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(&account_prefix) || name.starts_with("gh_") {
+        if name.starts_with(account_prefix) || name.starts_with("gh_") {
             if let Some(pos) = name.rfind('_') {
                 let clean = &name[..pos];
-                if clean.starts_with(&account_prefix) || clean.starts_with("gh_") {
+                if clean.starts_with(account_prefix) || clean.starts_with("gh_") {
                     return Some(clean.to_string());
                 }
             }
