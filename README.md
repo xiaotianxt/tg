@@ -11,6 +11,7 @@ tg 是一个 macOS 本地 Telegram 聊天记录读取 CLI。它把本机 Telegra
 - 用包含词、排除词、时间范围和输出字段做更精确的本地检索。
 - 把聊天导出成 `txt`、`csv`、`json`，用于归档、整理或本地分析。
 - 从本地缓存里导出图片、视频、表情等媒体文件。
+- 从本地媒体数据库里导出语音消息为 `.silk` 文件。
 - 给本地 AI/自动化助手一个稳定的聊天记录读取工具和 skill 描述。
 
 默认数据只留在本机。`~/.tg/all_keys.json`、`~/.tg/decrypted/`、`exported/` 都是敏感文件，请当作聊天原文保存和处理。
@@ -65,6 +66,13 @@ $ tg image "产品讨论群"
 exported/images/123456789_chatroom_Image_3_0001.jpg
 ```
 
+导出最近一条本地语音：
+
+```bash
+$ tg voice "产品讨论群"
+exported/voices/123456789_chatroom_Voice_34_0001_123.silk
+```
+
 ## 日常工作流
 
 第一次初始化后，最常用的是这些命令：
@@ -76,6 +84,7 @@ tg search "关键词"
 tg query --session "产品讨论群" --contains "项目" --not "取消" --fields time,sender,body
 tg export "张三" --format json --output exported/zhangsan
 tg image "产品讨论群" --list
+tg voice "产品讨论群" --list
 ```
 
 `search`、`query`、`export` 默认只处理最近 365 天，这是当前版本为速度和常见需求做的默认路径。需要全量历史时加 `--all-time`；需要更窄范围时用 `--since today`、`--since 30d` 或具体日期。
@@ -101,7 +110,7 @@ tg refresh
 | 消息读取 | 文本、群聊发送者、系统提示、撤回提示、引用、链接、小程序、聊天记录卡片展开、位置、文件卡片、图片/视频/语音/表情的可读摘要 |
 | 搜索 | 全局关键词搜索，单个会话内关键词搜索，结构化检索；支持包含词、排除词、时间范围、字段选择和 JSON 行输出 |
 | 导出 | `txt`、`csv`、`json` |
-| 媒体 | 尝试导出本地缓存图片、视频、表情；`.dat` 图片/视频会尝试解密 |
+| 媒体 | 尝试导出本地缓存图片、视频、表情；`.dat` 图片/视频会尝试解密；语音可通过 `voice` 导出为 `.silk` |
 | 增量更新 | 默认只解密变化过的数据库 |
 
 暂不支持或不保证：
@@ -109,7 +118,7 @@ tg refresh
 - 不支持 Windows、iOS、Android、网页版 Telegram。
 - 不恢复 Telegram 本地数据库里已经没有的消息。
 - 不保证导出所有媒体。Telegram 没有缓存、缓存被清理、文件未下载时，只能显示消息摘要。
-- `export --media-dir` 会尝试导出图片、视频、表情，但不导出语音音频和普通文件附件本体。
+- `export --media-dir` 会尝试导出图片、视频、表情，但不导出语音音频和普通文件附件本体；语音请用 `tg voice`。
 - 表情导出可能根据消息里的 URL 用 `curl` 下载；普通读取、解密、搜索不会上传聊天数据。
 - `tggf` 表情转换需要本机可用的 `ffmpeg`。
 - 不做 OCR、语义搜索、拼音搜索。
@@ -331,6 +340,28 @@ Index Time                Status   Source
 2     2026-04-27 22:10:01 missing  cdnthumburl...
 ```
 
+导出语音：
+
+```bash
+tg voice "张三"
+tg voice "张三" --list --limit 20
+tg voice "张三" --id 123
+tg voice "张三" --index 3
+tg voice "张三" --all --limit 10 --output exported/voices
+tg voice "张三" --id 123 --format wav
+```
+
+`voice --list` 会显示可复用的 `ID`，可以把它传给 `voice --id` 精确导出某条语音。`voice` 从本地媒体数据库读取语音 BLOB。当前 macOS 数据里常见格式是在 `#!SILK_V3` 前多一个前置字节，导出时会自动去掉这个字节并保存为 `.silk`。
+
+`.silk` 不是系统播放器通用格式。需要直接导出可播放 WAV 时，先安装一个 SILK 解码器：
+
+```bash
+brew install xiaotianxt/tap/rust-silk
+tg voice "张三" --id 123 --format wav
+```
+
+源码安装时也可以用 `cargo install rust-silk`。还可以用 `--decoder /path/to/rust-silk` 或 `TG_SILK_DECODER=/path/to/rust-silk` 指定解码器。当前支持 `rust-silk`、`silk-decoder` 和常见 `silk_v3_decoder`/`decoder` 命令。
+
 ## 时间过滤
 
 `--since` 支持：
@@ -397,6 +428,10 @@ tg messages "tgid_abcd1234" --limit 50
 ### 图片或视频导不出来
 
 媒体导出依赖 Telegram 本地缓存。可以先在 Telegram 里打开对应图片或视频，让 Telegram 把文件下载到本机，再重新运行 `tg image` 或 `tg export --media-dir ...`。
+
+### 语音导出后不能直接播放
+
+`tg voice` 默认导出 `.silk`，这是语音消息的原始语音编码，不是 macOS 系统播放器通常能直接打开的格式。安装 `xiaotianxt/tap/rust-silk` 后可以直接用 `tg voice "张三" --id <ID> --format wav` 导出 WAV；需要 `mp3` 时再让 `ffmpeg` 处理这个 WAV。
 
 ### `tggf` 表情转换失败
 

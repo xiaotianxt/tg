@@ -393,6 +393,7 @@ path.write_text(f'''class Tg < Formula
 {license_line}
 
   depends_on arch: :arm64
+  depends_on "rust-silk"
 
   def install
     bin.install "tg"

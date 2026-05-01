@@ -440,7 +440,7 @@ pub fn export_media_file(
     Ok(dest)
 }
 
-fn sanitize_filename(s: &str) -> String {
+pub(crate) fn sanitize_filename(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '-' || c == '_' {

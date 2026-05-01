@@ -73,6 +73,7 @@ fn is_known_subcommand(value: &str) -> bool {
             | "sql"
             | "export"
             | "image"
+            | "voice"
             | "doctor"
             | "refresh"
             | "skill"
@@ -384,6 +385,47 @@ enum Commands {
         /// Only consider images after this time (ISO 8601 or relative: 5min, 1h, today)
         #[arg(long)]
         since: Option<String>,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+    },
+    /// Export local cached voice messages from a specific session
+    Voice {
+        /// Session username (tgid_xxx) or display name to search
+        session: String,
+        /// Path to decrypted databases
+        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        decrypted_dir: PathBuf,
+        /// Output directory for normalized voice files
+        #[arg(long, default_value = "exported/voices")]
+        output: PathBuf,
+        /// Output format: silk, wav, or pcm
+        #[arg(long, default_value = "silk")]
+        format: String,
+        /// Path to SILK decoder command (defaults to TG_SILK_DECODER or PATH lookup)
+        #[arg(long)]
+        decoder: Option<PathBuf>,
+        /// List recent voice messages without exporting
+        #[arg(long, conflicts_with_all = ["all", "index", "id"])]
+        list: bool,
+        /// Export every local voice message in the selected window
+        #[arg(long, conflicts_with_all = ["index", "id"])]
+        all: bool,
+        /// Export the Nth voice shown by --list (newest first)
+        #[arg(long, conflicts_with = "id")]
+        index: Option<usize>,
+        /// Export a voice by the ID shown in --list
+        #[arg(long, conflicts_with_all = ["list", "all", "index"])]
+        id: Option<i64>,
+        /// Number of recent voice messages to scan
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Only consider voices after this time (ISO 8601 or relative: 5min, 1h, today)
+        #[arg(long)]
+        since: Option<String>,
+        /// Output sample rate for decoded pcm/wav
+        #[arg(long, default_value_t = 24000)]
+        sample_rate: u32,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
@@ -914,6 +956,54 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Voice {
+            session,
+            decrypted_dir,
+            output,
+            format,
+            decoder,
+            list,
+            all,
+            index,
+            id,
+            limit,
+            since,
+            sample_rate,
+            jobs,
+        } => {
+            let since_ts = match time::parse_since_opt(since.as_deref()) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    log::error!("Error parsing --since: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let output_format = match export::VoiceOutputFormat::parse(&format) {
+                Ok(format) => format,
+                Err(e) => {
+                    log::error!("Error parsing --format: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let _ = cache::refresh_decrypted(&decrypted_dir, jobs);
+            let config = export::VoiceExportConfig {
+                output_dir: &output,
+                format: output_format,
+                decoder: decoder.as_deref(),
+                list,
+                all,
+                index,
+                id,
+                limit,
+                since: since_ts,
+                jobs,
+                sample_rate,
+            };
+            if let Err(e) = export::export_voices(&decrypted_dir, &session, config) {
+                log::error!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Commands::Skill { command } => match command {
             SkillCommands::Install { dir } => {
                 match skill::install(skill::InstallOptions { target_dir: dir }) {
@@ -978,6 +1068,7 @@ mod tests {
             "sql",
             "export",
             "image",
+            "voice",
             "doctor",
             "refresh",
             "skill",
@@ -1066,6 +1157,35 @@ mod tests {
         match cli.command {
             Commands::Sessions { query, .. } => assert_eq!(query.as_deref(), Some("alice")),
             _ => panic!("expected sessions command"),
+        }
+    }
+
+    #[test]
+    fn voice_accepts_index_selection() {
+        let cli = Cli::parse_from(args(&[
+            "tg", "voice", "alice", "--index", "2", "--format", "wav",
+        ]));
+        match cli.command {
+            Commands::Voice {
+                session,
+                index,
+                format,
+                ..
+            } => {
+                assert_eq!(session, "alice");
+                assert_eq!(index, Some(2));
+                assert_eq!(format, "wav");
+            }
+            _ => panic!("expected voice command"),
+        }
+    }
+
+    #[test]
+    fn voice_accepts_id_selection() {
+        let cli = Cli::parse_from(args(&["tg", "voice", "alice", "--id", "42"]));
+        match cli.command {
+            Commands::Voice { id, .. } => assert_eq!(id, Some(42)),
+            _ => panic!("expected voice command"),
         }
     }
 

@@ -1,7 +1,10 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::cmp::Reverse;
 use std::collections::HashSet;
+use std::env;
+use std::ffi::OsStr;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -62,6 +65,20 @@ pub struct ImageExportConfig<'a> {
     pub jobs: usize,
 }
 
+pub struct VoiceExportConfig<'a> {
+    pub output_dir: &'a Path,
+    pub format: VoiceOutputFormat,
+    pub decoder: Option<&'a Path>,
+    pub list: bool,
+    pub all: bool,
+    pub index: Option<usize>,
+    pub id: Option<i64>,
+    pub limit: usize,
+    pub since: Option<i64>,
+    pub jobs: usize,
+    pub sample_rate: u32,
+}
+
 pub struct MessageExportConfig<'a> {
     pub decrypted_dir: &'a Path,
     pub session_query: &'a str,
@@ -86,6 +103,80 @@ struct ImageCandidate {
     message: ImageMessage,
     identifier: Option<String>,
     source: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct VoiceMessage {
+    time: String,
+    timestamp: i64,
+    local_id: i64,
+    svr_id: i64,
+    voice_data: Vec<u8>,
+}
+
+struct VoiceCandidate {
+    index: usize,
+    message: VoiceMessage,
+    format: Option<VoiceFormat>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceOutputFormat {
+    Silk,
+    Wav,
+    Pcm,
+}
+
+impl VoiceOutputFormat {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "silk" => Ok(Self::Silk),
+            "wav" => Ok(Self::Wav),
+            "pcm" => Ok(Self::Pcm),
+            other => Err(format!(
+                "Unsupported voice format '{}'; expected silk, wav, or pcm",
+                other
+            )),
+        }
+    }
+
+    fn extension(self, payload_format: VoiceFormat) -> &'static str {
+        match self {
+            VoiceOutputFormat::Silk => payload_format.extension(),
+            VoiceOutputFormat::Wav => "wav",
+            VoiceOutputFormat::Pcm => "pcm",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceFormat {
+    Silk,
+    Amr,
+    Raw,
+}
+
+impl VoiceFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            VoiceFormat::Silk => "silk",
+            VoiceFormat::Amr => "amr",
+            VoiceFormat::Raw => "aud",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            VoiceFormat::Silk => "silk",
+            VoiceFormat::Amr => "amr",
+            VoiceFormat::Raw => "raw",
+        }
+    }
+}
+
+struct VoicePayload<'a> {
+    bytes: &'a [u8],
+    format: VoiceFormat,
 }
 
 /// Export messages for a session.
@@ -867,6 +958,645 @@ fn try_protobuf_identifier(data: &[u8]) -> Option<String> {
     None
 }
 
+/// Export cached voice messages for a session.
+pub fn export_voices(
+    decrypted_dir: &Path,
+    session_query: &str,
+    config: VoiceExportConfig<'_>,
+) -> Result<Vec<PathBuf>, String> {
+    if config.limit == 0 {
+        return Err("--limit must be greater than 0".to_string());
+    }
+    if config.id.is_some() && (config.list || config.all || config.index.is_some()) {
+        return Err("--id cannot be used with --list, --all, or --index".to_string());
+    }
+    if let Some(index) = config.index {
+        if index == 0 {
+            return Err("--index is 1-based and must be greater than 0".to_string());
+        }
+    }
+    if let Some(id) = config.id {
+        let (username, message) =
+            load_voice_message_by_id(decrypted_dir, session_query, id, config.jobs)?;
+        return export_cached_voices(
+            &username,
+            config.output_dir,
+            config.format,
+            config.decoder,
+            config.sample_rate,
+            vec![CachedVoiceSource { index: 1, message }],
+        );
+    }
+
+    let scan_limit = config.limit.max(config.index.unwrap_or(1));
+    let (username, messages) = load_voice_messages(
+        decrypted_dir,
+        session_query,
+        config.since,
+        scan_limit,
+        config.jobs,
+    )?;
+    if messages.is_empty() {
+        return Err(format!("No voice messages found for '{}'", username));
+    }
+
+    let candidates = messages
+        .into_iter()
+        .enumerate()
+        .map(|(i, message)| {
+            let format = voice_payload(&message.voice_data).map(|payload| payload.format);
+            VoiceCandidate {
+                index: i + 1,
+                message,
+                format,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+
+    if config.list {
+        out.line(format_args!(
+            "{:<5} {:<10} {:<19} {:<8} {:>9} Format",
+            "Index", "ID", "Time", "Status", "Bytes"
+        ))?;
+        out.line(format_args!("{}", "-".repeat(78)))?;
+        for candidate in &candidates {
+            let status = if candidate.format.is_some() {
+                "cached"
+            } else {
+                "empty"
+            };
+            let format = candidate.format.map(VoiceFormat::label).unwrap_or("-");
+            out.line(format_args!(
+                "{:<5} {:<10} {:<19} {:<8} {:>9} {}",
+                candidate.index,
+                candidate.message.local_id,
+                candidate.message.time,
+                status,
+                candidate.message.voice_data.len(),
+                format
+            ))?;
+        }
+        out.flush()?;
+        return Ok(Vec::new());
+    }
+
+    let selected = if config.all {
+        candidates
+            .into_iter()
+            .filter(|candidate| candidate.format.is_some())
+            .take(config.limit)
+            .collect::<Vec<_>>()
+    } else if let Some(index) = config.index {
+        let Some(candidate) = candidates
+            .into_iter()
+            .find(|candidate| candidate.index == index)
+        else {
+            return Err(format!(
+                "Voice index {} is outside the scanned window",
+                index
+            ));
+        };
+        if candidate.format.is_none() {
+            return Err(format!("Voice #{} has no local audio data", index));
+        }
+        vec![candidate]
+    } else {
+        let Some(candidate) = candidates
+            .into_iter()
+            .find(|candidate| candidate.format.is_some())
+        else {
+            return Err(format!(
+                "No local voice data found in the latest {} voice messages",
+                config.limit
+            ));
+        };
+        vec![candidate]
+    };
+
+    if selected.is_empty() {
+        return Err(format!(
+            "No local voice data found in the latest {} voice messages",
+            config.limit
+        ));
+    }
+
+    let voices = selected
+        .into_iter()
+        .map(|candidate| CachedVoiceSource {
+            index: candidate.index,
+            message: candidate.message,
+        })
+        .collect::<Vec<_>>();
+
+    export_cached_voices(
+        &username,
+        config.output_dir,
+        config.format,
+        config.decoder,
+        config.sample_rate,
+        voices,
+    )
+}
+
+struct CachedVoiceSource {
+    index: usize,
+    message: VoiceMessage,
+}
+
+fn export_cached_voices(
+    username: &str,
+    output_dir: &Path,
+    output_format: VoiceOutputFormat,
+    decoder: Option<&Path>,
+    sample_rate: u32,
+    voices: Vec<CachedVoiceSource>,
+) -> Result<Vec<PathBuf>, String> {
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+    let mut paths = Vec::new();
+
+    for voice in voices {
+        match export_voice_file(
+            output_dir,
+            username,
+            voice.index,
+            &voice.message,
+            output_format,
+            decoder,
+            sample_rate,
+        ) {
+            Ok(path) => {
+                out.line(format_args!("{}", path.display()))?;
+                paths.push(path);
+            }
+            Err(e) => log::warn!("Voice #{} export failed: {}", voice.index, e),
+        }
+    }
+    out.flush()?;
+
+    if paths.is_empty() {
+        return Err("No voices were exported".to_string());
+    }
+
+    Ok(paths)
+}
+
+fn export_voice_file(
+    output_dir: &Path,
+    session_name: &str,
+    index: usize,
+    message: &VoiceMessage,
+    output_format: VoiceOutputFormat,
+    decoder: Option<&Path>,
+    sample_rate: u32,
+) -> Result<PathBuf, String> {
+    let payload =
+        voice_payload(&message.voice_data).ok_or_else(|| "Voice data is empty".to_string())?;
+    std::fs::create_dir_all(output_dir).map_err(|e| format!("Cannot create voice dir: {}", e))?;
+
+    let filename = format!(
+        "{}_Voice_34_{:04}_{}.{}",
+        media::sanitize_filename(session_name),
+        index,
+        message.local_id,
+        output_format.extension(payload.format)
+    );
+    let dest = output_dir.join(filename);
+
+    match output_format {
+        VoiceOutputFormat::Silk => {
+            std::fs::write(&dest, payload.bytes)
+                .map_err(|e| format!("Cannot write voice file: {}", e))?;
+        }
+        VoiceOutputFormat::Wav | VoiceOutputFormat::Pcm => {
+            export_decoded_voice(payload, &dest, output_format, decoder, sample_rate)?;
+        }
+    }
+
+    Ok(dest)
+}
+
+fn export_decoded_voice(
+    payload: VoicePayload<'_>,
+    dest: &Path,
+    output_format: VoiceOutputFormat,
+    decoder: Option<&Path>,
+    sample_rate: u32,
+) -> Result<(), String> {
+    if payload.format != VoiceFormat::Silk {
+        return Err(format!(
+            "--format {} currently requires silk voice data; source format is {}",
+            output_format.extension(payload.format),
+            payload.format.label()
+        ));
+    }
+
+    let decoder = resolve_voice_decoder(decoder)?;
+    let mut silk_file = tempfile::Builder::new()
+        .prefix("tg-voice-")
+        .suffix(".silk")
+        .tempfile()
+        .map_err(|e| format!("Create temporary silk file: {}", e))?;
+    silk_file
+        .write_all(payload.bytes)
+        .map_err(|e| format!("Write temporary silk file: {}", e))?;
+    silk_file
+        .flush()
+        .map_err(|e| format!("Flush temporary silk file: {}", e))?;
+
+    match decoder.kind {
+        VoiceDecoderKind::RustSilk => run_rust_silk_decoder(
+            &decoder.path,
+            silk_file.path(),
+            dest,
+            output_format,
+            sample_rate,
+        ),
+        VoiceDecoderKind::SilkDecoder => {
+            if output_format == VoiceOutputFormat::Pcm {
+                run_go_silk_decoder(&decoder.path, silk_file.path(), dest, sample_rate)
+            } else {
+                let pcm = tempfile::Builder::new()
+                    .prefix("tg-voice-")
+                    .suffix(".pcm")
+                    .tempfile()
+                    .map_err(|e| format!("Create temporary pcm file: {}", e))?;
+                run_go_silk_decoder(&decoder.path, silk_file.path(), pcm.path(), sample_rate)?;
+                write_wav_from_pcm(pcm.path(), dest, sample_rate)
+            }
+        }
+        VoiceDecoderKind::SilkV3Decoder => {
+            if output_format == VoiceOutputFormat::Pcm {
+                run_silk_v3_decoder(&decoder.path, silk_file.path(), dest, sample_rate)
+            } else {
+                let pcm = tempfile::Builder::new()
+                    .prefix("tg-voice-")
+                    .suffix(".pcm")
+                    .tempfile()
+                    .map_err(|e| format!("Create temporary pcm file: {}", e))?;
+                run_silk_v3_decoder(&decoder.path, silk_file.path(), pcm.path(), sample_rate)?;
+                write_wav_from_pcm(pcm.path(), dest, sample_rate)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceDecoderKind {
+    RustSilk,
+    SilkDecoder,
+    SilkV3Decoder,
+}
+
+struct VoiceDecoder {
+    path: PathBuf,
+    kind: VoiceDecoderKind,
+}
+
+fn resolve_voice_decoder(explicit: Option<&Path>) -> Result<VoiceDecoder, String> {
+    if let Some(path) = explicit {
+        return Ok(VoiceDecoder {
+            path: path.to_path_buf(),
+            kind: classify_voice_decoder(path),
+        });
+    }
+
+    if let Ok(value) = env::var("TG_SILK_DECODER") {
+        let path = PathBuf::from(value);
+        return Ok(VoiceDecoder {
+            kind: classify_voice_decoder(&path),
+            path,
+        });
+    }
+
+    for name in ["rust-silk", "silk-decoder", "silk_v3_decoder", "decoder"] {
+        if let Some(path) = find_command_in_path(name) {
+            return Ok(VoiceDecoder {
+                kind: classify_voice_decoder(&path),
+                path,
+            });
+        }
+    }
+
+    Err(
+        "No SILK decoder found. Install one with `brew install xiaotianxt/tap/rust-silk` \
+         or `cargo install rust-silk`, pass --decoder /path/to/rust-silk, \
+         or set TG_SILK_DECODER."
+            .to_string(),
+    )
+}
+
+fn classify_voice_decoder(path: &Path) -> VoiceDecoderKind {
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name.contains("rust-silk") {
+        VoiceDecoderKind::RustSilk
+    } else if name.contains("silk-decoder") {
+        VoiceDecoderKind::SilkDecoder
+    } else {
+        VoiceDecoderKind::SilkV3Decoder
+    }
+}
+
+fn find_command_in_path(name: &str) -> Option<PathBuf> {
+    let paths = env::var_os("PATH")?;
+    for dir in env::split_paths(&paths) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn run_rust_silk_decoder(
+    decoder: &Path,
+    input: &Path,
+    output: &Path,
+    output_format: VoiceOutputFormat,
+    sample_rate: u32,
+) -> Result<(), String> {
+    let mut command = Command::new(decoder);
+    command
+        .arg("decode")
+        .arg("-i")
+        .arg(input)
+        .arg("-o")
+        .arg(output);
+    command
+        .arg("--sample-rate")
+        .arg(sample_rate.to_string())
+        .arg("--tolerant")
+        .arg("skip");
+    if output_format == VoiceOutputFormat::Wav {
+        command.arg("--wav");
+    }
+    run_decoder_command(command, decoder)
+}
+
+fn run_go_silk_decoder(
+    decoder: &Path,
+    input: &Path,
+    output: &Path,
+    sample_rate: u32,
+) -> Result<(), String> {
+    let mut command = Command::new(decoder);
+    command
+        .arg("-i")
+        .arg(input)
+        .arg("-mp3=false")
+        .arg("-sampleRate")
+        .arg(sample_rate.to_string())
+        .arg("-o")
+        .arg(output);
+    run_decoder_command(command, decoder)
+}
+
+fn run_silk_v3_decoder(
+    decoder: &Path,
+    input: &Path,
+    output: &Path,
+    sample_rate: u32,
+) -> Result<(), String> {
+    let mut command = Command::new(decoder);
+    command
+        .arg(input)
+        .arg(output)
+        .arg("-Fs_API")
+        .arg(sample_rate.to_string());
+    run_decoder_command(command, decoder)
+}
+
+fn run_decoder_command(mut command: Command, decoder: &Path) -> Result<(), String> {
+    let output = command
+        .output()
+        .map_err(|e| format!("Run SILK decoder {}: {}", decoder.display(), e))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "SILK decoder {} failed with status {}{}",
+        decoder.display(),
+        output.status,
+        if stderr.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", truncate_for_log(stderr.trim(), 500))
+        }
+    ))
+}
+
+fn write_wav_from_pcm(pcm_path: &Path, wav_path: &Path, sample_rate: u32) -> Result<(), String> {
+    let pcm = std::fs::read(pcm_path).map_err(|e| format!("Read decoded PCM: {}", e))?;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    append_wav_header(&mut wav, pcm.len() as u32, sample_rate, 1, 16);
+    wav.extend_from_slice(&pcm);
+    std::fs::write(wav_path, wav).map_err(|e| format!("Write WAV file: {}", e))
+}
+
+fn append_wav_header(
+    out: &mut Vec<u8>,
+    data_len: u32,
+    sample_rate: u32,
+    channels: u16,
+    bits_per_sample: u16,
+) {
+    let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
+    let block_align = channels * bits_per_sample / 8;
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits_per_sample.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+}
+
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn load_voice_message_by_id(
+    decrypted_dir: &Path,
+    session_query: &str,
+    id: i64,
+    jobs: usize,
+) -> Result<(String, VoiceMessage), String> {
+    let (username, conn, chat_name_id) =
+        open_voice_db_for_session(decrypted_dir, session_query, jobs)?;
+    let Some(chat_name_id) = chat_name_id else {
+        return Err(format!("Voice id {} was not found for '{}'", id, username));
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT create_time, local_id, svr_id, voice_data \
+             FROM VoiceInfo \
+             WHERE chat_name_id = ?1 AND local_id = ?2 \
+             LIMIT 1",
+        )
+        .map_err(|e| format!("Prepare voice id query: {}", e))?;
+    let message = stmt
+        .query_row(params![chat_name_id, id], read_voice_row)
+        .optional()
+        .map_err(|e| format!("Read voice id {}: {}", id, e))?
+        .ok_or_else(|| format!("Voice id {} was not found for '{}'", id, username))?;
+    Ok((username, message))
+}
+
+fn load_voice_messages(
+    decrypted_dir: &Path,
+    session_query: &str,
+    since: Option<i64>,
+    limit: usize,
+    jobs: usize,
+) -> Result<(String, Vec<VoiceMessage>), String> {
+    let (username, conn, chat_name_id) =
+        open_voice_db_for_session(decrypted_dir, session_query, jobs)?;
+    let Some(chat_name_id) = chat_name_id else {
+        return Ok((username, Vec::new()));
+    };
+
+    let since_clause = since
+        .map(|ts| format!(" AND create_time >= {}", ts))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT create_time, local_id, svr_id, voice_data \
+         FROM VoiceInfo \
+         WHERE chat_name_id = {} AND create_time > 0{} \
+         ORDER BY create_time DESC LIMIT {}",
+        chat_name_id, since_clause, limit
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Prepare voice query: {}", e))?;
+    let rows = stmt
+        .query_map([], read_voice_row)
+        .map_err(|e| format!("Read voice rows: {}", e))?;
+
+    let mut messages = rows.filter_map(|row| row.ok()).collect::<Vec<_>>();
+    messages.sort_by_key(|message| {
+        (
+            Reverse(message.timestamp),
+            Reverse(message.local_id),
+            Reverse(message.svr_id),
+        )
+    });
+    messages.truncate(limit);
+    Ok((username, messages))
+}
+
+fn open_voice_db_for_session(
+    decrypted_dir: &Path,
+    session_query: &str,
+    jobs: usize,
+) -> Result<(String, Connection, Option<i64>), String> {
+    let (username, _) = resolve_image_session(decrypted_dir, session_query, jobs)?;
+    let media_db = decrypted_dir.join("message/media_0.db");
+    if !media_db.is_file() {
+        return Err(format!("Media database not found: {}", media_db.display()));
+    }
+
+    let conn = open_immutable_connection(&media_db)?;
+    let chat_name_id: Option<i64> = conn
+        .query_row(
+            "SELECT rowid FROM Name2Id WHERE user_name = ?1",
+            params![username],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("Resolve voice chat id: {}", e))?;
+
+    Ok((username, conn, chat_name_id))
+}
+
+fn read_voice_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VoiceMessage> {
+    let timestamp = row.get::<_, Option<i64>>(0)?.unwrap_or(0);
+    let voice_data = row.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default();
+    Ok(VoiceMessage {
+        time: time::format_local_timestamp(timestamp),
+        timestamp,
+        local_id: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+        svr_id: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+        voice_data,
+    })
+}
+
+fn voice_payload(data: &[u8]) -> Option<VoicePayload<'_>> {
+    const SILK_HEADER: &[u8] = b"#!SILK_V3";
+    const AMR_HEADER: &[u8] = b"#!AMR\n";
+
+    if data.is_empty() {
+        return None;
+    }
+    if data.starts_with(SILK_HEADER) {
+        return Some(VoicePayload {
+            bytes: data,
+            format: VoiceFormat::Silk,
+        });
+    }
+    if data.len() > 1 && data[1..].starts_with(SILK_HEADER) {
+        return Some(VoicePayload {
+            bytes: &data[1..],
+            format: VoiceFormat::Silk,
+        });
+    }
+    if data.starts_with(AMR_HEADER) {
+        return Some(VoicePayload {
+            bytes: data,
+            format: VoiceFormat::Amr,
+        });
+    }
+
+    Some(VoicePayload {
+        bytes: data,
+        format: VoiceFormat::Raw,
+    })
+}
+
+fn open_immutable_connection(path: &Path) -> Result<Connection, String> {
+    let uri = format!("file:{}?immutable=1", sqlite_uri_path(path));
+    Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| format!("Open media database {}: {}", path.display(), e))
+}
+
+fn sqlite_uri_path(path: &Path) -> String {
+    let mut encoded = String::new();
+    for byte in path.as_os_str().as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
+}
+
 /// Extract attribute value from XML-like string within content.
 fn extract_xml_attr_str(content: &str, attr: &str) -> Option<String> {
     let pattern = format!("{}=\"", attr);
@@ -1320,6 +2050,50 @@ mod tests {
         dir
     }
 
+    fn create_voice_decrypted_dir() -> TempDir {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+
+        let conn = Connection::open(message_dir.join("media_0.db")).unwrap();
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT PRIMARY KEY)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO Name2Id (rowid, user_name) VALUES (1, 'tgid_voices')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE VoiceInfo (
+                chat_name_id INTEGER,
+                create_time INTEGER,
+                local_id INTEGER,
+                svr_id INTEGER,
+                voice_data BLOB,
+                data_index TEXT DEFAULT '0'
+            )",
+            [],
+        )
+        .unwrap();
+
+        let mut old_voice = vec![2];
+        old_voice.extend_from_slice(b"#!SILK_V3 old");
+        let mut new_voice = vec![2];
+        new_voice.extend_from_slice(b"#!SILK_V3 new");
+        for (timestamp, local_id, data) in [(1000, 1, old_voice), (1002, 2, new_voice)] {
+            conn.execute(
+                "INSERT INTO VoiceInfo
+                 (chat_name_id, create_time, local_id, svr_id, voice_data)
+                 VALUES (1, ?1, ?2, ?3, ?4)",
+                params![timestamp, local_id, 9000 + local_id, data],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        dir
+    }
+
     fn image_message(raw_content: &str, packed_info: Vec<u8>) -> ImageMessage {
         ImageMessage {
             time: "2026-04-28 09:38:44".to_string(),
@@ -1447,6 +2221,96 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].timestamp, 1002);
         assert_eq!(image_identifier(&messages[0]).as_deref(), Some("new.dat"));
+    }
+
+    #[test]
+    fn load_voice_messages_returns_voices_newest_first() {
+        let decrypted = create_voice_decrypted_dir();
+
+        let (username, messages) =
+            load_voice_messages(decrypted.path(), "tgid_voices", None, 10, 1).unwrap();
+
+        assert_eq!(username, "tgid_voices");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.timestamp)
+                .collect::<Vec<_>>(),
+            vec![1002, 1000]
+        );
+    }
+
+    #[test]
+    fn voice_payload_removes_silk_padding_byte() {
+        let mut data = vec![2];
+        data.extend_from_slice(b"#!SILK_V3 payload");
+
+        let payload = voice_payload(&data).unwrap();
+
+        assert_eq!(payload.format, VoiceFormat::Silk);
+        assert_eq!(payload.bytes, b"#!SILK_V3 payload");
+    }
+
+    #[test]
+    fn export_voices_writes_normalized_silk() {
+        let decrypted = create_voice_decrypted_dir();
+        let output = tempdir().unwrap();
+
+        let results = export_voices(
+            decrypted.path(),
+            "tgid_voices",
+            VoiceExportConfig {
+                output_dir: output.path(),
+                format: VoiceOutputFormat::Silk,
+                decoder: None,
+                list: false,
+                all: false,
+                index: None,
+                id: None,
+                limit: 20,
+                since: None,
+                jobs: 1,
+                sample_rate: 24000,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].extension().and_then(|ext| ext.to_str()),
+            Some("silk")
+        );
+        let bytes = std::fs::read(&results[0]).unwrap();
+        assert!(bytes.starts_with(b"#!SILK_V3"));
+        assert_ne!(bytes.first(), Some(&2));
+    }
+
+    #[test]
+    fn load_voice_message_by_id_uses_listed_local_id() {
+        let decrypted = create_voice_decrypted_dir();
+
+        let (_, message) = load_voice_message_by_id(decrypted.path(), "tgid_voices", 2, 1).unwrap();
+
+        assert_eq!(message.timestamp, 1002);
+        assert_eq!(message.local_id, 2);
+    }
+
+    #[test]
+    fn wav_header_wraps_pcm_payload() {
+        let pcm = tempdir().unwrap();
+        let pcm_path = pcm.path().join("voice.pcm");
+        let wav_path = pcm.path().join("voice.wav");
+        std::fs::write(&pcm_path, [1u8, 0, 2, 0]).unwrap();
+
+        write_wav_from_pcm(&pcm_path, &wav_path, 24000).unwrap();
+
+        let wav = std::fs::read(wav_path).unwrap();
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(&wav[40..44], &4u32.to_le_bytes());
+        assert_eq!(&wav[44..], &[1, 0, 2, 0]);
     }
 
     #[test]

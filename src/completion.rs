@@ -27,7 +27,7 @@ function __tg_complete_sessions
 end
 
 function __tg_no_subcommand
-    not __fish_seen_subcommand_from keys decrypt sessions messages search query schema export image doctor refresh skill completions help
+    not __fish_seen_subcommand_from keys decrypt sessions messages search query schema export image voice doctor refresh skill completions help
 end
 
 complete -c tg -f
@@ -40,6 +40,7 @@ complete -c tg -n "__tg_no_subcommand" -a query -d "Run structured queries"
 complete -c tg -n "__tg_no_subcommand" -a schema -d "Show query fields"
 complete -c tg -n "__tg_no_subcommand" -a export -d "Export messages"
 complete -c tg -n "__tg_no_subcommand" -a image -d "Export images"
+complete -c tg -n "__tg_no_subcommand" -a voice -d "Export voices"
 complete -c tg -n "__tg_no_subcommand" -a doctor -d "Diagnose setup"
 complete -c tg -n "__tg_no_subcommand" -a refresh -d "Refresh decrypted cache"
 complete -c tg -n "__tg_no_subcommand" -a skill -d "Manage agent skill"
@@ -53,7 +54,7 @@ complete -c tg -l since -r -d "Lower time bound"
 complete -c tg -l all-time -d "Search full history"
 complete -c tg -n "__tg_no_subcommand; or __fish_seen_subcommand_from messages" -l anonymous -d "Use group/member public names"
 
-complete -c tg -n "__fish_seen_subcommand_from messages export image doctor sessions" -a "(__tg_complete_sessions)"
+complete -c tg -n "__fish_seen_subcommand_from messages export image voice doctor sessions" -a "(__tg_complete_sessions)"
 complete -c tg -n "__fish_seen_subcommand_from query" -l session -r -a "(__tg_complete_sessions)" -d "Limit query to one session"
 complete -c tg -n "__fish_seen_subcommand_from completions" -a "fish zsh bash"
 complete -c tg -n "__fish_seen_subcommand_from skill" -a install -d "Install local agent skill"
@@ -85,6 +86,7 @@ _tg() {
     'schema:show query fields'
     'export:export messages'
     'image:export images'
+    'voice:export voices'
     'doctor:diagnose setup'
     'refresh:refresh decrypted cache'
     'skill:manage agent skill'
@@ -110,7 +112,7 @@ _tg() {
       ;;
     arg)
       case "${words[1]}" in
-        messages|export|image|doctor|sessions)
+        messages|export|image|voice|doctor|sessions)
           _tg_sessions
           ;;
         completions)
@@ -138,7 +140,7 @@ __tg_complete_words() {
 
 __tg_is_command() {
   case "$1" in
-    keys|decrypt|sessions|messages|search|query|schema|export|image|doctor|refresh|skill|completions|help)
+    keys|decrypt|sessions|messages|search|query|schema|export|image|voice|doctor|refresh|skill|completions|help)
       return 0
       ;;
   esac
@@ -179,6 +181,9 @@ __tg_options_for_command() {
       ;;
     image)
       printf '%s\n' "--decrypted-dir --output --list --all --index --id --limit --since --jobs --help -h"
+      ;;
+    voice)
+      printf '%s\n' "--decrypted-dir --output --format --decoder --list --all --index --id --limit --since --sample-rate --jobs --help -h"
       ;;
     doctor)
       printf '%s\n' "--decrypted-dir --jobs --help -h"
@@ -247,7 +252,11 @@ _tg() {
       return 0
       ;;
     --format)
-      COMPREPLY=( $(compgen -W "table json txt csv" -- "$cur") )
+      if [[ "$subcommand" == "voice" ]]; then
+        COMPREPLY=( $(compgen -W "silk wav pcm" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "table json txt csv" -- "$cur") )
+      fi
       return 0
       ;;
     --order)
@@ -268,7 +277,7 @@ _tg() {
     if [[ "$cur" == -* ]]; then
       COMPREPLY=( $(compgen -W "--decrypted-dir --jobs --limit --since --all-time --help -h" -- "$cur") )
     else
-      COMPREPLY=( $(compgen -W "keys decrypt sessions messages search query schema export image doctor refresh skill completions $(__tg_complete_words sessions "$cur")" -- "$cur") )
+      COMPREPLY=( $(compgen -W "keys decrypt sessions messages search query schema export image voice doctor refresh skill completions $(__tg_complete_words sessions "$cur")" -- "$cur") )
     fi
     return 0
   fi
@@ -281,7 +290,7 @@ _tg() {
         COMPREPLY=( $(compgen -W "$(__tg_complete_words sessions "$cur")" -- "$cur") )
       fi
       ;;
-    export|image|doctor|sessions)
+    export|image|voice|doctor|sessions)
       if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W "$(__tg_options_for_command "$subcommand")" -- "$cur") )
       else
