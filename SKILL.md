@@ -164,5 +164,5 @@ Date, datetime, and displayed message times use the current system time zone.
 - No chats or messages found: run `tg refresh --keys`, then `tg sessions --top 50`.
 - Wrong chat matched: use `tg sessions --top 100` and rerun with the exact `tgid_...` or `...@chatroom`.
 - Missing media: open or download the media in Telegram first, then retry `tg image` or `tg export --media-dir ...`.
-- Voice output defaults to normalized `.silk`; use `tg voice ... --format wav` after installing `xiaotianxt/tap/rust-silk` or another supported SILK decoder.
+- Voice output defaults to normalized `.voice`; use `tg voice ... --format wav` after installing a compatible native voice decoder.
 - Unknown issue: run `tg doctor` or `tg doctor "联系人或群名"` and follow the result.

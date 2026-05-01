@@ -399,10 +399,10 @@ enum Commands {
         /// Output directory for normalized voice files
         #[arg(long, default_value = "exported/voices")]
         output: PathBuf,
-        /// Output format: silk, wav, or pcm
-        #[arg(long, default_value = "silk")]
+        /// Output format: native, wav, or pcm
+        #[arg(long, default_value = "native")]
         format: String,
-        /// Path to SILK decoder command (defaults to TG_SILK_DECODER or PATH lookup)
+        /// Path to native voice decoder command (defaults to TG_VOICE_DECODER or PATH lookup)
         #[arg(long)]
         decoder: Option<PathBuf>,
         /// List recent voice messages without exporting

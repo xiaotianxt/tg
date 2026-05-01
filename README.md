@@ -11,7 +11,7 @@ tg 是一个 macOS 本地 Telegram 聊天记录读取 CLI。它把本机 Telegra
 - 用包含词、排除词、时间范围和输出字段做更精确的本地检索。
 - 把聊天导出成 `txt`、`csv`、`json`，用于归档、整理或本地分析。
 - 从本地缓存里导出图片、视频、表情等媒体文件。
-- 从本地媒体数据库里导出语音消息为 `.silk` 文件。
+- 从本地媒体数据库里导出语音消息为 `.voice` 文件。
 - 给本地 AI/自动化助手一个稳定的聊天记录读取工具和 skill 描述。
 
 默认数据只留在本机。`~/.tg/all_keys.json`、`~/.tg/decrypted/`、`exported/` 都是敏感文件，请当作聊天原文保存和处理。
@@ -70,7 +70,7 @@ exported/images/123456789_chatroom_Image_3_0001.jpg
 
 ```bash
 $ tg voice "产品讨论群"
-exported/voices/123456789_chatroom_Voice_34_0001_123.silk
+exported/voices/123456789_chatroom_Voice_34_0001_123.voice
 ```
 
 ## 日常工作流
@@ -110,7 +110,7 @@ tg refresh
 | 消息读取 | 文本、群聊发送者、系统提示、撤回提示、引用、链接、小程序、聊天记录卡片展开、位置、文件卡片、图片/视频/语音/表情的可读摘要 |
 | 搜索 | 全局关键词搜索，单个会话内关键词搜索，结构化检索；支持包含词、排除词、时间范围、字段选择和 JSON 行输出 |
 | 导出 | `txt`、`csv`、`json` |
-| 媒体 | 尝试导出本地缓存图片、视频、表情；`.dat` 图片/视频会尝试解密；语音可通过 `voice` 导出为 `.silk` |
+| 媒体 | 尝试导出本地缓存图片、视频、表情；`.dat` 图片/视频会尝试解密；语音可通过 `voice` 导出为 `.voice` |
 | 增量更新 | 默认只解密变化过的数据库 |
 
 暂不支持或不保证：
@@ -351,16 +351,15 @@ tg voice "张三" --all --limit 10 --output exported/voices
 tg voice "张三" --id 123 --format wav
 ```
 
-`voice --list` 会显示可复用的 `ID`，可以把它传给 `voice --id` 精确导出某条语音。`voice` 从本地媒体数据库读取语音 BLOB。当前 macOS 数据里常见格式是在 `#!SILK_V3` 前多一个前置字节，导出时会自动去掉这个字节并保存为 `.silk`。
+`messages` 会把可定位的语音显示成 `[voice:<id>:<时长>s]`，例如 `[voice:123:7s]`；没有时长时显示 `[voice:<id>]`。这里的 `id` 可以直接传给 `voice --id` 精确导出某条语音。`voice --list` 也会显示同一个可复用的 `ID`。`voice` 从本地媒体数据库读取语音 BLOB。当前 macOS 数据里常见格式是在原始音频头前多一个前置字节，导出时会自动去掉这个字节并保存为 `.voice`。
 
-`.silk` 不是系统播放器通用格式。需要直接导出可播放 WAV 时，先安装一个 SILK 解码器：
+`.voice` 不是系统播放器通用格式。Homebrew 安装的 `tg` 会一并安装默认解码器；需要直接导出可播放 WAV 时：
 
 ```bash
-brew install xiaotianxt/tap/rust-silk
 tg voice "张三" --id 123 --format wav
 ```
 
-源码安装时也可以用 `cargo install rust-silk`。还可以用 `--decoder /path/to/rust-silk` 或 `TG_SILK_DECODER=/path/to/rust-silk` 指定解码器。当前支持 `rust-silk`、`silk-decoder` 和常见 `silk_v3_decoder`/`decoder` 命令。
+源码安装时也可以用 `--decoder /path/to/decoder` 或 `TG_VOICE_DECODER=/path/to/decoder` 指定解码器。当前会尝试从 `PATH` 寻找常见兼容解码器命令。
 
 ## 时间过滤
 
@@ -431,7 +430,7 @@ tg messages "tgid_abcd1234" --limit 50
 
 ### 语音导出后不能直接播放
 
-`tg voice` 默认导出 `.silk`，这是语音消息的原始语音编码，不是 macOS 系统播放器通常能直接打开的格式。安装 `xiaotianxt/tap/rust-silk` 后可以直接用 `tg voice "张三" --id <ID> --format wav` 导出 WAV；需要 `mp3` 时再让 `ffmpeg` 处理这个 WAV。
+`tg voice` 默认导出 `.voice`，这是语音消息的原始编码，不是 macOS 系统播放器通常能直接打开的格式。Homebrew 安装的 `tg` 会一并安装默认解码器，可以直接用 `tg voice "张三" --id <ID> --format wav` 导出 WAV；需要 `mp3` 时再让 `ffmpeg` 处理这个 WAV。
 
 ### `tggf` 表情转换失败
 
@@ -472,6 +471,22 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+性能回归可以用本地解密库跑一组固定命令。脚本会构建 baseline 和当前工作区两个 release binary，命令输出会丢弃，只保存耗时：
+
+```bash
+scripts/perf_regression.sh --session "张三" --runs 5
+TG_PERF_SESSION="张三" make perf
+```
+
+默认 baseline 是 `v1.4.1`。也可以显式指定：
+
+```bash
+scripts/perf_regression.sh --baseline v1.4.2 --candidate WORKTREE --session "张三"
+```
+
+需要把性能门禁接进 release checklist 时，加 `--fail-threshold 1.20`，候选中位数超过 baseline 20% 会非零退出。
+报告写到 `target/perf/<timestamp>/summary.csv`。
 
 项目入口是 `src/main.rs`。主要模块：
 

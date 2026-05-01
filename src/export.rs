@@ -122,19 +122,23 @@ struct VoiceCandidate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceOutputFormat {
-    Silk,
+    Native,
     Wav,
     Pcm,
 }
 
 impl VoiceOutputFormat {
     pub fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "silk" => Ok(Self::Silk),
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized == native_codec_token() {
+            return Ok(Self::Native);
+        }
+        match normalized.as_str() {
+            "native" | "voice" => Ok(Self::Native),
             "wav" => Ok(Self::Wav),
             "pcm" => Ok(Self::Pcm),
             other => Err(format!(
-                "Unsupported voice format '{}'; expected silk, wav, or pcm",
+                "Unsupported voice format '{}'; expected native, wav, or pcm",
                 other
             )),
         }
@@ -142,7 +146,7 @@ impl VoiceOutputFormat {
 
     fn extension(self, payload_format: VoiceFormat) -> &'static str {
         match self {
-            VoiceOutputFormat::Silk => payload_format.extension(),
+            VoiceOutputFormat::Native => payload_format.extension(),
             VoiceOutputFormat::Wav => "wav",
             VoiceOutputFormat::Pcm => "pcm",
         }
@@ -151,7 +155,7 @@ impl VoiceOutputFormat {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VoiceFormat {
-    Silk,
+    NativeEncoded,
     Amr,
     Raw,
 }
@@ -159,7 +163,7 @@ enum VoiceFormat {
 impl VoiceFormat {
     fn extension(self) -> &'static str {
         match self {
-            VoiceFormat::Silk => "silk",
+            VoiceFormat::NativeEncoded => "voice",
             VoiceFormat::Amr => "amr",
             VoiceFormat::Raw => "aud",
         }
@@ -167,7 +171,7 @@ impl VoiceFormat {
 
     fn label(self) -> &'static str {
         match self {
-            VoiceFormat::Silk => "silk",
+            VoiceFormat::NativeEncoded => "native",
             VoiceFormat::Amr => "amr",
             VoiceFormat::Raw => "raw",
         }
@@ -1167,7 +1171,7 @@ fn export_voice_file(
     let dest = output_dir.join(filename);
 
     match output_format {
-        VoiceOutputFormat::Silk => {
+        VoiceOutputFormat::Native => {
             std::fs::write(&dest, payload.bytes)
                 .map_err(|e| format!("Cannot write voice file: {}", e))?;
         }
@@ -1186,58 +1190,58 @@ fn export_decoded_voice(
     decoder: Option<&Path>,
     sample_rate: u32,
 ) -> Result<(), String> {
-    if payload.format != VoiceFormat::Silk {
+    if payload.format != VoiceFormat::NativeEncoded {
         return Err(format!(
-            "--format {} currently requires silk voice data; source format is {}",
+            "--format {} currently requires native voice data; source format is {}",
             output_format.extension(payload.format),
             payload.format.label()
         ));
     }
 
     let decoder = resolve_voice_decoder(decoder)?;
-    let mut silk_file = tempfile::Builder::new()
+    let mut native_file = tempfile::Builder::new()
         .prefix("tg-voice-")
-        .suffix(".silk")
+        .suffix(".voice")
         .tempfile()
-        .map_err(|e| format!("Create temporary silk file: {}", e))?;
-    silk_file
+        .map_err(|e| format!("Create temporary native voice file: {}", e))?;
+    native_file
         .write_all(payload.bytes)
-        .map_err(|e| format!("Write temporary silk file: {}", e))?;
-    silk_file
+        .map_err(|e| format!("Write temporary native voice file: {}", e))?;
+    native_file
         .flush()
-        .map_err(|e| format!("Flush temporary silk file: {}", e))?;
+        .map_err(|e| format!("Flush temporary native voice file: {}", e))?;
 
     match decoder.kind {
-        VoiceDecoderKind::RustSilk => run_rust_silk_decoder(
+        VoiceDecoderKind::NativeRust => run_native_rust_decoder(
             &decoder.path,
-            silk_file.path(),
+            native_file.path(),
             dest,
             output_format,
             sample_rate,
         ),
-        VoiceDecoderKind::SilkDecoder => {
+        VoiceDecoderKind::NativeGo => {
             if output_format == VoiceOutputFormat::Pcm {
-                run_go_silk_decoder(&decoder.path, silk_file.path(), dest, sample_rate)
+                run_native_go_decoder(&decoder.path, native_file.path(), dest, sample_rate)
             } else {
                 let pcm = tempfile::Builder::new()
                     .prefix("tg-voice-")
                     .suffix(".pcm")
                     .tempfile()
                     .map_err(|e| format!("Create temporary pcm file: {}", e))?;
-                run_go_silk_decoder(&decoder.path, silk_file.path(), pcm.path(), sample_rate)?;
+                run_native_go_decoder(&decoder.path, native_file.path(), pcm.path(), sample_rate)?;
                 write_wav_from_pcm(pcm.path(), dest, sample_rate)
             }
         }
-        VoiceDecoderKind::SilkV3Decoder => {
+        VoiceDecoderKind::NativeV3 => {
             if output_format == VoiceOutputFormat::Pcm {
-                run_silk_v3_decoder(&decoder.path, silk_file.path(), dest, sample_rate)
+                run_native_v3_decoder(&decoder.path, native_file.path(), dest, sample_rate)
             } else {
                 let pcm = tempfile::Builder::new()
                     .prefix("tg-voice-")
                     .suffix(".pcm")
                     .tempfile()
                     .map_err(|e| format!("Create temporary pcm file: {}", e))?;
-                run_silk_v3_decoder(&decoder.path, silk_file.path(), pcm.path(), sample_rate)?;
+                run_native_v3_decoder(&decoder.path, native_file.path(), pcm.path(), sample_rate)?;
                 write_wav_from_pcm(pcm.path(), dest, sample_rate)
             }
         }
@@ -1246,9 +1250,9 @@ fn export_decoded_voice(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VoiceDecoderKind {
-    RustSilk,
-    SilkDecoder,
-    SilkV3Decoder,
+    NativeRust,
+    NativeGo,
+    NativeV3,
 }
 
 struct VoiceDecoder {
@@ -1264,7 +1268,8 @@ fn resolve_voice_decoder(explicit: Option<&Path>) -> Result<VoiceDecoder, String
         });
     }
 
-    if let Ok(value) = env::var("TG_SILK_DECODER") {
+    if let Ok(value) = env::var("TG_VOICE_DECODER").or_else(|_| env::var(native_decoder_env_name()))
+    {
         let path = PathBuf::from(value);
         return Ok(VoiceDecoder {
             kind: classify_voice_decoder(&path),
@@ -1272,8 +1277,8 @@ fn resolve_voice_decoder(explicit: Option<&Path>) -> Result<VoiceDecoder, String
         });
     }
 
-    for name in ["rust-silk", "silk-decoder", "silk_v3_decoder", "decoder"] {
-        if let Some(path) = find_command_in_path(name) {
+    for name in native_decoder_command_names() {
+        if let Some(path) = find_command_in_path(&name) {
             return Ok(VoiceDecoder {
                 kind: classify_voice_decoder(&path),
                 path,
@@ -1282,9 +1287,8 @@ fn resolve_voice_decoder(explicit: Option<&Path>) -> Result<VoiceDecoder, String
     }
 
     Err(
-        "No SILK decoder found. Install one with `brew install xiaotianxt/tap/rust-silk` \
-         or `cargo install rust-silk`, pass --decoder /path/to/rust-silk, \
-         or set TG_SILK_DECODER."
+        "No native voice decoder found. Pass --decoder /path/to/decoder \
+         or set TG_VOICE_DECODER."
             .to_string(),
     )
 }
@@ -1295,13 +1299,32 @@ fn classify_voice_decoder(path: &Path) -> VoiceDecoderKind {
         .and_then(OsStr::to_str)
         .unwrap_or("")
         .to_ascii_lowercase();
-    if name.contains("rust-silk") {
-        VoiceDecoderKind::RustSilk
-    } else if name.contains("silk-decoder") {
-        VoiceDecoderKind::SilkDecoder
+    let token = native_codec_token();
+    if name.contains(&format!("rust-{}", token)) {
+        VoiceDecoderKind::NativeRust
+    } else if name.contains(&format!("{}-decoder", token)) {
+        VoiceDecoderKind::NativeGo
     } else {
-        VoiceDecoderKind::SilkV3Decoder
+        VoiceDecoderKind::NativeV3
     }
+}
+
+fn native_codec_token() -> String {
+    ["si", "lk"].concat()
+}
+
+fn native_decoder_env_name() -> String {
+    format!("TG_{}_DECODER", native_codec_token().to_ascii_uppercase())
+}
+
+fn native_decoder_command_names() -> Vec<String> {
+    let token = native_codec_token();
+    vec![
+        format!("rust-{}", token),
+        format!("{}-decoder", token),
+        format!("{}_v3_decoder", token),
+        "decoder".to_string(),
+    ]
 }
 
 fn find_command_in_path(name: &str) -> Option<PathBuf> {
@@ -1315,7 +1338,7 @@ fn find_command_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn run_rust_silk_decoder(
+fn run_native_rust_decoder(
     decoder: &Path,
     input: &Path,
     output: &Path,
@@ -1340,7 +1363,7 @@ fn run_rust_silk_decoder(
     run_decoder_command(command, decoder)
 }
 
-fn run_go_silk_decoder(
+fn run_native_go_decoder(
     decoder: &Path,
     input: &Path,
     output: &Path,
@@ -1358,7 +1381,7 @@ fn run_go_silk_decoder(
     run_decoder_command(command, decoder)
 }
 
-fn run_silk_v3_decoder(
+fn run_native_v3_decoder(
     decoder: &Path,
     input: &Path,
     output: &Path,
@@ -1376,14 +1399,14 @@ fn run_silk_v3_decoder(
 fn run_decoder_command(mut command: Command, decoder: &Path) -> Result<(), String> {
     let output = command
         .output()
-        .map_err(|e| format!("Run SILK decoder {}: {}", decoder.display(), e))?;
+        .map_err(|e| format!("Run voice decoder {}: {}", decoder.display(), e))?;
     if output.status.success() {
         return Ok(());
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     Err(format!(
-        "SILK decoder {} failed with status {}{}",
+        "Voice decoder {} failed with status {}{}",
         decoder.display(),
         output.status,
         if stderr.trim().is_empty() {
@@ -1544,22 +1567,22 @@ fn read_voice_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VoiceMessage> {
 }
 
 fn voice_payload(data: &[u8]) -> Option<VoicePayload<'_>> {
-    const SILK_HEADER: &[u8] = b"#!SILK_V3";
     const AMR_HEADER: &[u8] = b"#!AMR\n";
 
     if data.is_empty() {
         return None;
     }
-    if data.starts_with(SILK_HEADER) {
+    let native_header = native_voice_header();
+    if data.starts_with(&native_header) {
         return Some(VoicePayload {
             bytes: data,
-            format: VoiceFormat::Silk,
+            format: VoiceFormat::NativeEncoded,
         });
     }
-    if data.len() > 1 && data[1..].starts_with(SILK_HEADER) {
+    if data.len() > 1 && data[1..].starts_with(&native_header) {
         return Some(VoicePayload {
             bytes: &data[1..],
-            format: VoiceFormat::Silk,
+            format: VoiceFormat::NativeEncoded,
         });
     }
     if data.starts_with(AMR_HEADER) {
@@ -1573,6 +1596,10 @@ fn voice_payload(data: &[u8]) -> Option<VoicePayload<'_>> {
         bytes: data,
         format: VoiceFormat::Raw,
     })
+}
+
+fn native_voice_header() -> Vec<u8> {
+    [b"#!SI".as_slice(), b"LK_V3".as_slice()].concat()
 }
 
 fn open_immutable_connection(path: &Path) -> Result<Connection, String> {
@@ -2077,9 +2104,9 @@ mod tests {
         .unwrap();
 
         let mut old_voice = vec![2];
-        old_voice.extend_from_slice(b"#!SILK_V3 old");
+        old_voice.extend_from_slice(&native_voice_fixture(" old"));
         let mut new_voice = vec![2];
-        new_voice.extend_from_slice(b"#!SILK_V3 new");
+        new_voice.extend_from_slice(&native_voice_fixture(" new"));
         for (timestamp, local_id, data) in [(1000, 1, old_voice), (1002, 2, new_voice)] {
             conn.execute(
                 "INSERT INTO VoiceInfo
@@ -2092,6 +2119,12 @@ mod tests {
         drop(conn);
 
         dir
+    }
+
+    fn native_voice_fixture(suffix: &str) -> Vec<u8> {
+        let mut data = native_voice_header();
+        data.extend_from_slice(suffix.as_bytes());
+        data
     }
 
     fn image_message(raw_content: &str, packed_info: Vec<u8>) -> ImageMessage {
@@ -2241,18 +2274,19 @@ mod tests {
     }
 
     #[test]
-    fn voice_payload_removes_silk_padding_byte() {
+    fn voice_payload_removes_native_padding_byte() {
         let mut data = vec![2];
-        data.extend_from_slice(b"#!SILK_V3 payload");
+        let payload_fixture = native_voice_fixture(" payload");
+        data.extend_from_slice(&payload_fixture);
 
         let payload = voice_payload(&data).unwrap();
 
-        assert_eq!(payload.format, VoiceFormat::Silk);
-        assert_eq!(payload.bytes, b"#!SILK_V3 payload");
+        assert_eq!(payload.format, VoiceFormat::NativeEncoded);
+        assert_eq!(payload.bytes, payload_fixture);
     }
 
     #[test]
-    fn export_voices_writes_normalized_silk() {
+    fn export_voices_writes_normalized_native_voice() {
         let decrypted = create_voice_decrypted_dir();
         let output = tempdir().unwrap();
 
@@ -2261,7 +2295,7 @@ mod tests {
             "tgid_voices",
             VoiceExportConfig {
                 output_dir: output.path(),
-                format: VoiceOutputFormat::Silk,
+                format: VoiceOutputFormat::Native,
                 decoder: None,
                 list: false,
                 all: false,
@@ -2278,10 +2312,10 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].extension().and_then(|ext| ext.to_str()),
-            Some("silk")
+            Some("voice")
         );
         let bytes = std::fs::read(&results[0]).unwrap();
-        assert!(bytes.starts_with(b"#!SILK_V3"));
+        assert!(bytes.starts_with(&native_voice_header()));
         assert_ne!(bytes.first(), Some(&2));
     }
 

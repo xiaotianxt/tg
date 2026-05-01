@@ -4,6 +4,7 @@ all_keys.json
 /decrypted
 /.tg
 /export
+/exported/
 /scanner_macos
 *.db
 *.db-shm

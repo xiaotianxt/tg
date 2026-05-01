@@ -81,6 +81,12 @@ pub struct DecodedMessage {
     pub display_name: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecodeContext {
+    pub time_bucket: time::MessageTimeBucket,
+    pub voice_id: Option<i64>,
+}
+
 /// 解码消息。
 ///
 /// # Arguments
@@ -118,6 +124,29 @@ pub(crate) fn decode_message_with_time_bucket(
     time_bucket: time::MessageTimeBucket,
     resolve_display_name: impl Fn(&str) -> String,
 ) -> DecodedMessage {
+    decode_message_with_context(
+        msg_type,
+        raw_content,
+        session_display_name,
+        _compression_marker,
+        packed_info,
+        DecodeContext {
+            time_bucket,
+            voice_id: None,
+        },
+        resolve_display_name,
+    )
+}
+
+pub(crate) fn decode_message_with_context(
+    msg_type: i32,
+    raw_content: &str,
+    session_display_name: &str,
+    _compression_marker: Option<i64>,
+    packed_info: &[u8],
+    context: DecodeContext,
+    resolve_display_name: impl Fn(&str) -> String,
+) -> DecodedMessage {
     let msg_type_enum: MessageType = msg_type.into();
 
     if msg_type == 10000 || msg_type == 10002 {
@@ -134,7 +163,7 @@ pub(crate) fn decode_message_with_time_bucket(
             Some(id) => resolve_display_name(id),
             None => session_display_name.to_string(),
         };
-        let content = decode_media_content(msg_type, clean_content, packed_info);
+        let content = decode_media_content(msg_type, clean_content, packed_info, context.voice_id);
         return DecodedMessage {
             msg_type: msg_type_enum,
             content,
@@ -155,8 +184,12 @@ pub(crate) fn decode_message_with_time_bucket(
         Some(id) => resolve_display_name(id),
         None => session_display_name.to_string(),
     };
-    let content =
-        decode_content_by_type(msg_type, clean_content, time_bucket, &resolve_display_name);
+    let content = decode_content_by_type(
+        msg_type,
+        clean_content,
+        context.time_bucket,
+        &resolve_display_name,
+    );
 
     DecodedMessage {
         msg_type: msg_type_enum,
@@ -170,15 +203,14 @@ fn is_media_type(t: i32) -> bool {
 }
 
 /// 解码媒体类消息：优先使用 packed media metadata 的 protobuf 元信息，回退到 XML 解析。
-fn decode_media_content(msg_type: i32, raw_content: &str, packed_info: &[u8]) -> String {
+fn decode_media_content(
+    msg_type: i32,
+    raw_content: &str,
+    packed_info: &[u8],
+    voice_id: Option<i64>,
+) -> String {
     match msg_type {
-        34 => {
-            if let Some(audio) = extract_audio_meta(packed_info) {
-                return audio;
-            }
-            let dur = extract_voice_duration(raw_content);
-            format!("[语音{}]", dur)
-        }
+        34 => decode_voice_content(raw_content, packed_info, voice_id),
         47 => media::parse_sticker_info(raw_content).display(),
         43 => {
             if let Some(video) = extract_video_display(packed_info) {
@@ -196,6 +228,31 @@ fn decode_media_content(msg_type: i32, raw_content: &str, packed_info: &[u8]) ->
             let type_name: MessageType = msg_type.into();
             format!("[{}]", type_name)
         }
+    }
+}
+
+fn decode_voice_content(raw_content: &str, packed_info: &[u8], voice_id: Option<i64>) -> String {
+    let duration_secs = extract_voice_duration_secs(raw_content);
+    let audio_text = extract_audio_text(packed_info);
+
+    if let Some(id) = voice_id.filter(|id| *id > 0) {
+        let tag = voice_tag(id, duration_secs);
+        if let Some(text) = audio_text {
+            return format!("{} {}", tag, text);
+        }
+        return tag;
+    }
+
+    if let Some(text) = audio_text {
+        return format!("[语音] {}", text);
+    }
+    format!("[语音{}]", format_voice_duration_zh(duration_secs))
+}
+
+fn voice_tag(id: i64, duration_secs: Option<i64>) -> String {
+    match duration_secs.filter(|duration| *duration > 0) {
+        Some(duration) => format!("[voice:{}:{}s]", id, duration),
+        None => format!("[voice:{}]", id),
     }
 }
 
@@ -230,14 +287,14 @@ fn extract_video_display(data: &[u8]) -> Option<String> {
     None
 }
 
-fn extract_audio_meta(data: &[u8]) -> Option<String> {
+fn extract_audio_text(data: &[u8]) -> Option<String> {
     if data.is_empty() {
         return None;
     }
     if let Some(v2) = media_pb::parse_img2(data) {
         if let Some(audio) = v2.audio {
             if !audio.audio_text.is_empty() {
-                return Some(format!("[语音] {}", audio.audio_text));
+                return Some(audio.audio_text);
             }
         }
     }
@@ -661,7 +718,7 @@ fn decode_refermsg_content(
     } else {
         match ref_type {
             1 => decode_text_content(clean_content, time_bucket, resolve_display_name),
-            t if is_media_type(t) => decode_media_content(t, clean_content, &[]),
+            t if is_media_type(t) => decode_media_content(t, clean_content, &[], None),
             49 => {
                 let normalized = strip_display_prefix(clean_content);
                 if normalized.trim_start().starts_with('<') {
@@ -765,15 +822,18 @@ fn decode_music_content(content: &str) -> String {
     }
 }
 
-fn extract_voice_duration(content: &str) -> String {
-    let dur = crate::media::extract_xml_tag_int(content, "voicelength")
+fn extract_voice_duration_secs(content: &str) -> Option<i64> {
+    crate::media::extract_xml_tag_int(content, "voicelength")
         .or_else(|| crate::media::extract_xml_tag_int(content, "duration"))
         .or_else(|| {
             content
                 .split(|c: char| !c.is_ascii_digit())
                 .find_map(|s| s.parse::<i64>().ok())
-        });
-    match dur {
+        })
+}
+
+fn format_voice_duration_zh(duration_secs: Option<i64>) -> String {
+    match duration_secs {
         Some(d) if d > 0 => format!(" {}秒", d),
         _ => String::new(),
     }
@@ -960,6 +1020,38 @@ mod tests {
             }
         });
         assert_eq!(d.display_name, "Bob");
+    }
+
+    #[test]
+    fn test_decode_voice_includes_export_id_and_duration() {
+        let d = decode_message_with_context(
+            34,
+            "<msg><voicelength>7</voicelength></msg>",
+            "Alice",
+            None,
+            &[],
+            DecodeContext {
+                time_bucket: time::MessageTimeBucket::Minute(1),
+                voice_id: Some(42),
+            },
+            |id| id.to_string(),
+        );
+
+        assert_eq!(d.content, "[voice:42:7s]");
+    }
+
+    #[test]
+    fn test_decode_voice_keeps_legacy_display_without_id() {
+        let d = decode_message(
+            34,
+            "<msg><voicelength>7</voicelength></msg>",
+            "Alice",
+            None,
+            &[],
+            |id| id.to_string(),
+        );
+
+        assert_eq!(d.content, "[语音 7秒]");
     }
 
     #[test]

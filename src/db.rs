@@ -83,7 +83,17 @@ struct SessionMatchInfo {
     field_len: usize,
 }
 
-type MessageRow = (i64, i64, String, Option<i64>, String, Vec<u8>);
+#[derive(Debug, Clone)]
+struct MessageRow {
+    local_type: i64,
+    create_time: i64,
+    content: String,
+    compression_marker: Option<i64>,
+    sender_account_id: String,
+    packed_info: Vec<u8>,
+    local_id: Option<i64>,
+}
+
 type SearchRow = (i64, i64, String, String);
 const SESSION_TIME_BOUNDARY_ROWS: usize = 128;
 const SEARCH_PREVIEW_CHARS: usize = 100;
@@ -137,6 +147,22 @@ pub(crate) fn quote_identifier(name: &str) -> String {
     }
     quoted.push('"');
     quoted
+}
+
+pub(crate) fn table_has_column(conn: &Connection, table_name: &str, column_name: &str) -> bool {
+    let sql = format!("PRAGMA table_info({})", quote_identifier(table_name));
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return false;
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else {
+        return false;
+    };
+    for row in rows {
+        if row.ok().is_some_and(|name| name == column_name) {
+            return true;
+        }
+    }
+    false
 }
 
 fn session_stats_for_table(conn: &Connection, table_name: &str) -> Option<SessionInfo> {
@@ -532,9 +558,15 @@ pub fn read_messages(
             let marker_col = quote_identifier(&dictionary::msg_compression_marker_column());
             let sender_col = quote_identifier(&dictionary::msg_sender_column());
             let packed_col = quote_identifier(&dictionary::msg_packed_meta_column());
+            let local_id_col = if table_has_column(&conn, &table_name, "local_id") {
+                quote_identifier("local_id")
+            } else {
+                "NULL".to_string()
+            };
             let sql = format!(
-            "SELECT local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col} \
+            "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col} \
              FROM {table_name} WHERE create_time > 0{search_clause}{since_clause} ORDER BY create_time {order_dir}{limit_clause}",
+            local_id_col = local_id_col,
             body_col = body_col,
             marker_col = marker_col,
             sender_col = sender_col,
@@ -550,35 +582,36 @@ pub fn read_messages(
             rows = match conn.prepare(&sql) {
                 Ok(mut stmt) => {
                     let map_row = |row: &rusqlite::Row<'_>| {
-                        let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
+                        let compression_marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
                         let content: String = if compression_marker == Some(4) {
-                            if let Ok(b) = row.get::<_, Vec<u8>>(2) {
+                            if let Ok(b) = row.get::<_, Vec<u8>>(3) {
                                 message::try_decompress(&b).unwrap_or_default()
                             } else {
                                 String::new()
                             }
                         } else {
-                            match row.get::<_, Option<String>>(2) {
+                            match row.get::<_, Option<String>>(3) {
                                 Ok(Some(s)) => s,
-                                _ => match row.get::<_, Option<Vec<u8>>>(2) {
+                                _ => match row.get::<_, Option<Vec<u8>>>(3) {
                                     Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
                                     _ => String::new(),
                                 },
                             }
                         };
-                        let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                        let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
                         let sender_account_id =
                             name2id.get(&sender_id).cloned().unwrap_or_default();
                         let packed_info: Vec<u8> =
-                            row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
-                        Ok((
-                            row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
-                            row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                            row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
+                        Ok(MessageRow {
+                            local_id: row.get::<_, Option<i64>>(0)?,
+                            local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
+                            create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
                             content,
                             compression_marker,
                             sender_account_id,
                             packed_info,
-                        ))
+                        })
                     };
                     let rows = match &search_pattern {
                         Some(pattern) => stmt.query_map(params![pattern], map_row),
@@ -602,13 +635,13 @@ pub fn read_messages(
 
     if options.tail {
         // Each DB returns its latest rows; merge globally, then reverse for chronological display.
-        all_messages.sort_by_key(|row| Reverse(row.1));
+        all_messages.sort_by_key(|row| Reverse(row.create_time));
         if let Some(limit) = options.limit {
             all_messages.truncate(limit);
         }
         all_messages.reverse();
     } else {
-        all_messages.sort_by_key(|row| row.1);
+        all_messages.sort_by_key(|row| row.create_time);
     }
     let messages: Vec<_> = if options.tail {
         all_messages.iter().collect()
@@ -625,6 +658,7 @@ pub fn read_messages(
     if messages.is_empty() {
         return Ok(0);
     }
+    let displayed_count = messages.len();
 
     let stdout = std::io::stdout();
     let mut out = crate::output::Output::new(stdout.lock());
@@ -652,23 +686,30 @@ pub fn read_messages(
 
     let mut last_time_key = None;
     let mut last_sender: Option<String> = None;
-    for (local_type, create_time, content, compression_marker, sender_account_id, packed_info) in
-        &messages
-    {
+    for row in messages {
         // 1-on-1 chat: if the sender is not the chat partner, it's "me"
-        let sender_display = if sender_account_id.is_empty() || sender_account_id == &username {
-            display_name.as_str()
-        } else {
-            "我"
-        };
+        let sender_display =
+            if row.sender_account_id.is_empty() || row.sender_account_id == username {
+                display_name.as_str()
+            } else {
+                "我"
+            };
 
-        let decoded = message::decode_message_with_time_bucket(
-            *local_type as i32,
-            content,
+        let voice_id = if row.local_type == 34 {
+            row.local_id.filter(|id| *id > 0)
+        } else {
+            None
+        };
+        let decoded = message::decode_message_with_context(
+            row.local_type as i32,
+            &row.content,
             sender_display,
-            *compression_marker,
-            packed_info,
-            options.time_bucket,
+            row.compression_marker,
+            &row.packed_info,
+            message::DecodeContext {
+                time_bucket: options.time_bucket,
+                voice_id,
+            },
             |id| {
                 contact::resolve_sender_name_with_mode(
                     id,
@@ -682,16 +723,16 @@ pub fn read_messages(
         if options.time_bucket == time::MessageTimeBucket::PerMessage {
             out.line(format_args!(
                 "[{}] {}: {}",
-                time::format_local_timestamp(*create_time),
+                time::format_local_timestamp(row.create_time),
                 decoded.display_name,
                 decoded.content
             ))?;
         } else {
-            if let Some(time_key) = time::message_time_key(*create_time, options.time_bucket) {
+            if let Some(time_key) = time::message_time_key(row.create_time, options.time_bucket) {
                 if last_time_key != Some(time_key) {
                     out.line(format_args!(
                         "[{}]",
-                        time::format_message_time_bucket(*create_time, options.time_bucket)
+                        time::format_message_time_bucket(row.create_time, options.time_bucket)
                     ))?;
                     last_time_key = Some(time_key);
                     last_sender = None;
@@ -712,7 +753,7 @@ pub fn read_messages(
     out.blank_line()?;
     out.line(format_args!("--- End of messages ---"))?;
     out.flush()?;
-    Ok(messages.len())
+    Ok(displayed_count)
 }
 
 fn query_window_limit(limit: Option<usize>, offset: usize, tail: bool) -> Option<usize> {
@@ -768,7 +809,7 @@ fn read_messages_with_hot_index(
         .map(|limit| format!(" LIMIT {}", limit))
         .unwrap_or_default();
     let sql = format!(
-        "SELECT local_type, create_time, body, marker, sender_account, packed_info
+        "SELECT local_id, local_type, create_time, body, marker, sender_account, packed_info
          FROM messages
          WHERE {where_clause}
          ORDER BY create_time {order_dir}{limit_clause}",
@@ -784,14 +825,15 @@ fn read_messages_with_hot_index(
         .map_err(|e| format!("Prepare indexed message read: {}", e))?;
     let rows = stmt
         .query_map(params_from_iter(params.iter()), |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
-                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default(),
-            ))
+            Ok(MessageRow {
+                local_id: row.get::<_, Option<i64>>(0)?,
+                local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
+                create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                content: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                compression_marker: row.get::<_, Option<i64>>(4)?,
+                sender_account_id: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                packed_info: row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default(),
+            })
         })
         .map_err(|e| format!("Read indexed messages: {}", e))?
         .filter_map(|row| row.ok())

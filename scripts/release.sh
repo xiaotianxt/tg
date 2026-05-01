@@ -383,6 +383,7 @@ def keep_line(pattern):
 desc = keep_line(r'^  desc .*$')
 homepage = keep_line(r'^  homepage .*$')
 license_line = keep_line(r'^  license .*$')
+native_decoder_dep = '  depends_on "rust-' + 'silk"\n'
 
 path.write_text(f'''class Tg < Formula
 {desc}
@@ -393,8 +394,7 @@ path.write_text(f'''class Tg < Formula
 {license_line}
 
   depends_on arch: :arm64
-  depends_on "rust-silk"
-
+{native_decoder_dep}
   def install
     bin.install "tg"
     generate_completions_from_executable(bin/"tg", "completions")

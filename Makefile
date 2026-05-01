@@ -1,4 +1,4 @@
-.PHONY: all fmt clippy test check build install install-local clean
+.PHONY: all fmt clippy test check build perf install install-local clean
 
 all: check
 	$(MAKE) build
@@ -19,6 +19,9 @@ check:
 
 build:
 	cargo build --release
+
+perf:
+	scripts/perf_regression.sh
 
 install: build
 	sudo cp target/release/tg /usr/local/bin/

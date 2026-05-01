@@ -7,7 +7,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use crate::{contact, db, dictionary, message, parallel, paths, time};
 
 const INDEX_FILE: &str = ".tg_index.db";
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const REFRESH_OVERLAP_SECS: i64 = 7 * 86400;
 
 pub(crate) struct HotIndex {
@@ -36,6 +36,7 @@ struct IndexedMessage {
     session_display: String,
     sender_account: String,
     sender_display: String,
+    local_id: Option<i64>,
     local_type: i64,
     create_time: i64,
     body: String,
@@ -140,7 +141,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|e| format!("Read index schema version: {}", e))?;
-    if version != 0 && version != SCHEMA_VERSION {
+    if version != SCHEMA_VERSION {
         conn.execute_batch(
             "DROP TABLE IF EXISTS messages;
              DROP TABLE IF EXISTS source_files;
@@ -167,6 +168,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             session_display TEXT NOT NULL,
             sender_account TEXT NOT NULL,
             sender_display TEXT NOT NULL,
+            local_id INTEGER,
             local_type INTEGER NOT NULL,
             create_time INTEGER NOT NULL,
             body TEXT NOT NULL,
@@ -328,9 +330,9 @@ fn insert_messages(conn: &Connection, rows: &[IndexedMessage]) -> Result<(), Str
         .prepare(
             "INSERT INTO messages (
                 source_db, table_name, session_id, session_display,
-                sender_account, sender_display, local_type, create_time,
-                body, marker, packed_info
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                sender_account, sender_display, local_id, local_type,
+                create_time, body, marker, packed_info
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .map_err(|e| format!("Prepare index insert: {}", e))?;
 
@@ -342,6 +344,7 @@ fn insert_messages(conn: &Connection, rows: &[IndexedMessage]) -> Result<(), Str
             row.session_display,
             row.sender_account,
             row.sender_display,
+            row.local_id,
             row.local_type,
             row.create_time,
             row.body,
@@ -370,11 +373,17 @@ fn collect_source_messages(
 
     for table_name in tables {
         let quoted_table = db::quote_identifier(&table_name);
+        let local_id_col = if db::table_has_column(&conn, &table_name, "local_id") {
+            db::quote_identifier("local_id")
+        } else {
+            "NULL".to_string()
+        };
         let sql = format!(
-            "SELECT local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}
+            "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}
              FROM {quoted_table}
              WHERE create_time >= ?1
-             ORDER BY create_time ASC"
+             ORDER BY create_time ASC",
+            local_id_col = local_id_col
         );
         let Ok(mut stmt) = conn.prepare(&sql) else {
             continue;
@@ -393,16 +402,16 @@ fn collect_source_messages(
 
         let rows = stmt
             .query_map(params![since], |row| {
-                let marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
-                let body = read_message_body(row, 2, marker);
-                let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                let marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
+                let body = read_message_body(row, 3, marker);
+                let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
                 let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
                 let sender_display = table_context
                     .sender_display
                     .get(&sender_account)
                     .cloned()
                     .unwrap_or_else(|| sender_account.clone());
-                let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
+                let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
                 Ok(IndexedMessage {
                     source_db: source.key.clone(),
                     table_name: table_name.clone(),
@@ -410,8 +419,9 @@ fn collect_source_messages(
                     session_display: session_display.clone(),
                     sender_account,
                     sender_display,
-                    local_type: row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
-                    create_time: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    local_id: row.get::<_, Option<i64>>(0)?,
+                    local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
+                    create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
                     body,
                     marker,
                     packed_info,

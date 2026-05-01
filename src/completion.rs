@@ -253,7 +253,7 @@ _tg() {
       ;;
     --format)
       if [[ "$subcommand" == "voice" ]]; then
-        COMPREPLY=( $(compgen -W "silk wav pcm" -- "$cur") )
+        COMPREPLY=( $(compgen -W "native wav pcm" -- "$cur") )
       else
         COMPREPLY=( $(compgen -W "table json txt csv" -- "$cur") )
       fi
