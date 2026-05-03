@@ -1,5 +1,6 @@
 mod cache;
 mod completion;
+mod completion_values;
 mod contact;
 mod db;
 mod decrypt;
@@ -22,7 +23,7 @@ mod scanner;
 mod skill;
 mod time;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -61,26 +62,12 @@ fn messages_limit_or_default(
 }
 
 fn is_known_subcommand(value: &str) -> bool {
-    matches!(
-        value,
-        "keys"
-            | "decrypt"
-            | "sessions"
-            | "messages"
-            | "search"
-            | "query"
-            | "schema"
-            | "sql"
-            | "export"
-            | "image"
-            | "voice"
-            | "doctor"
-            | "refresh"
-            | "skill"
-            | "completions"
-            | "__complete"
-            | "help"
-    )
+    if matches!(value, "help" | "sql") {
+        return true;
+    }
+    Cli::command()
+        .get_subcommands()
+        .any(|command| command.get_name() == value)
 }
 
 fn print_refresh_stats(label: &str, stats: &decrypt::DecryptStats) {
@@ -146,13 +133,21 @@ enum Commands {
     /// Decrypt all encrypted databases using extracted keys
     Decrypt {
         /// Path to all_keys.json
-        #[arg(long, default_value_os_t = paths::default_keys_path())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_keys_path(),
+            value_hint = clap::ValueHint::FilePath
+        )]
         keys: PathBuf,
         /// Output directory for decrypted databases
-        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
         output: PathBuf,
         /// Path to Telegram db_storage directory (auto-detected if not provided)
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::DirPath)]
         db_dir: Option<PathBuf>,
         /// Force decrypting every database even when cached outputs are up to date
         #[arg(long)]
@@ -172,7 +167,11 @@ enum Commands {
         /// Optional display name or username query to filter sessions
         query: Option<String>,
         /// Path to decrypted databases
-        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
         decrypted_dir: PathBuf,
         /// Number of top sessions to show
         #[arg(long, default_value_t = 30)]
@@ -186,7 +185,11 @@ enum Commands {
         /// Optional session username (tgid_xxx) or display name to inspect
         session: Option<String>,
         /// Path to decrypted databases
-        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
         decrypted_dir: PathBuf,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
@@ -195,7 +198,11 @@ enum Commands {
     /// Refresh decrypted cache, refreshing keys if needed
     Refresh {
         /// Path to decrypted databases
-        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
         decrypted_dir: PathBuf,
         /// Extract keys before decrypting
         #[arg(long)]
@@ -209,7 +216,11 @@ enum Commands {
         /// Session username (tgid_xxx) or display name to search
         session: String,
         /// Path to decrypted databases
-        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
         decrypted_dir: PathBuf,
         /// Number of messages to show (defaults to 50 unless --since or --all-time is used)
         #[arg(long)]
@@ -233,7 +244,11 @@ enum Commands {
         #[arg(long, conflicts_with = "tail")]
         head: bool,
         /// Timestamp grouping for output: 1m/1min, 1h, 1d, 1mo, 1y, full, or none
-        #[arg(long, default_value = "1m")]
+        #[arg(
+            long,
+            default_value = "1m",
+            value_parser = completion_values::time_buckets()
+        )]
         time_bucket: String,
         /// Use group/member public names instead of your contact remarks
         #[arg(long)]
@@ -247,7 +262,11 @@ enum Commands {
         /// Search query
         query: String,
         /// Path to decrypted databases
-        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
         decrypted_dir: PathBuf,
         /// Number of results
         #[arg(long, default_value_t = 20)]
@@ -271,7 +290,11 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
         /// Path to decrypted databases
-        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
         decrypted_dir: PathBuf,
         /// Keyword that must appear in message text; repeat for multiple keywords
         #[arg(long = "contains")]
@@ -295,16 +318,28 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         offset: usize,
         /// Sort order: newest or oldest
-        #[arg(long, default_value = "newest")]
+        #[arg(
+            long,
+            default_value = "newest",
+            value_parser = completion_values::orders()
+        )]
         order: String,
         /// Keyword matching mode when --contains is repeated: all or any
-        #[arg(long, default_value = "all")]
+        #[arg(
+            long,
+            default_value = "all",
+            value_parser = completion_values::match_modes()
+        )]
         match_mode: String,
         /// Output fields: time,session,sender,type,body,timestamp
         #[arg(long, default_value = "time,session,sender,body")]
         fields: String,
         /// Output format: table or json
-        #[arg(long, default_value = "table")]
+        #[arg(
+            long,
+            default_value = "table",
+            value_parser = completion_values::query_formats()
+        )]
         format: String,
         /// Maximum displayed characters per text cell
         #[arg(long, default_value_t = 500)]
@@ -319,13 +354,25 @@ enum Commands {
     /// Show public query fields and filters without dumping raw database schema
     Schema {
         /// Cache target to check: messages, contact, fts, or message_N
-        #[arg(long, default_value = "messages")]
+        #[arg(
+            long,
+            default_value = "messages",
+            value_parser = completion_values::db_targets()
+        )]
         db: String,
         /// Path to decrypted databases
-        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
         decrypted_dir: PathBuf,
         /// Output format: table or json
-        #[arg(long, default_value = "table")]
+        #[arg(
+            long,
+            default_value = "table",
+            value_parser = completion_values::query_formats()
+        )]
         format: String,
         /// Maximum displayed characters per text cell
         #[arg(long, default_value_t = 500)]
@@ -339,16 +386,28 @@ enum Commands {
         /// Session username (tgid_xxx)
         session: String,
         /// Path to decrypted databases
-        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
         decrypted_dir: PathBuf,
         /// Output format: txt, csv, or json
-        #[arg(long, default_value = "txt")]
+        #[arg(
+            long,
+            default_value = "txt",
+            value_parser = completion_values::export_formats()
+        )]
         format: String,
         /// Output directory
-        #[arg(long, default_value = "exported")]
+        #[arg(
+            long,
+            default_value = "exported",
+            value_hint = clap::ValueHint::DirPath
+        )]
         output: PathBuf,
         /// Directory to save decoded media files (images, stickers, videos)
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::DirPath)]
         media_dir: Option<PathBuf>,
         /// Export messages after this time (defaults to the recent window)
         #[arg(long, conflicts_with = "all_time")]
@@ -371,10 +430,18 @@ enum Commands {
         /// Session username (tgid_xxx) or display name to search
         session: String,
         /// Path to decrypted databases
-        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
         decrypted_dir: PathBuf,
         /// Output directory for readable image files
-        #[arg(long, default_value = "exported/images")]
+        #[arg(
+            long,
+            default_value = "exported/images",
+            value_hint = clap::ValueHint::DirPath
+        )]
         output: PathBuf,
         /// List recent image messages without exporting
         #[arg(long, conflicts_with_all = ["all", "index"])]
@@ -403,16 +470,28 @@ enum Commands {
         /// Session username (tgid_xxx) or display name to search
         session: String,
         /// Path to decrypted databases
-        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
         decrypted_dir: PathBuf,
         /// Output directory for normalized voice files
-        #[arg(long, default_value = "exported/voices")]
+        #[arg(
+            long,
+            default_value = "exported/voices",
+            value_hint = clap::ValueHint::DirPath
+        )]
         output: PathBuf,
         /// Output format: native, wav, or pcm
-        #[arg(long, default_value = "native")]
+        #[arg(
+            long,
+            default_value = "native",
+            value_parser = completion_values::voice_formats()
+        )]
         format: String,
         /// Path to native voice decoder command (defaults to TG_VOICE_DECODER or PATH lookup)
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::FilePath)]
         decoder: Option<PathBuf>,
         /// List recent voice messages without exporting
         #[arg(long, conflicts_with_all = ["all", "index", "id"])]
@@ -454,14 +533,28 @@ enum Commands {
     Complete {
         /// Dynamic candidate kind
         kind: CompleteKind,
-        /// Current shell token to match
-        query: Option<String>,
         /// Path to decrypted databases
-        #[arg(long, default_value_os_t = paths::default_decrypted_dir())]
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
         decrypted_dir: PathBuf,
         /// Maximum candidates to return
         #[arg(long, default_value_t = 200)]
         limit: usize,
+        /// Shell requesting word completion
+        #[arg(long, value_enum)]
+        shell: Option<CompletionShell>,
+        /// Active word index reported by the shell
+        #[arg(long)]
+        cursor: Option<usize>,
+        /// Active token prefix reported by the shell
+        #[arg(long, allow_hyphen_values = true)]
+        current: Option<String>,
+        /// Shell words for runtime completion
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        words: Vec<String>,
     },
 }
 
@@ -470,7 +563,7 @@ enum SkillCommands {
     /// Install the local SKILL.md generated from tg's bundled template
     Install {
         /// Skill directory to write; defaults to $CODEX_HOME/skills/tg or ~/.codex/skills/tg
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::DirPath)]
         dir: Option<PathBuf>,
     },
 }
@@ -485,6 +578,7 @@ enum CompletionShell {
 #[derive(Clone, Copy, ValueEnum)]
 enum CompleteKind {
     Sessions,
+    Words,
 }
 
 fn main() {
@@ -1052,13 +1146,23 @@ fn main() {
         }
         Commands::Complete {
             kind,
-            query,
             decrypted_dir,
             limit,
+            shell,
+            cursor,
+            current,
+            words,
         } => {
-            if let Err(e) =
-                completion::print_candidates(kind, &decrypted_dir, limit, query.as_deref())
-            {
+            let request = completion::CompletionRequest {
+                kind,
+                decrypted_dir: &decrypted_dir,
+                limit,
+                shell,
+                cursor,
+                current: current.as_deref(),
+                words: &words,
+            };
+            if let Err(e) = completion::print_candidates(request) {
                 log::error!("Error: {}", e);
                 std::process::exit(1);
             }

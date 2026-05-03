@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -5,12 +6,17 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
+use clap::Arg;
+use clap::Command;
+use clap::CommandFactory;
+use clap::ValueHint;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 
 use crate::contact;
 use crate::db;
 use crate::paths;
+use crate::Cli;
 use crate::CompleteKind;
 use crate::CompletionShell;
 
@@ -21,294 +27,37 @@ const CONTACT_COMPLETION_POOL_FLOOR: usize = 200;
 const CONTACT_COMPLETION_POOL_FACTOR: usize = 8;
 
 const FISH_COMPLETIONS: &str = r#"# tg fish completions
-function __tg_complete_sessions
-    set -l token (commandline -ct)
-    tg __complete sessions -- "$token" 2>/dev/null
+function __tg_complete
+    set -l current (commandline -ct)
+    set -l words (commandline -opc)
+    tg __complete words --shell fish "--current=$current" -- $words 2>/dev/null
 end
 
-function __tg_no_subcommand
-    not __fish_seen_subcommand_from keys decrypt sessions messages search query schema export image voice doctor refresh skill completions help
-end
-
-complete -c tg -f
-complete -c tg -n "__tg_no_subcommand" -a keys -d "Extract local DB keys"
-complete -c tg -n "__tg_no_subcommand" -a decrypt -d "Decrypt local databases"
-complete -c tg -n "__tg_no_subcommand" -a sessions -d "List chat sessions"
-complete -c tg -n "__tg_no_subcommand" -a messages -d "Read a session"
-complete -c tg -n "__tg_no_subcommand" -a search -d "Search messages"
-complete -c tg -n "__tg_no_subcommand" -a query -d "Run structured queries"
-complete -c tg -n "__tg_no_subcommand" -a schema -d "Show query fields"
-complete -c tg -n "__tg_no_subcommand" -a export -d "Export messages"
-complete -c tg -n "__tg_no_subcommand" -a image -d "Export images"
-complete -c tg -n "__tg_no_subcommand" -a voice -d "Export voices"
-complete -c tg -n "__tg_no_subcommand" -a doctor -d "Diagnose setup"
-complete -c tg -n "__tg_no_subcommand" -a refresh -d "Refresh decrypted cache"
-complete -c tg -n "__tg_no_subcommand" -a skill -d "Manage agent skill"
-complete -c tg -n "__tg_no_subcommand" -a completions -d "Generate shell completions"
-complete -c tg -n "__tg_no_subcommand" -a "(__tg_complete_sessions)"
-
-complete -c tg -l decrypted-dir -r -d "Path to decrypted databases"
-complete -c tg -l jobs -r -d "Parallel job count"
-complete -c tg -l limit -r -d "Result limit"
-complete -c tg -l since -r -d "Lower time bound"
-complete -c tg -l all-time -d "Search full history"
-complete -c tg -n "__tg_no_subcommand; or __fish_seen_subcommand_from messages search query export" -l anonymous -d "Use public names"
-
-complete -c tg -n "__fish_seen_subcommand_from messages export image voice doctor sessions" -a "(__tg_complete_sessions)"
-complete -c tg -n "__fish_seen_subcommand_from query" -l session -r -a "(__tg_complete_sessions)" -d "Limit query to one session"
-complete -c tg -n "__fish_seen_subcommand_from completions" -a "fish zsh bash"
-complete -c tg -n "__fish_seen_subcommand_from skill" -a install -d "Install local agent skill"
+complete -c tg -f -a "(__tg_complete)"
 "#;
 
 const ZSH_COMPLETIONS: &str = r#"#compdef tg
 
-_tg_sessions() {
+_tg() {
   local -a candidates
   local value description
-  local token="${PREFIX:-}"
   while IFS=$'\t' read -r value description; do
     [[ -n "$value" ]] && candidates+=("${value}:${description}")
-  done < <(tg __complete sessions -- "$token" 2>/dev/null)
-  _describe 'sessions' candidates
-}
-
-_tg() {
-  local curcontext="$curcontext" state
-  typeset -A opt_args
-  local -a commands
-  commands=(
-    'keys:extract local DB keys'
-    'decrypt:decrypt local databases'
-    'sessions:list chat sessions'
-    'messages:read a session'
-    'search:search messages'
-    'query:run structured queries'
-    'schema:show query fields'
-    'export:export messages'
-    'image:export images'
-    'voice:export voices'
-    'doctor:diagnose setup'
-    'refresh:refresh decrypted cache'
-    'skill:manage agent skill'
-    'completions:generate shell completions'
-  )
-
-  _arguments -C \
-    '(-h --help)'{-h,--help}'[Print help]' \
-    '--decrypted-dir[Path to decrypted databases]:directory:_files -/' \
-    '--jobs[Parallel job count]:jobs:' \
-    '--limit[Result limit]:limit:' \
-    '--since[Lower time bound]:time:' \
-    '--all-time[Search full history]' \
-    '--anonymous[Use group/member public names]' \
-    '--session[Limit query to one session]:session:_tg_sessions' \
-    '1:command:->command' \
-    '*::arg:->arg'
-
-  case "$state" in
-    command)
-      _describe -t commands 'tg command' commands
-      _tg_sessions
-      ;;
-    arg)
-      case "${words[1]}" in
-        messages|export|image|voice|doctor|sessions)
-          _tg_sessions
-          ;;
-        completions)
-          _values 'shell' fish zsh bash
-          ;;
-        skill)
-          _values 'skill command' install
-          ;;
-      esac
-      ;;
-  esac
+  done < <(tg __complete words --shell zsh --cursor "$CURRENT" "--current=${words[CURRENT]}" -- "${words[@]}" 2>/dev/null)
+  _describe -t values 'tg completions' candidates
 }
 
 _tg "$@"
 "#;
 
 const BASH_COMPLETIONS: &str = r#"# tg bash completions
-__tg_complete_words() {
-  local kind="$1"
-  local token="${2-}"
-  tg __complete "$kind" -- "$token" 2>/dev/null | while IFS=$'\t' read -r value _description; do
-    [[ -n "$value" ]] && printf '%s\n' "$value"
-  done
-}
-
-__tg_is_command() {
-  case "$1" in
-    keys|decrypt|sessions|messages|search|query|schema|export|image|voice|doctor|refresh|skill|completions|help)
-      return 0
-      ;;
-  esac
-  return 1
-}
-
-__tg_option_takes_value() {
-  case "$1" in
-    --all-time|--full|--verbose|--keys|--tail|--head|--anonymous|--list|--all|--help|-h)
-      return 1
-      ;;
-    -*)
-      return 0
-      ;;
-  esac
-  return 1
-}
-
-__tg_options_for_command() {
-  case "$1" in
-    messages)
-      printf '%s\n' "--decrypted-dir --limit --offset --search --since --all-time --tail --head --time-bucket --anonymous --jobs --help -h"
-      ;;
-    sessions)
-      printf '%s\n' "--decrypted-dir --top --jobs --help -h"
-      ;;
-    search)
-      printf '%s\n' "--decrypted-dir --limit --since --all-time --anonymous --jobs --help -h"
-      ;;
-    query)
-      printf '%s\n' "--session --decrypted-dir --contains --not --since --all-time --until --limit --offset --order --match-mode --fields --format --max-cell-chars --anonymous --jobs --help -h"
-      ;;
-    schema)
-      printf '%s\n' "--db --decrypted-dir --format --max-cell-chars --jobs --help -h"
-      ;;
-    export)
-      printf '%s\n' "--decrypted-dir --format --output --media-dir --since --limit --all-time --anonymous --jobs --help -h"
-      ;;
-    image)
-      printf '%s\n' "--decrypted-dir --output --list --all --index --id --limit --since --jobs --help -h"
-      ;;
-    voice)
-      printf '%s\n' "--decrypted-dir --output --format --decoder --list --all --index --id --limit --since --sample-rate --jobs --help -h"
-      ;;
-    doctor)
-      printf '%s\n' "--decrypted-dir --jobs --help -h"
-      ;;
-    refresh)
-      printf '%s\n' "--decrypted-dir --keys --jobs --help -h"
-      ;;
-    decrypt)
-      printf '%s\n' "--keys --output --db-dir --full --since --verbose --jobs --help -h"
-      ;;
-    keys)
-      printf '%s\n' "--timeout --help -h"
-      ;;
-    *)
-      printf '%s\n' "--help -h"
-      ;;
-  esac
-}
-
-__tg_effective_subcommand() {
-  local word skip_next=0
-  for word in "${COMP_WORDS[@]:1:$COMP_CWORD-1}"; do
-    if (( skip_next )); then
-      skip_next=0
-      continue
-    fi
-    case "$word" in
-      --)
-        continue
-        ;;
-      --*=*)
-        continue
-        ;;
-      -*)
-        if __tg_option_takes_value "$word"; then
-          skip_next=1
-        fi
-        continue
-        ;;
-      *)
-        if __tg_is_command "$word"; then
-          printf '%s\n' "$word"
-        else
-          printf '%s\n' "messages"
-        fi
-        return 0
-        ;;
-    esac
-  done
-}
-
 _tg() {
-  local cur prev subcommand
+  local cur value description
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
-  prev="${COMP_WORDS[COMP_CWORD-1]}"
-  subcommand="$(__tg_effective_subcommand)"
-
-  case "$prev" in
-    --session)
-      COMPREPLY=( $(compgen -W "$(__tg_complete_words sessions "$cur")" -- "$cur") )
-      return 0
-      ;;
-    --time-bucket)
-      COMPREPLY=( $(compgen -W "1m 1min 1h 1d 1mo 1y full none" -- "$cur") )
-      return 0
-      ;;
-    --format)
-      if [[ "$subcommand" == "voice" ]]; then
-        COMPREPLY=( $(compgen -W "native wav pcm" -- "$cur") )
-      else
-        COMPREPLY=( $(compgen -W "table json txt csv" -- "$cur") )
-      fi
-      return 0
-      ;;
-    --order)
-      COMPREPLY=( $(compgen -W "newest oldest" -- "$cur") )
-      return 0
-      ;;
-    --match-mode)
-      COMPREPLY=( $(compgen -W "all any" -- "$cur") )
-      return 0
-      ;;
-    completions)
-      COMPREPLY=( $(compgen -W "fish zsh bash" -- "$cur") )
-      return 0
-      ;;
-  esac
-
-  if [[ -z "$subcommand" ]]; then
-    if [[ "$cur" == -* ]]; then
-      COMPREPLY=( $(compgen -W "--decrypted-dir --jobs --limit --since --all-time --help -h" -- "$cur") )
-    else
-      COMPREPLY=( $(compgen -W "keys decrypt sessions messages search query schema export image voice doctor refresh skill completions $(__tg_complete_words sessions "$cur")" -- "$cur") )
-    fi
-    return 0
-  fi
-
-  case "$subcommand" in
-    messages)
-      if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "$(__tg_options_for_command messages)" -- "$cur") )
-      else
-        COMPREPLY=( $(compgen -W "$(__tg_complete_words sessions "$cur")" -- "$cur") )
-      fi
-      ;;
-    export|image|voice|doctor|sessions)
-      if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "$(__tg_options_for_command "$subcommand")" -- "$cur") )
-      else
-        COMPREPLY=( $(compgen -W "$(__tg_complete_words sessions "$cur")" -- "$cur") )
-      fi
-      ;;
-    search|query|schema|refresh|decrypt|keys)
-      if [[ "$cur" == -* ]]; then
-        COMPREPLY=( $(compgen -W "$(__tg_options_for_command "$subcommand")" -- "$cur") )
-      fi
-      ;;
-    completions)
-      COMPREPLY=( $(compgen -W "fish zsh bash" -- "$cur") )
-      ;;
-    skill)
-      COMPREPLY=( $(compgen -W "install" -- "$cur") )
-      ;;
-  esac
+  while IFS=$'\t' read -r value description; do
+    [[ -n "$value" ]] && COMPREPLY+=("$value")
+  done < <(tg __complete words --shell bash --cursor "$COMP_CWORD" "--current=$cur" -- "${COMP_WORDS[@]}" 2>/dev/null)
 }
 
 complete -F _tg tg
@@ -318,6 +67,33 @@ complete -F _tg tg
 struct Candidate {
     value: String,
     description: String,
+}
+
+pub(crate) struct CompletionRequest<'a> {
+    pub kind: CompleteKind,
+    pub decrypted_dir: &'a Path,
+    pub limit: usize,
+    pub shell: Option<CompletionShell>,
+    pub cursor: Option<usize>,
+    pub current: Option<&'a str>,
+    pub words: &'a [String],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicKind {
+    Sessions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathKind {
+    Files,
+    Directories,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueCompletion {
+    Dynamic(DynamicKind),
+    Path(PathKind),
 }
 
 pub(crate) fn print_script(shell: CompletionShell) -> Result<(), String> {
@@ -331,15 +107,19 @@ pub(crate) fn print_script(shell: CompletionShell) -> Result<(), String> {
         .map_err(|e| format!("Write completion script: {}", e))
 }
 
-pub(crate) fn print_candidates(
-    kind: CompleteKind,
-    decrypted_dir: &Path,
-    limit: usize,
-    query: Option<&str>,
-) -> Result<(), String> {
-    let candidates = match kind {
-        CompleteKind::Sessions => session_candidates(decrypted_dir, limit, query)?,
+pub(crate) fn print_candidates(request: CompletionRequest<'_>) -> Result<(), String> {
+    let candidates = match request.kind {
+        CompleteKind::Sessions => session_candidates(
+            request.decrypted_dir,
+            request.limit,
+            request.words.first().map(String::as_str),
+        )?,
+        CompleteKind::Words => word_candidates(&request)?,
     };
+    print_candidate_lines(candidates)
+}
+
+fn print_candidate_lines(candidates: Vec<Candidate>) -> Result<(), String> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     for candidate in candidates {
@@ -352,6 +132,503 @@ pub(crate) fn print_candidates(
         .map_err(|e| format!("Write completion candidate: {}", e))?;
     }
     Ok(())
+}
+
+fn word_candidates(request: &CompletionRequest<'_>) -> Result<Vec<Candidate>, String> {
+    let current = request.current.unwrap_or_default();
+    let shell = request.shell.unwrap_or(CompletionShell::Bash);
+    let before = words_before_current(shell, request.cursor, current, request.words);
+    let decrypted_dir = decrypted_dir_from(&before).unwrap_or_else(|| request.decrypted_dir.into());
+    let user_words = strip_program_name(&before);
+
+    if let Some(candidates) = complete_attached_value(current, &user_words, &decrypted_dir)? {
+        return Ok(candidates);
+    }
+    if let Some(candidates) = complete_value_after_previous(current, &user_words, &decrypted_dir)? {
+        return Ok(candidates);
+    }
+
+    let root = Cli::command();
+    let context = command_context(&root, &user_words);
+    let candidates = if current.starts_with('-') {
+        option_candidates(context.command)
+    } else if context.path.is_empty() {
+        root_candidates(&root, current, &decrypted_dir)?
+    } else if context
+        .command
+        .get_subcommands()
+        .any(|command| !command.is_hide_set())
+    {
+        command_candidates(context.command)
+    } else {
+        positional_candidates(&context, &decrypted_dir)?
+    };
+
+    Ok(filter_candidates(candidates, current))
+}
+
+fn words_before_current(
+    shell: CompletionShell,
+    cursor: Option<usize>,
+    current: &str,
+    words: &[String],
+) -> Vec<String> {
+    match shell {
+        CompletionShell::Bash => {
+            let end = cursor.unwrap_or(words.len()).min(words.len());
+            words[..end].to_vec()
+        }
+        CompletionShell::Zsh => {
+            let end = cursor
+                .and_then(|value| value.checked_sub(1))
+                .unwrap_or(words.len())
+                .min(words.len());
+            words[..end].to_vec()
+        }
+        CompletionShell::Fish => {
+            if !current.is_empty() && words.last().is_some_and(|word| word == current) {
+                words[..words.len() - 1].to_vec()
+            } else {
+                words.to_vec()
+            }
+        }
+    }
+}
+
+fn strip_program_name(words: &[String]) -> Vec<String> {
+    if words.first().is_some_and(|word| word == "tg") {
+        words[1..].to_vec()
+    } else {
+        words.to_vec()
+    }
+}
+
+fn decrypted_dir_from(words: &[String]) -> Option<PathBuf> {
+    let mut iter = words.iter().peekable();
+    while let Some(word) = iter.next() {
+        if word == "--decrypted-dir" {
+            return iter.peek().map(|value| PathBuf::from(value.as_str()));
+        }
+        if let Some(value) = word.strip_prefix("--decrypted-dir=") {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
+}
+
+#[derive(Debug)]
+struct CompletionContext<'a> {
+    command: &'a Command,
+    path: Vec<String>,
+    positionals: Vec<String>,
+}
+
+fn command_context<'a>(root: &'a Command, user_words: &[String]) -> CompletionContext<'a> {
+    let mut command = root;
+    let mut path = Vec::new();
+    let mut positionals = Vec::new();
+    let mut expecting_value = false;
+
+    for word in user_words {
+        if expecting_value {
+            expecting_value = false;
+            continue;
+        }
+        if let Some(arg) = long_arg_from_word(command, word) {
+            expecting_value = option_takes_value(arg) && !word.contains('=');
+            continue;
+        }
+        if let Some(arg) = short_arg_from_word(command, word) {
+            expecting_value = option_takes_value(arg);
+            continue;
+        }
+        if word.starts_with('-') {
+            continue;
+        }
+        if let Some(subcommand) = visible_subcommand(command, word) {
+            command = subcommand;
+            path.push(word.clone());
+            positionals.clear();
+            continue;
+        }
+        if path.is_empty() && std::ptr::eq(command, root) {
+            if let Some(default_command) = visible_subcommand(root, "messages") {
+                command = default_command;
+                path.push("messages".to_string());
+                positionals.push(word.clone());
+                continue;
+            }
+        }
+        positionals.push(word.clone());
+    }
+
+    CompletionContext {
+        command,
+        path,
+        positionals,
+    }
+}
+
+fn root_candidates(
+    root: &Command,
+    current: &str,
+    decrypted_dir: &Path,
+) -> Result<Vec<Candidate>, String> {
+    let mut candidates = command_candidates(root);
+    candidates.extend(session_candidates(decrypted_dir, 200, Some(current))?);
+    Ok(candidates)
+}
+
+fn complete_attached_value(
+    current: &str,
+    user_words: &[String],
+    decrypted_dir: &Path,
+) -> Result<Option<Vec<Candidate>>, String> {
+    let Some((option_name, value_prefix)) = current.strip_prefix("--").and_then(|value| {
+        let (name, value) = value.split_once('=')?;
+        Some((name, value))
+    }) else {
+        return Ok(None);
+    };
+
+    let root = Cli::command();
+    let context = command_context(&root, user_words);
+    let Some(arg) = context
+        .command
+        .get_arguments()
+        .find(|arg| !arg.is_hide_set() && arg.get_long() == Some(option_name))
+    else {
+        return Ok(None);
+    };
+    let Some(candidates) =
+        value_candidates_for_arg(arg, &context.path, value_prefix, decrypted_dir)?
+    else {
+        return Ok(None);
+    };
+    let prefix = format!("--{option_name}=");
+    let candidates = candidates
+        .into_iter()
+        .map(|candidate| Candidate {
+            value: format!("{prefix}{}", candidate.value),
+            description: candidate.description,
+        })
+        .collect();
+    Ok(Some(candidates))
+}
+
+fn complete_value_after_previous(
+    current: &str,
+    user_words: &[String],
+    decrypted_dir: &Path,
+) -> Result<Option<Vec<Candidate>>, String> {
+    let Some(previous) = user_words.last() else {
+        return Ok(None);
+    };
+
+    let root = Cli::command();
+    let context = command_context(&root, &user_words[..user_words.len() - 1]);
+    option_from_token(context.command, previous)
+        .map(|arg| value_candidates_for_arg(arg, &context.path, current, decrypted_dir))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn positional_candidates(
+    context: &CompletionContext<'_>,
+    decrypted_dir: &Path,
+) -> Result<Vec<Candidate>, String> {
+    let index = context.positionals.len();
+    if let Some(kind) = positional_dynamic_kind(&context.path, index) {
+        return dynamic_candidates(kind, decrypted_dir, 200, "");
+    }
+    if let Some(arg) = positional_arg(context.command, index) {
+        let values = possible_value_candidates(arg);
+        if !values.is_empty() {
+            return Ok(values);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn positional_dynamic_kind(path: &[String], index: usize) -> Option<DynamicKind> {
+    match path {
+        [command]
+            if matches!(
+                command.as_str(),
+                "messages" | "sessions" | "doctor" | "export" | "image" | "voice"
+            ) && index == 0 =>
+        {
+            Some(DynamicKind::Sessions)
+        }
+        _ => None,
+    }
+}
+
+fn positional_arg(command: &Command, index: usize) -> Option<&Arg> {
+    let positionals = command
+        .get_positionals()
+        .filter(|arg| !arg.is_hide_set())
+        .collect::<Vec<_>>();
+    positionals
+        .get(index)
+        .copied()
+        .or_else(|| positionals.last().copied())
+}
+
+fn value_candidates_for_arg(
+    arg: &Arg,
+    _command_path: &[String],
+    prefix: &str,
+    decrypted_dir: &Path,
+) -> Result<Option<Vec<Candidate>>, String> {
+    if !option_takes_value(arg) {
+        return Ok(None);
+    }
+    if let Some(completion) = arg_value_completion(arg) {
+        return value_candidates(completion, prefix, decrypted_dir).map(Some);
+    }
+    let possible_values = possible_value_candidates(arg);
+    if possible_values.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(filter_candidates(possible_values, prefix)))
+    }
+}
+
+fn arg_value_completion(arg: &Arg) -> Option<ValueCompletion> {
+    if let Some(completion) = value_hint_completion(arg.get_value_hint()) {
+        return Some(completion);
+    }
+
+    let long = arg.get_long()?;
+    match long {
+        "session" => Some(ValueCompletion::Dynamic(DynamicKind::Sessions)),
+        "decrypted-dir" | "output" | "db-dir" | "media-dir" | "dir" => {
+            Some(ValueCompletion::Path(PathKind::Directories))
+        }
+        "keys" | "decoder" => Some(ValueCompletion::Path(PathKind::Files)),
+        _ => None,
+    }
+}
+
+fn value_hint_completion(value_hint: ValueHint) -> Option<ValueCompletion> {
+    match value_hint {
+        ValueHint::FilePath => Some(ValueCompletion::Path(PathKind::Files)),
+        ValueHint::DirPath => Some(ValueCompletion::Path(PathKind::Directories)),
+        _ => None,
+    }
+}
+
+fn value_candidates(
+    completion: ValueCompletion,
+    prefix: &str,
+    decrypted_dir: &Path,
+) -> Result<Vec<Candidate>, String> {
+    let candidates = match completion {
+        ValueCompletion::Dynamic(kind) => dynamic_candidates(kind, decrypted_dir, 200, prefix)?,
+        ValueCompletion::Path(kind) => path_candidates(prefix, kind)?,
+    };
+    Ok(filter_candidates(candidates, prefix))
+}
+
+fn dynamic_candidates(
+    kind: DynamicKind,
+    decrypted_dir: &Path,
+    limit: usize,
+    query: &str,
+) -> Result<Vec<Candidate>, String> {
+    match kind {
+        DynamicKind::Sessions => session_candidates(decrypted_dir, limit, Some(query)),
+    }
+}
+
+fn command_candidates(command: &Command) -> Vec<Candidate> {
+    command
+        .get_subcommands()
+        .filter(|command| !command.is_hide_set())
+        .map(|command| Candidate {
+            value: command.get_name().to_string(),
+            description: command
+                .get_about()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn option_candidates(command: &Command) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    for arg in command.get_arguments().filter(|arg| !arg.is_hide_set()) {
+        let description = arg.get_help().map(ToString::to_string).unwrap_or_default();
+        if let Some(long) = arg.get_long() {
+            candidates.push(Candidate {
+                value: format!("--{long}"),
+                description: description.clone(),
+            });
+        }
+        if let Some(short) = arg.get_short() {
+            candidates.push(Candidate {
+                value: format!("-{short}"),
+                description: description.clone(),
+            });
+        }
+    }
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.value == "--help")
+    {
+        candidates.push(Candidate {
+            value: "--help".to_string(),
+            description: "Print help".to_string(),
+        });
+        candidates.push(Candidate {
+            value: "-h".to_string(),
+            description: "Print help".to_string(),
+        });
+    }
+    if command.get_version().is_some()
+        && !candidates
+            .iter()
+            .any(|candidate| candidate.value == "--version")
+    {
+        candidates.push(Candidate {
+            value: "--version".to_string(),
+            description: "Print version".to_string(),
+        });
+        candidates.push(Candidate {
+            value: "-V".to_string(),
+            description: "Print version".to_string(),
+        });
+    }
+    candidates
+}
+
+fn possible_value_candidates(arg: &Arg) -> Vec<Candidate> {
+    arg.get_possible_values()
+        .into_iter()
+        .filter(|value| !value.is_hide_set())
+        .map(|value| Candidate {
+            value: value.get_name().to_string(),
+            description: value
+                .get_help()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn option_takes_value(arg: &Arg) -> bool {
+    arg.get_action().takes_values()
+}
+
+fn option_from_token<'a>(command: &'a Command, token: &str) -> Option<&'a Arg> {
+    long_arg_from_word(command, token).or_else(|| short_arg_from_word(command, token))
+}
+
+fn long_arg_from_word<'a>(command: &'a Command, word: &str) -> Option<&'a Arg> {
+    let name = word.strip_prefix("--")?.split_once('=').map_or_else(
+        || word.strip_prefix("--").unwrap_or_default(),
+        |(name, _)| name,
+    );
+    command
+        .get_arguments()
+        .find(|arg| !arg.is_hide_set() && arg.get_long() == Some(name))
+}
+
+fn short_arg_from_word<'a>(command: &'a Command, word: &str) -> Option<&'a Arg> {
+    let mut chars = word.strip_prefix('-')?.chars();
+    let short = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    command
+        .get_arguments()
+        .find(|arg| !arg.is_hide_set() && arg.get_short() == Some(short))
+}
+
+fn visible_subcommand<'a>(command: &'a Command, name: &str) -> Option<&'a Command> {
+    command
+        .get_subcommands()
+        .find(|command| !command.is_hide_set() && command.get_name() == name)
+}
+
+fn filter_candidates(candidates: Vec<Candidate>, prefix: &str) -> Vec<Candidate> {
+    let mut unique = BTreeMap::<String, String>::new();
+    for candidate in candidates {
+        if candidate.value.starts_with(prefix) {
+            unique
+                .entry(candidate.value)
+                .or_insert(candidate.description);
+        }
+    }
+    unique
+        .into_iter()
+        .map(|(value, description)| Candidate { value, description })
+        .collect()
+}
+
+fn path_candidates(prefix: &str, kind: PathKind) -> Result<Vec<Candidate>, String> {
+    let (dir_prefix, name_prefix) = split_path_prefix(prefix);
+    let read_dir = expand_tilde(if dir_prefix.is_empty() {
+        "."
+    } else {
+        dir_prefix
+    })?;
+    let Ok(entries) = fs::read_dir(&read_dir) else {
+        return Ok(Vec::new());
+    };
+
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Read path completion entry: {}", e))?;
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !name_prefix.starts_with('.') && file_name.starts_with('.') {
+            continue;
+        }
+        if !file_name.starts_with(name_prefix) {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Read path completion file type: {}", e))?;
+        let is_dir = file_type.is_dir();
+        if kind == PathKind::Directories && !is_dir {
+            continue;
+        }
+        let mut value = format!("{dir_prefix}{file_name}");
+        if is_dir {
+            value.push('/');
+        }
+        candidates.push(Candidate {
+            value,
+            description: if is_dir { "directory" } else { "file" }.to_string(),
+        });
+    }
+    Ok(candidates)
+}
+
+fn split_path_prefix(prefix: &str) -> (&str, &str) {
+    prefix
+        .rfind('/')
+        .map(|index| prefix.split_at(index + 1))
+        .unwrap_or(("", prefix))
+}
+
+fn expand_tilde(path: &str) -> Result<PathBuf, String> {
+    if path == "~" {
+        return std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set".to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set".to_string())?;
+        return Ok(home.join(rest));
+    }
+    Ok(PathBuf::from(path))
 }
 
 fn session_candidates(
@@ -1013,11 +1290,124 @@ mod tests {
     }
 
     #[test]
-    fn shell_completion_scripts_include_anonymous_flag() {
-        assert!(FISH_COMPLETIONS.contains("-l anonymous"));
-        assert!(ZSH_COMPLETIONS.contains("--anonymous["));
-        assert!(BASH_COMPLETIONS.contains("--time-bucket --anonymous"));
-        assert!(!BASH_COMPLETIONS.contains("mapfile"));
+    fn generated_shell_scripts_are_protocol_shims() {
+        for script in [FISH_COMPLETIONS, ZSH_COMPLETIONS, BASH_COMPLETIONS] {
+            assert!(script.contains("__complete words"));
+            assert!(!script.contains("--anonymous"));
+            assert!(!script.contains("--time-bucket"));
+            assert!(!script.contains("messages|"));
+            assert!(!script.contains("keys decrypt"));
+        }
+    }
+
+    #[test]
+    fn root_completion_comes_from_clap_commands() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let candidates = complete(&["tg"], "se", dir.path());
+
+        assert!(candidates.iter().any(|candidate| {
+            candidate.value == "sessions"
+                && candidate.description.starts_with("List all chat sessions")
+        }));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.value == "search"));
+    }
+
+    #[test]
+    fn root_completion_also_includes_default_session_candidates() {
+        let dir = create_decrypted_contacts(&[("tgid_alice", "Alice Zhang", "", "alice")]);
+
+        let candidates = complete(&["tg"], "tgid_a", dir.path());
+
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.value == "tgid_alice"));
+    }
+
+    #[test]
+    fn command_options_come_from_clap_command() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let candidates = complete(&["tg", "messages"], "--ano", dir.path());
+
+        assert!(candidates.iter().any(|candidate| {
+            candidate.value == "--anonymous"
+                && candidate
+                    .description
+                    .starts_with("Use group/member public names")
+        }));
+    }
+
+    #[test]
+    fn default_messages_options_come_from_messages_command() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let candidates = complete(&["tg", "tgid_alice"], "--lim", dir.path());
+
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.value == "--limit"));
+    }
+
+    #[test]
+    fn query_session_option_completes_sessions() {
+        let dir = create_decrypted_contacts(&[("tgid_alice", "Alice Zhang", "", "alice")]);
+
+        let candidates = complete(&["tg", "query", "--session"], "tgid_a", dir.path());
+
+        assert_eq!(
+            candidates,
+            vec![Candidate {
+                value: "tgid_alice".to_string(),
+                description: "Alice Zhang".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn clap_value_enum_positionals_complete_possible_values() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let candidates = complete(&["tg", "completions"], "f", dir.path());
+
+        assert_eq!(
+            candidates,
+            vec![Candidate {
+                value: "fish".to_string(),
+                description: String::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn command_specific_static_values_complete_in_rust_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let candidates = complete(&["tg", "voice", "tgid_alice", "--format"], "w", dir.path());
+
+        assert_eq!(
+            candidates,
+            vec![Candidate {
+                value: "wav".to_string(),
+                description: "WAV output".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn clap_command_carries_completion_metadata() {
+        let root = Cli::command();
+        let messages = visible_subcommand(&root, "messages").unwrap();
+        let time_bucket = long_arg_from_word(messages, "--time-bucket").unwrap();
+        let decrypted_dir = long_arg_from_word(messages, "--decrypted-dir").unwrap();
+
+        assert!(possible_value_candidates(time_bucket).contains(&Candidate {
+            value: "1m".to_string(),
+            description: "One-minute buckets".to_string(),
+        }));
+        assert_eq!(decrypted_dir.get_value_hint(), ValueHint::DirPath);
     }
 
     #[test]
@@ -1072,6 +1462,23 @@ mod tests {
 
         let candidates = session_candidates(dir.path(), 10, Some("新增")).unwrap();
         assert_eq!(candidates[0].value, "tgid_new");
+    }
+
+    fn complete(words: &[&str], current: &str, decrypted_dir: &Path) -> Vec<Candidate> {
+        let words = words
+            .iter()
+            .map(|word| (*word).to_string())
+            .collect::<Vec<_>>();
+        let request = CompletionRequest {
+            kind: CompleteKind::Words,
+            decrypted_dir,
+            limit: 200,
+            shell: Some(CompletionShell::Bash),
+            cursor: Some(words.len()),
+            current: Some(current),
+            words: &words,
+        };
+        word_candidates(&request).unwrap()
     }
 
     fn create_decrypted_contacts(rows: &[(&str, &str, &str, &str)]) -> TempDir {
