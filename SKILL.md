@@ -1,6 +1,7 @@
 ---
 name: tg
 description: Use when the user wants to read, search, inspect, back up, export, or troubleshoot local macOS Telegram chat history with tg. Keep the user's chat data local and guide them through the shortest working tg command flow.
+when_to_use: Trigger for requests mentioning Telegram聊天记录, Telegram聊天, Telegram群, Telegram里, local chat backup, message search, message export, or troubleshooting why local chat history cannot be read.
 ---
 
 # tg
@@ -22,6 +23,7 @@ Do not wait for the user to name tg. tg is the tool; the user goal is local macO
 ## Privacy
 
 Chat data is private. Keep work local by default, avoid printing more message content than the user asked for, and treat exports as sensitive.
+For summary requests, choose display names by the target. If the user clearly names a 1-on-1 person, omit `--anonymous` so the summary uses the user's intended name for that person. If the target is a group chat, a room, a global search, or the target type is unclear, use `--anonymous` whenever the command supports it to avoid exposing personal contact remarks in assistant-visible output and exported sender names.
 `~/.tg/all_keys.json` and `~/.tg/decrypted/` are sensitive local state. `~/.tg/decrypted/.tg_index.db` is a local derived hot index maintained by `tg refresh`; treat it as sensitive and safe to delete if it needs to be rebuilt.
 
 ## First Setup
@@ -42,7 +44,8 @@ Then run:
 sudo tg keys
 tg refresh
 tg sessions --top 50
-tg "联系人或群名" --limit 50
+tg "联系人" --limit 50
+tg "群名" --limit 50 --anonymous
 ```
 
 ## Common Commands
@@ -72,14 +75,15 @@ tg messages "张三" --all-time
 tg messages "张三" --search "关键词"
 tg messages "张三" --head --limit 20
 tg messages "张三" --tail --limit 20
+tg messages "产品讨论群" --limit 100 --anonymous
 ```
 
 Search globally:
 
 ```bash
-tg search "关键词" --limit 50
-tg search "关键词" --since today
-tg search "关键词" --all-time
+tg search "关键词" --limit 50 --anonymous
+tg search "关键词" --since today --anonymous
+tg search "关键词" --all-time --anonymous
 ```
 
 Use structured lookup when the user wants precise filters, multiple keywords,
@@ -87,11 +91,12 @@ excluded words, selected output fields, or JSON lines for a local analysis step.
 This is not a raw SQL interface; pass user intent as filters:
 
 ```bash
-tg query --contains "关键词" --limit 50
+tg query --contains "关键词" --limit 50 --anonymous
 tg query --session "张三" --contains "关键词" --fields time,sender,body --limit 20
-tg query --contains "项目" --contains "上线" --match-mode all --since today
-tg query --contains "项目" --not "已取消" --format json --fields timestamp,session,body
-tg query --contains "项目" --all-time
+tg query --session "产品讨论群" --contains "关键词" --fields time,sender,body --limit 20 --anonymous
+tg query --contains "项目" --contains "上线" --match-mode all --since today --anonymous
+tg query --contains "项目" --not "已取消" --format json --fields timestamp,session,body --anonymous
+tg query --contains "项目" --all-time --anonymous
 tg schema --db message_0
 ```
 
@@ -122,7 +127,7 @@ tg export "张三" --format txt
 tg export "张三" --format csv --since 30d --output exported/zhangsan
 tg export "张三" --format json --limit 1000 --output exported/zhangsan
 tg export "张三" --format json --all-time --output exported/zhangsan
-tg export "张三" --format json --output exported/zhangsan --media-dir exported/zhangsan/media
+tg export "产品讨论群" --format json --output exported/group --media-dir exported/group/media --anonymous
 ```
 
 Export cached images:

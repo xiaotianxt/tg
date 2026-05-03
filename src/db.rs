@@ -126,6 +126,7 @@ pub(crate) struct SearchMessagesOptions<'a> {
     pub limit: usize,
     pub since: Option<i64>,
     pub use_telegram_fts: bool,
+    pub name_mode: DisplayNameMode,
     pub jobs: usize,
 }
 
@@ -921,6 +922,7 @@ pub fn search_messages(
                             has_more,
                             results,
                             &contacts,
+                            options.name_mode,
                         );
                     }
                     Err(e) => log::warn!("Message index search failed; falling back: {}", e),
@@ -938,7 +940,14 @@ pub fn search_messages(
         search_messages_by_scanning(message_dbs, &options)
     };
 
-    print_search_results(options.query, displayed, has_more, results, &contacts)
+    print_search_results(
+        options.query,
+        displayed,
+        has_more,
+        results,
+        &contacts,
+        options.name_mode,
+    )
 }
 
 fn search_messages_with_hot_index(
@@ -1128,6 +1137,7 @@ fn print_search_results(
     has_more: bool,
     results: Vec<SearchRow>,
     contacts: &HashMap<String, Contact>,
+    name_mode: DisplayNameMode,
 ) -> Result<usize, String> {
     if displayed == 0 {
         return Ok(0);
@@ -1154,7 +1164,7 @@ fn print_search_results(
     for (i, (_, create_time, content, table_name)) in display_results.iter().enumerate() {
         let time_str = time::format_local_timestamp(*create_time);
 
-        let display = search_session_display(contacts, table_name);
+        let display = search_session_display(contacts, table_name, name_mode);
 
         let display_content = truncate_preview(content, SEARCH_PREVIEW_CHARS);
 
@@ -1224,14 +1234,18 @@ fn load_fts_name2id(conn: &Connection) -> HashMap<i64, String> {
     }
 }
 
-fn search_session_display(contacts: &HashMap<String, Contact>, session: &str) -> String {
+fn search_session_display(
+    contacts: &HashMap<String, Contact>,
+    session: &str,
+    name_mode: DisplayNameMode,
+) -> String {
     if session.starts_with("Msg_") {
         return find_username_by_table(contacts, session).unwrap_or_else(|| "(?)".to_string());
     }
 
     contacts
         .get(session)
-        .map(|c| c.personal_display_name().to_string())
+        .map(|c| c.display_name(name_mode).to_string())
         .unwrap_or_else(|| session.to_string())
 }
 
@@ -2031,6 +2045,7 @@ mod tests {
                 limit: 20,
                 since: None,
                 use_telegram_fts: true,
+                name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
             },
         )
@@ -2053,6 +2068,7 @@ mod tests {
                 limit: 20,
                 since: None,
                 use_telegram_fts: false,
+                name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
             },
         )
@@ -2075,6 +2091,7 @@ mod tests {
                 limit: 20,
                 since: None,
                 use_telegram_fts: false,
+                name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
             },
         )
@@ -2097,6 +2114,7 @@ mod tests {
                 limit: 20,
                 since: Some(1001),
                 use_telegram_fts: false,
+                name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
             },
         )
@@ -2195,6 +2213,7 @@ mod tests {
                 limit: 20,
                 since: None,
                 use_telegram_fts: true,
+                name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
             },
         )
@@ -2215,6 +2234,7 @@ mod tests {
                 limit: 20,
                 since: None,
                 use_telegram_fts: true,
+                name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
             },
         )
@@ -2234,6 +2254,7 @@ mod tests {
                 limit: 20,
                 since: None,
                 use_telegram_fts: true,
+                name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
             },
         )
@@ -2253,6 +2274,7 @@ mod tests {
                 limit: 20,
                 since: Some(1001),
                 use_telegram_fts: true,
+                name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
             },
         )

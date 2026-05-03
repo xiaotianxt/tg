@@ -82,6 +82,17 @@ mod tests {
     }
 
     #[test]
+    fn render_localizes_skill_trigger_words() {
+        let rendered = render_skill_template(
+            "description: Telegram chat history\nwhen_to_use: Telegram聊天记录, Telegram聊天, Telegram群, Telegram里",
+        );
+
+        assert!(rendered.contains(dictionary::desktop_app_name()));
+        assert!(rendered.contains(dictionary::desktop_app_localized_name()));
+        assert!(!rendered.contains("Telegram"));
+    }
+
+    #[test]
     fn install_writes_rendered_skill_md() {
         let dir = TempDir::new().unwrap();
         let path = install(InstallOptions {

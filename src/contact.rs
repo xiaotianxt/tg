@@ -35,16 +35,6 @@ pub(crate) enum DisplayNameMode {
     Anonymous,
 }
 
-/// Resolve a sender account id into the display name used by the default UI mode.
-pub(crate) fn resolve_sender_name(sender_id: &str, contacts: &HashMap<String, Contact>) -> String {
-    resolve_sender_name_with_mode(
-        sender_id,
-        contacts,
-        DisplayNameMode::PersonalRemark,
-        &HashMap::new(),
-    )
-}
-
 pub(crate) fn resolve_sender_name_with_mode(
     sender_id: &str,
     contacts: &HashMap<String, Contact>,

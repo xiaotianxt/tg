@@ -38,62 +38,13 @@ else
     cp target/release/tg "$BIN_DIR/"
 fi
 
-# --- 配置 Claude Code 技能 ---
+# --- 配置 Claude Code skill ---
 echo ""
-echo "==> 配置 Claude Code 技能..."
+echo "==> 配置 Claude Code skill..."
 CLAUDE_SETTINGS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-mkdir -p "$CLAUDE_SETTINGS_DIR"
-
-# 合并 settings.json（如果已存在）
-SKILL_CONFIG='{
-  "skills": {
-    "tg": {
-      "name": "tg",
-      "prompt": "Telegram聊天记录读取工具 tg 已安装。
-
-可用命令：
-  tg keys              # 提取密钥（需 sudo）
-  tg decrypt            # 解密数据库
-  tg sessions           # 列出会话
-  tg messages <会话名>   # 读取消息（支持 --limit --offset --search）
-  tg search <关键词>     # 全文搜索
-  tg export <会话名>     # 导出（--format txt|csv|json）
-
-工作流程：
-1. 确保Telegram正在运行
-2. sudo tg keys → 提取密钥到 all_keys.json
-3. tg decrypt → 解密到 decrypted/
-4. tg sessions → 查看会话列表
-5. tg messages \"联系人\" → 读消息"
-    }
-  }
-}'
-
-if [[ -f "$CLAUDE_SETTINGS_DIR/settings.json" ]]; then
-    # 使用 python3 合并 JSON（更安全）
-    python3 -c "
-import json
-import sys
-
-with open('$CLAUDE_SETTINGS_DIR/settings.json') as f:
-    existing = json.load(f)
-
-with open('/dev/stdin') as f:
-    new = json.load(f)
-
-# Merge skills
-skills = existing.get('skills', {})
-skills.update(new.get('skills', {}))
-existing['skills'] = skills
-
-with open('$CLAUDE_SETTINGS_DIR/settings.json', 'w') as f:
-    json.dump(existing, f, ensure_ascii=False, indent=2)
-" <<< "$SKILL_CONFIG"
-    echo "已合并到 $CLAUDE_SETTINGS_DIR/settings.json"
-else
-    echo "$SKILL_CONFIG" > "$CLAUDE_SETTINGS_DIR/settings.json"
-    echo "已创建 $CLAUDE_SETTINGS_DIR/settings.json"
-fi
+SKILL_DIR="$CLAUDE_SETTINGS_DIR/skills/tg"
+target/release/tg skill install --dir "$SKILL_DIR"
+echo "已安装 Claude Code skill 到 $SKILL_DIR/SKILL.md"
 
 # --- 完成 ---
 echo ""

@@ -151,6 +151,7 @@ pub(crate) struct QueryOptions<'a> {
     pub fields: QueryFields,
     pub format: QueryOutputFormat,
     pub max_cell_chars: usize,
+    pub name_mode: contact::DisplayNameMode,
     pub jobs: usize,
 }
 
@@ -254,6 +255,10 @@ fn try_run_indexed_messages_with_output<W: Write>(
     options: &QueryOptions<'_>,
     out: &mut output::Output<W>,
 ) -> Result<Option<usize>, String> {
+    if options.name_mode == contact::DisplayNameMode::Anonymous {
+        return Ok(None);
+    }
+
     let Some(since) = options.since else {
         return Ok(None);
     };
@@ -363,7 +368,7 @@ fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryConte
     let mut table_to_display = HashMap::new();
     let mut sender_display = HashMap::new();
     for (username, contact) in &contacts {
-        let display = contact.personal_display_name().to_string();
+        let display = contact.display_name(options.name_mode).to_string();
         table_to_session.insert(db::msg_table_name(username), username.clone());
         table_to_display.insert(db::msg_table_name(username), display.clone());
         sender_display.insert(username.clone(), display);
@@ -1091,6 +1096,7 @@ mod tests {
             fields: QueryFields::parse("timestamp,body").unwrap(),
             format: QueryOutputFormat::Table,
             max_cell_chars: 500,
+            name_mode: contact::DisplayNameMode::PersonalRemark,
             jobs: 1,
         }
     }

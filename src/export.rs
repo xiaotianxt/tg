@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::io::Write;
@@ -87,7 +87,26 @@ pub struct MessageExportConfig<'a> {
     pub media_dir: Option<&'a Path>,
     pub since: Option<i64>,
     pub limit: Option<usize>,
+    pub name_mode: contact::DisplayNameMode,
     pub jobs: usize,
+}
+
+struct MessageDisplayContext<'a> {
+    chat_name: &'a str,
+    contacts: &'a HashMap<String, contact::Contact>,
+    name_mode: contact::DisplayNameMode,
+    room_member_names: &'a HashMap<String, String>,
+}
+
+impl MessageDisplayContext<'_> {
+    fn resolve_sender(&self, id: &str) -> String {
+        contact::resolve_sender_name_with_mode(
+            id,
+            self.contacts,
+            self.name_mode,
+            self.room_member_names,
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -195,6 +214,7 @@ pub fn export_messages(
         media_dir,
         since,
         limit,
+        name_mode,
         jobs,
     } = config;
 
@@ -211,8 +231,21 @@ pub fn export_messages(
         .unwrap_or_default();
     let display_name = contacts
         .get(&username)
-        .map(|c| c.personal_display_name())
+        .map(|c| c.display_name(name_mode))
         .unwrap_or(&username);
+    let room_member_names = if name_mode == contact::DisplayNameMode::Anonymous {
+        contact_db_path
+            .and_then(|p| contact::load_chat_room_member_names(p, &username).ok())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let display_context = MessageDisplayContext {
+        chat_name: display_name,
+        contacts: &contacts,
+        name_mode,
+        room_member_names: &room_member_names,
+    };
 
     // Table name
     let table_name = db::msg_table_name(&username);
@@ -229,8 +262,7 @@ pub fn export_messages(
                 match load_indexed_export_messages(
                     &index,
                     &username,
-                    display_name,
-                    &contacts,
+                    &display_context,
                     since_ts,
                     limit,
                 ) {
@@ -314,10 +346,10 @@ pub fn export_messages(
                 let decoded = message::decode_message(
                     local_type as i32,
                     &content,
-                    display_name,
+                    display_context.chat_name,
                     compression_marker,
                     &packed_info,
-                    |id| contact::resolve_sender_name(id, &contacts),
+                    |id| display_context.resolve_sender(id),
                 );
 
                 messages.push(ExportMessage {
@@ -512,7 +544,7 @@ pub fn export_messages(
     out.line(format_args!(
         "Exported {} messages for {} ({})",
         all_messages.len(),
-        display_name,
+        display_context.chat_name,
         username
     ))?;
     out.flush()?;
@@ -522,8 +554,7 @@ pub fn export_messages(
 fn load_indexed_export_messages(
     index: &message_index::HotIndex,
     username: &str,
-    display_name: &str,
-    contacts: &std::collections::HashMap<String, contact::Contact>,
+    display_context: &MessageDisplayContext<'_>,
     since: i64,
     limit: Option<usize>,
 ) -> Result<Vec<ExportMessage>, String> {
@@ -558,10 +589,10 @@ fn load_indexed_export_messages(
                 let decoded = message::decode_message(
                     local_type as i32,
                     &content,
-                    display_name,
+                    display_context.chat_name,
                     compression_marker,
                     &packed_info,
-                    |id| contact::resolve_sender_name(id, contacts),
+                    |id| display_context.resolve_sender(id),
                 );
                 ExportMessage {
                     time: time::format_local_timestamp(create_time),
@@ -2149,6 +2180,7 @@ mod tests {
             media_dir: None,
             since: None,
             limit: None,
+            name_mode: contact::DisplayNameMode::PersonalRemark,
             jobs: 1,
         })
         .unwrap();
@@ -2170,6 +2202,33 @@ mod tests {
     }
 
     #[test]
+    fn export_messages_anonymous_uses_public_name() {
+        let decrypted = create_export_decrypted_dir();
+        let output = tempdir().unwrap();
+
+        export_messages(MessageExportConfig {
+            decrypted_dir: decrypted.path(),
+            session_query: "tgid_export",
+            format: "json",
+            output_dir: output.path(),
+            media_dir: None,
+            since: None,
+            limit: None,
+            name_mode: contact::DisplayNameMode::Anonymous,
+            jobs: 1,
+        })
+        .unwrap();
+
+        let data: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(output.path().join("chat.json")).unwrap(),
+        )
+        .unwrap();
+        let messages = data.as_array().unwrap();
+        assert_eq!(messages[0]["sender"], "Export Nick");
+        assert_ne!(messages[0]["sender"], "Export Remark");
+    }
+
+    #[test]
     fn export_messages_writes_all_formats_by_default() {
         let decrypted = create_export_decrypted_dir();
         let output = tempdir().unwrap();
@@ -2182,6 +2241,7 @@ mod tests {
             media_dir: None,
             since: None,
             limit: None,
+            name_mode: contact::DisplayNameMode::PersonalRemark,
             jobs: 1,
         })
         .unwrap();
@@ -2213,6 +2273,7 @@ mod tests {
             media_dir: None,
             since: Some(1000),
             limit: Some(1),
+            name_mode: contact::DisplayNameMode::PersonalRemark,
             jobs: 1,
         })
         .unwrap();

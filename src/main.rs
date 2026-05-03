@@ -258,6 +258,9 @@ enum Commands {
         /// Search the full history instead of the default recent window
         #[arg(long)]
         all_time: bool,
+        /// Use public names instead of your contact remarks in output
+        #[arg(long)]
+        anonymous: bool,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
@@ -306,6 +309,9 @@ enum Commands {
         /// Maximum displayed characters per text cell
         #[arg(long, default_value_t = 500)]
         max_cell_chars: usize,
+        /// Use public names instead of your contact remarks in output
+        #[arg(long)]
+        anonymous: bool,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
@@ -353,6 +359,9 @@ enum Commands {
         /// Export the full history instead of the default recent window
         #[arg(long)]
         all_time: bool,
+        /// Use public names instead of your contact remarks in exported messages
+        #[arg(long)]
+        anonymous: bool,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
@@ -685,6 +694,7 @@ fn main() {
             limit,
             since,
             all_time,
+            anonymous,
             jobs,
         } => {
             if limit == 0 {
@@ -721,6 +731,11 @@ fn main() {
                     limit,
                     since: since_ts,
                     use_telegram_fts,
+                    name_mode: if anonymous {
+                        contact::DisplayNameMode::Anonymous
+                    } else {
+                        contact::DisplayNameMode::PersonalRemark
+                    },
                     jobs,
                 },
             ) {
@@ -750,6 +765,7 @@ fn main() {
             fields,
             format,
             max_cell_chars,
+            anonymous,
             jobs,
         } => {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
@@ -820,6 +836,11 @@ fn main() {
                 fields,
                 format,
                 max_cell_chars,
+                name_mode: if anonymous {
+                    contact::DisplayNameMode::Anonymous
+                } else {
+                    contact::DisplayNameMode::PersonalRemark
+                },
                 jobs,
             }) {
                 Ok(0) => print_output(format_args!("No rows returned.")),
@@ -874,6 +895,7 @@ fn main() {
             since,
             limit,
             all_time,
+            anonymous,
             jobs,
         } => {
             let since_ts = match time::parse_since_opt(since.as_deref()) {
@@ -907,6 +929,11 @@ fn main() {
                 media_dir: media_dir.as_deref(),
                 since: since_ts,
                 limit,
+                name_mode: if anonymous {
+                    contact::DisplayNameMode::Anonymous
+                } else {
+                    contact::DisplayNameMode::PersonalRemark
+                },
                 jobs,
             }) {
                 Ok(paths) => {
@@ -1100,6 +1127,33 @@ mod tests {
         match cli.command {
             Commands::Messages { anonymous, .. } => assert!(anonymous),
             _ => panic!("expected messages command"),
+        }
+    }
+
+    #[test]
+    fn content_commands_accept_anonymous_flag() {
+        let cli = Cli::parse_from(args(&["tg", "search", "needle", "--anonymous"]));
+        match cli.command {
+            Commands::Search { anonymous, .. } => assert!(anonymous),
+            _ => panic!("expected search command"),
+        }
+
+        let cli = Cli::parse_from(args(&[
+            "tg",
+            "query",
+            "--contains",
+            "needle",
+            "--anonymous",
+        ]));
+        match cli.command {
+            Commands::Query { anonymous, .. } => assert!(anonymous),
+            _ => panic!("expected query command"),
+        }
+
+        let cli = Cli::parse_from(args(&["tg", "export", "room", "--anonymous"]));
+        match cli.command {
+            Commands::Export { anonymous, .. } => assert!(anonymous),
+            _ => panic!("expected export command"),
         }
     }
 

@@ -52,7 +52,7 @@ complete -c tg -l jobs -r -d "Parallel job count"
 complete -c tg -l limit -r -d "Result limit"
 complete -c tg -l since -r -d "Lower time bound"
 complete -c tg -l all-time -d "Search full history"
-complete -c tg -n "__tg_no_subcommand; or __fish_seen_subcommand_from messages" -l anonymous -d "Use group/member public names"
+complete -c tg -n "__tg_no_subcommand; or __fish_seen_subcommand_from messages search query export" -l anonymous -d "Use public names"
 
 complete -c tg -n "__fish_seen_subcommand_from messages export image voice doctor sessions" -a "(__tg_complete_sessions)"
 complete -c tg -n "__fish_seen_subcommand_from query" -l session -r -a "(__tg_complete_sessions)" -d "Limit query to one session"
@@ -168,16 +168,16 @@ __tg_options_for_command() {
       printf '%s\n' "--decrypted-dir --top --jobs --help -h"
       ;;
     search)
-      printf '%s\n' "--decrypted-dir --limit --since --all-time --jobs --help -h"
+      printf '%s\n' "--decrypted-dir --limit --since --all-time --anonymous --jobs --help -h"
       ;;
     query)
-      printf '%s\n' "--session --decrypted-dir --contains --not --since --all-time --until --limit --offset --order --match-mode --fields --format --max-cell-chars --jobs --help -h"
+      printf '%s\n' "--session --decrypted-dir --contains --not --since --all-time --until --limit --offset --order --match-mode --fields --format --max-cell-chars --anonymous --jobs --help -h"
       ;;
     schema)
       printf '%s\n' "--db --decrypted-dir --format --max-cell-chars --jobs --help -h"
       ;;
     export)
-      printf '%s\n' "--decrypted-dir --format --output --media-dir --since --limit --all-time --jobs --help -h"
+      printf '%s\n' "--decrypted-dir --format --output --media-dir --since --limit --all-time --anonymous --jobs --help -h"
       ;;
     image)
       printf '%s\n' "--decrypted-dir --output --list --all --index --id --limit --since --jobs --help -h"
