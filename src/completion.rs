@@ -30,7 +30,11 @@ const FISH_COMPLETIONS: &str = r#"# tg fish completions
 function __tg_complete
     set -l current (commandline -ct)
     set -l words (commandline -opc)
-    tg __complete words --shell fish "--current=$current" -- $words 2>/dev/null
+    set -l tg_cmd tg
+    if test (count $words) -gt 0
+        set tg_cmd $words[1]
+    end
+    command "$tg_cmd" __complete words --shell fish "--current=$current" -- $words 2>/dev/null
 end
 
 complete -c tg -f -a "(__tg_complete)"
@@ -40,10 +44,11 @@ const ZSH_COMPLETIONS: &str = r#"#compdef tg
 
 _tg() {
   local -a candidates
+  local tg_cmd="${words[1]:-tg}"
   local value description
   while IFS=$'\t' read -r value description; do
     [[ -n "$value" ]] && candidates+=("${value}:${description}")
-  done < <(tg __complete words --shell zsh --cursor "$CURRENT" "--current=${words[CURRENT]}" -- "${words[@]}" 2>/dev/null)
+  done < <("$tg_cmd" __complete words --shell zsh --cursor "$CURRENT" "--current=${words[CURRENT]}" -- "${words[@]}" 2>/dev/null)
   _describe -t values 'tg completions' candidates
 }
 
@@ -52,12 +57,13 @@ _tg "$@"
 
 const BASH_COMPLETIONS: &str = r#"# tg bash completions
 _tg() {
-  local cur value description
+  local cur value description tg_cmd
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
+  tg_cmd="${COMP_WORDS[0]:-tg}"
   while IFS=$'\t' read -r value description; do
     [[ -n "$value" ]] && COMPREPLY+=("$value")
-  done < <(tg __complete words --shell bash --cursor "$COMP_CWORD" "--current=$cur" -- "${COMP_WORDS[@]}" 2>/dev/null)
+  done < <("$tg_cmd" __complete words --shell bash --cursor "$COMP_CWORD" "--current=$cur" -- "${COMP_WORDS[@]}" 2>/dev/null)
 }
 
 complete -F _tg tg
@@ -196,11 +202,15 @@ fn words_before_current(
 }
 
 fn strip_program_name(words: &[String]) -> Vec<String> {
-    if words.first().is_some_and(|word| word == "tg") {
+    if words.first().is_some_and(|word| is_tg_program_name(word)) {
         words[1..].to_vec()
     } else {
         words.to_vec()
     }
+}
+
+fn is_tg_program_name(word: &str) -> bool {
+    Path::new(word).file_name().and_then(|name| name.to_str()) == Some("tg")
 }
 
 fn decrypted_dir_from(words: &[String]) -> Option<PathBuf> {
@@ -1338,6 +1348,20 @@ mod tests {
                     .description
                     .starts_with("Use group/member public names")
         }));
+    }
+
+    #[test]
+    fn path_invoked_command_completion_strips_program_name() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let candidates = complete(&["target/release/tg", "query"], "--se", dir.path());
+
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.value == "--session"));
+        assert!(!candidates
+            .iter()
+            .any(|candidate| candidate.value == "--search"));
     }
 
     #[test]
