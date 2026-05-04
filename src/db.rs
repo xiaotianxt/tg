@@ -1292,6 +1292,15 @@ pub(crate) fn resolve_username_for_messages(
     resolve_username_with_context(query, contact_db, Some(message_dbs), jobs)
 }
 
+pub(crate) fn resolve_username_for_messages_with_contacts(
+    query: &str,
+    contacts: &HashMap<String, Contact>,
+    message_dbs: &[PathBuf],
+    jobs: usize,
+) -> String {
+    resolve_username_from_contacts(query, contacts, Some(message_dbs), jobs)
+}
+
 #[allow(dead_code)]
 pub(crate) fn resolve_username(query: &str, contact_db: Option<&Path>) -> Result<String, String> {
     resolve_username_with_context(query, contact_db, None, 1)
@@ -1323,12 +1332,42 @@ fn resolve_username_with_context(
 
     let contacts = contact::load_contacts(contact_db)?;
 
-    // Try exact username match
-    if let Some(c) = contacts.get(query) {
-        return Ok(c.username.clone());
+    Ok(resolve_username_from_contacts(
+        query,
+        &contacts,
+        message_dbs,
+        jobs,
+    ))
+}
+
+fn resolve_username_from_contacts(
+    query: &str,
+    contacts: &HashMap<String, Contact>,
+    message_dbs: Option<&[PathBuf]>,
+    jobs: usize,
+) -> String {
+    let query = query.trim();
+    if query.is_empty() {
+        return query.to_string();
     }
 
-    let candidates = contact_match_candidates(&contacts, query, message_dbs, jobs);
+    if query.starts_with(dictionary::account_id_prefix())
+        || query.starts_with("gh_")
+        || query.contains("@chatroom")
+    {
+        return query.to_string();
+    }
+
+    // Try exact username match
+    if let Some(c) = contacts.get(query) {
+        return c.username.clone();
+    }
+
+    if let Some(username) = unique_exact_direct_username(contacts, query) {
+        return username;
+    }
+
+    let candidates = contact_match_candidates(contacts, query, message_dbs, jobs);
     if let Some(best) = candidates.first() {
         if candidates.len() > 1 || best.score < EXACT_MATCH_SCORE {
             log::info!(
@@ -1357,12 +1396,12 @@ fn resolve_username_with_context(
                 );
             }
         }
-        return Ok(best.contact.username.clone());
+        return best.contact.username.clone();
     }
 
     // No contact match. Treat the input as a raw username so callers can still
     // read sessions whose contact row is missing.
-    Ok(query.to_string())
+    query.to_string()
 }
 
 const EXACT_MATCH_SCORE: i64 = 400;
@@ -1446,6 +1485,33 @@ fn contact_match_candidates<'a>(
             .then_with(|| a.contact.username.cmp(&b.contact.username))
     });
     candidates
+}
+
+fn unique_exact_direct_username(
+    contacts: &HashMap<String, Contact>,
+    query: &str,
+) -> Option<String> {
+    let mut direct_matches = 0usize;
+    let mut exact_username = None;
+
+    for contact in contacts.values() {
+        let Some(score) = best_contact_score(contact, query) else {
+            continue;
+        };
+        if score.score < DIRECT_MATCH_SCORE_FLOOR {
+            continue;
+        }
+
+        direct_matches += 1;
+        if score.score == EXACT_MATCH_SCORE {
+            exact_username = Some(contact.username.clone());
+        }
+        if direct_matches > 1 {
+            return None;
+        }
+    }
+
+    exact_username
 }
 
 fn best_contact_score(contact: &Contact, query: &str) -> Option<ContactFieldScore> {
@@ -2301,6 +2367,46 @@ mod tests {
             resolve_username_for_messages("田雨坤", Some(&contact_db), &[message_db], 1).unwrap();
 
         assert_eq!(username, "tgid_active");
+    }
+
+    #[test]
+    fn unique_exact_direct_username_accepts_unambiguous_display_name() {
+        let (_contact_dir, contact_db) = create_contact_db(&[
+            ("linux_2025@chatroom", "Linux 俱乐部 #2025", "", ""),
+            ("linux_2026@chatroom", "Linux 俱乐部 #2026🌅", "", ""),
+        ]);
+        let contacts = contact::load_contacts(&contact_db).unwrap();
+
+        let username = unique_exact_direct_username(&contacts, "Linux 俱乐部 #2026🌅");
+
+        assert_eq!(username.as_deref(), Some("linux_2026@chatroom"));
+    }
+
+    #[test]
+    fn unique_exact_direct_username_rejects_other_direct_candidates() {
+        let (_contact_dir, contact_db) = create_contact_db(&[
+            ("tgid_empty", "豆", "", ""),
+            ("tgid_doubao", "豆宝", "", ""),
+            ("tgid_meilidou", "美丽豆", "", ""),
+        ]);
+        let contacts = contact::load_contacts(&contact_db).unwrap();
+
+        let username = unique_exact_direct_username(&contacts, "豆");
+
+        assert_eq!(username, None);
+    }
+
+    #[test]
+    fn unique_exact_direct_username_rejects_duplicate_exact_names() {
+        let (_contact_dir, contact_db) = create_contact_db(&[
+            ("tgid_old", "田雨坤", "", ""),
+            ("tgid_active", "田雨坤", "", ""),
+        ]);
+        let contacts = contact::load_contacts(&contact_db).unwrap();
+
+        let username = unique_exact_direct_username(&contacts, "田雨坤");
+
+        assert_eq!(username, None);
     }
 
     #[test]

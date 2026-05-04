@@ -380,12 +380,21 @@ fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryConte
 
     let selected_table = match options.session {
         Some(session) => {
-            let username = db::resolve_username_for_messages(
-                session,
-                contact_db.as_deref(),
-                &message_dbs,
-                options.jobs,
-            )?;
+            let username = if contacts.is_empty() {
+                db::resolve_username_for_messages(
+                    session,
+                    contact_db.as_deref(),
+                    &message_dbs,
+                    options.jobs,
+                )?
+            } else {
+                db::resolve_username_for_messages_with_contacts(
+                    session,
+                    &contacts,
+                    &message_dbs,
+                    options.jobs,
+                )
+            };
             let table = db::msg_table_name(&username);
             table_to_session
                 .entry(table.clone())
@@ -546,8 +555,28 @@ fn query_indexed_messages(
     index: &message_index::HotIndex,
     options: &QueryOptions<'_>,
 ) -> Result<Vec<MessageRow>, String> {
-    let selected_session = resolve_index_session(options)?;
-    let sender_display = load_sender_display_map(options.decrypted_dir, options.name_mode);
+    let (contact_db, message_dbs) = db::find_decrypted_dbs(options.decrypted_dir);
+    let contacts = contact_db
+        .as_ref()
+        .and_then(|path| contact::load_contacts(path).ok())
+        .unwrap_or_default();
+    let selected_session = match options.session {
+        Some(session) if contacts.is_empty() => db::resolve_username_for_messages(
+            session,
+            contact_db.as_deref(),
+            &message_dbs,
+            options.jobs,
+        )
+        .map(Some)?,
+        Some(session) => Some(db::resolve_username_for_messages_with_contacts(
+            session,
+            &contacts,
+            &message_dbs,
+            options.jobs,
+        )),
+        None => None,
+    };
+    let sender_display = sender_display_map(&contacts, options.name_mode);
     let result_window = message_query_window(options)?;
     let body_col = "body";
     let mut clauses = vec!["create_time > 0".to_string()];
@@ -632,15 +661,6 @@ fn query_indexed_messages(
         .collect())
 }
 
-fn resolve_index_session(options: &QueryOptions<'_>) -> Result<Option<String>, String> {
-    let Some(session) = options.session else {
-        return Ok(None);
-    };
-    let (contact_db, message_dbs) = db::find_decrypted_dbs(options.decrypted_dir);
-    db::resolve_username_for_messages(session, contact_db.as_deref(), &message_dbs, options.jobs)
-        .map(Some)
-}
-
 fn read_message_body(row: &rusqlite::Row<'_>, index: usize, marker: Option<i64>) -> String {
     if marker == Some(4) {
         if let Ok(bytes) = row.get::<_, Vec<u8>>(index) {
@@ -668,24 +688,17 @@ fn display_sender(sender_account: &str, context: &MessageQueryContext) -> String
         .unwrap_or_else(|| sender_account.to_string())
 }
 
-fn load_sender_display_map(
-    decrypted_dir: &Path,
+fn sender_display_map(
+    contacts: &HashMap<String, contact::Contact>,
     name_mode: contact::DisplayNameMode,
 ) -> HashMap<String, String> {
-    let (contact_db, _) = db::find_decrypted_dbs(decrypted_dir);
-    contact_db
-        .as_ref()
-        .and_then(|path| contact::load_contacts(path).ok())
-        .map(|contacts| {
-            contacts
-                .into_iter()
-                .map(|(username, contact)| {
-                    let display = contact.display_name(name_mode).to_string();
-                    (username, display)
-                })
-                .collect()
+    contacts
+        .iter()
+        .map(|(username, contact)| {
+            let display = contact.display_name(name_mode).to_string();
+            (username.clone(), display)
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn decode_query_body(
