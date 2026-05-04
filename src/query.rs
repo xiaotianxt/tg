@@ -83,6 +83,7 @@ enum MessageField {
     Sender,
     Type,
     Body,
+    RawBody,
     Timestamp,
 }
 
@@ -102,10 +103,11 @@ impl QueryFields {
                 "sender" => MessageField::Sender,
                 "type" | "local_type" => MessageField::Type,
                 "body" | "text" => MessageField::Body,
+                "raw_body" | "raw" => MessageField::RawBody,
                 "timestamp" | "create_time" => MessageField::Timestamp,
                 other => {
                     return Err(format!(
-                        "unknown field '{}'; expected time, session, sender, type, body, timestamp",
+                        "unknown field '{}'; expected time, session, sender, type, body, raw_body, timestamp",
                         other
                     ));
                 }
@@ -132,6 +134,7 @@ impl MessageField {
             Self::Sender => "sender",
             Self::Type => "type",
             Self::Body => "body",
+            Self::RawBody => "raw_body",
             Self::Timestamp => "timestamp",
         }
     }
@@ -184,6 +187,7 @@ struct MessageRow {
     local_type: i64,
     create_time: i64,
     body: String,
+    raw_body: String,
 }
 
 struct SchemaRow {
@@ -446,6 +450,11 @@ fn query_message_table(
     let body_col = db::quote_identifier(dictionary::msg_body_column());
     let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
     let sender_col = db::quote_identifier(dictionary::msg_sender_column());
+    let packed_col = if db::table_has_column(conn, table, dictionary::msg_packed_meta_column()) {
+        db::quote_identifier(dictionary::msg_packed_meta_column())
+    } else {
+        "x''".to_string()
+    };
     let quoted_table = db::quote_identifier(table);
     let result_window = message_query_window(options)?;
 
@@ -479,7 +488,7 @@ fn query_message_table(
     }
 
     let sql = format!(
-        "SELECT local_type, create_time, {body_col}, {marker_col}, {sender_col} \
+        "SELECT local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col} \
          FROM {quoted_table} \
          WHERE {where_clause} \
          ORDER BY create_time {order_dir} \
@@ -487,6 +496,7 @@ fn query_message_table(
         body_col = body_col,
         marker_col = marker_col,
         sender_col = sender_col,
+        packed_col = packed_col,
         quoted_table = quoted_table,
         where_clause = clauses.join(" AND "),
         order_dir = options.sort.order_dir(),
@@ -499,20 +509,32 @@ fn query_message_table(
     let mapped = stmt
         .query_map(params_from_iter(params.iter()), |row| {
             let marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
-            let body = read_message_body(row, 2, marker);
+            let raw_body = read_message_body(row, 2, marker);
             let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
             let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
+            let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
+            let session = context
+                .table_to_display
+                .get(table)
+                .cloned()
+                .or_else(|| context.table_to_session.get(table).cloned())
+                .unwrap_or_else(|| table.to_string());
+            let local_type = row.get::<_, Option<i64>>(0)?.unwrap_or(-1);
+            let body = decode_query_body(
+                local_type,
+                &raw_body,
+                marker,
+                &packed_info,
+                &session,
+                &context.sender_display,
+            );
             Ok(MessageRow {
-                session: context
-                    .table_to_display
-                    .get(table)
-                    .cloned()
-                    .or_else(|| context.table_to_session.get(table).cloned())
-                    .unwrap_or_else(|| table.to_string()),
+                session,
                 sender: display_sender(&sender_account, context),
-                local_type: row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
+                local_type,
                 create_time: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
                 body,
+                raw_body,
             })
         })
         .map_err(|e| format!("Message query error in {}: {}", target.label, e))?;
@@ -525,6 +547,7 @@ fn query_indexed_messages(
     options: &QueryOptions<'_>,
 ) -> Result<Vec<MessageRow>, String> {
     let selected_session = resolve_index_session(options)?;
+    let sender_display = load_sender_display_map(options.decrypted_dir, options.name_mode);
     let result_window = message_query_window(options)?;
     let body_col = "body";
     let mut clauses = vec!["create_time > 0".to_string()];
@@ -562,7 +585,7 @@ fn query_indexed_messages(
     }
 
     let sql = format!(
-        "SELECT session_display, sender_display, local_type, create_time, body
+        "SELECT session_display, sender_display, local_type, create_time, body, marker, packed_info
          FROM messages
          WHERE {where_clause}
          ORDER BY create_time {order_dir}
@@ -578,12 +601,26 @@ fn query_indexed_messages(
         .map_err(|e| format!("Prepare indexed query: {}", e))?;
     let mapped = stmt
         .query_map(params_from_iter(params.iter()), |row| {
+            let session = row.get::<_, Option<String>>(0)?.unwrap_or_default();
+            let local_type = row.get::<_, Option<i64>>(2)?.unwrap_or(-1);
+            let raw_body = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+            let marker = row.get::<_, Option<i64>>(5)?;
+            let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
+            let body = decode_query_body(
+                local_type,
+                &raw_body,
+                marker,
+                &packed_info,
+                &session,
+                &sender_display,
+            );
             Ok(MessageRow {
-                session: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                session,
                 sender: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                local_type: row.get::<_, Option<i64>>(2)?.unwrap_or(-1),
+                local_type,
                 create_time: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                body: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                body,
+                raw_body,
             })
         })
         .map_err(|e| format!("Run indexed query: {}", e))?;
@@ -629,6 +666,51 @@ fn display_sender(sender_account: &str, context: &MessageQueryContext) -> String
         .get(sender_account)
         .cloned()
         .unwrap_or_else(|| sender_account.to_string())
+}
+
+fn load_sender_display_map(
+    decrypted_dir: &Path,
+    name_mode: contact::DisplayNameMode,
+) -> HashMap<String, String> {
+    let (contact_db, _) = db::find_decrypted_dbs(decrypted_dir);
+    contact_db
+        .as_ref()
+        .and_then(|path| contact::load_contacts(path).ok())
+        .map(|contacts| {
+            contacts
+                .into_iter()
+                .map(|(username, contact)| {
+                    let display = contact.display_name(name_mode).to_string();
+                    (username, display)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn decode_query_body(
+    local_type: i64,
+    raw_body: &str,
+    marker: Option<i64>,
+    packed_info: &[u8],
+    session_display: &str,
+    sender_display: &HashMap<String, String>,
+) -> String {
+    let local_type = i32::try_from(local_type).unwrap_or(-1);
+    message::decode_message(
+        local_type,
+        raw_body,
+        session_display,
+        marker,
+        packed_info,
+        |id| {
+            sender_display
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| id.to_string())
+        },
+    )
+    .content
 }
 
 fn list_message_tables(conn: &Connection) -> Result<Vec<String>, String> {
@@ -726,6 +808,7 @@ fn message_field_text(row: &MessageRow, field: MessageField) -> String {
         MessageField::Sender => row.sender.clone(),
         MessageField::Type => row.local_type.to_string(),
         MessageField::Body => row.body.clone(),
+        MessageField::RawBody => row.raw_body.clone(),
         MessageField::Timestamp => row.create_time.to_string(),
     }
 }
@@ -794,6 +877,12 @@ fn public_schema_rows(db_target: &str, target_count: usize) -> Vec<SchemaRow> {
             name: "body",
             value: "string".to_string(),
             description: "message text or decoded text payload",
+        },
+        SchemaRow {
+            section: "field",
+            name: "raw_body",
+            value: "string".to_string(),
+            description: "raw message body from the local cache",
         },
         SchemaRow {
             section: "filter",
@@ -1021,6 +1110,7 @@ fn escape_table_cell(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
     use tempfile::{tempdir, TempDir};
 
     fn create_query_test_dir() -> TempDir {
@@ -1029,6 +1119,7 @@ mod tests {
         std::fs::create_dir_all(&message_dir).unwrap();
         let conn = Connection::open(message_dir.join("message_0.db")).unwrap();
         let marker_col = dictionary::msg_compression_marker_column();
+        let packed_col = dictionary::msg_packed_meta_column();
         conn.execute(
             &format!(
                 "CREATE TABLE Msg_test (
@@ -1036,7 +1127,8 @@ mod tests {
                 create_time INTEGER,
                 message_content TEXT,
                 {marker_col} INTEGER,
-                real_sender_id INTEGER
+                real_sender_id INTEGER,
+                {packed_col} BLOB
             )"
             ),
             [],
@@ -1051,24 +1143,24 @@ mod tests {
         .unwrap();
         conn.execute(
             &format!(
-                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id)
-             VALUES (1, 1000, 'before needle after', NULL, 7)"
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+             VALUES (1, 1000, 'before needle after', NULL, 7, x'')"
             ),
             [],
         )
         .unwrap();
         conn.execute(
             &format!(
-                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id)
-             VALUES (1, 1001, 'ordinary update', NULL, 0)"
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+             VALUES (1, 1001, 'ordinary update', NULL, 0, x'')"
             ),
             [],
         )
         .unwrap();
         conn.execute(
             &format!(
-                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id)
-             VALUES (1, 1002, 'literal 100%_match', NULL, 0)"
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+             VALUES (1, 1002, 'literal 100%_match', NULL, 0, x'')"
             ),
             [],
         )
@@ -1128,6 +1220,114 @@ mod tests {
 
         assert_eq!(count, 1);
         assert!(output.contains("before needle after"));
+    }
+
+    #[test]
+    fn message_query_decodes_app_and_image_xml_body() {
+        let dir = create_query_test_dir();
+        let conn = Connection::open(dir.path().join("message/message_0.db")).unwrap();
+        let marker_col = dictionary::msg_compression_marker_column();
+        let packed_col = dictionary::msg_packed_meta_column();
+        let quote_xml = r#"<msg><appmsg><title>回复内容</title><type>57</type><refermsg><type>1</type><displayname>Bob</displayname><content>引用内容</content></refermsg></appmsg></msg>"#;
+        let image_xml =
+            r#"<msg><img aeskey="image-key" cdnthumbwidth="180" cdnthumbheight="153" /></msg>"#;
+        conn.execute(
+            &format!(
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+                 VALUES (49, 1003, ?1, NULL, 7, x'')"
+            ),
+            params![quote_xml],
+        )
+        .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+                 VALUES (3, 1004, ?1, NULL, 7, x'')"
+            ),
+            params![image_xml],
+        )
+        .unwrap();
+        drop(conn);
+
+        let contains = vec!["内容".to_string()];
+        let (count, output) = run_messages_for_test(dir.path(), &contains, &[]).unwrap();
+
+        assert_eq!(count, 1);
+        assert!(output.contains("> Bob: 引用内容\\n 回复内容"));
+        assert!(!output.contains("<appmsg"));
+
+        let contains = vec!["image-key".to_string()];
+        let (count, output) = run_messages_for_test(dir.path(), &contains, &[]).unwrap();
+
+        assert_eq!(count, 1);
+        assert!(output.contains("[img:image-key]"));
+        assert!(!output.contains("<img"));
+    }
+
+    #[test]
+    fn message_query_can_return_raw_body() {
+        let dir = create_query_test_dir();
+        let conn = Connection::open(dir.path().join("message/message_0.db")).unwrap();
+        let marker_col = dictionary::msg_compression_marker_column();
+        let packed_col = dictionary::msg_packed_meta_column();
+        let image_xml = r#"<msg><img aeskey="raw-key" /></msg>"#;
+        conn.execute(
+            &format!(
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+                 VALUES (3, 1003, ?1, NULL, 7, x'')"
+            ),
+            params![image_xml],
+        )
+        .unwrap();
+        drop(conn);
+
+        let contains = vec!["raw-key".to_string()];
+        let mut bytes = Vec::new();
+        let mut out = output::Output::new(&mut bytes);
+        let mut options = default_query_options(dir.path(), &contains, &[]);
+        options.fields = QueryFields::parse("timestamp,body,raw_body").unwrap();
+        let count = run_messages_with_output(options, &mut out).unwrap();
+        out.flush().unwrap();
+        drop(out);
+        let output = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(count, 1);
+        assert!(output.contains("[img:raw-key]"));
+        assert!(output.contains("<msg><img aeskey=\"raw-key\" /></msg>"));
+    }
+
+    #[test]
+    fn message_query_decodes_indexed_xml_body() {
+        let dir = create_query_test_dir();
+        let conn = Connection::open(dir.path().join("message/message_0.db")).unwrap();
+        let marker_col = dictionary::msg_compression_marker_column();
+        let packed_col = dictionary::msg_packed_meta_column();
+        let create_time = crate::time::default_recent_since() + 1;
+        let quote_xml = r#"<msg><appmsg><title>索引回复</title><type>57</type><refermsg><type>1</type><displayname>Bob</displayname><content>索引引用</content></refermsg></appmsg></msg>"#;
+        conn.execute(
+            &format!(
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+                 VALUES (49, ?1, ?2, NULL, 7, x'')"
+            ),
+            params![create_time, quote_xml],
+        )
+        .unwrap();
+        drop(conn);
+        crate::message_index::ensure_recent(dir.path(), 1).unwrap();
+
+        let contains = vec!["索引回复".to_string()];
+        let mut bytes = Vec::new();
+        let mut out = output::Output::new(&mut bytes);
+        let mut options = default_query_options(dir.path(), &contains, &[]);
+        options.since = Some(crate::time::default_recent_since());
+        let count = run_messages_with_output(options, &mut out).unwrap();
+        out.flush().unwrap();
+        drop(out);
+        let output = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(count, 1);
+        assert!(output.contains("> Bob: 索引引用\\n 索引回复"));
+        assert!(!output.contains("<appmsg"));
     }
 
     #[test]
