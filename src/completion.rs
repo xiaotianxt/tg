@@ -990,15 +990,16 @@ fn query_contact_cache(
         return contact_cache_sorted_candidates(conn, limit);
     }
 
-    let direct_rows = query_direct_contact_cache(conn, &normalized_query)?;
+    let pool_limit = contact_completion_pool_limit(limit);
+    let direct_rows = query_prefix_contact_cache(conn, &normalized_query, pool_limit)?;
     let direct_candidates = score_contact_rows(direct_rows, limit, query);
     if !direct_candidates.is_empty() {
         return Ok(direct_candidates);
     }
 
-    let grams = completion_grams(&normalized_query);
+    let grams = query_completion_grams(&normalized_query);
     if grams.is_empty() {
-        return query_contact_cache_full_scan(conn, limit, query);
+        return Ok(Vec::new());
     }
 
     let placeholders = (1..=grams.len())
@@ -1006,9 +1007,6 @@ fn query_contact_cache(
         .collect::<Vec<_>>()
         .join(", ");
     let limit_index = grams.len() + 1;
-    let pool_limit = limit
-        .saturating_mul(CONTACT_COMPLETION_POOL_FACTOR)
-        .max(CONTACT_COMPLETION_POOL_FLOOR);
     let sql = format!(
         "SELECT c.id, c.username, c.display, c.remark, c.nick_name, c.alias, c.sort_key, c.is_stranger
          FROM contact_completion_grams g
@@ -1030,45 +1028,40 @@ fn query_contact_cache(
         .map_err(|e| format!("Read contact completion cache rows: {}", e))?
         .filter_map(|row| row.ok())
         .collect::<Vec<_>>();
-    let candidates = score_contact_rows(rows, limit, query);
-    if candidates.is_empty() {
-        query_contact_cache_full_scan(conn, limit, query)
-    } else {
-        Ok(candidates)
-    }
+    Ok(score_contact_rows(rows, limit, query))
 }
 
-fn query_direct_contact_cache(
+fn query_prefix_contact_cache(
     conn: &Connection,
     normalized_query: &str,
+    pool_limit: usize,
 ) -> Result<Vec<ContactCompletionRow>, String> {
-    let contains_pattern = like_contains_pattern(normalized_query);
-    let prefix_pattern = like_prefix_pattern(normalized_query);
+    let upper_bound = completion_prefix_upper_bound(normalized_query);
     let mut stmt = conn
         .prepare(
             "SELECT c.id, c.username, c.display, c.remark, c.nick_name, c.alias, c.sort_key, c.is_stranger
              FROM contact_completion_fields f
              JOIN contact_completion_contacts c ON c.id = f.contact_id
-             WHERE f.normalized_value LIKE ?1 ESCAPE '\\'
+             WHERE f.normalized_value >= ?1 AND f.normalized_value < ?2
              GROUP BY c.id
              ORDER BY
                  MIN(CASE
-                     WHEN f.normalized_value = ?2 THEN 0
-                     WHEN f.normalized_value LIKE ?3 ESCAPE '\\' THEN 1
-                     ELSE 2
+                     WHEN f.normalized_value = ?1 THEN 0
+                     ELSE 1
                  END),
                  MIN(f.field_priority) ASC,
                  MIN(f.field_len) ASC,
                  c.sort_key ASC,
-                 c.username ASC",
+                 c.username ASC
+             LIMIT ?3",
         )
-        .map_err(|e| format!("Prepare direct contact completion query: {}", e))?;
+        .map_err(|e| format!("Prepare prefix contact completion query: {}", e))?;
     let rows = stmt
         .query_map(
-            params![contains_pattern, normalized_query, prefix_pattern],
+            params![normalized_query, upper_bound, pool_limit as i64],
             contact_row_from_sql,
         )
-        .map_err(|e| format!("Read direct contact completion rows: {}", e))?;
+        .map_err(|e| format!("Read prefix contact completion rows: {}", e))?;
     Ok(rows.filter_map(|row| row.ok()).collect())
 }
 
@@ -1091,25 +1084,6 @@ fn contact_cache_sorted_candidates(
         .filter_map(|row| row.ok())
         .map(ContactCompletionRow::candidate)
         .collect())
-}
-
-fn query_contact_cache_full_scan(
-    conn: &Connection,
-    limit: usize,
-    query: &str,
-) -> Result<Vec<Candidate>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, username, display, remark, nick_name, alias, sort_key, is_stranger
-             FROM contact_completion_contacts",
-        )
-        .map_err(|e| format!("Prepare contact completion full scan: {}", e))?;
-    let rows = stmt
-        .query_map([], contact_row_from_sql)
-        .map_err(|e| format!("Read contact completion full scan rows: {}", e))?
-        .filter_map(|row| row.ok())
-        .collect::<Vec<_>>();
-    Ok(score_contact_rows(rows, limit, query))
 }
 
 fn contact_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContactCompletionRow> {
@@ -1212,6 +1186,29 @@ fn completion_grams(value: &str) -> Vec<String> {
     grams
 }
 
+fn query_completion_grams(value: &str) -> Vec<String> {
+    let chars = value.chars().collect::<Vec<_>>();
+    let mut grams = Vec::new();
+    let mut seen = HashSet::new();
+    if chars.len() < 2 {
+        for ch in chars {
+            let gram = ch.to_string();
+            if seen.insert(gram.clone()) {
+                grams.push(gram);
+            }
+        }
+        return grams;
+    }
+
+    for window in chars.windows(2) {
+        let gram = window.iter().collect::<String>();
+        if seen.insert(gram.clone()) {
+            grams.push(gram);
+        }
+    }
+    grams
+}
+
 fn normalize_completion_text(value: &str) -> String {
     value
         .trim()
@@ -1221,23 +1218,17 @@ fn normalize_completion_text(value: &str) -> String {
         .collect()
 }
 
-fn like_contains_pattern(value: &str) -> String {
-    format!("%{}%", escape_like_pattern(value))
+fn completion_prefix_upper_bound(prefix: &str) -> String {
+    let mut upper_bound = String::with_capacity(prefix.len() + 4);
+    upper_bound.push_str(prefix);
+    upper_bound.push(char::MAX);
+    upper_bound
 }
 
-fn like_prefix_pattern(value: &str) -> String {
-    format!("{}%", escape_like_pattern(value))
-}
-
-fn escape_like_pattern(value: &str) -> String {
-    let mut escaped = String::new();
-    for ch in value.chars() {
-        if matches!(ch, '%' | '_' | '\\') {
-            escaped.push('\\');
-        }
-        escaped.push(ch);
-    }
-    escaped
+fn contact_completion_pool_limit(limit: usize) -> usize {
+    limit
+        .saturating_mul(CONTACT_COMPLETION_POOL_FACTOR)
+        .max(CONTACT_COMPLETION_POOL_FLOOR)
 }
 
 fn contact_db_signature(path: &Path) -> Option<String> {
@@ -1465,6 +1456,15 @@ mod tests {
 
         assert_eq!(candidates[0].value, "tgid_real_name");
         assert_eq!(candidates[0].description, "某个备注 (真名测试)");
+    }
+
+    #[test]
+    fn session_completion_keeps_fuzzy_match_through_gram_cache() {
+        let dir = create_decrypted_contacts(&[("tgid_alice", "Alice Zhang", "", "alice")]);
+
+        let candidates = session_candidates(dir.path(), 10, Some("Alic Zhang")).unwrap();
+
+        assert_eq!(candidates[0].value, "tgid_alice");
     }
 
     #[test]
