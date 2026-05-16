@@ -156,21 +156,27 @@ fn word_candidates(request: &CompletionRequest<'_>) -> Result<Vec<Candidate>, St
 
     let root = Cli::command();
     let context = command_context(&root, &user_words);
-    let candidates = if current.starts_with('-') {
-        option_candidates(context.command)
-    } else if context.path.is_empty() {
-        root_candidates(&root, current, &decrypted_dir)?
-    } else if context
+    if current.starts_with('-') {
+        return Ok(filter_candidates(
+            option_candidates(context.command),
+            current,
+        ));
+    }
+    if context.path.is_empty() {
+        return root_candidates(&root, current, &decrypted_dir);
+    }
+    if context
         .command
         .get_subcommands()
         .any(|command| !command.is_hide_set())
     {
-        command_candidates(context.command)
-    } else {
-        positional_candidates(&context, &decrypted_dir)?
-    };
+        return Ok(filter_candidates(
+            command_candidates(context.command),
+            current,
+        ));
+    }
 
-    Ok(filter_candidates(candidates, current))
+    positional_candidates(&context, current, &decrypted_dir)
 }
 
 fn words_before_current(
@@ -284,7 +290,7 @@ fn root_candidates(
     current: &str,
     decrypted_dir: &Path,
 ) -> Result<Vec<Candidate>, String> {
-    let mut candidates = command_candidates(root);
+    let mut candidates = filter_candidates(command_candidates(root), current);
     candidates.extend(session_candidates(decrypted_dir, 200, Some(current))?);
     Ok(candidates)
 }
@@ -345,16 +351,17 @@ fn complete_value_after_previous(
 
 fn positional_candidates(
     context: &CompletionContext<'_>,
+    current: &str,
     decrypted_dir: &Path,
 ) -> Result<Vec<Candidate>, String> {
     let index = context.positionals.len();
     if let Some(kind) = positional_dynamic_kind(&context.path, index) {
-        return dynamic_candidates(kind, decrypted_dir, 200, "");
+        return dynamic_candidates(kind, decrypted_dir, 200, current);
     }
     if let Some(arg) = positional_arg(context.command, index) {
         let values = possible_value_candidates(arg);
         if !values.is_empty() {
-            return Ok(values);
+            return Ok(filter_candidates(values, current));
         }
     }
     Ok(Vec::new())
@@ -441,11 +448,13 @@ fn value_candidates(
     prefix: &str,
     decrypted_dir: &Path,
 ) -> Result<Vec<Candidate>, String> {
-    let candidates = match completion {
-        ValueCompletion::Dynamic(kind) => dynamic_candidates(kind, decrypted_dir, 200, prefix)?,
-        ValueCompletion::Path(kind) => path_candidates(prefix, kind)?,
-    };
-    Ok(filter_candidates(candidates, prefix))
+    match completion {
+        ValueCompletion::Dynamic(kind) => dynamic_candidates(kind, decrypted_dir, 200, prefix),
+        ValueCompletion::Path(kind) => {
+            let candidates = path_candidates(prefix, kind)?;
+            Ok(filter_candidates(candidates, prefix))
+        }
+    }
 }
 
 fn dynamic_candidates(
@@ -1332,6 +1341,23 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|candidate| candidate.value == "tgid_alice"));
+    }
+
+    #[test]
+    fn dynamic_session_completion_matches_display_not_only_value_prefix() {
+        let dir = create_decrypted_contacts(&[("45573543064@chatroom", "Linux Club", "", "")]);
+
+        for (words, current) in [
+            (vec!["tg"], "Linu"),
+            (vec!["tg", "messages"], "Linu"),
+            (vec!["tg", "query", "--session"], "Linu"),
+        ] {
+            let candidates = complete(&words, current, dir.path());
+
+            assert!(candidates.iter().any(|candidate| {
+                candidate.value == "45573543064@chatroom" && candidate.description == "Linux Club"
+            }));
+        }
     }
 
     #[test]
