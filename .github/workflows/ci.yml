@@ -10,26 +10,63 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    runs-on: macos-latest
+  fmt:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          components: rustfmt, clippy
-
-      - name: Verify arm64 runner
-        run: test "$(uname -m)" = "arm64"
+          components: rustfmt
 
       - name: Format
         run: cargo fmt --all -- --check
+
+  build:
+    needs: fmt
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-latest
+            uname: arm64
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+            uname: x86_64
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            uname: aarch64
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+
+      - name: Install Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libsqlite3-dev \
+            pkg-config
+
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = "${{ matrix.uname }}"
 
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --bin tg
 
       - name: Test
         run: cargo test --all-features

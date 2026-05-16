@@ -1,6 +1,6 @@
 # tg
 
-tg 是一个 macOS 本地 Telegram 聊天记录读取 CLI。它把本机 Telegram 桌面版的聊天数据整理成几个直接的命令：读一个会话、全局搜索、结构化检索、导出聊天和导出本地缓存媒体。
+tg 是一个 macOS/Linux 本地 Telegram 聊天记录读取 CLI。它把本机 Telegram 桌面版的聊天数据整理成几个直接的命令：读一个会话、全局搜索、结构化检索、导出聊天和导出本地缓存媒体。
 
 底层的密钥提取、数据库解密和索引维护仍然可控，但日常使用不需要反复关心这些步骤。`tg refresh` 负责刷新本地解密缓存和近期消息索引；`messages`、`search`、`query`、`export` 会在读取前尽量静默刷新，失败时继续使用已有缓存并给出诊断线索。
 
@@ -87,6 +87,7 @@ exported/voices/123456789_chatroom_Voice_34_0001_123.voice
 ```bash
 tg "张三" --limit 50
 tg "产品讨论群" --since today
+tg unread
 tg search "关键词"
 tg query --session "产品讨论群" --contains "项目" --not "取消" --fields time,sender,body
 tg export "张三" --format json --output exported/zhangsan
@@ -111,10 +112,11 @@ tg refresh
 
 | 类别 | 当前支持 |
 | --- | --- |
-| 系统 | macOS，本机 Telegram 桌面版的本地数据 |
-| Telegram 版本 | 主要面向 macOS Telegram 4.x；Telegram 升级后如果数据库结构变化，可能需要跟进适配 |
+| 系统 | macOS arm64、Linux x86_64、Linux arm64，本机 Telegram 桌面版的本地数据 |
+| Telegram 版本 | 主要面向 Telegram 4.x 桌面版；Telegram 升级后如果数据库结构变化，可能需要跟进适配 |
 | Telegram 数据 | 本机 `db_storage` 中的聊天数据库；无需手机备份 |
 | 会话匹配 | 联系人显示名、备注、别名、`tgid_...`、群 ID |
+| 未读 | `sessions` 显示未读数；`unread` 只列有未读消息的会话 |
 | 消息读取 | 文本、群聊发送者、系统提示、撤回提示、引用、链接、小程序、聊天记录卡片展开、位置、文件卡片、图片/视频/语音/表情的可读摘要 |
 | 搜索 | 全局关键词搜索，单个会话内关键词搜索，结构化检索；支持包含词、排除词、时间范围、字段选择和 JSON 行输出 |
 | 导出 | `txt`、`csv`、`json` |
@@ -141,9 +143,11 @@ brew install xiaotianxt/tap/tg
 tg --version
 ```
 
+Homebrew formula 会按当前系统选择 release asset：macOS Apple Silicon 使用 `darwin-arm64`，Linux 使用 `linux-x86_64` 或 `linux-arm64`。
+
 ### 源码安装
 
-需要 Rust 工具链和 Xcode Command Line Tools。
+需要 Rust 工具链。macOS 还需要 Xcode Command Line Tools；Linux 需要 C 编译器、`pkg-config` 和 SQLite 开发包。
 
 ```bash
 git clone https://github.com/xiaotianxt/tg.git
@@ -171,7 +175,7 @@ tg completions bash > ~/.local/share/bash-completion/completions/tg
 `~/.tg/decrypted/.tg_index.db` 或 contact cache，不会触发解密、刷新或读取在线服务。
 release formula 会为 Homebrew 用户自动安装这些 completions。
 
-如果没有 C 编译器：
+如果 macOS 没有 C 编译器：
 
 ```bash
 xcode-select --install
@@ -179,7 +183,7 @@ xcode-select --install
 
 ## 第一次使用
 
-1. 打开并登录 macOS Telegram。
+1. 打开并登录本机 Telegram 桌面版。
 2. 提取数据库密钥：
 
    ```bash
@@ -219,15 +223,17 @@ tg export "联系人或群名" --format json
 
 `search`、`query`、`export` 默认只看最近 365 天，这是大多数查询和导出的热路径。需要全量历史时加 `--all-time`；需要更窄窗口时加 `--since today`、`--since 30d` 或具体日期。
 
-`sessions` 会优先用轻量会话缓存列出最近活跃会话和未读数，不需要扫描 numbered message 数据库。`search`、`query`、`schema`、`export` 在读取前会尝试静默增量刷新 `~/.tg/decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
+`sessions` 和 `unread` 会优先用轻量会话缓存列出最近活跃会话和未读数，不需要扫描 numbered message 数据库。`search`、`query`、`schema`、`export` 在读取前会尝试静默增量刷新 `~/.tg/decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
 
-如果 `sudo tg keys` 遇到 `task_for_pid failed` 或权限问题，退出 Telegram 后重新签名一次：
+macOS 上如果 `sudo tg keys` 遇到 `task_for_pid failed` 或权限问题，退出 Telegram 后重新签名一次：
 
 ```bash
 sudo codesign --force --deep --sign - /Applications/Telegram.app
 ```
 
 如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径。重新打开 Telegram 后再运行 `sudo tg keys` 或 `tg refresh --keys`。
+
+Linux 上需要保持桌面客户端打开；如果普通用户无法读取进程内存，直接运行 `sudo tg keys`。
 
 ## 常用命令
 
@@ -256,6 +262,9 @@ tg decrypt --db-dir "/path/to/your/db_storage"
 tg sessions
 tg sessions "张三"
 tg sessions --top 50
+tg unread
+tg unread "张三"
+tg unread --top 50
 ```
 
 读取消息：
@@ -511,13 +520,13 @@ scripts/perf_regression.sh --baseline v1.4.2 --candidate WORKTREE --session "张
 
 项目入口是 `src/main.rs`。主要模块：
 
-- `src/scanner.rs`：运行内嵌的 macOS 密钥扫描器。
+- `src/scanner.rs`：运行内嵌的 macOS/Linux 密钥扫描器。
 - `src/decrypt.rs`：数据库解密。
 - `src/db.rs`：会话、联系人和消息查询。
 - `src/message.rs`：消息类型解析。
 - `src/media*.rs`：媒体元信息、缓存查找和解密。
 - `src/export.rs`：导出。
-- `vendor/find_all_keys_macos.c`：链接进 `tg` 的 macOS Telegram 进程扫描器。
+- `vendor/find_all_keys_macos.c`：链接进 `tg` 的 macOS Telegram 进程扫描器；Linux 扫描器在 Rust 窄适配层里实现。
 
 面向 AI/自动化助手的能力说明见 [SKILL.md](SKILL.md)。
 

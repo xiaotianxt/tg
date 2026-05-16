@@ -365,7 +365,14 @@ fn positional_dynamic_kind(path: &[String], index: usize) -> Option<DynamicKind>
         [command]
             if matches!(
                 command.as_str(),
-                "messages" | "sessions" | "doctor" | "export" | "image" | "file" | "voice"
+                "messages"
+                    | "sessions"
+                    | "unread"
+                    | "doctor"
+                    | "export"
+                    | "image"
+                    | "file"
+                    | "voice"
             ) && index == 0 =>
         {
             Some(DynamicKind::Sessions)

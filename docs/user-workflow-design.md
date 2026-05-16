@@ -26,6 +26,7 @@ Lower-level steps such as key extraction and database decryption remain availabl
 
 - `tg sessions`: list recently active chats and unread counts.
 - `tg sessions "<name>"`: narrow session discovery without reading messages.
+- `tg unread`: list only chats with unread messages using the lightweight session cache.
 
 ### Maintenance
 

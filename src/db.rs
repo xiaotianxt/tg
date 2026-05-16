@@ -135,6 +135,35 @@ pub(crate) struct SessionProbe {
     pub message_count: usize,
 }
 
+#[derive(Clone, Copy)]
+enum SessionDbListMode {
+    All,
+    Unread,
+}
+
+impl SessionDbListMode {
+    fn where_clause(self) -> &'static str {
+        match self {
+            Self::All => {
+                "WHERE COALESCE(last_timestamp, 0) > 0
+                    OR COALESCE(sort_timestamp, 0) > 0"
+            }
+            Self::Unread => {
+                "WHERE COALESCE(unread_count, 0) > 0
+                   AND (COALESCE(last_timestamp, 0) > 0
+                        OR COALESCE(sort_timestamp, 0) > 0)"
+            }
+        }
+    }
+
+    fn total_label(self) -> &'static str {
+        match self {
+            Self::All => "sessions",
+            Self::Unread => "unread sessions",
+        }
+    }
+}
+
 pub(crate) struct SearchMessagesOptions<'a> {
     pub query: &'a str,
     pub limit: usize,
@@ -245,7 +274,13 @@ pub fn list_sessions(
     };
 
     if let Some(session_db) = find_decrypted_session_db(decrypted_dir) {
-        match list_sessions_from_session_db(&session_db, &contacts, top_n, query) {
+        match list_sessions_from_session_db(
+            &session_db,
+            &contacts,
+            top_n,
+            query,
+            SessionDbListMode::All,
+        ) {
             Ok(Some(sessions)) => return Ok(sessions),
             Ok(None) => {}
             Err(e) => log::warn!(
@@ -447,24 +482,54 @@ pub fn list_sessions(
     Ok(result)
 }
 
+/// List unread chat sessions from the session database.
+pub fn list_unread_sessions(
+    decrypted_dir: &Path,
+    top_n: usize,
+    query: Option<&str>,
+) -> Result<SessionListRows, String> {
+    let contact_db = find_decrypted_contact_db(decrypted_dir);
+    let contacts = match &contact_db {
+        Some(path) => contact::load_contacts(path).unwrap_or_default(),
+        None => HashMap::new(),
+    };
+
+    let Some(session_db) = find_decrypted_session_db(decrypted_dir) else {
+        return Ok(Vec::new());
+    };
+
+    match list_sessions_from_session_db(
+        &session_db,
+        &contacts,
+        top_n,
+        query,
+        SessionDbListMode::Unread,
+    )? {
+        Some(sessions) => Ok(sessions),
+        None => Ok(Vec::new()),
+    }
+}
+
 fn list_sessions_from_session_db(
     session_db: &Path,
     contacts: &HashMap<String, Contact>,
     top_n: usize,
     query: Option<&str>,
+    mode: SessionDbListMode,
 ) -> Result<Option<SessionListRows>, String> {
     let conn = Connection::open(session_db)
         .map_err(|e| format!("Cannot open session DB {}: {}", session_db.display(), e))?;
+    let sql = format!(
+        "SELECT username,
+                COALESCE(unread_count, 0),
+                COALESCE(last_timestamp, 0),
+                COALESCE(sort_timestamp, 0)
+         FROM SessionTable
+         {}",
+        mode.where_clause()
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT username,
-                    COALESCE(unread_count, 0),
-                    COALESCE(last_timestamp, 0),
-                    COALESCE(sort_timestamp, 0)
-             FROM SessionTable
-             WHERE COALESCE(last_timestamp, 0) > 0
-                OR COALESCE(sort_timestamp, 0) > 0",
-        )
+        .prepare(&sql)
         .map_err(|e| format!("Prepare session list: {}", e))?;
 
     let rows = stmt
@@ -503,7 +568,7 @@ fn list_sessions_from_session_db(
         })
         .collect::<Vec<_>>();
 
-    if entries.is_empty() {
+    if entries.is_empty() && matches!(mode, SessionDbListMode::All) {
         return Ok(None);
     }
 
@@ -584,11 +649,17 @@ fn list_sessions_from_session_db(
     out.blank_line()?;
     if query.is_some() {
         out.line(format_args!(
-            "Matched: {} of {} sessions",
-            matched_sessions, total_sessions
+            "Matched: {} of {} {}",
+            matched_sessions,
+            total_sessions,
+            mode.total_label()
         ))?;
     } else {
-        out.line(format_args!("Total: {} sessions", total_sessions))?;
+        out.line(format_args!(
+            "Total: {} {}",
+            total_sessions,
+            mode.total_label()
+        ))?;
     }
     out.flush()?;
     Ok(Some(result))
@@ -2364,6 +2435,42 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].0, "tgid_alice");
+        assert_eq!(sessions[0].3, "Alice Zhang");
+    }
+
+    #[test]
+    fn list_unread_sessions_returns_only_unread_from_session_db() {
+        let dir = create_decrypted_dir_with_session_table(
+            &[
+                ("tgid_read", "Read Nick", "", ""),
+                ("tgid_unread", "Unread Nick", "", ""),
+            ],
+            &[("tgid_read", 0, 2000, 2000), ("tgid_unread", 2, 1000, 3000)],
+        );
+
+        let sessions = list_unread_sessions(dir.path(), 10, None).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0, "tgid_unread");
+        assert_eq!(sessions[0].1, 2);
+        assert_eq!(sessions[0].3, "Unread Nick");
+    }
+
+    #[test]
+    fn list_unread_sessions_filters_by_query() {
+        let dir = create_decrypted_dir_with_session_table(
+            &[
+                ("tgid_alice", "Alice Zhang", "", ""),
+                ("tgid_bob", "Bob Lee", "", ""),
+            ],
+            &[("tgid_alice", 4, 1000, 1000), ("tgid_bob", 1, 2000, 2000)],
+        );
+
+        let sessions = list_unread_sessions(dir.path(), 10, Some("Alic Zhang")).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0, "tgid_alice");
+        assert_eq!(sessions[0].1, 4);
         assert_eq!(sessions[0].3, "Alice Zhang");
     }
 

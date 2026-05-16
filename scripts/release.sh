@@ -18,7 +18,8 @@ usage() {
 Usage: scripts/release.sh [options]
 
 Create a tg release, bumping Cargo.toml when needed, wait for GitHub
-Actions to publish the arm64 artifact, update the Homebrew tap, and verify brew.
+Actions to publish macOS and Linux artifacts, update the Homebrew tap,
+and verify brew.
 
 Options:
   --bump LEVEL         Bump level when current version is already tagged on
@@ -168,6 +169,34 @@ tag_commit() {
   printf '%s' "$sha"
 }
 
+release_asset_sha() {
+  local tag="$1"
+  local asset_name="$2"
+  local asset_sha
+
+  asset_sha="$(
+    gh release view "$tag" \
+      --repo "$REPO_SLUG" \
+      --json assets \
+      --jq ".assets[] | select(.name == \"${asset_name}\") | .digest // empty"
+  )"
+  if [[ "$asset_sha" == sha256:* ]]; then
+    asset_sha="${asset_sha#sha256:}"
+  fi
+
+  if [[ -z "$asset_sha" ]]; then
+    if [[ -z "${TMP_DIR:-}" ]]; then
+      TMP_DIR="$(mktemp -d)"
+      trap 'rm -rf "$TMP_DIR"' EXIT
+    fi
+    gh release download "$tag" --repo "$REPO_SLUG" --pattern "$asset_name" --dir "$TMP_DIR" --clobber
+    asset_sha="$(shasum -a 256 "${TMP_DIR}/${asset_name}" | awk '{print $1}')"
+  fi
+  [[ -n "$asset_sha" ]] || die "could not determine sha256 for ${asset_name}"
+
+  printf '%s' "$asset_sha"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bump)
@@ -296,8 +325,12 @@ if [[ "$HEAD_SHA" != "$(git rev-parse origin/main)" ]]; then
   git push origin HEAD:main
 fi
 
-ASSET_NAME="tg-${TAG}-darwin-arm64.tar.gz"
-ASSET_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/${ASSET_NAME}"
+DARWIN_ARM64_ASSET="tg-${TAG}-darwin-arm64.tar.gz"
+LINUX_X86_64_ASSET="tg-${TAG}-linux-x86_64.tar.gz"
+LINUX_ARM64_ASSET="tg-${TAG}-linux-arm64.tar.gz"
+DARWIN_ARM64_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/${DARWIN_ARM64_ASSET}"
+LINUX_X86_64_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/${LINUX_X86_64_ASSET}"
+LINUX_ARM64_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/${LINUX_ARM64_ASSET}"
 
 log "preparing ${TAG}"
 
@@ -340,37 +373,34 @@ if ! gh release view "$TAG" --repo "$REPO_SLUG" >/dev/null 2>&1; then
 fi
 
 log "reading release asset digest"
-ASSET_SHA="$(
-  gh release view "$TAG" \
-    --repo "$REPO_SLUG" \
-    --json assets \
-    --jq ".assets[] | select(.name == \"${ASSET_NAME}\") | .digest // empty"
-)"
-if [[ "$ASSET_SHA" == sha256:* ]]; then
-  ASSET_SHA="${ASSET_SHA#sha256:}"
-fi
+DARWIN_ARM64_SHA="$(release_asset_sha "$TAG" "$DARWIN_ARM64_ASSET")"
+LINUX_X86_64_SHA="$(release_asset_sha "$TAG" "$LINUX_X86_64_ASSET")"
+LINUX_ARM64_SHA="$(release_asset_sha "$TAG" "$LINUX_ARM64_ASSET")"
 
-if [[ -z "$ASSET_SHA" ]]; then
-  TMP_DIR="$(mktemp -d)"
-  trap 'rm -rf "$TMP_DIR"' EXIT
-  gh release download "$TAG" --repo "$REPO_SLUG" --pattern "$ASSET_NAME" --dir "$TMP_DIR"
-  ASSET_SHA="$(shasum -a 256 "${TMP_DIR}/${ASSET_NAME}" | awk '{print $1}')"
-fi
-[[ -n "$ASSET_SHA" ]] || die "could not determine sha256 for ${ASSET_NAME}"
-
-log "asset sha256 ${ASSET_SHA}"
+log "asset sha256 ${DARWIN_ARM64_ASSET} ${DARWIN_ARM64_SHA}"
+log "asset sha256 ${LINUX_X86_64_ASSET} ${LINUX_X86_64_SHA}"
+log "asset sha256 ${LINUX_ARM64_ASSET} ${LINUX_ARM64_SHA}"
 
 if [[ "$UPDATE_TAP" -eq 1 ]]; then
   log "updating tap ${TAP_NAME}"
-  python3 - "$FORMULA_PATH" "$VERSION" "$ASSET_URL" "$ASSET_SHA" <<'PY'
+  python3 - \
+    "$FORMULA_PATH" \
+    "$VERSION" \
+    "$DARWIN_ARM64_URL" "$DARWIN_ARM64_SHA" \
+    "$LINUX_X86_64_URL" "$LINUX_X86_64_SHA" \
+    "$LINUX_ARM64_URL" "$LINUX_ARM64_SHA" <<'PY'
 from pathlib import Path
 import re
 import sys
 
 path = Path(sys.argv[1])
 version = sys.argv[2]
-asset_url = sys.argv[3]
-sha = sys.argv[4]
+darwin_arm64_url = sys.argv[3]
+darwin_arm64_sha = sys.argv[4]
+linux_x86_64_url = sys.argv[5]
+linux_x86_64_sha = sys.argv[6]
+linux_arm64_url = sys.argv[7]
+linux_arm64_sha = sys.argv[8]
 
 text = path.read_text()
 
@@ -388,12 +418,30 @@ native_decoder_dep = '  depends_on "rust-" + "si" + "lk"\n'
 path.write_text(f'''class Tg < Formula
 {desc}
 {homepage}
-  url "{asset_url}"
   version "{version}"
-  sha256 "{sha}"
 {license_line}
 
-  depends_on arch: :arm64
+  on_macos do
+    if Hardware::CPU.arm?
+      url "{darwin_arm64_url}"
+      sha256 "{darwin_arm64_sha}"
+    else
+      odie "tg provides prebuilt macOS releases for Apple Silicon only"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "{linux_arm64_url}"
+      sha256 "{linux_arm64_sha}"
+    elsif Hardware::CPU.intel?
+      url "{linux_x86_64_url}"
+      sha256 "{linux_x86_64_sha}"
+    else
+      odie "unsupported Linux architecture"
+    end
+  end
+
 {native_decoder_dep}
   def install
     bin.install "tg"

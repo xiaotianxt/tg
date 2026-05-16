@@ -24,7 +24,14 @@ fn cached_bytes(cell: &'static OnceLock<Vec<u8>>, encoded: &[u8]) -> &'static [u
 
 pub(crate) fn desktop_app_process() -> &'static str {
     static VALUE: OnceLock<String> = OnceLock::new();
-    cached_text(&VALUE, &[13, 63, 25, 50, 59, 46])
+    #[cfg(target_os = "linux")]
+    {
+        cached_text(&VALUE, &[45, 63, 57, 50, 59, 46])
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cached_text(&VALUE, &[13, 63, 25, 50, 59, 46])
+    }
 }
 
 pub(crate) fn desktop_app_name() -> &'static str {
@@ -107,6 +114,29 @@ pub(crate) fn documents_account_files_dir(home: &Path) -> PathBuf {
         .join(account_files_dir())
 }
 
+pub(crate) fn linux_account_files_dir(home: &Path) -> PathBuf {
+    home.join("Documents").join(account_files_dir())
+}
+
+pub(crate) fn account_files_candidate_dirs(home: &Path) -> Vec<PathBuf> {
+    let native = if cfg!(target_os = "linux") {
+        linux_account_files_dir(home)
+    } else {
+        documents_account_files_dir(home)
+    };
+    let fallback = if cfg!(target_os = "linux") {
+        documents_account_files_dir(home)
+    } else {
+        linux_account_files_dir(home)
+    };
+
+    if native == fallback {
+        vec![native]
+    } else {
+        vec![native, fallback]
+    }
+}
+
 pub(crate) fn app_support_dir(home: &Path) -> PathBuf {
     container_data_dir(home)
         .join("Library/Application Support")
@@ -115,4 +145,28 @@ pub(crate) fn app_support_dir(home: &Path) -> PathBuf {
 
 pub(crate) fn kvcomm_dir(home: &Path) -> PathBuf {
     container_data_dir(home).join("Documents/app_data/net/kvcomm")
+}
+
+pub(crate) fn linux_config_dir(home: &Path) -> PathBuf {
+    static VALUE: OnceLock<String> = OnceLock::new();
+    home.join(cached_text(&VALUE, &[116, 34, 45, 63, 57, 50, 59, 46]))
+}
+
+pub(crate) fn kvcomm_candidate_dirs(home: &Path) -> Vec<PathBuf> {
+    let native = if cfg!(target_os = "linux") {
+        linux_config_dir(home).join("net/kvcomm")
+    } else {
+        kvcomm_dir(home)
+    };
+    let fallback = if cfg!(target_os = "linux") {
+        kvcomm_dir(home)
+    } else {
+        linux_config_dir(home).join("net/kvcomm")
+    };
+
+    if native == fallback {
+        vec![native]
+    } else {
+        vec![native, fallback]
+    }
 }

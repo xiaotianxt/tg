@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 
 use crate::dictionary;
 
-const KVCOMM_REL: &str = "Documents/app_data/net/kvcomm";
-
 pub struct MediaKeys {
     /// 16-byte AES-128 key stored as ASCII bytes (NOT hex-decoded).
     pub aes_key: [u8; 16],
@@ -77,14 +75,22 @@ fn extract_clean_account_id(base: &Path) -> Result<String, String> {
 
 fn find_kvcomm_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-    let candidate = dictionary::container_data_dir(&PathBuf::from(home)).join(KVCOMM_REL);
+    let home = PathBuf::from(home);
+    let candidates = dictionary::kvcomm_candidate_dirs(&home);
 
-    if candidate.is_dir() {
-        return Ok(candidate);
+    for candidate in &candidates {
+        if candidate.is_dir() {
+            return Ok(candidate.clone());
+        }
     }
+
     Err(format!(
         "kvcomm directory not found at {}",
-        candidate.display()
+        candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 

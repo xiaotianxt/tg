@@ -6,30 +6,55 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-latest
+            uname: arm64
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+            uname: x86_64
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            uname: aarch64
 
     steps:
       - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - name: Verify arm64 runner
-        run: test "$(uname -m)" = "arm64"
+      - name: Install Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            libsqlite3-dev \
+            pkg-config
+
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = "${{ matrix.uname }}"
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --bin tg
 
       - name: Archive
         run: |
           mkdir -p archive
           cp target/release/tg archive/
           cd archive
-          tar czf ../tg-${{ github.ref_name }}-darwin-arm64.tar.gz \
+          tar czf ../tg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
             tg
 
       - uses: actions/upload-artifact@v7
         with:
-          name: tg-${{ github.ref_name }}-darwin-arm64
-          path: tg-${{ github.ref_name }}-darwin-arm64.tar.gz
+          name: tg-${{ github.ref_name }}-${{ matrix.target }}
+          path: tg-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
 
   release:
     needs: build

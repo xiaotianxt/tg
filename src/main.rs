@@ -180,6 +180,24 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         jobs: usize,
     },
+    /// List sessions with unread messages
+    Unread {
+        /// Optional display name or username query to filter unread sessions
+        query: Option<String>,
+        /// Path to decrypted databases
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
+        decrypted_dir: PathBuf,
+        /// Number of top unread sessions to show
+        #[arg(long, default_value_t = 30)]
+        top: usize,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+    },
     /// Diagnose tg setup and optionally a specific chat
     Doctor {
         /// Optional session username (tgid_xxx) or display name to inspect
@@ -698,6 +716,31 @@ fn main() {
                             print_output(format_args!(
                                 "No sessions found. Try running 'decrypt' first."
                             ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Unread {
+            query,
+            decrypted_dir,
+            top,
+            jobs,
+        } => {
+            let _ = cache::refresh_session_decrypted(&decrypted_dir, jobs);
+            match db::list_unread_sessions(&decrypted_dir, top, query.as_deref()) {
+                Ok(sessions) => {
+                    if sessions.is_empty() {
+                        if let Some(query) =
+                            query.as_deref().filter(|value| !value.trim().is_empty())
+                        {
+                            print_output(format_args!("No unread sessions matched '{}'.", query));
+                        } else {
+                            print_output(format_args!("No unread sessions."));
                         }
                     }
                 }
@@ -1267,6 +1310,7 @@ mod tests {
             "keys",
             "decrypt",
             "sessions",
+            "unread",
             "messages",
             "search",
             "query",
@@ -1391,6 +1435,15 @@ mod tests {
         match cli.command {
             Commands::Sessions { query, .. } => assert_eq!(query.as_deref(), Some("alice")),
             _ => panic!("expected sessions command"),
+        }
+    }
+
+    #[test]
+    fn unread_accepts_optional_query() {
+        let cli = Cli::parse_from(args(&["tg", "unread", "alice"]));
+        match cli.command {
+            Commands::Unread { query, .. } => assert_eq!(query.as_deref(), Some("alice")),
+            _ => panic!("expected unread command"),
         }
     }
 

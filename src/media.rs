@@ -390,21 +390,26 @@ pub(crate) fn format_file_size(bytes: u64) -> String {
 /// Telegram 4.x: account files with `msg/` subdir
 pub fn find_telegram_base_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    let docs_base = dictionary::documents_account_files_dir(&PathBuf::from(home));
-    if !docs_base.is_dir() {
-        return None;
-    }
-
-    for entry in fs::read_dir(&docs_base).ok()?.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
+    let home = PathBuf::from(home);
+    for docs_base in dictionary::account_files_candidate_dirs(&home) {
+        if !docs_base.is_dir() {
             continue;
         }
-        if path.join("Message/MessageTemp").is_dir() {
-            return Some(path);
-        }
-        if path.join("msg").is_dir() {
-            return Some(path);
+
+        let Ok(entries) = fs::read_dir(&docs_base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.join("Message/MessageTemp").is_dir() {
+                return Some(path);
+            }
+            if path.join("msg").is_dir() {
+                return Some(path);
+            }
         }
     }
     None

@@ -2,7 +2,7 @@
 name = "tg"
 version = "1.4.12"
 edition = "2021"
-description = "macOS Telegram 聊天记录读取 CLI 工具"
+description = "本地 Telegram 桌面聊天记录读取 CLI 工具"
 authors = ["xiaotianxt"]
 repository = "https://github.com/xiaotianxt/tg"
 license = "MIT"

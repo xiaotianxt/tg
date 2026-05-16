@@ -798,16 +798,9 @@ pub(crate) fn auto_detect_db_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let home = PathBuf::from(home);
 
-    let old_path = dictionary::documents_account_files_dir(&home);
-    if old_path.exists() {
-        // Find the first account directory with db_storage
-        if let Ok(entries) = fs::read_dir(&old_path) {
-            for entry in entries.flatten() {
-                let db_storage = entry.path().join("db_storage");
-                if db_storage.is_dir() {
-                    return Some(db_storage);
-                }
-            }
+    for account_files_dir in dictionary::account_files_candidate_dirs(&home) {
+        if let Some(db_storage) = find_db_storage_under_account_files(&account_files_dir) {
+            return Some(db_storage);
         }
     }
 
@@ -826,6 +819,35 @@ pub(crate) fn auto_detect_db_dir() -> Option<PathBuf> {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn find_db_storage_under_account_files(account_files_dir: &Path) -> Option<PathBuf> {
+    if !account_files_dir.exists() {
+        return None;
+    }
+
+    for entry in fs::read_dir(account_files_dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let direct = path.join("db_storage");
+        if direct.is_dir() {
+            return Some(direct);
+        }
+
+        if let Ok(sub_entries) = fs::read_dir(&path) {
+            for sub_entry in sub_entries.flatten() {
+                let nested = sub_entry.path().join("db_storage");
+                if nested.is_dir() {
+                    return Some(nested);
                 }
             }
         }
