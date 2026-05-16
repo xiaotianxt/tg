@@ -50,6 +50,18 @@ pub(crate) fn find_decrypted_contact_db(decrypted_dir: &Path) -> Option<PathBuf>
         .filter(|p| p.exists())
 }
 
+pub(crate) fn find_decrypted_session_db(decrypted_dir: &Path) -> Option<PathBuf> {
+    let session_db = decrypted_dir.join("session/session.db");
+    if session_db.exists() {
+        return Some(session_db);
+    }
+
+    decrypted_dir
+        .parent()
+        .map(|p| p.join("decrypted/session/session.db"))
+        .filter(|p| p.exists())
+}
+
 pub(crate) fn is_message_db_name(name: &str) -> bool {
     let Some(stem) = name
         .strip_prefix("message_")
@@ -95,6 +107,8 @@ struct MessageRow {
 }
 
 type SearchRow = (i64, i64, String, String);
+type SessionListRow = (String, i64, String, String);
+type SessionListRows = Vec<SessionListRow>;
 const SESSION_TIME_BOUNDARY_ROWS: usize = 128;
 const SEARCH_PREVIEW_CHARS: usize = 100;
 const INDEXED_UNBOUNDED_MESSAGE_WINDOW_SECS: i64 = 31 * 86400;
@@ -215,13 +229,13 @@ fn session_stats_for_table(conn: &Connection, table_name: &str) -> Option<Sessio
     })
 }
 
-/// List all sessions/messages with counts.
+/// List chat sessions.
 pub fn list_sessions(
     decrypted_dir: &Path,
     top_n: usize,
     query: Option<&str>,
     jobs: usize,
-) -> Result<Vec<(String, i64, String, String)>, String> {
+) -> Result<SessionListRows, String> {
     let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
 
     // Load contacts
@@ -229,6 +243,17 @@ pub fn list_sessions(
         Some(path) => contact::load_contacts(path).unwrap_or_default(),
         None => HashMap::new(),
     };
+
+    if let Some(session_db) = find_decrypted_session_db(decrypted_dir) {
+        match list_sessions_from_session_db(&session_db, &contacts, top_n, query) {
+            Ok(Some(sessions)) => return Ok(sessions),
+            Ok(None) => {}
+            Err(e) => log::warn!(
+                "Session database read failed; falling back to message scan: {}",
+                e
+            ),
+        }
+    }
 
     // Map: table_name -> SessionInfo
     // Also track: table_name -> contact username
@@ -420,6 +445,153 @@ pub fn list_sessions(
     }
     out.flush()?;
     Ok(result)
+}
+
+fn list_sessions_from_session_db(
+    session_db: &Path,
+    contacts: &HashMap<String, Contact>,
+    top_n: usize,
+    query: Option<&str>,
+) -> Result<Option<SessionListRows>, String> {
+    let conn = Connection::open(session_db)
+        .map_err(|e| format!("Cannot open session DB {}: {}", session_db.display(), e))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT username,
+                    COALESCE(unread_count, 0),
+                    COALESCE(last_timestamp, 0),
+                    COALESCE(sort_timestamp, 0)
+             FROM SessionTable
+             WHERE COALESCE(last_timestamp, 0) > 0
+                OR COALESCE(sort_timestamp, 0) > 0",
+        )
+        .map_err(|e| format!("Prepare session list: {}", e))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let username: String = row.get(0)?;
+            let unread_count: i64 = row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0);
+            let last_timestamp: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
+            let sort_timestamp: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+            let activity = sort_timestamp.max(last_timestamp);
+            Ok((username, unread_count, activity))
+        })
+        .map_err(|e| format!("Read sessions: {}", e))?;
+    let session_rows = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| format!("Read sessions: {}", e))?;
+
+    let mut entries = session_rows
+        .into_iter()
+        .filter(|(username, _, activity)| !username.trim().is_empty() && *activity > 0)
+        .map(|(username, unread_count, activity)| {
+            let display = contacts
+                .get(&username)
+                .map(|c| c.personal_display_name().to_string())
+                .unwrap_or_else(|| username.clone());
+
+            SessionListEntry {
+                username,
+                info: SessionInfo {
+                    count: unread_count,
+                    earliest: None,
+                    latest: Some(activity),
+                },
+                display,
+                match_info: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let total_sessions = entries.len();
+    let query = query.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(query) = query {
+        entries = entries
+            .into_iter()
+            .filter_map(|mut entry| {
+                let match_info =
+                    session_match_info(contacts, &entry.username, &entry.display, query)?;
+                entry.match_info = Some(match_info);
+                Some(entry)
+            })
+            .collect();
+
+        entries.sort_by(|a, b| {
+            let a_match = a.match_info.expect("filtered session entry has match info");
+            let b_match = b.match_info.expect("filtered session entry has match info");
+            a_match
+                .field_priority
+                .cmp(&b_match.field_priority)
+                .then_with(|| b_match.score.cmp(&a_match.score))
+                .then_with(|| {
+                    b.info
+                        .latest
+                        .unwrap_or_default()
+                        .cmp(&a.info.latest.unwrap_or_default())
+                })
+                .then_with(|| a_match.distance.cmp(&b_match.distance))
+                .then_with(|| a_match.field_len.cmp(&b_match.field_len))
+                .then_with(|| a.display.cmp(&b.display))
+                .then_with(|| a.username.cmp(&b.username))
+        });
+    } else {
+        entries.sort_by_key(|entry| Reverse(entry.info.latest.unwrap_or_default()));
+    }
+
+    if entries.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let matched_sessions = entries.len();
+
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+
+    out.line(format_args!(
+        "{:<4} {:<8} {:<20} {:<22} Username",
+        "Rank", "Unread", "Last Activity", "Display Name"
+    ))?;
+    out.line(format_args!("{}", "-".repeat(120)))?;
+
+    let mut result = Vec::new();
+    for (i, entry) in entries.iter().enumerate().take(top_n) {
+        let activity = entry
+            .info
+            .latest
+            .map(time::format_local_timestamp_minutes)
+            .unwrap_or_default();
+
+        out.line(format_args!(
+            "{:<4} {:<8} {:<20} {:<22} {}",
+            i + 1,
+            entry.info.count,
+            activity,
+            entry.display,
+            entry.username
+        ))?;
+
+        result.push((
+            entry.username.clone(),
+            entry.info.count,
+            activity,
+            entry.display.clone(),
+        ));
+    }
+
+    out.blank_line()?;
+    if query.is_some() {
+        out.line(format_args!(
+            "Matched: {} of {} sessions",
+            matched_sessions, total_sessions
+        ))?;
+    } else {
+        out.line(format_args!("Total: {} sessions", total_sessions))?;
+    }
+    out.flush()?;
+    Ok(Some(result))
 }
 
 fn session_match_info(
@@ -1897,6 +2069,66 @@ mod tests {
         dir
     }
 
+    fn create_decrypted_dir_with_session_table(
+        contacts: &[(&str, &str, &str, &str)],
+        rows: &[(&str, i64, i64, i64)],
+    ) -> TempDir {
+        let dir = tempdir().unwrap();
+        let contact_dir = dir.path().join("contact");
+        let session_dir = dir.path().join("session");
+        std::fs::create_dir_all(&contact_dir).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        let contact_conn = Connection::open(contact_dir.join("contact.db")).unwrap();
+        contact_conn
+            .execute(
+                "CREATE TABLE contact (
+                    username TEXT,
+                    nick_name TEXT,
+                    remark TEXT,
+                    alias TEXT
+                )",
+                [],
+            )
+            .unwrap();
+        for (username, nick_name, remark, alias) in contacts {
+            contact_conn
+                .execute(
+                    "INSERT INTO contact (username, nick_name, remark, alias)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![username, nick_name, remark, alias],
+                )
+                .unwrap();
+        }
+        drop(contact_conn);
+
+        let session_conn = Connection::open(session_dir.join("session.db")).unwrap();
+        session_conn
+            .execute(
+                "CREATE TABLE SessionTable (
+                    username TEXT PRIMARY KEY,
+                    unread_count INTEGER,
+                    last_timestamp INTEGER,
+                    sort_timestamp INTEGER
+                )",
+                [],
+            )
+            .unwrap();
+        for (username, unread_count, last_timestamp, sort_timestamp) in rows {
+            session_conn
+                .execute(
+                    "INSERT INTO SessionTable
+                     (username, unread_count, last_timestamp, sort_timestamp)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![username, unread_count, last_timestamp, sort_timestamp],
+                )
+                .unwrap();
+        }
+        drop(session_conn);
+
+        dir
+    }
+
     fn create_decrypted_dir_with_messages(username: &str, contents: &[&str]) -> TempDir {
         let dir = tempdir().unwrap();
         let message_dir = dir.path().join("message");
@@ -2088,6 +2320,44 @@ mod tests {
                 ("tgid_inactive", "Alice Archive", "", ""),
             ],
             &[("tgid_alice", 2, 1000), ("tgid_bob", 5, 2000)],
+        );
+
+        let sessions = list_sessions(dir.path(), 10, Some("Alic Zhang"), 1).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0, "tgid_alice");
+        assert_eq!(sessions[0].3, "Alice Zhang");
+    }
+
+    #[test]
+    fn list_sessions_prefers_session_db_without_message_dbs() {
+        let dir = create_decrypted_dir_with_session_table(
+            &[
+                ("tgid_old", "Old Nick", "Old Remark", ""),
+                ("tgid_recent", "Recent Nick", "", ""),
+            ],
+            &[("tgid_old", 0, 1000, 1000), ("tgid_recent", 3, 2000, 2100)],
+        );
+
+        let sessions = list_sessions(dir.path(), 10, None, 1).unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].0, "tgid_recent");
+        assert_eq!(sessions[0].1, 3);
+        assert_eq!(sessions[0].3, "Recent Nick");
+        assert_eq!(sessions[1].0, "tgid_old");
+        assert_eq!(sessions[1].1, 0);
+        assert_eq!(sessions[1].3, "Old Remark");
+    }
+
+    #[test]
+    fn list_sessions_filters_session_db_by_contact_query() {
+        let dir = create_decrypted_dir_with_session_table(
+            &[
+                ("tgid_alice", "Alice Zhang", "", ""),
+                ("tgid_bob", "Bob Lee", "", ""),
+            ],
+            &[("tgid_alice", 0, 1000, 1000), ("tgid_bob", 0, 2000, 2000)],
         );
 
         let sessions = list_sessions(dir.path(), 10, Some("Alic Zhang"), 1).unwrap();

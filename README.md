@@ -22,11 +22,11 @@ tg 是一个 macOS 本地 Telegram 聊天记录读取 CLI。它把本机 Telegra
 
 ```bash
 $ tg sessions --top 5
-Rank Count    Time Range                                     Display Name           Username
+Rank Unread   Last Activity        Display Name           Username
 ------------------------------------------------------------------------------------------------------------------------
-1    12843    2024-02-03 10:21 ~ 2026-04-28 09:41            产品讨论群              123456789@chatroom
-2    8921     2023-11-18 08:12 ~ 2026-04-27 23:10            张三                    tgid_abcd1234
-3    502      2025-06-01 14:33 ~ 2026-04-20 18:05            文件传输助手            filehelper
+1    4        2026-04-28 09:41     产品讨论群              123456789@chatroom
+2    0        2026-04-27 23:10     张三                    tgid_abcd1234
+3    0        2026-04-20 18:05     文件传输助手            filehelper
 
 Total: 37 sessions
 ```
@@ -219,7 +219,7 @@ tg export "联系人或群名" --format json
 
 `search`、`query`、`export` 默认只看最近 365 天，这是大多数查询和导出的热路径。需要全量历史时加 `--all-time`；需要更窄窗口时加 `--since today`、`--since 30d` 或具体日期。
 
-`sessions`、`search`、`query`、`schema`、`export` 在读取前会尝试静默增量刷新 `~/.tg/decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
+`sessions` 会优先用轻量会话缓存列出最近活跃会话和未读数，不需要扫描 numbered message 数据库。`search`、`query`、`schema`、`export` 在读取前会尝试静默增量刷新 `~/.tg/decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
 
 如果 `sudo tg keys` 遇到 `task_for_pid failed` 或权限问题，退出 Telegram 后重新签名一次：
 

@@ -72,6 +72,7 @@ pub struct DecryptConfig {
 #[derive(Clone, Copy)]
 pub enum DecryptScope {
     All,
+    Sessions,
     Messages,
 }
 
@@ -849,6 +850,9 @@ fn source_freshness_mtime(_db_path: &Path, db_meta: &fs::Metadata) -> Option<Sys
 fn path_in_decrypt_scope(scope: DecryptScope, rel_path: &str) -> bool {
     match scope {
         DecryptScope::All => true,
+        DecryptScope::Sessions => {
+            rel_path == "contact/contact.db" || rel_path == "session/session.db"
+        }
         DecryptScope::Messages => {
             rel_path == "contact/contact.db" || is_numbered_message_rel_path(rel_path)
         }
@@ -1253,6 +1257,26 @@ mod tests {
         assert!(!path_in_decrypt_scope(
             DecryptScope::Messages,
             "session/session.db"
+        ));
+    }
+
+    #[test]
+    fn session_decrypt_scope_includes_only_contact_and_session_db() {
+        assert!(path_in_decrypt_scope(
+            DecryptScope::Sessions,
+            "contact/contact.db"
+        ));
+        assert!(path_in_decrypt_scope(
+            DecryptScope::Sessions,
+            "session/session.db"
+        ));
+        assert!(!path_in_decrypt_scope(
+            DecryptScope::Sessions,
+            "message/message_0.db"
+        ));
+        assert!(!path_in_decrypt_scope(
+            DecryptScope::Sessions,
+            "message/message_fts.db"
         ));
     }
 

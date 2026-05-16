@@ -24,7 +24,7 @@ Lower-level steps such as key extraction and database decryption remain availabl
 
 ### Discovery
 
-- `tg sessions`: list recent/high-volume chats.
+- `tg sessions`: list recently active chats and unread counts.
 - `tg sessions "<name>"`: narrow session discovery without reading messages.
 
 ### Maintenance

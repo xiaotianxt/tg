@@ -686,7 +686,7 @@ fn main() {
             top,
             jobs,
         } => {
-            let _ = cache::refresh_message_decrypted(&decrypted_dir, jobs);
+            let _ = cache::refresh_session_decrypted(&decrypted_dir, jobs);
             match db::list_sessions(&decrypted_dir, top, query.as_deref(), jobs) {
                 Ok(sessions) => {
                     if sessions.is_empty() {

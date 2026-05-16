@@ -20,6 +20,21 @@ pub(crate) fn refresh_decrypted(
     decrypt::decrypt_all(&paths::default_keys_path(), decrypted_dir, None, &config)
 }
 
+pub(crate) fn refresh_session_decrypted(
+    decrypted_dir: &Path,
+    jobs: usize,
+) -> Result<decrypt::DecryptStats, String> {
+    let config = decrypt::DecryptConfig {
+        incremental: true,
+        since: None,
+        scope: decrypt::DecryptScope::Sessions,
+        recent_output_grace: Some(MESSAGE_AUTO_REFRESH_GRACE),
+        quiet: true,
+        jobs,
+    };
+    decrypt::decrypt_all(&paths::default_keys_path(), decrypted_dir, None, &config)
+}
+
 pub(crate) fn refresh_message_decrypted(
     decrypted_dir: &Path,
     jobs: usize,
