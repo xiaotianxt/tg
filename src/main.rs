@@ -406,7 +406,7 @@ enum Commands {
             value_hint = clap::ValueHint::DirPath
         )]
         output: PathBuf,
-        /// Directory to save decoded media files (images, stickers, videos)
+        /// Directory to save decoded media files (images, stickers, videos, files)
         #[arg(long, value_hint = clap::ValueHint::DirPath)]
         media_dir: Option<PathBuf>,
         /// Export messages after this time (defaults to the recent window)

@@ -191,6 +191,36 @@ impl MiniProgramInfo {
     }
 }
 
+/// Parsed info about a file attachment (type 49, subtype 6).
+#[derive(Debug, Clone, Default)]
+pub struct FileInfo {
+    pub title: String,
+    pub total_len: u64,
+    pub file_ext: String,
+}
+
+impl FileInfo {
+    pub fn display(&self, fallback_name: Option<&str>) -> String {
+        let name = non_empty(&self.title)
+            .or_else(|| fallback_name.and_then(non_empty))
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                let ext = self.file_ext.trim().trim_start_matches('.');
+                if ext.is_empty() {
+                    "未知文件".to_string()
+                } else {
+                    format!("未知文件.{}", ext)
+                }
+            });
+        let size = format_file_size(self.total_len);
+        if size.is_empty() {
+            format!("[文件] {}", name)
+        } else {
+            format!("[文件] {} ({})", name, size)
+        }
+    }
+}
+
 // ===== XML parsing =====
 
 pub(crate) fn parse_image_info(xml: &str) -> ImageInfo {
@@ -319,6 +349,37 @@ pub(crate) fn parse_mini_program_info(xml: &str) -> Option<MiniProgramInfo> {
         app_name: extract_xml_tag(xml, "appname").unwrap_or_default(),
         page_path: extract_xml_tag(xml, "pagepath").unwrap_or_default(),
     })
+}
+
+pub(crate) fn parse_file_info(xml: &str) -> Option<FileInfo> {
+    if !xml.contains("<type>6</type>") && !xml.contains("<type>62</type>") {
+        return None;
+    }
+    Some(FileInfo {
+        title: extract_xml_tag(xml, "title").unwrap_or_default(),
+        total_len: extract_xml_tag(xml, "totallen")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        file_ext: extract_xml_tag(xml, "fileext").unwrap_or_default(),
+    })
+}
+
+pub(crate) fn format_file_size(bytes: u64) -> String {
+    if bytes == 0 {
+        return String::new();
+    }
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1}GB", bytes as f64 / GB)
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / MB)
+    } else if bytes >= 1024 {
+        format!("{}KB", (bytes as f64 / KB).round() as u64)
+    } else {
+        format!("{}B", bytes)
+    }
 }
 
 // ===== Telegram base path detection =====
@@ -557,5 +618,15 @@ mod tests {
             parse_image_info(r#"<msg><img cdnthumbwidth="180" cdnthumbheight="153" /></msg>"#);
         assert_eq!(info.identifier(), None);
         assert_eq!(info.display(), "[img]");
+    }
+
+    #[test]
+    fn test_parse_file_info_display() {
+        let xml = r#"<msg><appmsg><title>report.pdf</title><type>6</type><appattach><totallen>1536000</totallen><fileext>pdf</fileext><md5>abc</md5></appattach></appmsg></msg>"#;
+        let info = parse_file_info(xml).unwrap();
+        assert_eq!(info.title, "report.pdf");
+        assert_eq!(info.file_ext, "pdf");
+        assert_eq!(info.total_len, 1536000);
+        assert_eq!(info.display(None), "[文件] report.pdf (1.5MB)");
     }
 }

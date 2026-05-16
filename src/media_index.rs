@@ -92,6 +92,11 @@ impl MediaIndex {
         if lower.is_empty() {
             return None;
         }
+        let lower_stem = Path::new(&lower)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("")
+            .to_string();
 
         self.query_path(
             "SELECT dirs.path, files.relative_path FROM files \
@@ -102,6 +107,20 @@ impl MediaIndex {
             category,
             &lower,
         )
+        .or_else(|| {
+            if lower_stem.is_empty() || lower_stem == lower {
+                return None;
+            }
+            self.query_path(
+                "SELECT dirs.path, files.relative_path FROM files \
+                 JOIN dirs ON dirs.id = files.dir_id \
+                 WHERE dirs.base_path = ?1 AND dirs.category = ?2 \
+                   AND (files.lower_name = ?3 OR files.lower_stem = ?3) \
+                 ORDER BY files.is_thumb ASC, files.len DESC LIMIT 1",
+                category,
+                &lower_stem,
+            )
+        })
         .or_else(|| {
             let prefix = format!("{}%", escape_like(&lower));
             self.query_path(
@@ -405,6 +424,13 @@ fn discover_media_dirs(
         }
     }
 
+    if categories.contains(&"File") {
+        let attach_dir = base_path.join("msg/attach");
+        if attach_dir.is_dir() {
+            discover_attach_file_dirs(&attach_dir, session_id, &mut dirs);
+        }
+    }
+
     if categories.contains(&"Video") {
         let video_dir = base_path.join("msg/video");
         if video_dir.is_dir() {
@@ -450,6 +476,40 @@ fn discover_attach_image_dirs(attach_dir: &Path, dirs: &mut Vec<MediaDirSpec>) {
             }
         }
     }
+}
+
+fn discover_attach_file_dirs(attach_dir: &Path, session_id: &str, dirs: &mut Vec<MediaDirSpec>) {
+    fn walk(dir: &Path, dirs: &mut Vec<MediaDirSpec>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some("F") {
+                dirs.push(MediaDirSpec {
+                    path,
+                    category: "File".to_string(),
+                });
+            } else {
+                walk(&path, dirs);
+            }
+        }
+    }
+
+    let session_dir = attach_dir.join(session_attach_dir_name(session_id));
+    if session_dir.is_dir() {
+        walk(&session_dir, dirs);
+    }
+}
+
+fn session_attach_dir_name(session_id: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(session_id.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn scan_media_dir(spec: MediaDirSpec, fingerprint: DirFingerprint) -> ScannedMediaDir {
@@ -574,6 +634,79 @@ mod tests {
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0].path, img_dir);
         assert_eq!(dirs[0].category, "Image");
+    }
+
+    #[test]
+    fn discovers_telegram4_file_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_dir = session_attach_dir_name("session");
+        let file_dir = temp
+            .path()
+            .join("msg/attach")
+            .join(session_dir)
+            .join("2026-04/Rec/item/F");
+        fs::create_dir_all(&file_dir).unwrap();
+        fs::create_dir_all(temp.path().join("msg/attach/other/2026-04/Rec/item/F")).unwrap();
+
+        let dirs = discover_media_dirs(temp.path(), "session", &["File"]);
+
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].path, file_dir);
+        assert_eq!(dirs[0].category, "File");
+    }
+
+    #[test]
+    fn indexes_and_finds_cached_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let session_dir = session_attach_dir_name("session");
+        let file_dir = temp
+            .path()
+            .join("msg/attach")
+            .join(session_dir)
+            .join("2026-04/Rec/item/F");
+        fs::create_dir_all(&file_dir).unwrap();
+        fs::write(file_dir.join("report.pdf"), b"pdf").unwrap();
+
+        let index = MediaIndex::load_with_cache_dir(
+            temp.path(),
+            "session",
+            &["File"],
+            1,
+            Some(cache.path()),
+        );
+
+        assert_eq!(
+            index.find("File", "report.pdf").unwrap(),
+            file_dir.join("report.pdf")
+        );
+    }
+
+    #[test]
+    fn finds_cached_file_by_identifier_stem() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let session_dir = session_attach_dir_name("session");
+        let file_dir = temp
+            .path()
+            .join("msg/attach")
+            .join(session_dir)
+            .join("2026-04/Rec/item/F");
+        fs::create_dir_all(&file_dir).unwrap();
+        fs::write(file_dir.join("report"), b"pdf").unwrap();
+
+        let index = MediaIndex::load_with_cache_dir(
+            temp.path(),
+            "session",
+            &["File"],
+            1,
+            Some(cache.path()),
+        );
+
+        assert_eq!(
+            index.find("File", "report.pdf").unwrap(),
+            file_dir.join("report")
+        );
     }
 
     #[test]

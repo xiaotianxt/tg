@@ -247,6 +247,14 @@ pub fn display_video(meta: &VideoMeta) -> String {
     format!("[视频{}{}]", dims, name)
 }
 
+pub fn file_identifier(meta: &FileMeta) -> Option<&str> {
+    if meta.filename.trim().is_empty() {
+        None
+    } else {
+        Some(meta.filename.trim())
+    }
+}
+
 // ===== Internal parsers =====
 
 fn parse_image_meta(data: &[u8]) -> Option<ImageMeta> {
@@ -383,5 +391,23 @@ mod tests {
         let buf = &[8, 1, 16, 0, 26, 7, 112, 105, 99, 46, 112, 110, 103];
         let parsed = parse_img(buf).unwrap();
         assert_eq!(parsed.filename, "pic.png");
+    }
+
+    #[test]
+    fn test_parse_file_meta() {
+        let filename = b"report.pdf";
+        let mut inner = vec![8, 0, 18, filename.len() as u8];
+        inner.extend_from_slice(filename);
+
+        let mut file = vec![10, inner.len() as u8];
+        file.extend_from_slice(&inner);
+
+        let mut packed = vec![8, 3, 16, 6, 58, file.len() as u8];
+        packed.extend_from_slice(&file);
+
+        let parsed = parse_img2(&packed).unwrap();
+        let meta = parsed.file.unwrap();
+        assert_eq!(meta.filename, "report.pdf");
+        assert_eq!(file_identifier(&meta), Some("report.pdf"));
     }
 }

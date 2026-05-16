@@ -187,6 +187,7 @@ pub(crate) fn decode_message_with_context(
     let content = decode_content_by_type(
         msg_type,
         clean_content,
+        packed_info,
         context.time_bucket,
         &resolve_display_name,
     );
@@ -304,15 +305,16 @@ fn extract_audio_text(data: &[u8]) -> Option<String> {
 fn decode_content_by_type(
     msg_type: i32,
     content: &str,
+    packed_info: &[u8],
     time_bucket: time::MessageTimeBucket,
     resolve_display_name: &impl Fn(&str) -> String,
 ) -> String {
     match msg_type {
         1 => decode_text_content(content, time_bucket, resolve_display_name),
-        49 => decode_link_content(content, time_bucket, resolve_display_name),
+        49 => decode_link_content(content, packed_info, time_bucket, resolve_display_name),
         48 => decode_location_content(content),
         50 => decode_call_content(content),
-        62 => decode_file_content(content),
+        62 => decode_file_content(content, packed_info),
         419430449 => decode_music_content(content),
         436207665 | 536870918 => format!("[{}]", MessageType::from(msg_type)),
         _ => decode_text_content(content, time_bucket, resolve_display_name),
@@ -369,7 +371,12 @@ fn decode_internal_xml_fragment(
     }
 
     if xml.contains("<appmsg") {
-        return Some(decode_link_content(xml, time_bucket, resolve_display_name));
+        return Some(decode_link_content(
+            xml,
+            &[],
+            time_bucket,
+            resolve_display_name,
+        ));
     }
     if xml.contains("<img") {
         return Some(media::parse_image_info(xml).display());
@@ -423,6 +430,7 @@ fn decode_system_content(content: &str, msg_type: MessageType) -> String {
 
 fn decode_link_content(
     content: &str,
+    packed_info: &[u8],
     time_bucket: time::MessageTimeBucket,
     resolve_display_name: &impl Fn(&str) -> String,
 ) -> String {
@@ -448,11 +456,7 @@ fn decode_link_content(
                 .unwrap_or_else(|| "未知歌曲".to_string());
             format!("[音乐] {}", title)
         }
-        6 => {
-            let name = crate::media::extract_xml_tag(content, "title")
-                .unwrap_or_else(|| "未知文件".to_string());
-            format!("[文件] {}", name)
-        }
+        6 => decode_file_content(content, packed_info),
         19 => decode_chat_history_content(content, time_bucket),
         57 => decode_quote_content(content, time_bucket, resolve_display_name),
         51 => {
@@ -722,7 +726,7 @@ fn decode_refermsg_content(
             49 => {
                 let normalized = strip_display_prefix(clean_content);
                 if normalized.trim_start().starts_with('<') {
-                    decode_link_content(normalized, time_bucket, resolve_display_name)
+                    decode_link_content(normalized, &[], time_bucket, resolve_display_name)
                 } else {
                     decode_text_content(clean_content, time_bucket, resolve_display_name)
                 }
@@ -799,8 +803,21 @@ fn decode_call_content(content: &str) -> String {
     "[通话]".to_string()
 }
 
-fn decode_file_content(content: &str) -> String {
-    let name = if content.contains('/') {
+fn decode_file_content(content: &str, packed_info: &[u8]) -> String {
+    let packed_name = extract_file_name_from_packed_info(packed_info);
+    if content.trim_start().starts_with('<') {
+        if let Some(info) = media::parse_file_info(content) {
+            return info.display(packed_name.as_deref());
+        }
+        if let Some(name) = packed_name {
+            return format!("[文件] {}", name);
+        }
+        return "[文件]".to_string();
+    }
+
+    let name = if let Some(name) = packed_name.as_deref() {
+        name
+    } else if content.contains('/') {
         content.rsplit('/').next().unwrap_or(content)
     } else if !content.is_empty() {
         content
@@ -812,6 +829,14 @@ fn decode_file_content(content: &str) -> String {
     } else {
         format!("[文件] {}", name)
     }
+}
+
+fn extract_file_name_from_packed_info(data: &[u8]) -> Option<String> {
+    if data.is_empty() {
+        return None;
+    }
+    let meta = media_pb::parse_img2(data)?.file?;
+    media_pb::file_identifier(&meta).map(ToString::to_string)
 }
 
 fn decode_music_content(content: &str) -> String {
@@ -1070,6 +1095,28 @@ mod tests {
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
         assert!(d.content.contains("链接"));
         assert!(d.content.contains("标题"));
+    }
+
+    #[test]
+    fn test_decode_file_message_includes_size() {
+        let xml = r#"<msg><appmsg><title>report.pdf</title><type>6</type><appattach><totallen>1536</totallen><fileext>pdf</fileext></appattach></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "[文件] report.pdf (2KB)");
+    }
+
+    #[test]
+    fn test_decode_file_message_uses_packed_name_fallback() {
+        let filename = b"fallback.docx";
+        let mut inner = vec![8, 0, 18, filename.len() as u8];
+        inner.extend_from_slice(filename);
+        let mut file = vec![10, inner.len() as u8];
+        file.extend_from_slice(&inner);
+        let mut packed = vec![8, 3, 16, 6, 58, file.len() as u8];
+        packed.extend_from_slice(&file);
+
+        let xml = r#"<msg><appmsg><type>6</type><appattach><totallen>0</totallen></appattach></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &packed, |id| id.to_string());
+        assert_eq!(d.content, "[文件] fallback.docx");
     }
 
     #[test]

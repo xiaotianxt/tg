@@ -440,7 +440,11 @@ pub fn export_messages(
             log::warn!("Cannot derive media decryption keys: {}", e);
         }
         let media_keys = media_keys.ok();
-        let media_index = MediaIndex::load(&telegram_base, &username, &["Image", "Video"], jobs);
+        let mut index_categories = vec!["Image", "Video"];
+        if all_messages.iter().any(is_file_message) {
+            index_categories.push("File");
+        }
+        let media_index = MediaIndex::load(&telegram_base, &username, &index_categories, jobs);
 
         let mut media_jobs = Vec::new();
         let mut next_index = 1usize;
@@ -486,6 +490,26 @@ pub fn export_messages(
                 message: m.clone(),
             });
             next_index += 1;
+        }
+
+        for m in &all_messages {
+            if !is_file_message(m) {
+                continue;
+            }
+
+            let Some(identifier) = file_identifier(m) else {
+                continue;
+            };
+
+            if let Some(src) = media_index.find("File", &identifier) {
+                media_jobs.push(MediaExportJob::Cached {
+                    index: next_index,
+                    src,
+                    category: "File",
+                    msg_type: file_export_type(m.msg_type),
+                });
+                next_index += 1;
+            }
         }
 
         let media_job_count = parallel::job_count(jobs, 4);
@@ -991,6 +1015,65 @@ fn try_protobuf_identifier(data: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+fn try_protobuf_file_identifier(data: &[u8]) -> Option<String> {
+    if data.is_empty() {
+        return None;
+    }
+    let v2 = crate::media_pb::parse_img2(data)?;
+    let file = v2.file?;
+    crate::media_pb::file_identifier(&file).map(ToString::to_string)
+}
+
+fn file_identifier(message: &ExportMessage) -> Option<String> {
+    try_protobuf_file_identifier(&message.packed_info)
+        .or_else(|| {
+            media::parse_file_info(&message.raw_content)
+                .and_then(|info| (!info.title.trim().is_empty()).then_some(info.title))
+        })
+        .or_else(|| file_path_basename(&message.raw_content))
+}
+
+fn file_path_basename(content: &str) -> Option<String> {
+    let content = content.trim();
+    if content.is_empty() || content.starts_with('<') {
+        return None;
+    }
+    let name = content.rsplit('/').next().unwrap_or(content).trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn is_file_message(message: &ExportMessage) -> bool {
+    message.msg_type == 62
+        || app_message_subtype(message.msg_type) == Some(6)
+        || (((message.msg_type as u64) & 0xffff_ffff) == 49
+            && media::extract_xml_tag_int(&message.raw_content, "type") == Some(6))
+}
+
+fn app_message_subtype(local_type: i64) -> Option<i64> {
+    let encoded = local_type as u64;
+    if encoded & 0xffff_ffff != 49 {
+        return None;
+    }
+    let subtype = encoded >> 32;
+    if subtype == 0 {
+        None
+    } else {
+        Some(subtype as i64)
+    }
+}
+
+fn file_export_type(local_type: i64) -> i64 {
+    if local_type == 62 {
+        62
+    } else {
+        49
+    }
 }
 
 /// Export cached voice messages for a session.
@@ -1983,6 +2066,18 @@ mod tests {
         packed
     }
 
+    fn packed_file(filename: &str) -> Vec<u8> {
+        let mut inner = vec![8, 0, 18, filename.len() as u8];
+        inner.extend_from_slice(filename.as_bytes());
+
+        let mut file = vec![10, inner.len() as u8];
+        file.extend_from_slice(&inner);
+
+        let mut packed = vec![8, 3, 16, 6, 58, file.len() as u8];
+        packed.extend_from_slice(&file);
+        packed
+    }
+
     fn create_export_decrypted_dir() -> TempDir {
         let dir = tempdir().unwrap();
         let contact_dir = dir.path().join("contact");
@@ -2162,6 +2257,19 @@ mod tests {
         ImageMessage {
             time: "2026-04-28 09:38:44".to_string(),
             timestamp: 1,
+            raw_content: raw_content.to_string(),
+            packed_info,
+        }
+    }
+
+    fn export_message(msg_type: i64, raw_content: &str, packed_info: Vec<u8>) -> ExportMessage {
+        ExportMessage {
+            time: "2026-04-28 09:38:44".to_string(),
+            timestamp: 1,
+            sender: "Alice".to_string(),
+            msg_type,
+            type_name: "文件".to_string(),
+            content: String::new(),
             raw_content: raw_content.to_string(),
             packed_info,
         }
@@ -2428,6 +2536,31 @@ mod tests {
 
         let message = image_message(r#"<msg><img cdnthumburl="thumb-id" /></msg>"#, Vec::new());
         assert_eq!(image_identifier(&message).as_deref(), Some("thumb-id"));
+    }
+
+    #[test]
+    fn file_identifier_prefers_protobuf_filename() {
+        let message = export_message(
+            25_769_803_825,
+            r#"<msg><appmsg><title>xml.pdf</title><type>6</type></appmsg></msg>"#,
+            packed_file("proto.pdf"),
+        );
+
+        assert_eq!(file_identifier(&message).as_deref(), Some("proto.pdf"));
+        assert!(is_file_message(&message));
+        assert_eq!(file_export_type(message.msg_type), 49);
+    }
+
+    #[test]
+    fn file_identifier_uses_xml_title_fallback() {
+        let message = export_message(
+            49,
+            r#"<msg><appmsg><title>xml.pdf</title><type>6</type></appmsg></msg>"#,
+            Vec::new(),
+        );
+
+        assert_eq!(file_identifier(&message).as_deref(), Some("xml.pdf"));
+        assert!(is_file_message(&message));
     }
 
     #[test]
