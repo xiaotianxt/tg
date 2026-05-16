@@ -65,6 +65,17 @@ pub struct ImageExportConfig<'a> {
     pub jobs: usize,
 }
 
+pub struct FileExportConfig<'a> {
+    pub output_dir: &'a Path,
+    pub list: bool,
+    pub all: bool,
+    pub index: Option<usize>,
+    pub id: Option<&'a str>,
+    pub limit: usize,
+    pub since: Option<i64>,
+    pub jobs: usize,
+}
+
 pub struct VoiceExportConfig<'a> {
     pub output_dir: &'a Path,
     pub format: VoiceOutputFormat,
@@ -120,6 +131,22 @@ struct ImageMessage {
 struct ImageCandidate {
     index: usize,
     message: ImageMessage,
+    identifier: Option<String>,
+    source: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct FileMessage {
+    time: String,
+    timestamp: i64,
+    raw_content: String,
+    packed_info: Vec<u8>,
+    msg_type: i64,
+}
+
+struct FileCandidate {
+    index: usize,
+    message: FileMessage,
     identifier: Option<String>,
     source: Option<PathBuf>,
 }
@@ -986,6 +1013,101 @@ fn load_image_messages(
     Ok((username, messages))
 }
 
+fn load_file_messages(
+    decrypted_dir: &Path,
+    session_query: &str,
+    since: Option<i64>,
+    limit: usize,
+    jobs: usize,
+) -> Result<(String, Vec<FileMessage>), String> {
+    let (username, message_dbs) = resolve_image_session(decrypted_dir, session_query, jobs)?;
+    let table_name = db::msg_table_name(&username);
+    let since_clause = since
+        .map(|ts| format!(" AND create_time >= {}", ts))
+        .unwrap_or_default();
+
+    let db_jobs = parallel::job_count(jobs, 8);
+    let per_db_messages = parallel::map_ordered(message_dbs, db_jobs, |db_path| {
+        let mut messages = Vec::new();
+        let conn = match Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(_) => return messages,
+        };
+
+        let body_col = dictionary::msg_body_column();
+        let marker_col = dictionary::msg_compression_marker_column();
+        let packed_col = dictionary::msg_packed_meta_column();
+        let table = db::quote_identifier(&table_name);
+        let app_file_type = app_file_local_type();
+        let sql = format!(
+            "SELECT local_type, create_time, {body_col}, {marker_col}, {packed_col} \
+             FROM {table} \
+             WHERE create_time > 0 \
+               AND (local_type = 62 \
+                    OR local_type = {app_file_type} \
+                    OR (local_type = 49 AND {marker_col} IS NOT 4 AND {body_col} LIKE '%<type>6</type>%'))\
+               {since_clause} \
+             ORDER BY create_time DESC LIMIT {limit}"
+        );
+
+        let rows: Vec<(i64, i64, String, Vec<u8>)> = match conn.prepare(&sql) {
+            Ok(mut stmt) => match stmt.query_map([], |row| {
+                let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
+                let content: String = if compression_marker == Some(4) {
+                    if let Ok(b) = row.get::<_, Vec<u8>>(2) {
+                        message::try_decompress(&b).unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    match row.get::<_, Option<String>>(2) {
+                        Ok(Some(s)) => s,
+                        _ => match row.get::<_, Option<Vec<u8>>>(2) {
+                            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
+                            _ => String::new(),
+                        },
+                    }
+                };
+                let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    content,
+                    packed_info,
+                ))
+            }) {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(_) => vec![],
+            },
+            Err(_) => vec![],
+        };
+
+        for (msg_type, timestamp, raw_content, packed_info) in rows {
+            if !is_file_message_parts(msg_type, &raw_content) {
+                continue;
+            }
+            let time = time::format_local_timestamp(timestamp);
+            messages.push(FileMessage {
+                time,
+                timestamp,
+                raw_content,
+                packed_info,
+                msg_type,
+            });
+        }
+        messages
+    });
+
+    let mut messages = Vec::new();
+    for db_messages in per_db_messages {
+        messages.extend(db_messages);
+    }
+    messages.sort_by_key(|message| Reverse(message.timestamp));
+    messages.truncate(limit);
+
+    Ok((username, messages))
+}
+
 fn image_identifier(message: &ImageMessage) -> Option<String> {
     try_protobuf_identifier(&message.packed_info)
         .or_else(|| extract_xml_attr_str(&message.raw_content, "aeskey"))
@@ -1027,12 +1149,20 @@ fn try_protobuf_file_identifier(data: &[u8]) -> Option<String> {
 }
 
 fn file_identifier(message: &ExportMessage) -> Option<String> {
-    try_protobuf_file_identifier(&message.packed_info)
+    file_identifier_from_parts(&message.packed_info, &message.raw_content)
+}
+
+fn file_message_identifier(message: &FileMessage) -> Option<String> {
+    file_identifier_from_parts(&message.packed_info, &message.raw_content)
+}
+
+fn file_identifier_from_parts(packed_info: &[u8], raw_content: &str) -> Option<String> {
+    try_protobuf_file_identifier(packed_info)
         .or_else(|| {
-            media::parse_file_info(&message.raw_content)
+            media::parse_file_info(raw_content)
                 .and_then(|info| (!info.title.trim().is_empty()).then_some(info.title))
         })
-        .or_else(|| file_path_basename(&message.raw_content))
+        .or_else(|| file_path_basename(raw_content))
 }
 
 fn file_path_basename(content: &str) -> Option<String> {
@@ -1049,10 +1179,14 @@ fn file_path_basename(content: &str) -> Option<String> {
 }
 
 fn is_file_message(message: &ExportMessage) -> bool {
-    message.msg_type == 62
-        || app_message_subtype(message.msg_type) == Some(6)
-        || (((message.msg_type as u64) & 0xffff_ffff) == 49
-            && media::extract_xml_tag_int(&message.raw_content, "type") == Some(6))
+    is_file_message_parts(message.msg_type, &message.raw_content)
+}
+
+fn is_file_message_parts(msg_type: i64, raw_content: &str) -> bool {
+    msg_type == 62
+        || app_message_subtype(msg_type) == Some(6)
+        || (((msg_type as u64) & 0xffff_ffff) == 49
+            && media::extract_xml_tag_int(raw_content, "type") == Some(6))
 }
 
 fn app_message_subtype(local_type: i64) -> Option<i64> {
@@ -1073,6 +1207,296 @@ fn file_export_type(local_type: i64) -> i64 {
         62
     } else {
         49
+    }
+}
+
+fn app_file_local_type() -> i64 {
+    (6_i64 << 32) | 49
+}
+
+/// Export cached file attachments for a session.
+pub fn export_files(
+    decrypted_dir: &Path,
+    session_query: &str,
+    config: FileExportConfig<'_>,
+) -> Result<Vec<PathBuf>, String> {
+    if config.limit == 0 {
+        return Err("--limit must be greater than 0".to_string());
+    }
+    if config.id.is_some() && (config.list || config.all || config.index.is_some()) {
+        return Err("--id cannot be used with --list, --all, or --index".to_string());
+    }
+    if let Some(index) = config.index {
+        if index == 0 {
+            return Err("--index is 1-based and must be greater than 0".to_string());
+        }
+    }
+    if let Some(identifier) = config.id {
+        return export_file_by_identifier(decrypted_dir, session_query, identifier, &config);
+    }
+
+    let scan_limit = config.limit.max(config.index.unwrap_or(1));
+    let (username, messages) = load_file_messages(
+        decrypted_dir,
+        session_query,
+        config.since,
+        scan_limit,
+        config.jobs,
+    )?;
+    if messages.is_empty() {
+        return Err(format!("No file messages found for '{}'", username));
+    }
+
+    let telegram_base = media::find_telegram_base_path()
+        .ok_or_else(|| "Telegram data directory not found".to_string())?;
+    let media_index = MediaIndex::load(&telegram_base, &username, &["File"], config.jobs);
+
+    let candidates = messages
+        .into_iter()
+        .enumerate()
+        .map(|(i, message)| {
+            let identifier = file_message_identifier(&message);
+            let source = identifier
+                .as_deref()
+                .and_then(|id| media_index.find("File", id));
+            FileCandidate {
+                index: i + 1,
+                message,
+                identifier,
+                source,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+
+    if config.list {
+        out.line(format_args!(
+            "{:<5} {:<19} {:<8} {:>9} Source",
+            "Index", "Time", "Status", "Size"
+        ))?;
+        out.line(format_args!("{}", "-".repeat(100)))?;
+        for candidate in &candidates {
+            let status = if candidate.source.is_some() {
+                "cached"
+            } else {
+                "missing"
+            };
+            let source = candidate
+                .source
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .or_else(|| candidate.identifier.clone())
+                .unwrap_or_else(|| "(no identifier)".to_string());
+            out.line(format_args!(
+                "{:<5} {:<19} {:<8} {:>9} {}",
+                candidate.index,
+                candidate.message.time,
+                status,
+                file_size_label(&candidate.message),
+                source
+            ))?;
+        }
+        out.flush()?;
+        return Ok(Vec::new());
+    }
+
+    let selected = if config.all {
+        candidates
+            .into_iter()
+            .filter(|candidate| candidate.source.is_some())
+            .take(config.limit)
+            .collect::<Vec<_>>()
+    } else if let Some(index) = config.index {
+        let Some(candidate) = candidates
+            .into_iter()
+            .find(|candidate| candidate.index == index)
+        else {
+            return Err(format!(
+                "File index {} is outside the scanned window",
+                index
+            ));
+        };
+        if candidate.source.is_none() {
+            return Err(format!(
+                "File #{} is not available in local Telegram cache",
+                index
+            ));
+        }
+        vec![candidate]
+    } else {
+        let Some(candidate) = candidates
+            .into_iter()
+            .find(|candidate| candidate.source.is_some())
+        else {
+            return Err(format!(
+                "No locally cached files found in the latest {} file messages",
+                config.limit
+            ));
+        };
+        vec![candidate]
+    };
+
+    if selected.is_empty() {
+        return Err(format!(
+            "No locally cached files found in the latest {} file messages",
+            config.limit
+        ));
+    }
+
+    let files = selected
+        .into_iter()
+        .filter_map(|candidate| {
+            candidate.source.map(|src| CachedFileSource {
+                index: candidate.index,
+                src,
+                identifier: candidate.identifier,
+                msg_type: file_export_type(candidate.message.msg_type),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    export_cached_files(&username, config.output_dir, config.jobs, files)
+}
+
+fn export_file_by_identifier(
+    decrypted_dir: &Path,
+    session_query: &str,
+    identifier: &str,
+    config: &FileExportConfig<'_>,
+) -> Result<Vec<PathBuf>, String> {
+    let identifier = normalize_file_id(identifier)?;
+    let (username, _) = resolve_image_session(decrypted_dir, session_query, config.jobs)?;
+    let telegram_base = media::find_telegram_base_path()
+        .ok_or_else(|| "Telegram data directory not found".to_string())?;
+    let media_index = MediaIndex::load(&telegram_base, &username, &["File"], config.jobs);
+    let Some(src) = media_index.find("File", &identifier) else {
+        return Err(format!(
+            "File id '{}' is not available in local Telegram cache",
+            identifier
+        ));
+    };
+
+    export_cached_files(
+        &username,
+        config.output_dir,
+        config.jobs,
+        vec![CachedFileSource {
+            index: 1,
+            src,
+            identifier: Some(identifier),
+            msg_type: 49,
+        }],
+    )
+}
+
+fn normalize_file_id(identifier: &str) -> Result<String, String> {
+    let identifier = identifier.trim();
+    if identifier.is_empty() {
+        Err("--id must not be empty".to_string())
+    } else {
+        Ok(identifier.to_string())
+    }
+}
+
+fn file_size_label(message: &FileMessage) -> String {
+    media::parse_file_info(&message.raw_content)
+        .map(|info| media::format_file_size(info.total_len))
+        .filter(|size| !size.is_empty())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+struct CachedFileSource {
+    index: usize,
+    src: PathBuf,
+    identifier: Option<String>,
+    msg_type: i64,
+}
+
+fn export_cached_files(
+    username: &str,
+    output_dir: &Path,
+    jobs: usize,
+    files: Vec<CachedFileSource>,
+) -> Result<Vec<PathBuf>, String> {
+    std::fs::create_dir_all(output_dir).map_err(|e| format!("Cannot create file dir: {}", e))?;
+
+    let file_job_count = parallel::job_count(jobs, 4);
+    let file_results = parallel::map_ordered(files, file_job_count, |file| {
+        let index = file.index;
+        MediaExportResult {
+            index,
+            is_sticker: false,
+            result: export_file_attachment(output_dir, username, file),
+        }
+    });
+
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+    let mut paths = Vec::new();
+    for file_result in file_results {
+        match file_result.result {
+            Ok(path) => {
+                out.line(format_args!("{}", path.display()))?;
+                paths.push(path);
+            }
+            Err(e) => log::warn!("File #{} export failed: {}", file_result.index, e),
+        }
+    }
+    out.flush()?;
+
+    if paths.is_empty() {
+        return Err("No files were exported".to_string());
+    }
+
+    Ok(paths)
+}
+
+fn export_file_attachment(
+    output_dir: &Path,
+    session_name: &str,
+    file: CachedFileSource,
+) -> Result<PathBuf, String> {
+    let ext = file_extension(&file.src, file.identifier.as_deref());
+    let filename = format!(
+        "{}_File_{}_{:04}.{}",
+        media::sanitize_filename(session_name),
+        file.msg_type,
+        file.index,
+        ext
+    );
+    let dest = output_dir.join(filename);
+    std::fs::copy(&file.src, &dest).map_err(|e| {
+        format!(
+            "Cannot copy file {} to {}: {}",
+            file.src.display(),
+            dest.display(),
+            e
+        )
+    })?;
+    Ok(dest)
+}
+
+fn file_extension(src: &Path, identifier: Option<&str>) -> String {
+    src.extension()
+        .and_then(OsStr::to_str)
+        .and_then(clean_file_extension)
+        .or_else(|| {
+            identifier
+                .and_then(|id| Path::new(id).extension())
+                .and_then(OsStr::to_str)
+                .and_then(clean_file_extension)
+        })
+        .unwrap_or_else(|| "bin".to_string())
+}
+
+fn clean_file_extension(ext: &str) -> Option<String> {
+    let ext = ext.trim().trim_start_matches('.');
+    if ext.is_empty() || ext.len() > 24 || !ext.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        None
+    } else {
+        Some(ext.to_ascii_lowercase())
     }
 }
 
@@ -2203,6 +2627,69 @@ mod tests {
         dir
     }
 
+    fn create_file_decrypted_dir() -> TempDir {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+
+        let message_conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let table_name = db::msg_table_name("tgid_files");
+        let body_col = db::quote_identifier(dictionary::msg_body_column());
+        let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+        let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
+        message_conn
+            .execute(
+                &format!(
+                    "CREATE TABLE {} (
+                        local_type INTEGER,
+                        create_time INTEGER,
+                        {} TEXT,
+                        {} INTEGER,
+                        {} BLOB
+                    )",
+                    table_name, body_col, marker_col, packed_col
+                ),
+                [],
+            )
+            .unwrap();
+
+        let app_file_type = app_file_local_type();
+        for (msg_type, timestamp, content, packed) in [
+            (
+                49,
+                1000,
+                r#"<msg><appmsg><title>old.pdf</title><type>6</type><totallen>2048</totallen></appmsg></msg>"#,
+                Vec::new(),
+            ),
+            (
+                49,
+                1001,
+                r#"<msg><appmsg><title>link</title><type>5</type></appmsg></msg>"#,
+                Vec::new(),
+            ),
+            (
+                app_file_type,
+                1002,
+                r#"<msg><appmsg><title>xml.pdf</title><type>6</type><totallen>1024</totallen></appmsg></msg>"#,
+                packed_file("new.pdf"),
+            ),
+        ] {
+            message_conn
+                .execute(
+                    &format!(
+                        "INSERT INTO {} (local_type, create_time, {}, {}, {})
+                         VALUES (?1, ?2, ?3, NULL, ?4)",
+                        table_name, body_col, marker_col, packed_col
+                    ),
+                    params![msg_type, timestamp, content, packed],
+                )
+                .unwrap();
+        }
+        drop(message_conn);
+
+        dir
+    }
+
     fn create_voice_decrypted_dir() -> TempDir {
         let dir = tempdir().unwrap();
         let message_dir = dir.path().join("message");
@@ -2426,6 +2913,43 @@ mod tests {
     }
 
     #[test]
+    fn load_file_messages_returns_files_newest_first() {
+        let decrypted = create_file_decrypted_dir();
+
+        let (username, messages) =
+            load_file_messages(decrypted.path(), "tgid_files", None, 10, 1).unwrap();
+
+        assert_eq!(username, "tgid_files");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.timestamp)
+                .collect::<Vec<_>>(),
+            vec![1002, 1000]
+        );
+        assert_eq!(
+            file_message_identifier(&messages[0]).as_deref(),
+            Some("new.pdf")
+        );
+        assert_eq!(file_size_label(&messages[0]), "1KB");
+    }
+
+    #[test]
+    fn load_file_messages_respects_since_and_limit() {
+        let decrypted = create_file_decrypted_dir();
+
+        let (_, messages) =
+            load_file_messages(decrypted.path(), "tgid_files", Some(1001), 1, 1).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].timestamp, 1002);
+        assert_eq!(
+            file_message_identifier(&messages[0]).as_deref(),
+            Some("new.pdf")
+        );
+    }
+
+    #[test]
     fn load_voice_messages_returns_voices_newest_first() {
         let decrypted = create_voice_decrypted_dir();
 
@@ -2564,6 +3088,24 @@ mod tests {
     }
 
     #[test]
+    fn file_extension_uses_identifier_when_cache_name_has_no_extension() {
+        assert_eq!(
+            file_extension(Path::new("/tmp/report"), Some("report.pdf")),
+            "pdf"
+        );
+        assert_eq!(
+            file_extension(Path::new("/tmp/report.bin"), Some("report.pdf")),
+            "bin"
+        );
+    }
+
+    #[test]
+    fn normalize_file_id_rejects_empty_value() {
+        assert_eq!(normalize_file_id("  abc.pdf  ").as_deref(), Ok("abc.pdf"));
+        assert!(normalize_file_id("   ").unwrap_err().contains("--id"));
+    }
+
+    #[test]
     fn normalize_image_id_rejects_empty_value() {
         assert_eq!(normalize_image_id("  abc  ").as_deref(), Ok("abc"));
         assert!(normalize_image_id("   ").unwrap_err().contains("--id"));
@@ -2581,6 +3123,28 @@ mod tests {
                 all: false,
                 index: None,
                 id: Some("abc"),
+                limit: 1,
+                since: None,
+                jobs: 1,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("--id cannot be used"));
+    }
+
+    #[test]
+    fn file_id_conflicts_with_window_selection_modes() {
+        let output_dir = Path::new("out");
+        let err = export_files(
+            Path::new("decrypted"),
+            "session",
+            FileExportConfig {
+                output_dir,
+                list: true,
+                all: false,
+                index: None,
+                id: Some("report.pdf"),
                 limit: 1,
                 since: None,
                 jobs: 1,

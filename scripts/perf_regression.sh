@@ -8,6 +8,7 @@ RUNS="${TG_PERF_RUNS:-5}"
 DECRYPTED_DIR="${TG_PERF_DECRYPTED_DIR:-${HOME}/.tg/decrypted}"
 SESSION="${TG_PERF_SESSION:-}"
 QUERY="${TG_PERF_QUERY:-项目}"
+CASES="${TG_PERF_CASES:-sessions messages query image-list voice-list}"
 OUT_DIR="${TG_PERF_OUT_DIR:-}"
 FAIL_THRESHOLD="${TG_PERF_FAIL_THRESHOLD:-}"
 KEEP_SOURCES=0
@@ -25,6 +26,7 @@ Options:
   --runs N             Timing runs per command. Default: TG_PERF_RUNS or 5.
   --session NAME       Session/display name for session-specific commands.
   --query TEXT         Query keyword for query/search cases. Default: 项目.
+  --cases LIST         Space-separated cases. Default: sessions messages query image-list voice-list.
   --decrypted-dir DIR  Decrypted database dir. Default: ~/.tg/decrypted.
   --out-dir DIR        Report directory. Default: target/perf/<timestamp>.
   --fail-threshold R   Exit nonzero if candidate/baseline median exceeds R.
@@ -32,7 +34,7 @@ Options:
   -h, --help           Show this help.
 
 Environment mirrors the long options: TG_PERF_BASELINE, TG_PERF_CANDIDATE,
-TG_PERF_RUNS, TG_PERF_SESSION, TG_PERF_QUERY, TG_PERF_DECRYPTED_DIR,
+TG_PERF_RUNS, TG_PERF_SESSION, TG_PERF_QUERY, TG_PERF_CASES, TG_PERF_DECRYPTED_DIR,
 TG_PERF_OUT_DIR, TG_PERF_FAIL_THRESHOLD.
 USAGE
 }
@@ -71,6 +73,11 @@ while [[ $# -gt 0 ]]; do
     --query)
       [[ $# -ge 2 ]] || die "--query requires a value"
       QUERY="$2"
+      shift
+      ;;
+    --cases)
+      [[ $# -ge 2 ]] || die "--cases requires a value"
+      CASES="$2"
       shift
       ;;
     --decrypted-dir)
@@ -168,6 +175,9 @@ measure_case_once() {
     image-list)
       measure_once "$bin" image "$SESSION" --decrypted-dir "$DECRYPTED_DIR" --list --limit 20 --jobs 1
       ;;
+    file-list)
+      measure_once "$bin" file "$SESSION" --decrypted-dir "$DECRYPTED_DIR" --list --limit 20 --jobs 1
+      ;;
     voice-list)
       measure_once "$bin" voice "$SESSION" --decrypted-dir "$DECRYPTED_DIR" --list --limit 20 --jobs 1
       ;;
@@ -179,7 +189,7 @@ measure_case_once() {
 
 case_requires_session() {
   case "$1" in
-    messages|query|image-list|voice-list)
+    messages|query|image-list|file-list|voice-list)
       return 0
       ;;
     *)
@@ -300,7 +310,6 @@ EOF
 CSV="${OUT_DIR}/summary.csv"
 printf 'case,binary,ref,runs,status,median_seconds,samples\n' >"$CSV"
 
-CASES="sessions messages query image-list voice-list"
 for case_name in $CASES; do
   log "benchmarking ${case_name}"
   run_case baseline "$BASELINE_REF" "$BASELINE_BIN" "$case_name"
@@ -333,7 +342,11 @@ if awk -F, -v fail_threshold="$FAIL_THRESHOLD" '
       if (bs[key] != "ok" || cs[key] != "ok") {
         printf "%-14s %-11s %-11s %-9s %-8s\n", key, bs[key], cs[key], "-", "skip"
       } else {
-        ratio = c[key] / b[key]
+        if (b[key] + 0 == 0) {
+          ratio = (c[key] + 0 == 0) ? 1 : 999999
+        } else {
+          ratio = c[key] / b[key]
+        }
         status = ratio > 1.20 ? "slower" : (ratio < 0.80 ? "faster" : "ok")
         ratio_text = sprintf("%.2fx", ratio)
         printf "%-14s %-11.6f %-11.6f %-9s %-8s\n", key, b[key], c[key], ratio_text, status

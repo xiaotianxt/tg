@@ -465,6 +465,46 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         jobs: usize,
     },
+    /// Export local cached file attachments from a specific session
+    File {
+        /// Session username (tgid_xxx) or display name to search
+        session: String,
+        /// Path to decrypted databases
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
+        decrypted_dir: PathBuf,
+        /// Output directory for cached file attachments
+        #[arg(
+            long,
+            default_value = "exported/files",
+            value_hint = clap::ValueHint::DirPath
+        )]
+        output: PathBuf,
+        /// List recent file messages without exporting
+        #[arg(long, conflicts_with_all = ["all", "index"])]
+        list: bool,
+        /// Export every locally cached file in the selected window
+        #[arg(long, conflicts_with = "index")]
+        all: bool,
+        /// Export the Nth file shown by --list (newest first)
+        #[arg(long)]
+        index: Option<usize>,
+        /// Export a file by compact message identifier or filename
+        #[arg(long, conflicts_with_all = ["list", "all", "index"])]
+        id: Option<String>,
+        /// Number of recent file messages to scan
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Only consider files after this time (ISO 8601 or relative: 5min, 1h, today)
+        #[arg(long)]
+        since: Option<String>,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+    },
     /// Export local cached voice messages from a specific session
     Voice {
         /// Session username (tgid_xxx) or display name to search
@@ -1077,6 +1117,41 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::File {
+            session,
+            decrypted_dir,
+            output,
+            list,
+            all,
+            index,
+            id,
+            limit,
+            since,
+            jobs,
+        } => {
+            let since_ts = match time::parse_since_opt(since.as_deref()) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    log::error!("Error parsing --since: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let _ = cache::refresh_decrypted(&decrypted_dir, jobs);
+            let config = export::FileExportConfig {
+                output_dir: &output,
+                list,
+                all,
+                index,
+                id: id.as_deref(),
+                limit,
+                since: since_ts,
+                jobs,
+            };
+            if let Err(e) = export::export_files(&decrypted_dir, &session, config) {
+                log::error!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Commands::Voice {
             session,
             decrypted_dir,
@@ -1199,6 +1274,7 @@ mod tests {
             "sql",
             "export",
             "image",
+            "file",
             "voice",
             "doctor",
             "refresh",
@@ -1344,6 +1420,27 @@ mod tests {
         match cli.command {
             Commands::Voice { id, .. } => assert_eq!(id, Some(42)),
             _ => panic!("expected voice command"),
+        }
+    }
+
+    #[test]
+    fn file_accepts_index_selection() {
+        let cli = Cli::parse_from(args(&["tg", "file", "alice", "--index", "2"]));
+        match cli.command {
+            Commands::File { session, index, .. } => {
+                assert_eq!(session, "alice");
+                assert_eq!(index, Some(2));
+            }
+            _ => panic!("expected file command"),
+        }
+    }
+
+    #[test]
+    fn file_accepts_id_selection() {
+        let cli = Cli::parse_from(args(&["tg", "file", "alice", "--id", "report.pdf"]));
+        match cli.command {
+            Commands::File { id, .. } => assert_eq!(id.as_deref(), Some("report.pdf")),
+            _ => panic!("expected file command"),
         }
     }
 

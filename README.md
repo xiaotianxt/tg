@@ -10,7 +10,7 @@ tg 是一个 macOS 本地 Telegram 聊天记录读取 CLI。它把本机 Telegra
 - 快速找某个人、某个群、某个关键词的历史消息。
 - 用包含词、排除词、时间范围和输出字段做更精确的本地检索。
 - 把聊天导出成 `txt`、`csv`、`json`，用于归档、整理或本地分析。
-- 从本地缓存里导出图片、视频、表情等媒体文件。
+- 从本地缓存里导出图片、视频、表情和普通文件附件。
 - 从本地媒体数据库里导出语音消息为 `.voice` 文件。
 - 给本地 AI/自动化助手一个稳定的聊天记录读取工具和 skill 描述。
 
@@ -66,6 +66,13 @@ $ tg image "产品讨论群"
 exported/images/123456789_chatroom_Image_3_0001.jpg
 ```
 
+导出最近一个本地缓存文件附件：
+
+```bash
+$ tg file "产品讨论群"
+exported/files/123456789_chatroom_File_49_0001.pdf
+```
+
 导出最近一条本地语音：
 
 ```bash
@@ -84,6 +91,7 @@ tg search "关键词"
 tg query --session "产品讨论群" --contains "项目" --not "取消" --fields time,sender,body
 tg export "张三" --format json --output exported/zhangsan
 tg image "产品讨论群" --list
+tg file "产品讨论群" --list
 tg voice "产品讨论群" --list
 ```
 
@@ -110,7 +118,7 @@ tg refresh
 | 消息读取 | 文本、群聊发送者、系统提示、撤回提示、引用、链接、小程序、聊天记录卡片展开、位置、文件卡片、图片/视频/语音/表情的可读摘要 |
 | 搜索 | 全局关键词搜索，单个会话内关键词搜索，结构化检索；支持包含词、排除词、时间范围、字段选择和 JSON 行输出 |
 | 导出 | `txt`、`csv`、`json` |
-| 媒体 | 尝试导出本地缓存图片、视频、表情；`.dat` 图片/视频会尝试解密；语音可通过 `voice` 导出为 `.voice` |
+| 媒体 | 尝试导出本地缓存图片、视频、表情和普通文件附件；`.dat` 图片/视频会尝试解密；语音可通过 `voice` 导出为 `.voice` |
 | 增量更新 | 默认只解密变化过的数据库 |
 
 暂不支持或不保证：
@@ -118,7 +126,7 @@ tg refresh
 - 不支持 Windows、iOS、Android、网页版 Telegram。
 - 不恢复 Telegram 本地数据库里已经没有的消息。
 - 不保证导出所有媒体。Telegram 没有缓存、缓存被清理、文件未下载时，只能显示消息摘要。
-- `export --media-dir` 会尝试导出图片、视频、表情，但不导出语音音频和普通文件附件本体；语音请用 `tg voice`。
+- `export --media-dir` 会尝试导出图片、视频、表情和普通文件附件；语音请用 `tg voice`。
 - 表情导出可能根据消息里的 URL 用 `curl` 下载；普通读取、解密、搜索不会上传聊天数据。
 - `tggf` 表情转换需要本机可用的 `ffmpeg`。
 - 不做 OCR、语义搜索、拼音搜索。
@@ -341,6 +349,18 @@ Index Time                Status   Source
 2     2026-04-27 22:10:01 missing  cdnthumburl...
 ```
 
+导出文件附件：
+
+```bash
+tg file "张三"
+tg file "张三" --list --limit 20
+tg file "张三" --index 3
+tg file "张三" --id report.pdf
+tg file "张三" --all --limit 10 --output exported/files
+```
+
+`messages` 会把文件卡片显示成 `[文件:标题 (大小)]`。`file --list` 会列出最近文件附件是否仍在本地缓存中；`file --id` 可以用列表里的文件名或消息里的文件标识直接导出本地缓存文件。文件缓存索引只扫描当前会话对应的附件目录，避免为了单个会话遍历全量附件缓存。
+
 导出语音：
 
 ```bash
@@ -425,9 +445,9 @@ tg sessions --top 30
 tg messages "tgid_abcd1234" --limit 50
 ```
 
-### 图片或视频导不出来
+### 图片、视频或文件导不出来
 
-媒体导出依赖 Telegram 本地缓存。可以先在 Telegram 里打开对应图片或视频，让 Telegram 把文件下载到本机，再重新运行 `tg image` 或 `tg export --media-dir ...`。
+媒体导出依赖 Telegram 本地缓存。可以先在 Telegram 里打开对应图片、视频或文件，让 Telegram 把文件下载到本机，再重新运行 `tg image`、`tg file` 或 `tg export --media-dir ...`。
 
 ### 语音导出后不能直接播放
 
