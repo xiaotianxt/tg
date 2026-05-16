@@ -12,15 +12,19 @@ pub enum MessageType {
     Text,         // 1
     Image,        // 3
     Voice,        // 34
+    Mail,         // 35
     Sticker,      // 47
     Video,        // 43
     Link,         // 49 — 链接/文件/小程序/音乐
     System,       // 10000
+    Notification, // 11000
     RedEnvelope,  // 436207665
     Transfer,     // 536870918
     Location,     // 48
+    ContactCard,  // 42
     File,         // 62
     Call,         // 50
+    ExternalCard, // 66
     Music,        // 419430449
     Revoke,       // 10002 撤回消息
     Unknown(i32), // 其他
@@ -32,15 +36,19 @@ impl fmt::Display for MessageType {
             MessageType::Text => "文本",
             MessageType::Image => "图片",
             MessageType::Voice => "语音",
+            MessageType::Mail => "邮件",
             MessageType::Sticker => "表情",
             MessageType::Video => "视频",
             MessageType::Link => "链接/文件/小程序",
             MessageType::System => "系统提示",
+            MessageType::Notification => "通知",
             MessageType::RedEnvelope => "红包",
             MessageType::Transfer => "转账",
             MessageType::Location => "位置",
+            MessageType::ContactCard => "名片",
             MessageType::File => "文件",
             MessageType::Call => "语音/视频通话",
+            MessageType::ExternalCard => "外部联系人",
             MessageType::Music => "音乐",
             MessageType::Revoke => "撤回消息",
             MessageType::Unknown(n) => return write!(f, "未知({})", n),
@@ -55,6 +63,8 @@ impl From<i32> for MessageType {
             1 => MessageType::Text,
             3 => MessageType::Image,
             34 => MessageType::Voice,
+            35 => MessageType::Mail,
+            42 => MessageType::ContactCard,
             43 => MessageType::Video,
             47 => MessageType::Sticker,
             48 => MessageType::Location,
@@ -62,8 +72,10 @@ impl From<i32> for MessageType {
             50 => MessageType::Call,
             62 => MessageType::File,
             10000 => MessageType::System,
+            11000 => MessageType::Notification,
             10002 => MessageType::Revoke,
             419430449 => MessageType::Music,
+            66 => MessageType::ExternalCard,
             436207665 => MessageType::RedEnvelope,
             536870918 => MessageType::Transfer,
             n => MessageType::Unknown(n),
@@ -150,9 +162,10 @@ pub(crate) fn decode_message_with_context(
     let msg_type_enum: MessageType = msg_type.into();
 
     if msg_type == 10000 || msg_type == 10002 {
+        let (_, clean_content) = parse_sender_from_content(raw_content);
         return DecodedMessage {
             msg_type: msg_type_enum,
-            content: decode_system_content(raw_content, msg_type_enum),
+            content: sanitize_decoded_content(decode_system_content(clean_content, msg_type_enum)),
             display_name: "系统".to_string(),
         };
     }
@@ -166,7 +179,7 @@ pub(crate) fn decode_message_with_context(
         let content = decode_media_content(msg_type, clean_content, packed_info, context.voice_id);
         return DecodedMessage {
             msg_type: msg_type_enum,
-            content,
+            content: sanitize_decoded_content(content),
             display_name,
         };
     }
@@ -174,7 +187,7 @@ pub(crate) fn decode_message_with_context(
     if raw_content.is_empty() && msg_type != 1 {
         return DecodedMessage {
             msg_type: msg_type_enum,
-            content: format!("[{}]", msg_type_enum),
+            content: sanitize_decoded_content(format!("[{}]", msg_type_enum)),
             display_name: session_display_name.to_string(),
         };
     }
@@ -194,7 +207,7 @@ pub(crate) fn decode_message_with_context(
 
     DecodedMessage {
         msg_type: msg_type_enum,
-        content,
+        content: sanitize_decoded_content(content),
         display_name,
     }
 }
@@ -312,9 +325,12 @@ fn decode_content_by_type(
     match msg_type {
         1 => decode_text_content(content, time_bucket, resolve_display_name),
         49 => decode_link_content(content, packed_info, time_bucket, resolve_display_name),
+        35 => decode_mail_content(content),
+        42 => decode_contact_card_content(content, "名片"),
         48 => decode_location_content(content),
         50 => decode_call_content(content),
         62 => decode_file_content(content, packed_info),
+        66 => decode_contact_card_content(content, "外部联系人"),
         419430449 => decode_music_content(content),
         436207665 | 536870918 => format!("[{}]", MessageType::from(msg_type)),
         _ => decode_text_content(content, time_bucket, resolve_display_name),
@@ -360,13 +376,17 @@ fn decode_internal_xml_fragment(
 ) -> Option<String> {
     let fragment = strip_display_prefix(fragment).trim_start();
     let xml = if fragment.starts_with("<?xml") {
-        let start = fragment.find("<msg")?;
+        let start = fragment.find("<msg").or_else(|| fragment.find("<sysmsg"))?;
         &fragment[start..]
     } else {
         fragment
     };
 
-    if !xml.starts_with("<msg") {
+    if xml.starts_with("&lt;") {
+        return Some("[消息]".to_string());
+    }
+
+    if !xml.starts_with("<msg") && !xml.starts_with("<sysmsg") {
         return None;
     }
 
@@ -384,8 +404,14 @@ fn decode_internal_xml_fragment(
     if xml.contains("<videomsg") || xml.contains("<video") {
         return Some(media::parse_video_info(xml).display());
     }
+    if xml.contains("<emoji") {
+        return Some(media::parse_sticker_info(xml).display());
+    }
+    if xml.starts_with("<sysmsg") {
+        return Some(decode_system_content(xml, MessageType::System));
+    }
 
-    None
+    Some(decode_generic_xml_fragment(xml))
 }
 
 fn strip_display_prefix(content: &str) -> &str {
@@ -399,10 +425,101 @@ fn strip_display_prefix(content: &str) -> &str {
 }
 
 fn find_internal_xml_start(content: &str) -> Option<usize> {
-    ["<?xml", "<msg"]
-        .iter()
-        .filter_map(|needle| content.find(needle))
-        .min()
+    [
+        "<?xml",
+        "<msg",
+        "<sysmsg",
+        "&lt;?xml",
+        "&lt;msg",
+        "&lt;sysmsg",
+    ]
+    .iter()
+    .filter_map(|needle| content.find(needle))
+    .min()
+}
+
+fn contains_internal_xml_marker(content: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "<?xml",
+        "<msg",
+        "<appmsg",
+        "<sysmsg",
+        "<recordinfo",
+        "<datalist",
+        "<dataitem",
+        "<img",
+        "<videomsg",
+        "<voicemsg",
+        "<emoji",
+        "<location",
+        "<pushmail",
+        "&lt;?xml",
+        "&lt;msg",
+        "&lt;appmsg",
+        "&lt;sysmsg",
+        "&lt;recordinfo",
+        "&lt;dataitem",
+    ];
+    NEEDLES.iter().any(|needle| content.contains(needle))
+}
+
+fn sanitize_decoded_content(content: String) -> String {
+    if !contains_internal_xml_marker(&content) {
+        return content;
+    }
+
+    let marker_start = find_internal_xml_start(&content)
+        .or_else(|| content.find("<img"))
+        .or_else(|| content.find("<emoji"))
+        .or_else(|| content.find("<appmsg"))
+        .or_else(|| content.find('<'))
+        .unwrap_or(content.len());
+    let prefix = content[..marker_start].trim_end();
+    let marker = &content[marker_start..];
+    let replacement = if marker.contains("<emoji") {
+        "[表情]"
+    } else if marker.contains("<img") || marker.contains("&lt;img") {
+        "[img]"
+    } else if marker.contains("<videomsg") || marker.contains("<video") {
+        "[视频]"
+    } else {
+        "[消息]"
+    };
+
+    if prefix.is_empty() {
+        replacement.to_string()
+    } else if prefix == ">" {
+        format!("> {}", replacement)
+    } else {
+        format!("{}\n{}", prefix, replacement)
+    }
+}
+
+fn safe_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    crate::media::extract_xml_tag(xml, tag).and_then(clean_summary_field)
+}
+
+fn clean_summary_field(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || contains_internal_xml_marker(value) {
+        None
+    } else {
+        Some(truncate_display(value, 200))
+    }
+}
+
+fn decode_generic_xml_fragment(xml: &str) -> String {
+    let title = safe_xml_tag(xml, "title");
+    let desc = safe_xml_tag(xml, "des")
+        .or_else(|| safe_xml_tag(xml, "desc"))
+        .or_else(|| safe_xml_tag(xml, "content"));
+
+    match (title, desc) {
+        (Some(title), Some(desc)) => format!("[消息] {} - {}", title, desc),
+        (Some(title), None) => format!("[消息] {}", title),
+        (None, Some(desc)) => format!("[消息] {}", desc),
+        (None, None) => "[消息]".to_string(),
+    }
 }
 
 fn decode_system_content(content: &str, msg_type: MessageType) -> String {
@@ -420,9 +537,14 @@ fn decode_system_content(content: &str, msg_type: MessageType) -> String {
     }
 
     if trimmed.starts_with('<') {
-        if let Some(text) = crate::media::extract_xml_tag(trimmed, "content") {
+        if let Some(text) = safe_xml_tag(trimmed, "content") {
             return text;
         }
+        let generic = decode_generic_xml_fragment(trimmed);
+        if generic != "[消息]" {
+            return generic;
+        }
+        return format!("[{}]", msg_type);
     }
 
     content.to_string()
@@ -436,7 +558,7 @@ fn decode_link_content(
 ) -> String {
     if !content.trim_start().starts_with('<') {
         if content.len() > 200 {
-            return format!("[链接] {}", &content[..200]);
+            return format!("[链接] {}", truncate_display(content, 200));
         }
         return format!("[链接] {}", content);
     }
@@ -451,33 +573,53 @@ fn decode_link_content(
             .as_ref()
             .map(media::MiniProgramInfo::display)
             .unwrap_or_else(|| "[小程序]".to_string()),
+        36 => media::parse_mini_program_info(content)
+            .as_ref()
+            .map(media::MiniProgramInfo::display)
+            .unwrap_or_else(|| decode_app_card_fallback(sub_type, "小程序", content)),
         3 => {
             let title = crate::media::extract_xml_tag(content, "title")
                 .unwrap_or_else(|| "未知歌曲".to_string());
             format!("[音乐] {}", title)
         }
         6 => decode_file_content(content, packed_info),
+        62 => decode_file_content(content, packed_info),
         19 => decode_chat_history_content(content, time_bucket),
         57 => decode_quote_content(content, time_bucket, resolve_display_name),
+        2000 => decode_app_card_fallback(sub_type, "转账", content),
+        2001 => decode_app_card_fallback(sub_type, "红包", content),
         51 => {
             let title = crate::media::extract_xml_tag(content, "title")
                 .unwrap_or_else(|| "聊天记录".to_string());
             format!("[引用: {}]", title)
         }
-        _ => {
-            let title = crate::media::extract_xml_tag(content, "title").unwrap_or_default();
-            let desc = crate::media::extract_xml_tag(content, "des").unwrap_or_default();
-            let title = if !title.is_empty() {
-                title
-            } else {
-                "未知卡片".to_string()
-            };
-            if !desc.is_empty() {
-                format!("[卡片] {} - {}", title, desc)
-            } else {
-                format!("[卡片] {}", title)
-            }
+        _ => decode_app_card_fallback(sub_type, "卡片", content),
+    }
+}
+
+fn decode_app_card_fallback(sub_type: i64, label: &str, content: &str) -> String {
+    let title = safe_xml_tag(content, "title").unwrap_or_default();
+    let desc = safe_xml_tag(content, "des").unwrap_or_default();
+    let label = if label == "卡片" {
+        if sub_type > 0 {
+            format!("{}:{}", label, sub_type)
+        } else {
+            label.to_string()
         }
+    } else {
+        label.to_string()
+    };
+    let title = if !title.is_empty() {
+        title
+    } else if label.starts_with("卡片:") {
+        "未知卡片".to_string()
+    } else {
+        format!("未知{}", label)
+    };
+    if !desc.is_empty() {
+        format!("[{}] {} - {}", label, title, desc)
+    } else {
+        format!("[{}] {}", label, title)
     }
 }
 
@@ -570,7 +712,7 @@ fn parse_chat_history_item(item_xml: &str) -> Option<ChatHistoryItem> {
 fn decode_chat_history_item_body(item_xml: &str, datatype: Option<i64>) -> String {
     let desc = crate::media::extract_xml_tag(item_xml, "datadesc").unwrap_or_default();
     if !desc.is_empty() {
-        return desc;
+        return decode_embedded_history_text(&desc);
     }
 
     let title = crate::media::extract_xml_tag(item_xml, "datatitle")
@@ -584,9 +726,20 @@ fn decode_chat_history_item_body(item_xml: &str, datatype: Option<i64>) -> Strin
         Some(5) => fallback_tag_with_title("链接", &title),
         Some(6) => fallback_tag_with_title("位置", &title),
         Some(8) => fallback_tag_with_title("文件", &title),
-        _ if !title.is_empty() => title,
+        _ if !title.is_empty() => decode_embedded_history_text(&title),
         Some(t) => format!("[记录:{}]", t),
         None => "[记录]".to_string(),
+    }
+}
+
+fn decode_embedded_history_text(value: &str) -> String {
+    if contains_internal_xml_marker(value) {
+        decode_text_with_internal_xml(value, time::MessageTimeBucket::Minute(1), &|id| {
+            id.to_string()
+        })
+        .unwrap_or_else(|| "[消息]".to_string())
+    } else {
+        value.to_string()
     }
 }
 
@@ -693,7 +846,7 @@ fn decode_quote_content(
     time_bucket: time::MessageTimeBucket,
     resolve_display_name: &impl Fn(&str) -> String,
 ) -> String {
-    let reply = crate::media::extract_xml_tag(content, "title").unwrap_or_default();
+    let reply = safe_xml_tag(content, "title").unwrap_or_default();
     let quoted = crate::media::extract_xml_tag(content, "refermsg")
         .map(|refermsg| decode_refermsg_content(&refermsg, time_bucket, resolve_display_name))
         .unwrap_or_default();
@@ -803,6 +956,56 @@ fn decode_call_content(content: &str) -> String {
     "[通话]".to_string()
 }
 
+fn decode_mail_content(content: &str) -> String {
+    if !content.trim_start().starts_with('<') {
+        if content.is_empty() {
+            return "[邮件]".to_string();
+        }
+        return format!("[邮件] {}", truncate_display(content, 120));
+    }
+
+    let subject = crate::media::extract_xml_tag(content, "subject")
+        .or_else(|| crate::media::extract_xml_tag(content, "title"))
+        .unwrap_or_default();
+    let sender = crate::media::extract_xml_tag(content, "sender")
+        .or_else(|| crate::media::extract_xml_tag(content, "name"))
+        .unwrap_or_default();
+    let digest = crate::media::extract_xml_tag(content, "digest").unwrap_or_default();
+    let summary = if !subject.is_empty() {
+        subject
+    } else if !digest.is_empty() {
+        digest
+    } else {
+        String::new()
+    };
+
+    match (summary.is_empty(), sender.is_empty()) {
+        (false, false) => format!("[邮件] {} - {}", summary, sender),
+        (false, true) => format!("[邮件] {}", summary),
+        (true, false) => format!("[邮件] {}", sender),
+        (true, true) => "[邮件]".to_string(),
+    }
+}
+
+fn decode_contact_card_content(content: &str, label: &str) -> String {
+    if !content.trim_start().starts_with('<') {
+        if content.is_empty() {
+            return format!("[{}]", label);
+        }
+        return format!("[{}] {}", label, truncate_display(content, 120));
+    }
+
+    let name = crate::media::extract_xml_attr(content, "nickname")
+        .or_else(|| crate::media::extract_xml_attr(content, "alias"))
+        .or_else(|| crate::media::extract_xml_attr(content, "username"))
+        .unwrap_or_default();
+    if name.is_empty() {
+        format!("[{}]", label)
+    } else {
+        format!("[{}] {}", label, name)
+    }
+}
+
 fn decode_file_content(content: &str, packed_info: &[u8]) -> String {
     let packed_name = extract_file_name_from_packed_info(packed_info);
     if content.trim_start().starts_with('<') {
@@ -862,6 +1065,18 @@ fn format_voice_duration_zh(duration_secs: Option<i64>) -> String {
         Some(d) if d > 0 => format!(" {}秒", d),
         _ => String::new(),
     }
+}
+
+fn truncate_display(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Decompress message content.
@@ -945,7 +1160,10 @@ mod tests {
     #[test]
     fn test_message_type_from_i32() {
         assert_eq!(MessageType::from(1), MessageType::Text);
-        assert_eq!(MessageType::from(42), MessageType::Unknown(42));
+        assert_eq!(MessageType::from(35), MessageType::Mail);
+        assert_eq!(MessageType::from(42), MessageType::ContactCard);
+        assert_eq!(MessageType::from(66), MessageType::ExternalCard);
+        assert_eq!(MessageType::from(11000), MessageType::Notification);
     }
 
     #[test]
@@ -967,6 +1185,15 @@ mod tests {
         let xml = r#"<?xml version="1.0"?><sysmsg type="revokemsg"><revokemsg><content>&quot;张三&quot; 撤回了一条消息</content><revoketime>0</revoketime></revokemsg></sysmsg>"#;
         let d = decode_message(10000, xml, "Alice", None, &[], |id| id.to_string());
         assert_eq!(d.content, r#"[撤回] "张三" 撤回了一条消息"#);
+        assert_eq!(d.display_name, "系统");
+    }
+
+    #[test]
+    fn test_decode_system_message_strips_sender_prefix_before_xml() {
+        let xml = r#"tgid_abc:
+<sysmsg type="revokemsg"><revokemsg><content>撤回了一条消息</content></revokemsg></sysmsg>"#;
+        let d = decode_message(10000, xml, "Group", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "[撤回] 撤回了一条消息");
         assert_eq!(d.display_name, "系统");
     }
 
@@ -1105,6 +1332,13 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_app_subtype_62_as_file() {
+        let xml = r#"<msg><appmsg><title>report.pdf</title><type>62</type><appattach><totallen>4096</totallen><fileext>pdf</fileext></appattach></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "[文件] report.pdf (4KB)");
+    }
+
+    #[test]
     fn test_decode_file_message_uses_packed_name_fallback() {
         let filename = b"fallback.docx";
         let mut inner = vec![8, 0, 18, filename.len() as u8];
@@ -1117,6 +1351,73 @@ mod tests {
         let xml = r#"<msg><appmsg><type>6</type><appattach><totallen>0</totallen></appattach></appmsg></msg>"#;
         let d = decode_message(49, xml, "Alice", None, &packed, |id| id.to_string());
         assert_eq!(d.content, "[文件] fallback.docx");
+    }
+
+    #[test]
+    fn test_decode_mail_message() {
+        let xml = r#"<msg><pushmail><subject>Weekly Update</subject><sender>Alice</sender><digest>short</digest></pushmail></msg>"#;
+        let d = decode_message(35, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.msg_type, MessageType::Mail);
+        assert_eq!(d.content, "[邮件] Weekly Update - Alice");
+    }
+
+    #[test]
+    fn test_decode_contact_card_message() {
+        let xml = r#"<msg username="tgid_card" nickname="Alice Card" alias="alice" />"#;
+        let d = decode_message(42, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.msg_type, MessageType::ContactCard);
+        assert_eq!(d.content, "[名片] Alice Card");
+    }
+
+    #[test]
+    fn test_decode_external_card_message() {
+        let xml = r#"<msg username="tgid_external" nickname="External Alice" />"#;
+        let d = decode_message(66, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.msg_type, MessageType::ExternalCard);
+        assert_eq!(d.content, "[外部联系人] External Alice");
+    }
+
+    #[test]
+    fn test_decode_notification_message() {
+        let d = decode_message(11000, "", "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.msg_type, MessageType::Notification);
+        assert_eq!(d.content, "[通知]");
+    }
+
+    #[test]
+    fn test_unknown_app_subtype_keeps_subtype_in_summary() {
+        let xml = r#"<msg><appmsg><title>Special Card</title><des>Details</des><type>87</type></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "[卡片:87] Special Card - Details");
+    }
+
+    #[test]
+    fn test_unknown_internal_xml_is_summarized_without_raw_tags() {
+        let xml = r#"<msg><quote username="tgid_a" displayname="Alice" /></msg>"#;
+        let d = decode_message(1, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "[消息]");
+    }
+
+    #[test]
+    fn test_late_internal_xml_tail_is_sanitized() {
+        let raw = "prefix <msg><emoji /></msg>";
+        let d = decode_message(1, raw, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "prefix\n[表情]");
+    }
+
+    #[test]
+    fn test_long_non_xml_link_truncates_on_char_boundary() {
+        let raw = "好".repeat(220);
+        let d = decode_message(49, &raw, "Alice", None, &[], |id| id.to_string());
+        assert!(d.content.starts_with("[链接] "));
+        assert!(d.content.ends_with("..."));
+    }
+
+    #[test]
+    fn test_app_fallback_drops_xml_summary_fields() {
+        let xml = r#"<msg><appmsg><title>&lt;msg&gt;&lt;quote /&gt;&lt;/msg&gt;</title><type>87</type></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "[卡片:87] 未知卡片");
     }
 
     #[test]

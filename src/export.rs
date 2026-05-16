@@ -1039,13 +1039,16 @@ fn load_file_messages(
         let packed_col = dictionary::msg_packed_meta_column();
         let table = db::quote_identifier(&table_name);
         let app_file_type = app_file_local_type();
+        let app_file_alt_type = app_local_type(62);
         let sql = format!(
             "SELECT local_type, create_time, {body_col}, {marker_col}, {packed_col} \
              FROM {table} \
              WHERE create_time > 0 \
                AND (local_type = 62 \
                     OR local_type = {app_file_type} \
-                    OR (local_type = 49 AND {marker_col} IS NOT 4 AND {body_col} LIKE '%<type>6</type>%'))\
+                    OR local_type = {app_file_alt_type} \
+                    OR (local_type = 49 AND {marker_col} IS NOT 4 \
+                        AND ({body_col} LIKE '%<type>6</type>%' OR {body_col} LIKE '%<type>62</type>%')))\
                {since_clause} \
              ORDER BY create_time DESC LIMIT {limit}"
         );
@@ -1184,9 +1187,12 @@ fn is_file_message(message: &ExportMessage) -> bool {
 
 fn is_file_message_parts(msg_type: i64, raw_content: &str) -> bool {
     msg_type == 62
-        || app_message_subtype(msg_type) == Some(6)
+        || matches!(app_message_subtype(msg_type), Some(6 | 62))
         || (((msg_type as u64) & 0xffff_ffff) == 49
-            && media::extract_xml_tag_int(raw_content, "type") == Some(6))
+            && matches!(
+                media::extract_xml_tag_int(raw_content, "type"),
+                Some(6 | 62)
+            ))
 }
 
 fn app_message_subtype(local_type: i64) -> Option<i64> {
@@ -1203,7 +1209,7 @@ fn app_message_subtype(local_type: i64) -> Option<i64> {
 }
 
 fn file_export_type(local_type: i64) -> i64 {
-    if local_type == 62 {
+    if local_type == 62 || app_message_subtype(local_type) == Some(62) {
         62
     } else {
         49
@@ -1211,7 +1217,11 @@ fn file_export_type(local_type: i64) -> i64 {
 }
 
 fn app_file_local_type() -> i64 {
-    (6_i64 << 32) | 49
+    app_local_type(6)
+}
+
+fn app_local_type(subtype: i64) -> i64 {
+    (subtype << 32) | 49
 }
 
 /// Export cached file attachments for a session.
@@ -2654,6 +2664,7 @@ mod tests {
             .unwrap();
 
         let app_file_type = app_file_local_type();
+        let app_file_alt_type = app_local_type(62);
         for (msg_type, timestamp, content, packed) in [
             (
                 49,
@@ -2672,6 +2683,12 @@ mod tests {
                 1002,
                 r#"<msg><appmsg><title>xml.pdf</title><type>6</type><totallen>1024</totallen></appmsg></msg>"#,
                 packed_file("new.pdf"),
+            ),
+            (
+                app_file_alt_type,
+                1003,
+                r#"<msg><appmsg><title>alt.pdf</title><type>62</type><totallen>4096</totallen></appmsg></msg>"#,
+                packed_file("alt.pdf"),
             ),
         ] {
             message_conn
@@ -2925,13 +2942,14 @@ mod tests {
                 .iter()
                 .map(|message| message.timestamp)
                 .collect::<Vec<_>>(),
-            vec![1002, 1000]
+            vec![1003, 1002, 1000]
         );
         assert_eq!(
             file_message_identifier(&messages[0]).as_deref(),
-            Some("new.pdf")
+            Some("alt.pdf")
         );
-        assert_eq!(file_size_label(&messages[0]), "1KB");
+        assert_eq!(file_size_label(&messages[0]), "4KB");
+        assert_eq!(file_export_type(messages[0].msg_type), 62);
     }
 
     #[test]
@@ -2942,10 +2960,10 @@ mod tests {
             load_file_messages(decrypted.path(), "tgid_files", Some(1001), 1, 1).unwrap();
 
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].timestamp, 1002);
+        assert_eq!(messages[0].timestamp, 1003);
         assert_eq!(
             file_message_identifier(&messages[0]).as_deref(),
-            Some("new.pdf")
+            Some("alt.pdf")
         );
     }
 
@@ -3073,6 +3091,19 @@ mod tests {
         assert_eq!(file_identifier(&message).as_deref(), Some("proto.pdf"));
         assert!(is_file_message(&message));
         assert_eq!(file_export_type(message.msg_type), 49);
+    }
+
+    #[test]
+    fn file_identifier_accepts_app_subtype_62() {
+        let message = export_message(
+            app_local_type(62),
+            r#"<msg><appmsg><title>alt.pdf</title><type>62</type></appmsg></msg>"#,
+            packed_file("alt.pdf"),
+        );
+
+        assert_eq!(file_identifier(&message).as_deref(), Some("alt.pdf"));
+        assert!(is_file_message(&message));
+        assert_eq!(file_export_type(message.msg_type), 62);
     }
 
     #[test]
