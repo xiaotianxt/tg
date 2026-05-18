@@ -62,7 +62,7 @@ fn messages_limit_or_default(
 }
 
 fn is_known_subcommand(value: &str) -> bool {
-    if matches!(value, "help" | "sql") {
+    if matches!(value, "help" | "sql" | "emoji") {
         return true;
     }
     Cli::command()
@@ -517,6 +517,47 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Only consider files after this time (ISO 8601 or relative: 5min, 1h, today)
+        #[arg(long)]
+        since: Option<String>,
+        /// Number of parallel jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
+    },
+    /// Export local cached stickers from a specific session
+    #[command(visible_alias = "emoji")]
+    Sticker {
+        /// Session username (tgid_xxx) or display name to search
+        session: String,
+        /// Path to decrypted databases
+        #[arg(
+            long,
+            default_value_os_t = paths::default_decrypted_dir(),
+            value_hint = clap::ValueHint::DirPath
+        )]
+        decrypted_dir: PathBuf,
+        /// Output directory for sticker files
+        #[arg(
+            long,
+            default_value = "exported/stickers",
+            value_hint = clap::ValueHint::DirPath
+        )]
+        output: PathBuf,
+        /// List recent sticker messages without exporting
+        #[arg(long, conflicts_with_all = ["all", "index", "id"])]
+        list: bool,
+        /// Export every exportable sticker in the selected window
+        #[arg(long, conflicts_with_all = ["index", "id"])]
+        all: bool,
+        /// Export the Nth sticker shown by --list (newest first)
+        #[arg(long, conflicts_with = "id")]
+        index: Option<usize>,
+        /// Export a sticker by the md5 or URL shown by --list
+        #[arg(long, conflicts_with_all = ["list", "all", "index"])]
+        id: Option<String>,
+        /// Number of recent sticker messages to scan
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Only consider stickers after this time (ISO 8601 or relative: 5min, 1h, today)
         #[arg(long)]
         since: Option<String>,
         /// Number of parallel jobs (0 = auto)
@@ -1195,6 +1236,41 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Sticker {
+            session,
+            decrypted_dir,
+            output,
+            list,
+            all,
+            index,
+            id,
+            limit,
+            since,
+            jobs,
+        } => {
+            let since_ts = match time::parse_since_opt(since.as_deref()) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    log::error!("Error parsing --since: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let _ = cache::refresh_decrypted(&decrypted_dir, jobs);
+            let config = export::StickerExportConfig {
+                output_dir: &output,
+                list,
+                all,
+                index,
+                id: id.as_deref(),
+                limit,
+                since: since_ts,
+                jobs,
+            };
+            if let Err(e) = export::export_stickers(&decrypted_dir, &session, config) {
+                log::error!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Commands::Voice {
             session,
             decrypted_dir,
@@ -1319,6 +1395,8 @@ mod tests {
             "export",
             "image",
             "file",
+            "sticker",
+            "emoji",
             "voice",
             "doctor",
             "refresh",
@@ -1464,6 +1542,29 @@ mod tests {
                 assert_eq!(format, "wav");
             }
             _ => panic!("expected voice command"),
+        }
+    }
+
+    #[test]
+    fn sticker_accepts_index_selection_and_emoji_alias() {
+        let cli = Cli::parse_from(args(&["tg", "sticker", "alice", "--index", "2"]));
+        match cli.command {
+            Commands::Sticker { session, index, .. } => {
+                assert_eq!(session, "alice");
+                assert_eq!(index, Some(2));
+            }
+            _ => panic!("expected sticker command"),
+        }
+
+        let cli = Cli::parse_from(normalize_args_for_default_messages(args(&[
+            "tg", "emoji", "alice", "--list",
+        ])));
+        match cli.command {
+            Commands::Sticker { session, list, .. } => {
+                assert_eq!(session, "alice");
+                assert!(list);
+            }
+            _ => panic!("expected sticker command"),
         }
     }
 

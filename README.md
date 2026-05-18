@@ -73,6 +73,13 @@ $ tg file "产品讨论群"
 exported/files/123456789_chatroom_File_49_0001.pdf
 ```
 
+导出最近一个表情：
+
+```bash
+$ tg sticker "产品讨论群"
+exported/stickers/123456789_chatroom_Sticker_47_0001.webp
+```
+
 导出最近一条本地语音：
 
 ```bash
@@ -93,6 +100,7 @@ tg query --session "产品讨论群" --contains "项目" --not "取消" --fields
 tg export "张三" --format json --output exported/zhangsan
 tg image "产品讨论群" --list
 tg file "产品讨论群" --list
+tg sticker "产品讨论群" --list
 tg voice "产品讨论群" --list
 ```
 
@@ -120,7 +128,7 @@ tg refresh
 | 消息读取 | 文本、群聊发送者、系统提示、撤回提示、引用、链接、小程序、聊天记录卡片展开、位置、文件卡片、图片/视频/语音/表情的可读摘要 |
 | 搜索 | 全局关键词搜索，单个会话内关键词搜索，结构化检索；支持包含词、排除词、时间范围、字段选择和 JSON 行输出 |
 | 导出 | `txt`、`csv`、`json` |
-| 媒体 | 尝试导出本地缓存图片、视频、表情和普通文件附件；`.dat` 图片/视频会尝试解密；语音可通过 `voice` 导出为 `.voice` |
+| 媒体 | 尝试导出本地缓存图片、视频、表情和普通文件附件；`.dat` 图片/视频会尝试解密；表情可通过 `sticker` 单独导出；语音可通过 `voice` 导出为 `.voice` |
 | 增量更新 | 默认只解密变化过的数据库 |
 
 暂不支持或不保证：
@@ -370,6 +378,18 @@ tg file "张三" --all --limit 10 --output exported/files
 
 `messages` 会把文件卡片显示成 `[文件:标题 (大小)]`。`file --list` 会列出最近文件附件是否仍在本地缓存中；`file --id` 可以用列表里的文件名或消息里的文件标识直接导出本地缓存文件。文件缓存索引只扫描当前会话对应的附件目录，避免为了单个会话遍历全量附件缓存。
 
+导出表情：
+
+```bash
+tg sticker "张三"
+tg sticker "张三" --list --limit 20
+tg sticker "张三" --index 3
+tg sticker "张三" --id bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+tg sticker "张三" --all --limit 10 --output exported/stickers
+```
+
+`messages` 里有可定位信息的表情会显示成 `[sticker:<id>]`；这个 `<id>` 可以直接传给 `sticker --id`。`sticker --list` 也会列出最近表情的 `ID`、缓存状态和来源；状态是 `remote` 的表情会在导出时按消息里的 URL 尝试下载。`emoji` 是 `sticker` 的别名。
+
 导出语音：
 
 ```bash
@@ -456,7 +476,7 @@ tg messages "tgid_abcd1234" --limit 50
 
 ### 图片、视频或文件导不出来
 
-媒体导出依赖 Telegram 本地缓存。可以先在 Telegram 里打开对应图片、视频或文件，让 Telegram 把文件下载到本机，再重新运行 `tg image`、`tg file` 或 `tg export --media-dir ...`。
+媒体导出依赖 Telegram 本地缓存。可以先在 Telegram 里打开对应图片、视频、表情或文件，让 Telegram 把文件下载到本机，再重新运行 `tg image`、`tg sticker`、`tg file` 或 `tg export --media-dir ...`。
 
 ### 语音导出后不能直接播放
 
@@ -515,7 +535,7 @@ TG_PERF_SESSION="张三" make perf
 scripts/perf_regression.sh --baseline v1.4.2 --candidate WORKTREE --session "张三"
 ```
 
-需要把性能门禁接进 release checklist 时，加 `--fail-threshold 1.20`，候选中位数超过 baseline 20% 会非零退出。
+需要把性能门禁接进 release checklist 时，加 `--fail-threshold 1.20`，候选中位数超过 baseline 20% 会非零退出。默认用例包括 `sessions`、`messages`、`query`、`image-list`、`file-list`、`voice-list`、`sticker-list`。
 报告写到 `target/perf/<timestamp>/summary.csv`。
 
 项目入口是 `src/main.rs`。主要模块：

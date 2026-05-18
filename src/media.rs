@@ -113,7 +113,21 @@ pub struct StickerInfo {
 }
 
 impl StickerInfo {
+    pub fn identifier(&self) -> Option<&str> {
+        non_empty(&self.md5)
+            .or_else(|| non_empty(&self.extern_md5))
+            .or_else(|| non_empty(&self.cdn_url))
+            .or_else(|| non_empty(&self.extern_url))
+            .or_else(|| non_empty(&self.url))
+            .or_else(|| non_empty(&self.thumb_url))
+            .or_else(|| non_empty(&self.encrypt_url))
+    }
+
     pub fn display(&self) -> String {
+        if let Some(id) = self.identifier() {
+            return sticker_tag(Some(id));
+        }
+
         let name = if !self.pack_name.is_empty() {
             format!(" {}", self.pack_name)
         } else if !self.product_id.is_empty() {
@@ -135,6 +149,13 @@ impl StickerInfo {
         } else {
             format!("[表情{}]", name)
         }
+    }
+}
+
+pub(crate) fn sticker_tag(identifier: Option<&str>) -> String {
+    match identifier.and_then(non_empty) {
+        Some(id) => format!("[sticker:{}]", id),
+        None => "[表情]".to_string(),
     }
 }
 
@@ -521,10 +542,10 @@ pub(crate) fn sanitize_filename(s: &str) -> String {
 // ===== XML helpers (reused from message.rs) =====
 
 pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
-    let pattern = format!("{}=\"", attr);
     let mut search_from = 0;
+    let bytes = xml.as_bytes();
 
-    while let Some(relative_start) = xml[search_from..].find(&pattern) {
+    while let Some(relative_start) = xml[search_from..].find(attr) {
         let start = search_from + relative_start;
         let has_attr_boundary = xml[..start]
             .chars()
@@ -535,12 +556,26 @@ pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
             continue;
         }
 
-        let value_start = start + pattern.len();
-        if value_start >= xml.len() {
-            return None;
+        let mut pos = start + attr.len();
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
         }
+        if pos >= bytes.len() || bytes[pos] != b'=' {
+            search_from = start + attr.len();
+            continue;
+        }
+        pos += 1;
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= bytes.len() || (bytes[pos] != b'"' && bytes[pos] != b'\'') {
+            search_from = start + attr.len();
+            continue;
+        }
+        let quote = bytes[pos] as char;
+        let value_start = pos + 1;
         let rest = &xml[value_start..];
-        let end = rest.find('"')?;
+        let end = rest.find(quote)?;
         let value = decode_xml_entities(&rest[..end]);
         return if value.is_empty() { None } else { Some(value) };
     }
@@ -596,6 +631,16 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_xml_attr_accepts_spaced_equals() {
+        let xml = r#"<emoji cdnurl = "http://x.test/a?m=1&amp;n=2" aeskey= 'abc123'></emoji>"#;
+        assert_eq!(
+            extract_xml_attr(xml, "cdnurl").as_deref(),
+            Some("http://x.test/a?m=1&n=2")
+        );
+        assert_eq!(extract_xml_attr(xml, "aeskey").as_deref(), Some("abc123"));
+    }
+
+    #[test]
     fn test_parse_sticker_info_core_fields() {
         let xml = r#"<emoji md5="abc123" len="4963" cdnurl="http://x.test/a.gif" encrypturl="http://x.test/e" aeskey="00112233445566778899aabbccddeeff" width="48" height="47"></emoji>"#;
         let info = parse_sticker_info(xml);
@@ -606,6 +651,21 @@ mod tests {
         assert_eq!(info.len, 4963);
         assert_eq!(info.width, 48);
         assert_eq!(info.height, 47);
+        assert_eq!(info.identifier(), Some("abc123"));
+        assert_eq!(info.display(), "[sticker:abc123]");
+    }
+
+    #[test]
+    fn test_sticker_display_without_identifier_keeps_summary() {
+        let info = parse_sticker_info(
+            r#"<emoji productid="com.test.pack"><packname>fun</packname><emojibuf>abc</emojibuf></emoji>"#,
+        );
+        assert_eq!(info.identifier(), None);
+        assert_eq!(info.display(), "[表情 fun (含图)]");
+
+        let info = parse_sticker_info(r#"<emoji><emojibuf>abc</emojibuf></emoji>"#);
+        assert_eq!(info.identifier(), None);
+        assert_eq!(info.display(), "[表情 (含图)]");
     }
 
     #[test]

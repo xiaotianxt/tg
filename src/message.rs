@@ -477,17 +477,17 @@ fn sanitize_decoded_content(content: String) -> String {
     let prefix = content[..marker_start].trim_end();
     let marker = &content[marker_start..];
     let replacement = if marker.contains("<emoji") {
-        "[表情]"
+        media::parse_sticker_info(marker).display()
     } else if marker.contains("<img") || marker.contains("&lt;img") {
-        "[img]"
+        "[img]".to_string()
     } else if marker.contains("<videomsg") || marker.contains("<video") {
-        "[视频]"
+        "[视频]".to_string()
     } else {
-        "[消息]"
+        "[消息]".to_string()
     };
 
     if prefix.is_empty() {
-        replacement.to_string()
+        replacement
     } else if prefix == ">" {
         format!("> {}", replacement)
     } else {
@@ -1403,6 +1403,17 @@ mod tests {
         let raw = "prefix <msg><emoji /></msg>";
         let d = decode_message(1, raw, "Alice", None, &[], |id| id.to_string());
         assert_eq!(d.content, "prefix\n[表情]");
+    }
+
+    #[test]
+    fn test_sticker_message_includes_export_identifier() {
+        let raw = r#"<msg><emoji md5="abc123" /></msg>"#;
+        let d = decode_message(47, raw, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "[sticker:abc123]");
+
+        let raw = r#"prefix <msg><emoji md5="abc123" /></msg>"#;
+        let d = decode_message(1, raw, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "prefix\n[sticker:abc123]");
     }
 
     #[test]

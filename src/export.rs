@@ -76,6 +76,17 @@ pub struct FileExportConfig<'a> {
     pub jobs: usize,
 }
 
+pub struct StickerExportConfig<'a> {
+    pub output_dir: &'a Path,
+    pub list: bool,
+    pub all: bool,
+    pub index: Option<usize>,
+    pub id: Option<&'a str>,
+    pub limit: usize,
+    pub since: Option<i64>,
+    pub jobs: usize,
+}
+
 pub struct VoiceExportConfig<'a> {
     pub output_dir: &'a Path,
     pub format: VoiceOutputFormat,
@@ -149,6 +160,21 @@ struct FileCandidate {
     message: FileMessage,
     identifier: Option<String>,
     source: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct StickerMessage {
+    time: String,
+    timestamp: i64,
+    raw_content: String,
+}
+
+#[derive(Clone)]
+struct StickerCandidate {
+    index: usize,
+    message: StickerMessage,
+    info: media::StickerInfo,
+    cached_source: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -1111,6 +1137,94 @@ fn load_file_messages(
     Ok((username, messages))
 }
 
+fn load_sticker_messages(
+    decrypted_dir: &Path,
+    session_query: &str,
+    since: Option<i64>,
+    limit: usize,
+    jobs: usize,
+) -> Result<(String, Vec<StickerMessage>), String> {
+    let (username, message_dbs) = resolve_image_session(decrypted_dir, session_query, jobs)?;
+    let table_name = db::msg_table_name(&username);
+    let since_clause = since
+        .map(|ts| format!(" AND create_time >= {}", ts))
+        .unwrap_or_default();
+
+    let db_jobs = parallel::job_count(jobs, 8);
+    let per_db_messages = parallel::map_ordered(message_dbs, db_jobs, |db_path| {
+        let mut messages = Vec::new();
+        let conn = match Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(_) => return messages,
+        };
+
+        let body_col = dictionary::msg_body_column();
+        let marker_col = dictionary::msg_compression_marker_column();
+        let table = db::quote_identifier(&table_name);
+        let sql = format!(
+            "SELECT local_type, create_time, {body_col}, {marker_col} \
+             FROM {table} \
+             WHERE create_time > 0 \
+               AND (local_type = 47 \
+                    OR ({marker_col} IS NOT 4 AND {body_col} LIKE '%<emoji%'))\
+               {since_clause} \
+             ORDER BY create_time DESC LIMIT {limit}"
+        );
+
+        let rows: Vec<(i64, i64, String)> = match conn.prepare(&sql) {
+            Ok(mut stmt) => match stmt.query_map([], |row| {
+                let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
+                let content: String = if compression_marker == Some(4) {
+                    if let Ok(b) = row.get::<_, Vec<u8>>(2) {
+                        message::try_decompress(&b).unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    match row.get::<_, Option<String>>(2) {
+                        Ok(Some(s)) => s,
+                        _ => match row.get::<_, Option<Vec<u8>>>(2) {
+                            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
+                            _ => String::new(),
+                        },
+                    }
+                };
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    content,
+                ))
+            }) {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(_) => vec![],
+            },
+            Err(_) => vec![],
+        };
+
+        for (msg_type, timestamp, raw_content) in rows {
+            if !is_sticker_message_parts(msg_type, &raw_content) {
+                continue;
+            }
+            let time = time::format_local_timestamp(timestamp);
+            messages.push(StickerMessage {
+                time,
+                timestamp,
+                raw_content,
+            });
+        }
+        messages
+    });
+
+    let mut messages = Vec::new();
+    for db_messages in per_db_messages {
+        messages.extend(db_messages);
+    }
+    messages.sort_by_key(|message| Reverse(message.timestamp));
+    messages.truncate(limit);
+
+    Ok((username, messages))
+}
+
 fn image_identifier(message: &ImageMessage) -> Option<String> {
     try_protobuf_identifier(&message.packed_info)
         .or_else(|| extract_xml_attr_str(&message.raw_content, "aeskey"))
@@ -1508,6 +1622,376 @@ fn clean_file_extension(ext: &str) -> Option<String> {
     } else {
         Some(ext.to_ascii_lowercase())
     }
+}
+
+/// Export local cached sticker messages for a session.
+pub fn export_stickers(
+    decrypted_dir: &Path,
+    session_query: &str,
+    config: StickerExportConfig<'_>,
+) -> Result<Vec<PathBuf>, String> {
+    if config.limit == 0 {
+        return Err("--limit must be greater than 0".to_string());
+    }
+    if config.id.is_some() && (config.list || config.all || config.index.is_some()) {
+        return Err("--id cannot be used with --list, --all, or --index".to_string());
+    }
+    if let Some(index) = config.index {
+        if index == 0 {
+            return Err("--index is 1-based and must be greater than 0".to_string());
+        }
+    }
+    if let Some(identifier) = config.id {
+        return export_sticker_by_identifier(decrypted_dir, session_query, identifier, &config);
+    }
+
+    let scan_limit = config.limit.max(config.index.unwrap_or(1));
+    let (username, messages) = load_sticker_messages(
+        decrypted_dir,
+        session_query,
+        config.since,
+        scan_limit,
+        config.jobs,
+    )?;
+    if messages.is_empty() {
+        return Err(format!("No sticker messages found for '{}'", username));
+    }
+
+    let telegram_base = media::find_telegram_base_path()
+        .ok_or_else(|| "Telegram data directory not found".to_string())?;
+    let candidates = build_sticker_candidates(&telegram_base, messages);
+
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+
+    if config.list {
+        out.line(format_args!(
+            "{:<5} {:<19} {:<8} {:<34} {:<20} Source",
+            "Index", "Time", "Status", "ID", "Info"
+        ))?;
+        out.line(format_args!("{}", "-".repeat(146)))?;
+        for candidate in &candidates {
+            out.line(format_args!(
+                "{:<5} {:<19} {:<8} {:<34} {:<20} {}",
+                candidate.index,
+                candidate.message.time,
+                sticker_status(candidate),
+                sticker_id_label(candidate),
+                truncate_for_table(&sticker_info_label(&candidate.info), 20),
+                sticker_source_label(candidate)
+            ))?;
+        }
+        out.flush()?;
+        return Ok(Vec::new());
+    }
+
+    let selected = if config.all {
+        candidates
+            .into_iter()
+            .filter(sticker_can_export)
+            .take(config.limit)
+            .collect::<Vec<_>>()
+    } else if let Some(index) = config.index {
+        let Some(candidate) = candidates
+            .into_iter()
+            .find(|candidate| candidate.index == index)
+        else {
+            return Err(format!(
+                "Sticker index {} is outside the scanned window",
+                index
+            ));
+        };
+        if !sticker_can_export(&candidate) {
+            return Err(format!(
+                "Sticker #{} is not available in local cache and has no downloadable URL",
+                index
+            ));
+        }
+        vec![candidate]
+    } else {
+        let Some(candidate) = candidates.into_iter().find(sticker_can_export) else {
+            return Err(format!(
+                "No exportable stickers found in the latest {} sticker messages",
+                config.limit
+            ));
+        };
+        vec![candidate]
+    };
+
+    if selected.is_empty() {
+        return Err(format!(
+            "No exportable stickers found in the latest {} sticker messages",
+            config.limit
+        ));
+    }
+
+    export_sticker_candidates(
+        &telegram_base,
+        &username,
+        config.output_dir,
+        config.jobs,
+        selected,
+    )
+}
+
+fn export_sticker_by_identifier(
+    decrypted_dir: &Path,
+    session_query: &str,
+    identifier: &str,
+    config: &StickerExportConfig<'_>,
+) -> Result<Vec<PathBuf>, String> {
+    let identifier = normalize_sticker_id(identifier)?;
+    let (username, messages) = load_sticker_messages(
+        decrypted_dir,
+        session_query,
+        config.since,
+        config.limit,
+        config.jobs,
+    )?;
+    let telegram_base = media::find_telegram_base_path()
+        .ok_or_else(|| "Telegram data directory not found".to_string())?;
+    let candidates = build_sticker_candidates(&telegram_base, messages);
+
+    if let Some(candidate) = candidates
+        .into_iter()
+        .find(|candidate| sticker_candidate_matches_id(candidate, &identifier))
+    {
+        if !sticker_can_export(&candidate) {
+            return Err(format!(
+                "Sticker id '{}' is not available in local cache and has no downloadable URL",
+                identifier
+            ));
+        }
+        return export_sticker_candidates(
+            &telegram_base,
+            &username,
+            config.output_dir,
+            config.jobs,
+            vec![candidate],
+        );
+    }
+
+    if let Some(info) = direct_sticker_info_from_id(&identifier) {
+        let cached_source = (!info.md5.is_empty())
+            .then(|| media::find_cached_sticker(&telegram_base, &info.md5))
+            .flatten();
+        if cached_source.is_some() || sticker_has_download_source(&info) {
+            let candidate = StickerCandidate {
+                index: 1,
+                message: StickerMessage {
+                    time: String::new(),
+                    timestamp: 0,
+                    raw_content: String::new(),
+                },
+                info,
+                cached_source,
+            };
+            return export_sticker_candidates(
+                &telegram_base,
+                &username,
+                config.output_dir,
+                config.jobs,
+                vec![candidate],
+            );
+        }
+    }
+
+    Err(format!(
+        "Sticker id '{}' was not found in the latest {} sticker messages",
+        identifier, config.limit
+    ))
+}
+
+fn build_sticker_candidates(
+    telegram_base: &Path,
+    messages: Vec<StickerMessage>,
+) -> Vec<StickerCandidate> {
+    messages
+        .into_iter()
+        .enumerate()
+        .map(|(i, message)| {
+            let info = media::parse_sticker_info(&message.raw_content);
+            let cached_source = (!info.md5.is_empty())
+                .then(|| media::find_cached_sticker(telegram_base, &info.md5))
+                .flatten();
+            StickerCandidate {
+                index: i + 1,
+                message,
+                info,
+                cached_source,
+            }
+        })
+        .collect()
+}
+
+fn export_sticker_candidates(
+    telegram_base: &Path,
+    username: &str,
+    output_dir: &Path,
+    jobs: usize,
+    stickers: Vec<StickerCandidate>,
+) -> Result<Vec<PathBuf>, String> {
+    let sticker_job_count = parallel::job_count(jobs, 4);
+    let sticker_results =
+        parallel::map_ordered(stickers, sticker_job_count, |sticker| MediaExportResult {
+            index: sticker.index,
+            is_sticker: true,
+            result: export_sticker_info(
+                &sticker.info,
+                telegram_base,
+                output_dir,
+                username,
+                sticker.index,
+            ),
+        });
+
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+    let mut paths = Vec::new();
+    for sticker_result in sticker_results {
+        match sticker_result.result {
+            Ok(path) => {
+                out.line(format_args!("{}", path.display()))?;
+                paths.push(path);
+            }
+            Err(e) => log::warn!("Sticker #{} export failed: {}", sticker_result.index, e),
+        }
+    }
+    out.flush()?;
+
+    if paths.is_empty() {
+        return Err("No stickers were exported".to_string());
+    }
+
+    Ok(paths)
+}
+
+fn is_sticker_message_parts(msg_type: i64, raw_content: &str) -> bool {
+    msg_type == 47 || raw_content.contains("<emoji")
+}
+
+fn sticker_can_export(candidate: &StickerCandidate) -> bool {
+    candidate.cached_source.is_some() || sticker_has_download_source(&candidate.info)
+}
+
+fn sticker_has_download_source(info: &media::StickerInfo) -> bool {
+    !info.cdn_url.is_empty()
+        || !info.extern_url.is_empty()
+        || !info.url.is_empty()
+        || !info.thumb_url.is_empty()
+        || !info.encrypt_url.is_empty()
+}
+
+fn sticker_status(candidate: &StickerCandidate) -> &'static str {
+    if candidate.cached_source.is_some() {
+        "cached"
+    } else if sticker_has_download_source(&candidate.info) {
+        "remote"
+    } else {
+        "missing"
+    }
+}
+
+fn sticker_source_label(candidate: &StickerCandidate) -> String {
+    candidate
+        .cached_source
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| sticker_identifier(&candidate.info))
+        .unwrap_or_else(|| "(no identifier)".to_string())
+}
+
+fn sticker_id_label(candidate: &StickerCandidate) -> String {
+    sticker_identifier(&candidate.info).unwrap_or_else(|| "-".to_string())
+}
+
+fn sticker_identifier(info: &media::StickerInfo) -> Option<String> {
+    info.identifier().map(ToString::to_string)
+}
+
+fn sticker_info_label(info: &media::StickerInfo) -> String {
+    let mut parts = Vec::new();
+    if info.width > 0 && info.height > 0 {
+        parts.push(format!("{}x{}", info.width, info.height));
+    }
+    let size = media::format_file_size(info.len);
+    if !size.is_empty() {
+        parts.push(size);
+    }
+    if !info.pack_name.is_empty() {
+        parts.push(info.pack_name.clone());
+    } else if !info.product_id.is_empty() {
+        parts.push(
+            info.product_id
+                .rsplit('.')
+                .next()
+                .unwrap_or(&info.product_id)
+                .to_string(),
+        );
+    }
+    if info.has_emojibuf {
+        parts.push("buffer".to_string());
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn sticker_candidate_matches_id(candidate: &StickerCandidate, identifier: &str) -> bool {
+    let identifier_lower = identifier.to_ascii_lowercase();
+    let info = &candidate.info;
+    [&info.md5, &info.extern_md5]
+        .into_iter()
+        .any(|value| !value.is_empty() && value.to_ascii_lowercase() == identifier_lower)
+        || [
+            &info.cdn_url,
+            &info.extern_url,
+            &info.url,
+            &info.thumb_url,
+            &info.encrypt_url,
+            &info.product_id,
+        ]
+        .into_iter()
+        .any(|value| !value.is_empty() && value == identifier)
+}
+
+fn direct_sticker_info_from_id(identifier: &str) -> Option<media::StickerInfo> {
+    if identifier.starts_with("http://") || identifier.starts_with("https://") {
+        return Some(media::StickerInfo {
+            cdn_url: identifier.to_string(),
+            ..Default::default()
+        });
+    }
+    if identifier.len() == 32 && identifier.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Some(media::StickerInfo {
+            md5: identifier.to_ascii_lowercase(),
+            ..Default::default()
+        });
+    }
+    None
+}
+
+fn normalize_sticker_id(identifier: &str) -> Result<String, String> {
+    let identifier = identifier.trim();
+    if identifier.is_empty() {
+        Err("--id must not be empty".to_string())
+    } else {
+        Ok(identifier.to_string())
+    }
+}
+
+fn truncate_for_table(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = value
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
 }
 
 /// Export cached voice messages for a session.
@@ -2174,31 +2658,7 @@ fn sqlite_uri_path(path: &Path) -> String {
 
 /// Extract attribute value from XML-like string within content.
 fn extract_xml_attr_str(content: &str, attr: &str) -> Option<String> {
-    let pattern = format!("{}=\"", attr);
-    let mut search_from = 0;
-
-    while let Some(relative_start) = content[search_from..].find(&pattern) {
-        let start = search_from + relative_start;
-        let has_attr_boundary = content[..start]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c == '<' || c.is_whitespace());
-        if !has_attr_boundary {
-            search_from = start + 1;
-            continue;
-        }
-
-        let value_start = start + pattern.len();
-        if value_start >= content.len() {
-            return None;
-        }
-        let rest = &content[value_start..];
-        let end = rest.find('"')?;
-        let value = rest[..end].to_string();
-        return if value.is_empty() { None } else { Some(value) };
-    }
-
-    None
+    media::extract_xml_attr(content, attr)
 }
 
 fn export_txt(
@@ -2307,6 +2767,16 @@ fn export_sticker_message(
     index: usize,
 ) -> Result<PathBuf, String> {
     let info = media::parse_sticker_info(&message.raw_content);
+    export_sticker_info(&info, telegram_base, output_dir, session_name, index)
+}
+
+fn export_sticker_info(
+    info: &media::StickerInfo,
+    telegram_base: &Path,
+    output_dir: &Path,
+    session_name: &str,
+    index: usize,
+) -> Result<PathBuf, String> {
     if info.md5.is_empty()
         && info.url.is_empty()
         && info.cdn_url.is_empty()
@@ -2322,7 +2792,7 @@ fn export_sticker_message(
             let data = std::fs::read(&src)
                 .map_err(|e| format!("Read cached sticker {}: {}", src.display(), e))?;
             if let Some(path) =
-                write_sticker_candidate(&data, &info, output_dir, session_name, index)?
+                write_sticker_candidate(&data, info, output_dir, session_name, index)?
             {
                 return Ok(path);
             }
@@ -2337,7 +2807,7 @@ fn export_sticker_message(
         match download_url(url) {
             Ok(data) => {
                 if let Some(path) =
-                    write_sticker_candidate(&data, &info, output_dir, session_name, index)?
+                    write_sticker_candidate(&data, info, output_dir, session_name, index)?
                 {
                     return Ok(path);
                 }
@@ -2348,8 +2818,7 @@ fn export_sticker_message(
 
     if !info.encrypt_url.is_empty() && tried_urls.insert(info.encrypt_url.clone()) {
         let data = download_url(&info.encrypt_url)?;
-        if let Some(path) = write_sticker_candidate(&data, &info, output_dir, session_name, index)?
-        {
+        if let Some(path) = write_sticker_candidate(&data, info, output_dir, session_name, index)? {
             return Ok(path);
         }
     }
@@ -2707,6 +3176,66 @@ mod tests {
         dir
     }
 
+    fn create_sticker_decrypted_dir() -> TempDir {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+
+        let message_conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let table_name = db::msg_table_name("tgid_stickers");
+        let body_col = db::quote_identifier(dictionary::msg_body_column());
+        let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+        let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
+        message_conn
+            .execute(
+                &format!(
+                    "CREATE TABLE {} (
+                        local_type INTEGER,
+                        create_time INTEGER,
+                        {} TEXT,
+                        {} INTEGER,
+                        {} BLOB
+                    )",
+                    table_name, body_col, marker_col, packed_col
+                ),
+                [],
+            )
+            .unwrap();
+
+        for (msg_type, timestamp, content) in [
+            (
+                47,
+                1000,
+                r#"<msg><emoji md5="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" len="2048" width="48" height="48" /></msg>"#,
+            ),
+            (1, 1001, "not a sticker"),
+            (
+                47,
+                1002,
+                r#"<msg><emoji md5="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" cdnurl="https://x.test/b.webp" len="4096" width="64" height="64"><packname>fun</packname></emoji></msg>"#,
+            ),
+            (
+                1,
+                1003,
+                r#"<msg><emoji md5="cccccccccccccccccccccccccccccccc" cdnurl="https://x.test/c.gif" /></msg>"#,
+            ),
+        ] {
+            message_conn
+                .execute(
+                    &format!(
+                        "INSERT INTO {} (local_type, create_time, {}, {}, {})
+                         VALUES (?1, ?2, ?3, NULL, x'')",
+                        table_name, body_col, marker_col, packed_col
+                    ),
+                    params![msg_type, timestamp, content],
+                )
+                .unwrap();
+        }
+        drop(message_conn);
+
+        dir
+    }
+
     fn create_voice_decrypted_dir() -> TempDir {
         let dir = tempdir().unwrap();
         let message_dir = dir.path().join("message");
@@ -2968,6 +3497,70 @@ mod tests {
     }
 
     #[test]
+    fn load_sticker_messages_returns_stickers_newest_first() {
+        let decrypted = create_sticker_decrypted_dir();
+
+        let (username, messages) =
+            load_sticker_messages(decrypted.path(), "tgid_stickers", None, 10, 1).unwrap();
+
+        assert_eq!(username, "tgid_stickers");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.timestamp)
+                .collect::<Vec<_>>(),
+            vec![1003, 1002, 1000]
+        );
+        assert_eq!(
+            sticker_identifier(&media::parse_sticker_info(&messages[0].raw_content)).as_deref(),
+            Some("cccccccccccccccccccccccccccccccc")
+        );
+    }
+
+    #[test]
+    fn load_sticker_messages_respects_since_and_limit() {
+        let decrypted = create_sticker_decrypted_dir();
+
+        let (_, messages) =
+            load_sticker_messages(decrypted.path(), "tgid_stickers", Some(1001), 1, 1).unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].timestamp, 1003);
+    }
+
+    #[test]
+    fn sticker_helpers_surface_identifier_and_status() {
+        let info = media::parse_sticker_info(
+            r#"<msg><emoji md5="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" cdnurl="https://x.test/b.webp" len="4096" width="64" height="64"><packname>fun</packname></emoji></msg>"#,
+        );
+        let candidate = StickerCandidate {
+            index: 1,
+            message: StickerMessage {
+                time: String::new(),
+                timestamp: 0,
+                raw_content: String::new(),
+            },
+            info,
+            cached_source: None,
+        };
+
+        assert_eq!(
+            sticker_identifier(&candidate.info).as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(
+            sticker_id_label(&candidate),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(sticker_status(&candidate), "remote");
+        assert_eq!(sticker_info_label(&candidate.info), "64x64 4KB fun");
+        assert!(sticker_candidate_matches_id(
+            &candidate,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ));
+    }
+
+    #[test]
     fn load_voice_messages_returns_voices_newest_first() {
         let decrypted = create_voice_decrypted_dir();
 
@@ -3176,6 +3769,28 @@ mod tests {
                 all: false,
                 index: None,
                 id: Some("report.pdf"),
+                limit: 1,
+                since: None,
+                jobs: 1,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("--id cannot be used"));
+    }
+
+    #[test]
+    fn sticker_id_conflicts_with_window_selection_modes() {
+        let output_dir = Path::new("out");
+        let err = export_stickers(
+            Path::new("decrypted"),
+            "session",
+            StickerExportConfig {
+                output_dir,
+                list: true,
+                all: false,
+                index: None,
+                id: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 limit: 1,
                 since: None,
                 jobs: 1,

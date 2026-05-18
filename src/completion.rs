@@ -379,6 +379,8 @@ fn positional_dynamic_kind(path: &[String], index: usize) -> Option<DynamicKind>
                     | "export"
                     | "image"
                     | "file"
+                    | "sticker"
+                    | "emoji"
                     | "voice"
             ) && index == 0 =>
         {

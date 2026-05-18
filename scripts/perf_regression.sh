@@ -8,7 +8,7 @@ RUNS="${TG_PERF_RUNS:-5}"
 DECRYPTED_DIR="${TG_PERF_DECRYPTED_DIR:-${HOME}/.tg/decrypted}"
 SESSION="${TG_PERF_SESSION:-}"
 QUERY="${TG_PERF_QUERY:-项目}"
-CASES="${TG_PERF_CASES:-sessions messages query image-list voice-list}"
+CASES="${TG_PERF_CASES:-sessions messages query image-list file-list voice-list sticker-list}"
 OUT_DIR="${TG_PERF_OUT_DIR:-}"
 FAIL_THRESHOLD="${TG_PERF_FAIL_THRESHOLD:-}"
 KEEP_SOURCES=0
@@ -26,7 +26,7 @@ Options:
   --runs N             Timing runs per command. Default: TG_PERF_RUNS or 5.
   --session NAME       Session/display name for session-specific commands.
   --query TEXT         Query keyword for query/search cases. Default: 项目.
-  --cases LIST         Space-separated cases. Default: sessions messages query image-list voice-list.
+  --cases LIST         Space-separated cases. Default: sessions messages query image-list file-list voice-list sticker-list.
   --decrypted-dir DIR  Decrypted database dir. Default: ~/.tg/decrypted.
   --out-dir DIR        Report directory. Default: target/perf/<timestamp>.
   --fail-threshold R   Exit nonzero if candidate/baseline median exceeds R.
@@ -181,6 +181,9 @@ measure_case_once() {
     voice-list)
       measure_once "$bin" voice "$SESSION" --decrypted-dir "$DECRYPTED_DIR" --list --limit 20 --jobs 1
       ;;
+    sticker-list)
+      measure_once "$bin" sticker "$SESSION" --decrypted-dir "$DECRYPTED_DIR" --list --limit 20 --jobs 1
+      ;;
     *)
       return 1
       ;;
@@ -189,7 +192,7 @@ measure_case_once() {
 
 case_requires_session() {
   case "$1" in
-    messages|query|image-list|file-list|voice-list)
+    messages|query|image-list|file-list|voice-list|sticker-list)
       return 0
       ;;
     *)
