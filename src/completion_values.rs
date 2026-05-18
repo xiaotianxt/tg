@@ -49,6 +49,16 @@ pub(crate) fn match_modes() -> PossibleValuesParser {
     ])
 }
 
+pub(crate) fn media_types() -> PossibleValuesParser {
+    parser(&[
+        ("voice", "Voice messages"),
+        ("image", "Image messages"),
+        ("sticker", "Sticker messages"),
+        ("file", "File attachments"),
+        ("video", "Video messages"),
+    ])
+}
+
 pub(crate) fn db_targets() -> PossibleValuesParser {
     parser(&[
         ("messages", "Message cache"),

@@ -320,6 +320,12 @@ enum Commands {
         /// Keyword that must not appear in message text; repeat for multiple keywords
         #[arg(long = "not")]
         not_contains: Vec<String>,
+        /// Keyword that must appear in the raw database message body; repeat for multiple keywords
+        #[arg(long = "raw-contains")]
+        raw_contains: Vec<String>,
+        /// Require a structured media type: voice, image, sticker, file, or video
+        #[arg(long = "has", value_parser = completion_values::media_types())]
+        has: Vec<String>,
         /// Show messages after this time (ISO 8601 or relative: 5min, 1h, today)
         #[arg(long, conflicts_with = "all_time")]
         since: Option<String>,
@@ -973,6 +979,8 @@ fn main() {
             decrypted_dir,
             contains,
             not_contains,
+            raw_contains,
+            has,
             since,
             all_time,
             until,
@@ -1033,18 +1041,24 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let refresh = cache::refresh_message_decrypted(&decrypted_dir, jobs);
-            if cache::needs_message_key_retry(&refresh) {
-                log::warn!(
-                    "Decrypted message cache refresh had issues ({}). Query results may be stale.",
-                    cache::retry_reason(&refresh)
-                );
-            }
-            match query::run(query::QueryOptions {
+            let has = match has
+                .iter()
+                .map(|value| query::QueryMediaType::parse(value))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(has) => has,
+                Err(e) => {
+                    log::error!("Error parsing --has: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let query_options = query::QueryOptions {
                 decrypted_dir: &decrypted_dir,
                 session: session.as_deref(),
                 contains: &contains,
                 not_contains: &not_contains,
+                raw_contains: &raw_contains,
+                has: &has,
                 since: since_ts,
                 until: until_ts,
                 limit,
@@ -1060,7 +1074,17 @@ fn main() {
                     contact::DisplayNameMode::PersonalRemark
                 },
                 jobs,
-            }) {
+            };
+            if !query::can_answer_from_existing_index(&query_options) {
+                let refresh = cache::refresh_message_decrypted(&decrypted_dir, jobs);
+                if cache::needs_message_key_retry(&refresh) {
+                    log::warn!(
+                        "Decrypted message cache refresh had issues ({}). Query results may be stale.",
+                        cache::retry_reason(&refresh)
+                    );
+                }
+            }
+            match query::run(query_options) {
                 Ok(0) => print_output(format_args!("No rows returned.")),
                 Ok(_) => {}
                 Err(e) => {
@@ -1605,14 +1629,24 @@ mod tests {
             "query",
             "--contains",
             "needle",
+            "--raw-contains",
+            "<appmsg",
+            "--has",
+            "voice",
             "--fields",
             "time,body",
         ]));
         match cli.command {
             Commands::Query {
-                contains, fields, ..
+                contains,
+                raw_contains,
+                has,
+                fields,
+                ..
             } => {
                 assert_eq!(contains, vec!["needle"]);
+                assert_eq!(raw_contains, vec!["<appmsg"]);
+                assert_eq!(has, vec!["voice"]);
                 assert_eq!(fields, "time,body");
             }
             _ => panic!("expected query command"),

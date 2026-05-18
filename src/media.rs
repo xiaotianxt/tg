@@ -242,6 +242,36 @@ impl FileInfo {
     }
 }
 
+pub(crate) fn message_media_type(local_type: i64, raw_body: &str) -> Option<&'static str> {
+    match local_type_low32(local_type) {
+        3 => Some("image"),
+        34 => Some("voice"),
+        43 => Some("video"),
+        47 => Some("sticker"),
+        62 => Some("file"),
+        49 if is_file_app_message(local_type, raw_body) => Some("file"),
+        _ => None,
+    }
+}
+
+pub(crate) fn local_type_low32(local_type: i64) -> i64 {
+    ((local_type as u64) & 0xffff_ffff) as i64
+}
+
+fn is_file_app_message(local_type: i64, raw_body: &str) -> bool {
+    matches!(app_message_subtype(local_type), Some(6 | 62))
+        || matches!(extract_xml_tag_int(raw_body, "type"), Some(6 | 62))
+}
+
+fn app_message_subtype(local_type: i64) -> Option<i64> {
+    let encoded = local_type as u64;
+    if encoded & 0xffff_ffff != 49 {
+        return None;
+    }
+    let subtype = encoded >> 32;
+    (subtype != 0).then_some(subtype as i64)
+}
+
 // ===== XML parsing =====
 
 pub(crate) fn parse_image_info(xml: &str) -> ImageInfo {
@@ -693,5 +723,26 @@ mod tests {
         assert_eq!(info.file_ext, "pdf");
         assert_eq!(info.total_len, 1536000);
         assert_eq!(info.display(None), "[文件] report.pdf (1.5MB)");
+    }
+
+    #[test]
+    fn test_message_media_type_normalizes_structured_media() {
+        assert_eq!(message_media_type(34, ""), Some("voice"));
+        assert_eq!(message_media_type(3, ""), Some("image"));
+        assert_eq!(message_media_type(47, ""), Some("sticker"));
+        assert_eq!(message_media_type(43, ""), Some("video"));
+        assert_eq!(message_media_type(62, ""), Some("file"));
+        assert_eq!(message_media_type((6_i64 << 32) | 49, ""), Some("file"));
+        assert_eq!(
+            message_media_type(
+                49,
+                "<msg><appmsg><title>report.pdf</title><type>6</type></appmsg></msg>"
+            ),
+            Some("file")
+        );
+        assert_eq!(
+            message_media_type(49, "<msg><appmsg><type>5</type></appmsg></msg>"),
+            None
+        );
     }
 }

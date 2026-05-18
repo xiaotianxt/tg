@@ -4,10 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::{contact, db, dictionary, message, parallel, paths, time};
+use crate::{contact, db, dictionary, media, message, parallel, paths, time};
 
 const INDEX_FILE: &str = ".tg_index.db";
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 const REFRESH_OVERLAP_SECS: i64 = 7 * 86400;
 
 pub(crate) struct HotIndex {
@@ -38,8 +38,10 @@ struct IndexedMessage {
     sender_display: String,
     local_id: Option<i64>,
     local_type: i64,
+    media_type: String,
     create_time: i64,
-    body: String,
+    raw_body: String,
+    decoded_body: String,
     marker: Option<i64>,
     packed_info: Vec<u8>,
 }
@@ -97,7 +99,7 @@ pub(crate) fn open_existing_recent(decrypted_dir: &Path) -> Result<Option<HotInd
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|e| format!("Read index schema version: {}", e))?;
-    if version != SCHEMA_VERSION {
+    if version != SCHEMA_VERSION && version != 3 && version != 2 {
         return Ok(None);
     }
 
@@ -170,7 +172,10 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             sender_display TEXT NOT NULL,
             local_id INTEGER,
             local_type INTEGER NOT NULL,
+            media_type TEXT NOT NULL,
             create_time INTEGER NOT NULL,
+            raw_body TEXT NOT NULL,
+            decoded_body TEXT NOT NULL,
             body TEXT NOT NULL,
             marker INTEGER,
             packed_info BLOB NOT NULL
@@ -179,6 +184,8 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             ON messages(create_time DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_session_time
             ON messages(session_id, create_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_media_time
+            ON messages(media_type, create_time DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_source
             ON messages(source_db);",
     )
@@ -331,8 +338,8 @@ fn insert_messages(conn: &Connection, rows: &[IndexedMessage]) -> Result<(), Str
             "INSERT INTO messages (
                 source_db, table_name, session_id, session_display,
                 sender_account, sender_display, local_id, local_type,
-                create_time, body, marker, packed_info
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                media_type, create_time, raw_body, decoded_body, body, marker, packed_info
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .map_err(|e| format!("Prepare index insert: {}", e))?;
 
@@ -346,8 +353,11 @@ fn insert_messages(conn: &Connection, rows: &[IndexedMessage]) -> Result<(), Str
             row.sender_display,
             row.local_id,
             row.local_type,
+            row.media_type,
             row.create_time,
-            row.body,
+            row.raw_body,
+            row.decoded_body,
+            row.raw_body,
             row.marker,
             row.packed_info,
         ])
@@ -403,7 +413,7 @@ fn collect_source_messages(
         let rows = stmt
             .query_map(params![since], |row| {
                 let marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
-                let body = read_message_body(row, 3, marker);
+                let raw_body = read_message_body(row, 3, marker);
                 let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
                 let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
                 let sender_display = table_context
@@ -412,6 +422,17 @@ fn collect_source_messages(
                     .cloned()
                     .unwrap_or_else(|| sender_account.clone());
                 let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
+                let local_id = row.get::<_, Option<i64>>(0)?;
+                let local_type = row.get::<_, Option<i64>>(1)?.unwrap_or(-1);
+                let decoded_body = indexed_decoded_body(
+                    local_type,
+                    &raw_body,
+                    marker,
+                    &packed_info,
+                    &session_display,
+                    local_id,
+                    table_context,
+                );
                 Ok(IndexedMessage {
                     source_db: source.key.clone(),
                     table_name: table_name.clone(),
@@ -419,10 +440,14 @@ fn collect_source_messages(
                     session_display: session_display.clone(),
                     sender_account,
                     sender_display,
-                    local_id: row.get::<_, Option<i64>>(0)?,
-                    local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
+                    local_id,
+                    local_type,
+                    media_type: media::message_media_type(local_type, &raw_body)
+                        .unwrap_or("")
+                        .to_string(),
                     create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    body,
+                    raw_body,
+                    decoded_body,
                     marker,
                     packed_info,
                 })
@@ -432,6 +457,41 @@ fn collect_source_messages(
     }
 
     Ok(messages)
+}
+
+fn indexed_decoded_body(
+    local_type: i64,
+    raw_body: &str,
+    marker: Option<i64>,
+    packed_info: &[u8],
+    session_display: &str,
+    local_id: Option<i64>,
+    table_context: &TableContext,
+) -> String {
+    let voice_id = if media::local_type_low32(local_type) == 34 {
+        local_id.filter(|id| *id > 0)
+    } else {
+        None
+    };
+    message::decode_message_with_context(
+        local_type as i32,
+        raw_body,
+        session_display,
+        marker,
+        packed_info,
+        message::DecodeContext {
+            time_bucket: time::MessageTimeBucket::Minute(1),
+            voice_id,
+        },
+        |id| {
+            table_context
+                .sender_display
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| id.to_string())
+        },
+    )
+    .content
 }
 
 struct TableContext {
@@ -613,6 +673,7 @@ mod tests {
         conn.execute(
             &format!(
                 "CREATE TABLE {} (
+                    local_id INTEGER,
                     local_type INTEGER,
                     create_time INTEGER,
                     {} TEXT,
@@ -629,8 +690,8 @@ mod tests {
             .unwrap();
         conn.execute(
             &format!(
-                "INSERT INTO {} (local_type, create_time, {}, {}, {}, {})
-                 VALUES (1, ?1, 'indexed needle', NULL, 0, x'')",
+                "INSERT INTO {} (local_id, local_type, create_time, {}, {}, {}, {})
+                 VALUES (NULL, 1, ?1, 'indexed needle', NULL, 0, x'')",
                 table, body_col, marker_col, sender_col, packed_col
             ),
             params![time::default_recent_since() + 1],
@@ -643,8 +704,12 @@ mod tests {
         let count: i64 = indexed
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap();
+        let media_type: String = indexed
+            .query_row("SELECT media_type FROM messages", [], |row| row.get(0))
+            .unwrap();
 
         assert_eq!(count, 1);
+        assert_eq!(media_type, "");
         assert!(open_existing_recent(dir.path()).unwrap().is_some());
 
         std::fs::copy(
@@ -653,6 +718,101 @@ mod tests {
         )
         .unwrap();
         assert!(open_existing_recent(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn rebuilds_old_schema_and_indexes_decoded_body() {
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join(INDEX_FILE);
+        let old = Connection::open(&index_path).unwrap();
+        old.execute_batch(
+            "PRAGMA user_version = 2;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE source_files (path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, size INTEGER NOT NULL);
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 source_db TEXT NOT NULL,
+                 table_name TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 session_display TEXT NOT NULL,
+                 sender_account TEXT NOT NULL,
+                 sender_display TEXT NOT NULL,
+                 local_id INTEGER,
+                 local_type INTEGER NOT NULL,
+                 create_time INTEGER NOT NULL,
+                 body TEXT NOT NULL,
+                 marker INTEGER,
+                 packed_info BLOB NOT NULL
+             );
+             INSERT INTO meta (key, value) VALUES ('index_since', '1');
+             INSERT INTO messages (
+                 source_db, table_name, session_id, session_display,
+                 sender_account, sender_display, local_id, local_type,
+                 create_time, body, marker, packed_info
+             ) VALUES (
+                 'old', 'old', 'old', 'old', '', '', NULL, 1, 1, 'stale', NULL, x''
+             );",
+        )
+        .unwrap();
+        drop(old);
+        assert!(open_existing_recent(dir.path()).unwrap().is_some());
+
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let table = db::msg_table_name("tgid_voice");
+        let body_col = db::quote_identifier(dictionary::msg_body_column());
+        let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+        let sender_col = db::quote_identifier(dictionary::msg_sender_column());
+        let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
+        conn.execute(
+            &format!(
+                "CREATE TABLE {} (
+                    local_id INTEGER,
+                    local_type INTEGER,
+                    create_time INTEGER,
+                    {} TEXT,
+                    {} INTEGER,
+                    {} INTEGER,
+                    {} BLOB
+                )",
+                table, body_col, marker_col, sender_col, packed_col
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {} (local_id, local_type, create_time, {}, {}, {}, {})
+                 VALUES (42, 34, ?1, '', NULL, 0, x'')",
+                table, body_col, marker_col, sender_col, packed_col
+            ),
+            params![time::default_recent_since() + 1],
+        )
+        .unwrap();
+        drop(conn);
+
+        let index = ensure_recent(dir.path(), 1).unwrap();
+        let indexed = Connection::open(index.path).unwrap();
+        let version: i64 = indexed
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let (raw_body, decoded_body, legacy_body, media_type): (String, String, String, String) =
+            indexed
+                .query_row(
+                    "SELECT raw_body, decoded_body, body, media_type FROM messages",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(raw_body, "");
+        assert_eq!(legacy_body, raw_body);
+        assert_eq!(decoded_body, "[voice:42]");
+        assert_eq!(media_type, "voice");
     }
 
     #[test]

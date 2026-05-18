@@ -315,13 +315,15 @@ tg query --session "张三" --contains "项目" --fields time,sender,body --limi
 tg query --session "产品讨论群" --contains "项目" --fields time,sender,body --limit 20 --anonymous
 tg query --contains "项目" --contains "上线" --match-mode all --since today --anonymous
 tg query --contains "项目" --not "已取消" --format json --fields timestamp,session,body --anonymous
+tg query --has voice --session "张三" --limit 20
+tg query --raw-contains "<appmsg" --fields time,session,raw_body --limit 20
 tg query --contains "项目" --all-time --anonymous
 tg schema --db message_0
 ```
 
-`query` 适合在本机做精确检索：限定某个会话、同时要求多个关键词、排除某些词、按时间收窄结果，或者只输出后续脚本需要的字段。`--fields` 支持 `time,session,sender,type,body,timestamp`，`--format json` 会按 JSON lines 输出，便于继续处理。
+`query` 适合在本机做精确检索：限定某个会话、同时要求多个关键词、排除某些词、筛选媒体类型、按时间收窄结果，或者只输出后续脚本需要的字段。`--contains` 匹配解码后的展示文本，图片、语音、表情等会按 tg 的可读标记参与匹配；需要查原始 XML/缓存正文时用 `--raw-contains`。`--has` 支持 `voice,image,sticker,file,video`，命中的是 hot index 里的结构化 `media_type`，不是展示文本。`--fields` 支持 `time,session,sender,type,body,raw_body,timestamp`，`--format json` 会按 JSON lines 输出，便于继续处理。升级后运行一次 `tg refresh` 可重建包含 `decoded_body` / `media_type` 的新版 hot index；旧索引缺列时会回退到只读原始缓存扫描。
 
-`query` 不接受原始 SQL。用户只传会话、关键词、排除词、时间、排序和输出字段，tg 内部生成固定的参数化数据库查询，并以只读方式打开消息数据库。默认查询最近 365 天；加 `--all-time` 后，为了避免误扫全库，必须至少传 `--contains` 或 `--since` 之一。空关键词会被拒绝；单次 `--limit + --offset` 最多 10000。table 输出会转义终端控制字符，避免聊天正文影响终端显示。`schema` 展示的是公开查询字段和过滤器，不输出原始表名、列名或建表语句。
+`query` 不接受原始 SQL。用户只传会话、关键词、排除词、媒体类型、时间、排序和输出字段，tg 内部生成固定的参数化数据库查询，并以只读方式打开消息数据库。默认查询最近 365 天；加 `--all-time` 后，为了避免误扫全库，必须至少传 `--contains`、`--raw-contains`、`--has` 或 `--since` 之一。空关键词会被拒绝；单次 `--limit + --offset` 最多 10000。table 输出会转义终端控制字符，避免聊天正文影响终端显示。`schema` 展示的是公开查询字段和过滤器，不输出原始表名、列名或建表语句。
 
 诊断：
 
