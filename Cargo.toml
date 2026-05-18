@@ -1,6 +1,6 @@
 [package]
 name = "tg"
-version = "1.4.16"
+version = "1.4.17"
 edition = "2021"
 description = "本地 Telegram 桌面聊天记录读取 CLI 工具"
 authors = ["xiaotianxt"]
