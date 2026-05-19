@@ -1042,10 +1042,17 @@ fn read_messages_with_hot_index(
         return Ok(None);
     };
 
+    let conn = Connection::open(&index.path)
+        .map_err(|e| format!("Cannot open message index {}: {}", index.path.display(), e))?;
+    let body_col = if table_has_column(&conn, "messages", "raw_body") {
+        "raw_body"
+    } else {
+        "body"
+    };
     let mut clauses = vec!["session_id = ?".to_string(), "create_time >= ?".to_string()];
     let mut params = vec![Value::Text(username.to_string()), Value::Integer(since)];
     if let Some(query) = options.search_query {
-        clauses.push("body LIKE ? ESCAPE '\\'".to_string());
+        clauses.push(format!("{body_col} LIKE ? ESCAPE '\\'"));
         params.push(Value::Text(like_contains_pattern(query)));
     }
     let order_dir = if options.tail { "DESC" } else { "ASC" };
@@ -1053,17 +1060,16 @@ fn read_messages_with_hot_index(
         .map(|limit| format!(" LIMIT {}", limit))
         .unwrap_or_default();
     let sql = format!(
-        "SELECT local_id, local_type, create_time, body, marker, sender_account, packed_info
+        "SELECT local_id, local_type, create_time, {body_col}, marker, sender_account, packed_info
          FROM messages
          WHERE {where_clause}
          ORDER BY create_time {order_dir}{limit_clause}",
+        body_col = body_col,
         where_clause = clauses.join(" AND "),
         order_dir = order_dir,
         limit_clause = limit_clause,
     );
 
-    let conn = Connection::open(&index.path)
-        .map_err(|e| format!("Cannot open message index {}: {}", index.path.display(), e))?;
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| format!("Prepare indexed message read: {}", e))?;
@@ -1202,15 +1208,23 @@ fn search_messages_with_hot_index(
         .ok_or_else(|| "indexed search requires a since bound".to_string())?;
     let conn = Connection::open(&index.path)
         .map_err(|e| format!("Cannot open message index {}: {}", index.path.display(), e))?;
+    let body_col = if table_has_column(&conn, "messages", "raw_body") {
+        "raw_body"
+    } else {
+        "body"
+    };
     let search_pattern = like_contains_pattern(options.query);
     let result_limit = options.limit.saturating_add(1);
-    let sql = "SELECT local_type, create_time, body, session_id
+    let sql = format!(
+        "SELECT local_type, create_time, {body_col}, session_id
                FROM messages
-               WHERE create_time >= ?1 AND body LIKE ?2 ESCAPE '\\'
+               WHERE create_time >= ?1 AND {body_col} LIKE ?2 ESCAPE '\\'
                ORDER BY create_time DESC
-               LIMIT ?3";
+               LIMIT ?3",
+        body_col = body_col
+    );
     let mut stmt = conn
-        .prepare(sql)
+        .prepare(&sql)
         .map_err(|e| format!("Prepare indexed search: {}", e))?;
     let rows = stmt
         .query_map(params![since, search_pattern, result_limit as i64], |row| {

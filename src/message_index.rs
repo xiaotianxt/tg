@@ -1,13 +1,14 @@
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use std::collections::HashMap;
-use std::fs;
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
-use crate::{contact, db, dictionary, media, message, parallel, paths, time};
+use crate::{
+    contact, db, dictionary, index_policy, media, message, parallel, paths, row_identity, time,
+};
 
 const INDEX_FILE: &str = ".tg_index.db";
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 7;
 const REFRESH_OVERLAP_SECS: i64 = 7 * 86400;
 
 pub(crate) struct HotIndex {
@@ -19,13 +20,30 @@ pub(crate) struct HotIndex {
 struct SourceFile {
     key: String,
     path: PathBuf,
-    mtime_ns: i64,
-    size: i64,
+    fingerprint: row_identity::SourceFingerprint,
 }
 
 #[derive(Clone)]
 struct SourceRefresh {
     source: SourceFile,
+    since: i64,
+    mode: index_policy::RefreshMode,
+}
+
+struct CollectedSource {
+    messages: Vec<IndexedMessage>,
+    table_states: Vec<TableState>,
+    replaced_windows: Vec<TableWindow>,
+    current_tables: HashSet<String>,
+}
+
+struct TableState {
+    table_name: String,
+    max_local_id: Option<i64>,
+}
+
+struct TableWindow {
+    table_name: String,
     since: i64,
 }
 
@@ -64,11 +82,13 @@ pub(crate) fn ensure_recent(decrypted_dir: &Path, jobs: usize) -> Result<HotInde
     let index_path = decrypted_dir.join(INDEX_FILE);
     let mut conn = Connection::open(&index_path)
         .map_err(|e| format!("Cannot open message index {}: {}", index_path.display(), e))?;
+    conn.busy_timeout(Duration::from_secs(30))
+        .map_err(|e| format!("Set index busy timeout: {}", e))?;
+    ensure_schema(&conn)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| format!("Set index journal mode: {}", e))?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| format!("Set index synchronous mode: {}", e))?;
-    ensure_schema(&conn)?;
 
     let build_since = time::default_recent_since();
     let current_since = meta_i64(&conn, "index_since")?;
@@ -79,6 +99,7 @@ pub(crate) fn ensure_recent(decrypted_dir: &Path, jobs: usize) -> Result<HotInde
     }
 
     let since = meta_i64(&conn, "index_since")?.unwrap_or(build_since);
+    checkpoint_index(&conn);
     Ok(HotIndex {
         path: index_path,
         since,
@@ -99,7 +120,13 @@ pub(crate) fn open_existing_recent(decrypted_dir: &Path) -> Result<Option<HotInd
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|e| format!("Read index schema version: {}", e))?;
-    if version != SCHEMA_VERSION && version != 3 && version != 2 {
+    if version != SCHEMA_VERSION
+        && version != 6
+        && version != 5
+        && version != 4
+        && version != 3
+        && version != 2
+    {
         return Ok(None);
     }
 
@@ -117,16 +144,7 @@ pub(crate) fn open_existing_recent(decrypted_dir: &Path) -> Result<Option<HotInd
 }
 
 fn index_matches_sources(conn: &Connection, decrypted_dir: &Path) -> Result<bool, String> {
-    let (contact_db, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
-    let contact_signature = contact_db
-        .as_deref()
-        .and_then(file_signature)
-        .unwrap_or_default();
-    let previous_contact_signature = meta_string(conn, "contact_signature")?.unwrap_or_default();
-    if contact_signature != previous_contact_signature {
-        return Ok(false);
-    }
-
+    let (_, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
     let sources = source_files(decrypted_dir, message_dbs);
     let previous = previous_sources(conn)?;
     if previous.len() != sources.len() {
@@ -135,7 +153,7 @@ fn index_matches_sources(conn: &Connection, decrypted_dir: &Path) -> Result<bool
     Ok(sources.iter().all(|source| {
         previous
             .get(&source.key)
-            .is_some_and(|signature| *signature == (source.mtime_ns, source.size))
+            .is_some_and(|signature| *signature == source.fingerprint)
     }))
 }
 
@@ -143,13 +161,18 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|e| format!("Read index schema version: {}", e))?;
-    if version != SCHEMA_VERSION {
+    if version != SCHEMA_VERSION && version != 6 {
+        conn.pragma_update(None, "journal_mode", "DELETE")
+            .map_err(|e| format!("Prepare index schema reset: {}", e))?;
         conn.execute_batch(
             "DROP TABLE IF EXISTS messages;
              DROP TABLE IF EXISTS source_files;
+             DROP TABLE IF EXISTS table_states;
              DROP TABLE IF EXISTS meta;",
         )
         .map_err(|e| format!("Reset index schema: {}", e))?;
+        conn.execute_batch("VACUUM;")
+            .map_err(|e| format!("Compact reset index schema: {}", e))?;
     }
 
     conn.execute_batch(
@@ -161,6 +184,12 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             path TEXT PRIMARY KEY,
             mtime_ns INTEGER NOT NULL,
             size INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS table_states (
+            source_db TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            max_local_id INTEGER,
+            PRIMARY KEY(source_db, table_name)
         );
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY,
@@ -176,7 +205,6 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             create_time INTEGER NOT NULL,
             raw_body TEXT NOT NULL,
             decoded_body TEXT NOT NULL,
-            body TEXT NOT NULL,
             marker INTEGER,
             packed_info BLOB NOT NULL
         );
@@ -187,9 +215,14 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_messages_media_time
             ON messages(media_type, create_time DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_source
-            ON messages(source_db);",
+            ON messages(source_db);
+        CREATE INDEX IF NOT EXISTS idx_table_states_source
+            ON table_states(source_db);",
     )
     .map_err(|e| format!("Create index schema: {}", e))?;
+    if version == 6 {
+        seed_table_states(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|e| format!("Set index schema version: {}", e))?;
     Ok(())
@@ -207,6 +240,7 @@ fn rebuild_all(
     tx.execute_batch(
         "DELETE FROM messages;
          DELETE FROM source_files;
+         DELETE FROM table_states;
          DELETE FROM meta;",
     )
     .map_err(|e| format!("Clear index: {}", e))?;
@@ -223,51 +257,28 @@ fn refresh_changed_sources(
     jobs: usize,
 ) -> Result<(), String> {
     let (contact_db, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
-    let contact_signature = contact_db
-        .as_deref()
-        .and_then(file_signature)
-        .unwrap_or_default();
-    let previous_contact_signature = meta_string(conn, "contact_signature")?.unwrap_or_default();
-    let contact_changed = contact_signature != previous_contact_signature;
-
-    let contacts = contact_db
-        .as_ref()
-        .and_then(|path| contact::load_contacts(path).ok())
-        .unwrap_or_default();
-    let table_context = table_context(&contacts);
     let sources = source_files(decrypted_dir, message_dbs);
     let previous = previous_sources(conn)?;
 
     let mut refreshes = Vec::new();
-    if contact_changed {
-        refreshes.extend(
-            sources
-                .iter()
-                .cloned()
-                .map(|source| SourceRefresh { source, since }),
-        );
-    } else {
-        for source in &sources {
-            let Some((old_mtime, old_size)) = previous.get(&source.key).copied() else {
-                refreshes.push(SourceRefresh {
-                    source: source.clone(),
+    for source in &sources {
+        if let Some(mode) = index_policy::source_refresh_mode(
+            previous.get(&source.key).copied(),
+            source.fingerprint,
+        ) {
+            let refresh_since = match mode {
+                index_policy::RefreshMode::FullWindow => since,
+                index_policy::RefreshMode::LocalIdCursor => index_policy::overlap_since(
+                    indexed_source_latest(conn, &source.key)?,
                     since,
-                });
-                continue;
+                    REFRESH_OVERLAP_SECS,
+                ),
             };
-            if (old_mtime, old_size) != (source.mtime_ns, source.size) {
-                let refresh_since = if source.size < old_size {
-                    since
-                } else {
-                    indexed_source_latest(conn, &source.key)?
-                        .map(|latest| (latest - REFRESH_OVERLAP_SECS).max(since))
-                        .unwrap_or(since)
-                };
-                refreshes.push(SourceRefresh {
-                    source: source.clone(),
-                    since: refresh_since,
-                });
-            }
+            refreshes.push(SourceRefresh {
+                source: source.clone(),
+                since: refresh_since,
+                mode,
+            });
         }
     }
 
@@ -279,17 +290,36 @@ fn refresh_changed_sources(
         .cloned()
         .collect::<Vec<_>>();
 
-    if refreshes.is_empty() && removed.is_empty() && !contact_changed {
+    if refreshes.is_empty() && removed.is_empty() {
         return Ok(());
     }
 
+    let contacts = contact_db
+        .as_ref()
+        .and_then(|path| contact::load_contacts(path).ok())
+        .unwrap_or_default();
+    let contact_signature = contact_signature(&contacts);
+    let previous_contact_signature = meta_string(conn, "contact_signature")?.unwrap_or_default();
+    let contact_changed = contact_signature != previous_contact_signature;
+    if contact_changed {
+        refreshes.clear();
+        refreshes.extend(sources.iter().cloned().map(|source| SourceRefresh {
+            source,
+            since,
+            mode: index_policy::RefreshMode::FullWindow,
+        }));
+    }
+
+    let table_context = table_context(&contacts);
+    let previous_tables = previous_table_states(conn)?;
+
     let job_count = parallel::job_count(jobs, 8);
     let rows_by_source = parallel::map_ordered(refreshes.clone(), job_count, |refresh| {
-        collect_source_messages(&refresh.source, refresh.since, &table_context)
+        collect_source_messages(&refresh, &table_context, &previous_tables)
     });
 
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| format!("Start index update: {}", e))?;
 
     if contact_changed {
@@ -297,29 +327,54 @@ fn refresh_changed_sources(
             .map_err(|e| format!("Clear messages after contact change: {}", e))?;
         tx.execute("DELETE FROM source_files", [])
             .map_err(|e| format!("Clear source state after contact change: {}", e))?;
+        tx.execute("DELETE FROM table_states", [])
+            .map_err(|e| format!("Clear table state after contact change: {}", e))?;
     } else {
         for key in &removed {
             tx.execute("DELETE FROM messages WHERE source_db = ?1", params![key])
                 .map_err(|e| format!("Delete removed source {}: {}", key, e))?;
             tx.execute("DELETE FROM source_files WHERE path = ?1", params![key])
                 .map_err(|e| format!("Delete removed source state {}: {}", key, e))?;
+            tx.execute(
+                "DELETE FROM table_states WHERE source_db = ?1",
+                params![key],
+            )
+            .map_err(|e| format!("Delete removed table state {}: {}", key, e))?;
         }
     }
 
-    for (refresh, rows) in refreshes.iter().zip(rows_by_source) {
+    for (refresh, collected) in refreshes.iter().zip(rows_by_source) {
+        let collected = collected?;
+        if !contact_changed {
+            delete_removed_tables(&tx, refresh, &previous_tables, &collected.current_tables)?;
+            for window in &collected.replaced_windows {
+                tx.execute(
+                    "DELETE FROM messages
+                     WHERE source_db = ?1 AND table_name = ?2 AND create_time >= ?3",
+                    params![refresh.source.key, window.table_name, window.since],
+                )
+                .map_err(|e| {
+                    format!(
+                        "Delete stale table window {}.{}: {}",
+                        refresh.source.key, window.table_name, e
+                    )
+                })?;
+            }
+        }
+        insert_messages(&tx, &collected.messages)?;
         tx.execute(
-            "DELETE FROM messages WHERE source_db = ?1 AND create_time >= ?2",
-            params![refresh.source.key, refresh.since],
+            "DELETE FROM table_states WHERE source_db = ?1",
+            params![refresh.source.key],
         )
-        .map_err(|e| format!("Delete stale source window {}: {}", refresh.source.key, e))?;
-        insert_messages(&tx, &rows?)?;
+        .map_err(|e| format!("Clear table state {}: {}", refresh.source.key, e))?;
+        insert_table_states(&tx, &refresh.source.key, &collected.table_states)?;
         tx.execute(
             "INSERT OR REPLACE INTO source_files (path, mtime_ns, size)
              VALUES (?1, ?2, ?3)",
             params![
                 refresh.source.key,
-                refresh.source.mtime_ns,
-                refresh.source.size
+                refresh.source.fingerprint.mtime_ns,
+                refresh.source.fingerprint.size
             ],
         )
         .map_err(|e| format!("Record source state {}: {}", refresh.source.key, e))?;
@@ -329,7 +384,16 @@ fn refresh_changed_sources(
     set_meta_string_tx(&tx, "contact_signature", &contact_signature)?;
     tx.commit()
         .map_err(|e| format!("Commit index update: {}", e))?;
+    checkpoint_index(conn);
     Ok(())
+}
+
+fn checkpoint_index(conn: &Connection) {
+    let _ = conn.busy_timeout(Duration::from_millis(250));
+    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        log::debug!("Message index WAL checkpoint failed: {}", e);
+    }
+    let _ = conn.busy_timeout(Duration::from_secs(30));
 }
 
 fn insert_messages(conn: &Connection, rows: &[IndexedMessage]) -> Result<(), String> {
@@ -338,8 +402,8 @@ fn insert_messages(conn: &Connection, rows: &[IndexedMessage]) -> Result<(), Str
             "INSERT INTO messages (
                 source_db, table_name, session_id, session_display,
                 sender_account, sender_display, local_id, local_type,
-                media_type, create_time, raw_body, decoded_body, body, marker, packed_info
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                media_type, create_time, raw_body, decoded_body, marker, packed_info
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )
         .map_err(|e| format!("Prepare index insert: {}", e))?;
 
@@ -357,7 +421,6 @@ fn insert_messages(conn: &Connection, rows: &[IndexedMessage]) -> Result<(), Str
             row.create_time,
             row.raw_body,
             row.decoded_body,
-            row.raw_body,
             row.marker,
             row.packed_info,
         ])
@@ -366,11 +429,94 @@ fn insert_messages(conn: &Connection, rows: &[IndexedMessage]) -> Result<(), Str
     Ok(())
 }
 
+fn insert_table_states(
+    conn: &Connection,
+    source_key: &str,
+    states: &[TableState],
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "INSERT OR REPLACE INTO table_states (source_db, table_name, max_local_id)
+             VALUES (?1, ?2, ?3)",
+        )
+        .map_err(|e| format!("Prepare table state insert: {}", e))?;
+
+    for state in states {
+        stmt.execute(params![source_key, state.table_name, state.max_local_id])
+            .map_err(|e| {
+                format!(
+                    "Insert table state {}.{}: {}",
+                    source_key, state.table_name, e
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn seed_table_states(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "DELETE FROM table_states;
+         INSERT OR REPLACE INTO table_states (source_db, table_name, max_local_id)
+         SELECT source_db, table_name, MAX(local_id)
+         FROM messages
+         GROUP BY source_db, table_name;",
+    )
+    .map_err(|e| format!("Seed table cursor state: {}", e))?;
+    Ok(())
+}
+
+fn previous_table_states(
+    conn: &Connection,
+) -> Result<HashMap<(String, String), Option<i64>>, String> {
+    let mut stmt = conn
+        .prepare("SELECT source_db, table_name, max_local_id FROM table_states")
+        .map_err(|e| format!("Prepare table state query: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .map_err(|e| format!("Read table state: {}", e))?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+fn delete_removed_tables(
+    conn: &Connection,
+    refresh: &SourceRefresh,
+    previous_tables: &HashMap<(String, String), Option<i64>>,
+    current_tables: &HashSet<String>,
+) -> Result<(), String> {
+    for (source_db, table_name) in previous_tables.keys() {
+        if source_db != &refresh.source.key || current_tables.contains(table_name) {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM messages WHERE source_db = ?1 AND table_name = ?2",
+            params![source_db, table_name],
+        )
+        .map_err(|e| format!("Delete removed table {}.{}: {}", source_db, table_name, e))?;
+        conn.execute(
+            "DELETE FROM table_states WHERE source_db = ?1 AND table_name = ?2",
+            params![source_db, table_name],
+        )
+        .map_err(|e| {
+            format!(
+                "Delete removed table state {}.{}: {}",
+                source_db, table_name, e
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn collect_source_messages(
-    source: &SourceFile,
-    since: i64,
+    refresh: &SourceRefresh,
     table_context: &TableContext,
-) -> Result<Vec<IndexedMessage>, String> {
+    previous_tables: &HashMap<(String, String), Option<i64>>,
+) -> Result<CollectedSource, String> {
+    let source = &refresh.source;
     let conn = Connection::open(&source.path)
         .map_err(|e| format!("Cannot open {}: {}", source.path.display(), e))?;
     let tables = list_message_tables(&conn)?;
@@ -380,24 +526,39 @@ fn collect_source_messages(
     let sender_col = db::quote_identifier(dictionary::msg_sender_column());
     let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
     let mut messages = Vec::new();
+    let mut table_states = Vec::new();
+    let mut replaced_windows = Vec::new();
+    let mut current_tables = HashSet::new();
 
     for table_name in tables {
+        current_tables.insert(table_name.clone());
         let quoted_table = db::quote_identifier(&table_name);
-        let local_id_col = if db::table_has_column(&conn, &table_name, "local_id") {
+        let has_local_id = db::table_has_column(&conn, &table_name, "local_id");
+        let current_max_local_id = if has_local_id {
+            table_max_local_id(&conn, &table_name)?
+        } else {
+            None
+        };
+        table_states.push(TableState {
+            table_name: table_name.clone(),
+            max_local_id: current_max_local_id,
+        });
+
+        let local_id_col = if has_local_id {
             db::quote_identifier("local_id")
         } else {
             "NULL".to_string()
         };
-        let sql = format!(
-            "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}
-             FROM {quoted_table}
-             WHERE create_time >= ?1
-             ORDER BY create_time ASC",
-            local_id_col = local_id_col
-        );
-        let Ok(mut stmt) = conn.prepare(&sql) else {
+        let previous_max_local_id = previous_tables
+            .get(&(source.key.clone(), table_name.clone()))
+            .copied()
+            .flatten();
+        let local_id_cursor = refresh.mode == index_policy::RefreshMode::LocalIdCursor
+            && has_local_id
+            && previous_max_local_id.is_some();
+        if local_id_cursor && current_max_local_id <= previous_max_local_id {
             continue;
-        };
+        }
 
         let session_id = table_context
             .table_to_session
@@ -410,53 +571,105 @@ fn collect_source_messages(
             .cloned()
             .unwrap_or_else(|| "(?)".to_string());
 
-        let rows = stmt
-            .query_map(params![since], |row| {
-                let marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
-                let raw_body = read_message_body(row, 3, marker);
-                let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
-                let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
-                let sender_display = table_context
-                    .sender_display
-                    .get(&sender_account)
-                    .cloned()
-                    .unwrap_or_else(|| sender_account.clone());
-                let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
-                let local_id = row.get::<_, Option<i64>>(0)?;
-                let local_type = row.get::<_, Option<i64>>(1)?.unwrap_or(-1);
-                let decoded_body = indexed_decoded_body(
-                    local_type,
-                    &raw_body,
-                    marker,
-                    &packed_info,
-                    &session_display,
-                    local_id,
-                    table_context,
-                );
-                Ok(IndexedMessage {
-                    source_db: source.key.clone(),
-                    table_name: table_name.clone(),
-                    session_id: session_id.clone(),
-                    session_display: session_display.clone(),
-                    sender_account,
-                    sender_display,
-                    local_id,
-                    local_type,
-                    media_type: media::message_media_type(local_type, &raw_body)
-                        .unwrap_or("")
-                        .to_string(),
-                    create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    raw_body,
-                    decoded_body,
-                    marker,
-                    packed_info,
-                })
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
+            let raw_body = read_message_body(row, 3, marker);
+            let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
+            let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
+            let sender_display = table_context
+                .sender_display
+                .get(&sender_account)
+                .cloned()
+                .unwrap_or_else(|| sender_account.clone());
+            let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
+            let local_id = row.get::<_, Option<i64>>(0)?;
+            let local_type = row.get::<_, Option<i64>>(1)?.unwrap_or(-1);
+            let decoded_body = indexed_decoded_body(
+                local_type,
+                &raw_body,
+                marker,
+                &packed_info,
+                &session_display,
+                local_id,
+                table_context,
+            );
+            Ok(IndexedMessage {
+                source_db: source.key.clone(),
+                table_name: table_name.clone(),
+                session_id: session_id.clone(),
+                session_display: session_display.clone(),
+                sender_account,
+                sender_display,
+                local_id,
+                local_type,
+                media_type: media::message_media_type(local_type, &raw_body)
+                    .unwrap_or("")
+                    .to_string(),
+                create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                raw_body,
+                decoded_body,
+                marker,
+                packed_info,
             })
-            .map_err(|e| format!("Read indexed messages from {}: {}", source.key, e))?;
-        messages.extend(rows.filter_map(|row| row.ok()));
+        };
+
+        if let Some(previous_max_local_id) =
+            local_id_cursor.then_some(previous_max_local_id).flatten()
+        {
+            let sql = format!(
+                "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}
+                 FROM {quoted_table}
+                 WHERE {local_id_col} > ?1 AND create_time >= ?2
+                 ORDER BY {local_id_col} ASC",
+                local_id_col = local_id_col
+            );
+            let Ok(mut stmt) = conn.prepare(&sql) else {
+                continue;
+            };
+            let rows = stmt
+                .query_map(params![previous_max_local_id, refresh.since], |row| {
+                    map_row(row)
+                })
+                .map_err(|e| format!("Read indexed messages from {}: {}", source.key, e))?;
+            messages.extend(rows.filter_map(|row| row.ok()));
+        } else {
+            replaced_windows.push(TableWindow {
+                table_name: table_name.clone(),
+                since: refresh.since,
+            });
+            let sql = format!(
+                "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}
+                 FROM {quoted_table}
+                 WHERE create_time >= ?1
+                 ORDER BY create_time ASC",
+                local_id_col = local_id_col
+            );
+            let Ok(mut stmt) = conn.prepare(&sql) else {
+                continue;
+            };
+            let rows = stmt
+                .query_map(params![refresh.since], |row| map_row(row))
+                .map_err(|e| format!("Read indexed messages from {}: {}", source.key, e))?;
+            messages.extend(rows.filter_map(|row| row.ok()));
+        }
     }
 
-    Ok(messages)
+    Ok(CollectedSource {
+        messages,
+        table_states,
+        replaced_windows,
+        current_tables,
+    })
+}
+
+fn table_max_local_id(conn: &Connection, table_name: &str) -> Result<Option<i64>, String> {
+    let sql = format!(
+        "SELECT MAX({}) FROM {}",
+        db::quote_identifier("local_id"),
+        db::quote_identifier(table_name)
+    );
+    conn.query_row(&sql, [], |row| row.get::<_, Option<i64>>(0))
+        .map_err(|e| format!("Read table max local_id {}: {}", table_name, e))
 }
 
 fn indexed_decoded_body(
@@ -564,18 +777,19 @@ fn source_files(decrypted_dir: &Path, message_dbs: Vec<PathBuf>) -> Vec<SourceFi
         .into_iter()
         .filter_map(|path| {
             let key = relative_label(decrypted_dir, &path);
-            let (mtime_ns, size) = file_stat(&path)?;
+            let fingerprint = row_identity::SourceFingerprint::from_path(&path)?;
             Some(SourceFile {
                 key,
                 path,
-                mtime_ns,
-                size,
+                fingerprint,
             })
         })
         .collect()
 }
 
-fn previous_sources(conn: &Connection) -> Result<HashMap<String, (i64, i64)>, String> {
+fn previous_sources(
+    conn: &Connection,
+) -> Result<HashMap<String, row_identity::SourceFingerprint>, String> {
     let mut stmt = conn
         .prepare("SELECT path, mtime_ns, size FROM source_files")
         .map_err(|e| format!("Prepare source state query: {}", e))?;
@@ -583,7 +797,10 @@ fn previous_sources(conn: &Connection) -> Result<HashMap<String, (i64, i64)>, St
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+                row_identity::SourceFingerprint {
+                    mtime_ns: row.get(1)?,
+                    size: row.get(2)?,
+                },
             ))
         })
         .map_err(|e| format!("Read source state: {}", e))?;
@@ -601,22 +818,18 @@ fn indexed_source_latest(conn: &Connection, source_key: &str) -> Result<Option<i
     .map_err(|e| format!("Read indexed source latest {}: {}", source_key, e))
 }
 
-fn file_signature(path: &Path) -> Option<String> {
-    let (mtime_ns, size) = file_stat(path)?;
-    Some(format!("{}:{}", mtime_ns, size))
-}
-
-fn file_stat(path: &Path) -> Option<(i64, i64)> {
-    let meta = fs::metadata(path).ok()?;
-    let mtime_ns = meta
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos()
-        .try_into()
-        .ok()?;
-    Some((mtime_ns, meta.len().try_into().ok()?))
+fn contact_signature(contacts: &HashMap<String, contact::Contact>) -> String {
+    let mut entries = contacts
+        .values()
+        .map(|contact| row_identity::ContactFingerprintEntry {
+            account: &contact.username,
+            nick_name: &contact.nick_name,
+            remark: &contact.remark,
+            alias: &contact.alias,
+            is_stranger: contact.is_stranger,
+        })
+        .collect::<Vec<_>>();
+    row_identity::contact_fingerprint(&mut entries).to_string()
 }
 
 fn relative_label(base: &Path, path: &Path) -> String {
@@ -721,6 +934,179 @@ mod tests {
     }
 
     #[test]
+    fn contact_mtime_changes_do_not_block_existing_index_open() {
+        let dir = tempdir().unwrap();
+        let contact_dir = dir.path().join("contact");
+        std::fs::create_dir_all(&contact_dir).unwrap();
+        let contact_path = contact_dir.join("contact.db");
+        let contact_conn = Connection::open(&contact_path).unwrap();
+        contact_conn
+            .execute(
+                "CREATE TABLE contact (
+                    username TEXT,
+                    nick_name TEXT,
+                    remark TEXT,
+                    alias TEXT
+                )",
+                [],
+            )
+            .unwrap();
+        contact_conn
+            .execute(
+                "INSERT INTO contact (username, nick_name, remark, alias)
+                 VALUES ('tgid_indexed', 'Indexed Nick', '', '')",
+                [],
+            )
+            .unwrap();
+        drop(contact_conn);
+
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let table = db::msg_table_name("tgid_indexed");
+        let body_col = db::quote_identifier(dictionary::msg_body_column());
+        let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+        let sender_col = db::quote_identifier(dictionary::msg_sender_column());
+        let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
+        conn.execute(
+            &format!(
+                "CREATE TABLE {} (
+                    local_id INTEGER,
+                    local_type INTEGER,
+                    create_time INTEGER,
+                    {} TEXT,
+                    {} INTEGER,
+                    {} INTEGER,
+                    {} BLOB
+                )",
+                table, body_col, marker_col, sender_col, packed_col
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {} (local_id, local_type, create_time, {}, {}, {}, {})
+                 VALUES (1, 1, ?1, 'indexed needle', NULL, 0, x'')",
+                table, body_col, marker_col, sender_col, packed_col
+            ),
+            params![time::default_recent_since() + 1],
+        )
+        .unwrap();
+        drop(conn);
+
+        ensure_recent(dir.path(), 1).unwrap();
+        assert!(open_existing_recent(dir.path()).unwrap().is_some());
+
+        let bytes = std::fs::read(&contact_path).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        std::fs::write(&contact_path, bytes).unwrap();
+        assert!(open_existing_recent(dir.path()).unwrap().is_some());
+
+        let contact_conn = Connection::open(&contact_path).unwrap();
+        contact_conn
+            .execute(
+                "UPDATE contact SET remark = 'Changed Remark' WHERE username = 'tgid_indexed'",
+                [],
+            )
+            .unwrap();
+        drop(contact_conn);
+        assert!(open_existing_recent(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn local_id_cursor_refresh_appends_new_rows_without_duplication() {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let message_path = message_dir.join("message_0.db");
+        let conn = Connection::open(&message_path).unwrap();
+        let table = db::msg_table_name("tgid_cursor");
+        let body_col = db::quote_identifier(dictionary::msg_body_column());
+        let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+        let sender_col = db::quote_identifier(dictionary::msg_sender_column());
+        let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
+        conn.execute(
+            &format!(
+                "CREATE TABLE {} (
+                    local_id INTEGER,
+                    local_type INTEGER,
+                    create_time INTEGER,
+                    {} TEXT,
+                    {} INTEGER,
+                    {} INTEGER,
+                    {} BLOB
+                )",
+                table, body_col, marker_col, sender_col, packed_col
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {} (local_id, local_type, create_time, {}, {}, {}, {})
+                 VALUES (1, 1, ?1, 'old cursor row', NULL, 0, x'')",
+                table, body_col, marker_col, sender_col, packed_col
+            ),
+            params![time::default_recent_since() + 10],
+        )
+        .unwrap();
+        drop(conn);
+
+        let index = ensure_recent(dir.path(), 1).unwrap();
+        let indexed = Connection::open(&index.path).unwrap();
+        let initial_count: i64 = indexed
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        let initial_cursor: i64 = indexed
+            .query_row("SELECT max_local_id FROM table_states", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        drop(indexed);
+
+        assert_eq!(initial_count, 1);
+        assert_eq!(initial_cursor, 1);
+
+        std::thread::sleep(Duration::from_millis(2));
+        let conn = Connection::open(&message_path).unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {} (local_id, local_type, create_time, {}, {}, {}, {})
+                 VALUES (2, 1, ?1, 'new cursor row', NULL, 0, x'')",
+                table, body_col, marker_col, sender_col, packed_col
+            ),
+            params![time::default_recent_since() + 20],
+        )
+        .unwrap();
+        drop(conn);
+
+        let index = ensure_recent(dir.path(), 1).unwrap();
+        let indexed = Connection::open(index.path).unwrap();
+        let (count, old_count, new_count, cursor): (i64, i64, i64, i64) = indexed
+            .query_row(
+                "SELECT
+                    COUNT(*),
+                    SUM(CASE WHEN raw_body = 'old cursor row' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN raw_body = 'new cursor row' THEN 1 ELSE 0 END),
+                    (SELECT max_local_id FROM table_states)
+                 FROM messages",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(old_count, 1);
+        assert_eq!(new_count, 1);
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
     fn rebuilds_old_schema_and_indexes_decoded_body() {
         let dir = tempdir().unwrap();
         let index_path = dir.path().join(INDEX_FILE);
@@ -799,18 +1185,17 @@ mod tests {
         let version: i64 = indexed
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        let (raw_body, decoded_body, legacy_body, media_type): (String, String, String, String) =
-            indexed
-                .query_row(
-                    "SELECT raw_body, decoded_body, body, media_type FROM messages",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .unwrap();
+        let (raw_body, decoded_body, media_type): (String, String, String) = indexed
+            .query_row(
+                "SELECT raw_body, decoded_body, media_type FROM messages",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
 
         assert_eq!(version, SCHEMA_VERSION);
+        assert!(!db::table_has_column(&indexed, "messages", "body"));
         assert_eq!(raw_body, "");
-        assert_eq!(legacy_body, raw_body);
         assert_eq!(decoded_body, "[voice:42]");
         assert_eq!(media_type, "voice");
     }
