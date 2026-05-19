@@ -416,7 +416,7 @@ fn decode_internal_xml_fragment(
 
 fn strip_display_prefix(content: &str) -> &str {
     let trimmed = content.trim_start();
-    for prefix in ["[链接]", "[卡片]", "[小程序]", "[文件]"] {
+    for prefix in ["[链接]", "[卡片]", "[小程序]", "[文件]", "[视频]"] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             return rest.trim_start();
         }
@@ -565,10 +565,7 @@ fn decode_link_content(
 
     let sub_type = crate::media::extract_xml_tag_int(content, "type").unwrap_or(0);
     match sub_type {
-        5 => media::parse_link_info(content)
-            .as_ref()
-            .map(media::LinkInfo::display)
-            .unwrap_or_else(|| "[链接]".to_string()),
+        5 => decode_app_link_content(content),
         33 => media::parse_mini_program_info(content)
             .as_ref()
             .map(media::MiniProgramInfo::display)
@@ -577,6 +574,7 @@ fn decode_link_content(
             .as_ref()
             .map(media::MiniProgramInfo::display)
             .unwrap_or_else(|| decode_app_card_fallback(sub_type, "小程序", content)),
+        4 => decode_app_card_fallback(sub_type, "视频", content),
         3 => {
             let title = crate::media::extract_xml_tag(content, "title")
                 .unwrap_or_else(|| "未知歌曲".to_string());
@@ -594,6 +592,25 @@ fn decode_link_content(
             format!("[引用: {}]", title)
         }
         _ => decode_app_card_fallback(sub_type, "卡片", content),
+    }
+}
+
+fn decode_app_link_content(content: &str) -> String {
+    media::parse_link_info(content)
+        .as_ref()
+        .map(display_link_info)
+        .unwrap_or_else(|| "[链接]".to_string())
+}
+
+fn display_link_info(info: &media::LinkInfo) -> String {
+    let display = info.display();
+    let Some(url) = clean_url_field(&info.url) else {
+        return display;
+    };
+    if display.contains(&url) {
+        display
+    } else {
+        append_url_line(display, Some(url))
     }
 }
 
@@ -616,10 +633,37 @@ fn decode_app_card_fallback(sub_type: i64, label: &str, content: &str) -> String
     } else {
         format!("未知{}", label)
     };
-    if !desc.is_empty() {
+    let display = if !desc.is_empty() {
         format!("[{}] {} - {}", label, title, desc)
     } else {
         format!("[{}] {}", label, title)
+    };
+    append_url_line(display, safe_url_tag(content))
+}
+
+fn append_url_line(mut display: String, url: Option<String>) -> String {
+    if let Some(url) = url {
+        display.push('\n');
+        display.push_str("  ");
+        display.push_str(&url);
+    }
+    display
+}
+
+fn safe_url_tag(xml: &str) -> Option<String> {
+    crate::media::extract_xml_tag(xml, "url").and_then(|url| clean_url_field(&url))
+}
+
+fn clean_url_field(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.contains('<')
+        || value.contains('>')
+        || contains_internal_xml_marker(value)
+    {
+        None
+    } else {
+        Some(value.to_string())
     }
 }
 
@@ -1133,10 +1177,9 @@ pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
         let prefix = &content[..i];
         let is_id = prefix.starts_with(account_prefix)
             || prefix.starts_with("gh_")
-            || prefix.contains('@')
             || prefix
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'@'));
         if is_id && prefix.len() >= 3 {
             let after = &content[i + 1..];
             let after = after.trim_start_matches([' ', '\n']);
@@ -1311,6 +1354,9 @@ mod tests {
         let (id, c) = parse_sender_from_content("tgid_a:\nHi");
         assert_eq!(id, Some("tgid_a"));
         assert_eq!(c, "Hi");
+        let (id, c) = parse_sender_from_content("room@chatroom:\nHi");
+        assert_eq!(id, Some("room@chatroom"));
+        assert_eq!(c, "Hi");
         let (id, c) = parse_sender_from_content("plain text");
         assert_eq!(id, None);
         assert_eq!(c, "plain text");
@@ -1322,6 +1368,72 @@ mod tests {
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
         assert!(d.content.contains("链接"));
         assert!(d.content.contains("标题"));
+    }
+
+    #[test]
+    fn test_decode_xml_declared_app_link_from_text_path() {
+        let xml = r#"<?xml version="1.0"?>
+<msg>
+        <appmsg appid="test" sdkver="0">
+                <title>我说这家纽约zui好吃台湾菜应该没人反对吧</title>
+                <des>@曼迪酱's note
+95 Shares</des>
+                <type>5</type>
+                <url>https://www.example.com/item/1?x=1&amp;y=2</url>
+        </appmsg>
+</msg>"#;
+        let d = decode_message(1, xml, "Alice", None, &[], |id| id.to_string());
+
+        assert!(d.content.starts_with("[链接]"));
+        assert!(d
+            .content
+            .contains("我说这家纽约zui好吃台湾菜应该没人反对吧"));
+        assert!(d.content.contains("@曼迪酱's note"));
+        assert!(d.content.contains("https://www.example.com/item/1?x=1&y=2"));
+        assert!(!d.content.contains("<appmsg"));
+    }
+
+    #[test]
+    fn test_decode_app_link_keeps_long_url() {
+        let long_url = format!("https://www.example.com/{}", "a".repeat(180));
+        let xml = format!(
+            r#"<msg><appmsg><title>Long Link</title><des>Details</des><type>5</type><url>{}</url></appmsg></msg>"#,
+            long_url
+        );
+        let d = decode_message(49, &xml, "Alice", None, &[], |id| id.to_string());
+
+        assert_eq!(
+            d.content,
+            format!("[链接] Long Link - Details\n  {}", long_url)
+        );
+    }
+
+    #[test]
+    fn test_decode_app_subtype_4_as_video_card() {
+        let xml = r#"<?xml version="1.0"?>
+<msg>
+        <appmsg appid="test" sdkver="0">
+                <title>她有时候只是激素影响，并不是故意的</title>
+                <des>@有趣小剧场's note
+38.2k Shares</des>
+                <type>4</type>
+                <url>https://www.example.com/video/1</url>
+        </appmsg>
+</msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+
+        assert_eq!(
+            d.content,
+            "[视频] 她有时候只是激素影响，并不是故意的 - @有趣小剧场's note\n38.2k Shares\n  https://www.example.com/video/1"
+        );
+    }
+
+    #[test]
+    fn test_decode_prefixed_app_video_xml() {
+        let xml = r#"[视频] <?xml version="1.0"?><msg><appmsg><title>思朗诵，开始吟唱</title><type>4</type></appmsg></msg>"#;
+        let d = decode_message(1, xml, "Alice", None, &[], |id| id.to_string());
+
+        assert_eq!(d.content, "[视频] 思朗诵，开始吟唱");
     }
 
     #[test]
