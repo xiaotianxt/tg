@@ -238,7 +238,7 @@ pub(crate) fn run(options: QueryOptions<'_>) -> Result<usize, String> {
 }
 
 pub(crate) fn can_answer_from_existing_index(options: &QueryOptions<'_>) -> bool {
-    existing_answerable_index(options).is_some()
+    source_validated_answerable_index(options).is_some()
 }
 
 pub(crate) fn run_schema(options: SchemaOptions<'_>) -> Result<usize, String> {
@@ -297,8 +297,15 @@ fn try_run_indexed_messages_with_output<W: Write>(
     options: &QueryOptions<'_>,
     out: &mut output::Output<W>,
 ) -> Result<Option<usize>, String> {
-    if options.name_mode == contact::DisplayNameMode::Anonymous {
+    if !query_may_use_index(options) {
         return Ok(None);
+    }
+
+    if let Err(e) = message_index::ensure_recent_sessions(options.decrypted_dir, options.jobs) {
+        log::warn!(
+            "Message index session catch-up failed; falling back if needed: {}",
+            e
+        );
     }
 
     let Some(index) = existing_answerable_index(options) else {
@@ -318,13 +325,34 @@ fn try_run_indexed_messages_with_output<W: Write>(
     Ok(Some(displayed))
 }
 
+fn query_may_use_index(options: &QueryOptions<'_>) -> bool {
+    options.name_mode != contact::DisplayNameMode::Anonymous && options.since.is_some()
+}
+
 fn existing_answerable_index(options: &QueryOptions<'_>) -> Option<message_index::HotIndex> {
+    answerable_index(options, true)
+}
+
+fn source_validated_answerable_index(
+    options: &QueryOptions<'_>,
+) -> Option<message_index::HotIndex> {
+    answerable_index(options, false)
+}
+
+fn answerable_index(
+    options: &QueryOptions<'_>,
+    allow_session_catch_up: bool,
+) -> Option<message_index::HotIndex> {
     if options.name_mode == contact::DisplayNameMode::Anonymous {
         return None;
     }
 
     let since = options.since?;
-    let index = match message_index::open_existing_recent(options.decrypted_dir) {
+    let index = match if allow_session_catch_up {
+        message_index::open_existing_query_index(options.decrypted_dir)
+    } else {
+        message_index::open_existing_recent(options.decrypted_dir)
+    } {
         Ok(Some(index)) if index.covers(since) => index,
         Ok(_) => return None,
         Err(e) => {

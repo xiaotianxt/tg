@@ -8,7 +8,7 @@ use crate::{
 };
 
 const INDEX_FILE: &str = ".tg_index.db";
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const REFRESH_OVERLAP_SECS: i64 = 7 * 86400;
 
 pub(crate) struct HotIndex {
@@ -45,6 +45,21 @@ struct TableState {
 struct TableWindow {
     table_name: String,
     since: i64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionCatchUpStats {
+    pub(crate) changed_sessions: usize,
+    pub(crate) refreshed_tables: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SessionIndexState {
+    username: String,
+    last_timestamp: i64,
+    sort_timestamp: i64,
+    last_msg_local_id: Option<i64>,
+    last_msg_type: Option<i64>,
 }
 
 struct IndexedMessage {
@@ -97,12 +112,123 @@ pub(crate) fn ensure_recent(decrypted_dir: &Path, jobs: usize) -> Result<HotInde
     } else {
         refresh_changed_sources(&mut conn, decrypted_dir, build_since, jobs)?;
     }
+    if let Err(e) = sync_current_session_states(&mut conn, decrypted_dir) {
+        log::debug!("Message index session state sync skipped: {}", e);
+    }
 
     let since = meta_i64(&conn, "index_since")?.unwrap_or(build_since);
     checkpoint_index(&conn);
     Ok(HotIndex {
         path: index_path,
         since,
+    })
+}
+
+pub(crate) fn ensure_recent_sessions(
+    decrypted_dir: &Path,
+    jobs: usize,
+) -> Result<SessionCatchUpStats, String> {
+    paths::ensure_private_dir(decrypted_dir).map_err(|e| {
+        format!(
+            "Cannot create index parent {}: {}",
+            decrypted_dir.display(),
+            e
+        )
+    })?;
+
+    let Some(session_db) = db::find_decrypted_session_db(decrypted_dir) else {
+        return Ok(SessionCatchUpStats::default());
+    };
+
+    let index_path = decrypted_dir.join(INDEX_FILE);
+    let mut conn = Connection::open(&index_path)
+        .map_err(|e| format!("Cannot open message index {}: {}", index_path.display(), e))?;
+    conn.busy_timeout(Duration::from_secs(30))
+        .map_err(|e| format!("Set index busy timeout: {}", e))?;
+    ensure_schema(&conn)?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| format!("Set index journal mode: {}", e))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(|e| format!("Set index synchronous mode: {}", e))?;
+
+    let build_since = time::default_recent_since();
+    let index_since = meta_i64(&conn, "index_since")?.unwrap_or(build_since);
+    if meta_i64(&conn, "index_since")?.is_none() {
+        set_meta_i64_tx(&conn, "index_since", index_since)?;
+    }
+
+    let current_sessions = load_session_index_states(&session_db)?;
+    if current_sessions.is_empty() {
+        return Ok(SessionCatchUpStats::default());
+    }
+    let previous_sessions = previous_session_states(&conn)?;
+    let changed_sessions = current_sessions
+        .into_iter()
+        .filter(|state| previous_sessions.get(&state.username) != Some(state))
+        .collect::<Vec<_>>();
+    if changed_sessions.is_empty() {
+        return Ok(SessionCatchUpStats::default());
+    }
+
+    let (contact_db, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
+    if message_dbs.is_empty() {
+        return Ok(SessionCatchUpStats {
+            changed_sessions: changed_sessions.len(),
+            refreshed_tables: 0,
+        });
+    }
+
+    let contacts = contact_db
+        .as_ref()
+        .and_then(|path| contact::load_contacts(path).ok())
+        .unwrap_or_default();
+    let table_context = table_context(&contacts);
+    let source_files = source_files(decrypted_dir, message_dbs);
+    let table_jobs = parallel::job_count(jobs, 8);
+    let mut refreshes = Vec::new();
+    for state in &changed_sessions {
+        let table_name = db::msg_table_name(&state.username);
+        for source in &source_files {
+            refreshes.push((source.clone(), state.username.clone(), table_name.clone()));
+        }
+    }
+
+    let collected = parallel::map_ordered(refreshes.clone(), table_jobs, |refresh| {
+        let (source, username, table_name) = refresh;
+        collect_session_table_messages(&source, &username, &table_name, &table_context, index_since)
+    });
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| format!("Start session index catch-up: {}", e))?;
+    let mut refreshed_tables = 0usize;
+    for ((source, _username, table_name), collected) in refreshes.into_iter().zip(collected) {
+        let Some(collected) = collected? else {
+            continue;
+        };
+        refreshed_tables += 1;
+        tx.execute(
+            "DELETE FROM messages
+             WHERE source_db = ?1 AND table_name = ?2 AND create_time >= ?3",
+            params![source.key, table_name, index_since],
+        )
+        .map_err(|e| {
+            format!(
+                "Delete stale session table window {}.{}: {}",
+                source.key, table_name, e
+            )
+        })?;
+        insert_messages(&tx, &collected.messages)?;
+        insert_table_states(&tx, &source.key, &collected.table_states)?;
+    }
+    insert_session_states(&tx, &changed_sessions)?;
+    tx.commit()
+        .map_err(|e| format!("Commit session index catch-up: {}", e))?;
+    checkpoint_index(&conn);
+
+    Ok(SessionCatchUpStats {
+        changed_sessions: changed_sessions.len(),
+        refreshed_tables,
     })
 }
 
@@ -117,16 +243,8 @@ pub(crate) fn open_existing_recent(decrypted_dir: &Path) -> Result<Option<HotInd
         .map_err(|e| format!("Cannot open message index {}: {}", index_path.display(), e))?;
     let _ = conn.busy_timeout(Duration::from_millis(50));
 
-    let version: i64 = conn
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|e| format!("Read index schema version: {}", e))?;
-    if version != SCHEMA_VERSION
-        && version != 6
-        && version != 5
-        && version != 4
-        && version != 3
-        && version != 2
-    {
+    let version = index_schema_version(&conn)?;
+    if !is_supported_schema_version(version) {
         return Ok(None);
     }
 
@@ -137,6 +255,29 @@ pub(crate) fn open_existing_recent(decrypted_dir: &Path) -> Result<Option<HotInd
         return Ok(None);
     }
 
+    Ok(Some(HotIndex {
+        path: index_path,
+        since,
+    }))
+}
+
+pub(crate) fn open_existing_query_index(decrypted_dir: &Path) -> Result<Option<HotIndex>, String> {
+    let index_path = decrypted_dir.join(INDEX_FILE);
+    if !index_path.exists() {
+        return Ok(None);
+    }
+
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(&index_path, flags)
+        .map_err(|e| format!("Cannot open message index {}: {}", index_path.display(), e))?;
+    let _ = conn.busy_timeout(Duration::from_millis(50));
+    let version = index_schema_version(&conn)?;
+    if !is_supported_schema_version(version) {
+        return Ok(None);
+    }
+    let Some(since) = meta_i64(&conn, "index_since")? else {
+        return Ok(None);
+    };
     Ok(Some(HotIndex {
         path: index_path,
         since,
@@ -158,16 +299,15 @@ fn index_matches_sources(conn: &Connection, decrypted_dir: &Path) -> Result<bool
 }
 
 fn ensure_schema(conn: &Connection) -> Result<(), String> {
-    let version: i64 = conn
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|e| format!("Read index schema version: {}", e))?;
-    if version != SCHEMA_VERSION && version != 6 {
+    let version = index_schema_version(conn)?;
+    if version != SCHEMA_VERSION && version != 7 && version != 6 {
         conn.pragma_update(None, "journal_mode", "DELETE")
             .map_err(|e| format!("Prepare index schema reset: {}", e))?;
         conn.execute_batch(
             "DROP TABLE IF EXISTS messages;
              DROP TABLE IF EXISTS source_files;
              DROP TABLE IF EXISTS table_states;
+             DROP TABLE IF EXISTS session_states;
              DROP TABLE IF EXISTS meta;",
         )
         .map_err(|e| format!("Reset index schema: {}", e))?;
@@ -190,6 +330,13 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
             table_name TEXT NOT NULL,
             max_local_id INTEGER,
             PRIMARY KEY(source_db, table_name)
+        );
+        CREATE TABLE IF NOT EXISTS session_states (
+            username TEXT PRIMARY KEY,
+            last_timestamp INTEGER NOT NULL,
+            sort_timestamp INTEGER NOT NULL,
+            last_msg_local_id INTEGER,
+            last_msg_type INTEGER
         );
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY,
@@ -241,6 +388,7 @@ fn rebuild_all(
         "DELETE FROM messages;
          DELETE FROM source_files;
          DELETE FROM table_states;
+         DELETE FROM session_states;
          DELETE FROM meta;",
     )
     .map_err(|e| format!("Clear index: {}", e))?;
@@ -640,6 +788,109 @@ fn collect_source_messages(
     })
 }
 
+fn collect_session_table_messages(
+    source: &SourceFile,
+    username: &str,
+    table_name: &str,
+    table_context: &TableContext,
+    since: i64,
+) -> Result<Option<CollectedSource>, String> {
+    let conn = Connection::open(&source.path)
+        .map_err(|e| format!("Cannot open {}: {}", source.path.display(), e))?;
+    if !message_table_exists(&conn, table_name) {
+        return Ok(None);
+    }
+
+    let name2id = load_name2id(&conn);
+    let body_col = db::quote_identifier(dictionary::msg_body_column());
+    let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+    let sender_col = db::quote_identifier(dictionary::msg_sender_column());
+    let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
+    let quoted_table = db::quote_identifier(table_name);
+    let has_local_id = db::table_has_column(&conn, table_name, "local_id");
+    let local_id_col = if has_local_id {
+        db::quote_identifier("local_id")
+    } else {
+        "NULL".to_string()
+    };
+    let current_max_local_id = if has_local_id {
+        table_max_local_id(&conn, table_name)?
+    } else {
+        None
+    };
+    let session_display = table_context
+        .table_to_display
+        .get(table_name)
+        .cloned()
+        .unwrap_or_else(|| username.to_string());
+    let sql = format!(
+        "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}
+         FROM {quoted_table}
+         WHERE create_time >= ?1
+         ORDER BY create_time ASC",
+        local_id_col = local_id_col
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Read session table {}.{}: {}", source.key, table_name, e))?;
+    let rows = stmt
+        .query_map(params![since], |row| {
+            let marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
+            let raw_body = read_message_body(row, 3, marker);
+            let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
+            let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
+            let sender_display = table_context
+                .sender_display
+                .get(&sender_account)
+                .cloned()
+                .unwrap_or_else(|| sender_account.clone());
+            let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
+            let local_id = row.get::<_, Option<i64>>(0)?;
+            let local_type = row.get::<_, Option<i64>>(1)?.unwrap_or(-1);
+            let decoded_body = indexed_decoded_body(
+                local_type,
+                &raw_body,
+                marker,
+                &packed_info,
+                &session_display,
+                local_id,
+                table_context,
+            );
+            Ok(IndexedMessage {
+                source_db: source.key.clone(),
+                table_name: table_name.to_string(),
+                session_id: username.to_string(),
+                session_display: session_display.clone(),
+                sender_account,
+                sender_display,
+                local_id,
+                local_type,
+                media_type: media::message_media_type(local_type, &raw_body)
+                    .unwrap_or("")
+                    .to_string(),
+                create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                raw_body,
+                decoded_body,
+                marker,
+                packed_info,
+            })
+        })
+        .map_err(|e| format!("Read indexed messages from {}: {}", source.key, e))?;
+
+    Ok(Some(CollectedSource {
+        messages: rows.filter_map(|row| row.ok()).collect(),
+        table_states: vec![TableState {
+            table_name: table_name.to_string(),
+            max_local_id: current_max_local_id,
+        }],
+        replaced_windows: vec![TableWindow {
+            table_name: table_name.to_string(),
+            since,
+        }],
+        current_tables: HashSet::new(),
+    }))
+}
+
 fn table_max_local_id(conn: &Connection, table_name: &str) -> Result<Option<i64>, String> {
     let sql = format!(
         "SELECT MAX({}) FROM {}",
@@ -721,6 +972,14 @@ fn list_message_tables(conn: &Connection) -> Result<Vec<String>, String> {
     Ok(rows.filter_map(|row| row.ok()).collect())
 }
 
+fn message_table_exists(conn: &Connection, table_name: &str) -> bool {
+    conn.prepare(&format!(
+        "SELECT 1 FROM {} LIMIT 1",
+        db::quote_identifier(table_name)
+    ))
+    .is_ok()
+}
+
 fn load_name2id(conn: &Connection) -> HashMap<i64, String> {
     match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
         Ok(mut stmt) => stmt
@@ -785,6 +1044,121 @@ fn previous_sources(
     Ok(rows.filter_map(|row| row.ok()).collect())
 }
 
+fn previous_session_states(
+    conn: &Connection,
+) -> Result<HashMap<String, SessionIndexState>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT username, last_timestamp, sort_timestamp, last_msg_local_id, last_msg_type
+             FROM session_states",
+        )
+        .map_err(|e| format!("Prepare session state query: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let state = SessionIndexState {
+                username: row.get(0)?,
+                last_timestamp: row.get(1)?,
+                sort_timestamp: row.get(2)?,
+                last_msg_local_id: row.get(3)?,
+                last_msg_type: row.get(4)?,
+            };
+            Ok((state.username.clone(), state))
+        })
+        .map_err(|e| format!("Read session state: {}", e))?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+fn insert_session_states(conn: &Connection, states: &[SessionIndexState]) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "INSERT OR REPLACE INTO session_states (
+                username, last_timestamp, sort_timestamp, last_msg_local_id, last_msg_type
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .map_err(|e| format!("Prepare session state insert: {}", e))?;
+    for state in states {
+        stmt.execute(params![
+            state.username,
+            state.last_timestamp,
+            state.sort_timestamp,
+            state.last_msg_local_id,
+            state.last_msg_type
+        ])
+        .map_err(|e| format!("Insert session state {}: {}", state.username, e))?;
+    }
+    Ok(())
+}
+
+fn sync_current_session_states(conn: &mut Connection, decrypted_dir: &Path) -> Result<(), String> {
+    let Some(session_db) = db::find_decrypted_session_db(decrypted_dir) else {
+        return Ok(());
+    };
+    let states = load_session_index_states(&session_db)?;
+    let current = states
+        .iter()
+        .map(|state| (state.username.clone(), state.clone()))
+        .collect::<HashMap<_, _>>();
+    if previous_session_states(conn)? == current {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| format!("Start session state sync: {}", e))?;
+    tx.execute("DELETE FROM session_states", [])
+        .map_err(|e| format!("Clear session state: {}", e))?;
+    insert_session_states(&tx, &states)?;
+    tx.commit()
+        .map_err(|e| format!("Commit session state sync: {}", e))?;
+    Ok(())
+}
+
+fn load_session_index_states(session_db: &Path) -> Result<Vec<SessionIndexState>, String> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(session_db, flags)
+        .map_err(|e| format!("Cannot open session db {}: {}", session_db.display(), e))?;
+    let has_last_local_id = db::table_has_column(&conn, "SessionTable", "last_msg_locald_id");
+    let has_last_type = db::table_has_column(&conn, "SessionTable", "last_msg_type");
+    let last_local_id_col = if has_last_local_id {
+        "last_msg_locald_id"
+    } else {
+        "NULL"
+    };
+    let last_type_col = if has_last_type {
+        "last_msg_type"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT username,
+                COALESCE(last_timestamp, 0),
+                COALESCE(sort_timestamp, 0),
+                {last_local_id_col},
+                {last_type_col}
+         FROM SessionTable
+         WHERE username IS NOT NULL
+           AND username != ''
+           AND (COALESCE(last_timestamp, 0) > 0
+                OR COALESCE(sort_timestamp, 0) > 0
+                OR {last_local_id_col} IS NOT NULL)"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Prepare session table scan: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SessionIndexState {
+                username: row.get(0)?,
+                last_timestamp: row.get(1)?,
+                sort_timestamp: row.get(2)?,
+                last_msg_local_id: row.get(3)?,
+                last_msg_type: row.get(4)?,
+            })
+        })
+        .map_err(|e| format!("Read session table: {}", e))?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
 fn indexed_source_latest(conn: &Connection, source_key: &str) -> Result<Option<i64>, String> {
     conn.query_row(
         "SELECT MAX(create_time) FROM messages WHERE source_db = ?1",
@@ -827,6 +1201,15 @@ fn meta_string(conn: &Connection, key: &str) -> Result<Option<String>, String> {
     .map_err(|e| format!("Read index meta {}: {}", key, e))
 }
 
+fn index_schema_version(conn: &Connection) -> Result<i64, String> {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| format!("Read index schema version: {}", e))
+}
+
+fn is_supported_schema_version(version: i64) -> bool {
+    matches!(version, SCHEMA_VERSION | 7 | 6 | 5 | 4 | 3 | 2)
+}
+
 fn meta_i64(conn: &Connection, key: &str) -> Result<Option<i64>, String> {
     Ok(meta_string(conn, key)?.and_then(|value| value.parse().ok()))
 }
@@ -849,6 +1232,96 @@ mod tests {
     use super::*;
     use rusqlite::params;
     use tempfile::tempdir;
+
+    fn create_session_db(dir: &Path, rows: &[(&str, i64, i64, i64, i64)]) {
+        let session_dir = dir.join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let conn = Connection::open(session_dir.join("session.db")).unwrap();
+        conn.execute(
+            "CREATE TABLE SessionTable (
+                username TEXT PRIMARY KEY,
+                last_timestamp INTEGER,
+                sort_timestamp INTEGER,
+                last_msg_locald_id INTEGER,
+                last_msg_type INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+        for (username, last_timestamp, sort_timestamp, local_id, msg_type) in rows {
+            conn.execute(
+                "INSERT INTO SessionTable (
+                    username, last_timestamp, sort_timestamp, last_msg_locald_id, last_msg_type
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![username, last_timestamp, sort_timestamp, local_id, msg_type],
+            )
+            .unwrap();
+        }
+    }
+
+    fn update_session_last_message(dir: &Path, username: &str, local_id: i64, last_timestamp: i64) {
+        let conn = Connection::open(dir.join("session/session.db")).unwrap();
+        conn.execute(
+            "UPDATE SessionTable
+             SET last_timestamp = ?2, sort_timestamp = ?2, last_msg_locald_id = ?3
+             WHERE username = ?1",
+            params![username, last_timestamp, local_id],
+        )
+        .unwrap();
+    }
+
+    fn create_message_db(dir: &Path, rows: &[(&str, i64, i64, &str)]) -> PathBuf {
+        let message_dir = dir.join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let message_path = message_dir.join("message_0.db");
+        let conn = Connection::open(&message_path).unwrap();
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .unwrap();
+        let body_col = db::quote_identifier(dictionary::msg_body_column());
+        let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+        let sender_col = db::quote_identifier(dictionary::msg_sender_column());
+        let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
+        for (username, local_id, create_time, body) in rows {
+            let table = db::msg_table_name(username);
+            conn.execute(
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS {} (
+                        local_id INTEGER,
+                        local_type INTEGER,
+                        create_time INTEGER,
+                        {} TEXT,
+                        {} INTEGER,
+                        {} INTEGER,
+                        {} BLOB
+                    )",
+                    table, body_col, marker_col, sender_col, packed_col
+                ),
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                &format!(
+                    "INSERT INTO {} (local_id, local_type, create_time, {}, {}, {}, {})
+                     VALUES (?1, 1, ?2, ?3, NULL, 0, x'')",
+                    table, body_col, marker_col, sender_col, packed_col
+                ),
+                params![local_id, create_time, body],
+            )
+            .unwrap();
+        }
+        message_path
+    }
+
+    fn update_message_body(message_path: &Path, username: &str, local_id: i64, body: &str) {
+        let conn = Connection::open(message_path).unwrap();
+        let table = db::msg_table_name(username);
+        let body_col = db::quote_identifier(dictionary::msg_body_column());
+        conn.execute(
+            &format!("UPDATE {} SET {} = ?1 WHERE local_id = ?2", table, body_col),
+            params![body, local_id],
+        )
+        .unwrap();
+    }
 
     #[test]
     fn builds_recent_index_for_numbered_message_dbs() {
@@ -1302,5 +1775,139 @@ mod tests {
         let index = open_existing_recent(dir.path()).unwrap();
 
         assert!(index.is_none());
+    }
+
+    #[test]
+    fn unchanged_session_table_produces_no_session_refresh() {
+        let dir = tempdir().unwrap();
+        let since = time::default_recent_since() + 10;
+        create_session_db(dir.path(), &[("tgid_state_a", since, since, 1, 1)]);
+        let message_path = create_message_db(dir.path(), &[("tgid_state_a", 1, since, "first")]);
+
+        let initial = ensure_recent_sessions(dir.path(), 1).unwrap();
+        update_message_body(&message_path, "tgid_state_a", 1, "mutated without session");
+        let second = ensure_recent_sessions(dir.path(), 1).unwrap();
+        let indexed = Connection::open(dir.path().join(INDEX_FILE)).unwrap();
+        let body: String = indexed
+            .query_row("SELECT raw_body FROM messages", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(
+            initial,
+            SessionCatchUpStats {
+                changed_sessions: 1,
+                refreshed_tables: 1
+            }
+        );
+        assert_eq!(second, SessionCatchUpStats::default());
+        assert_eq!(body, "first");
+    }
+
+    #[test]
+    fn changed_session_refreshes_only_that_session_table() {
+        let dir = tempdir().unwrap();
+        let since = time::default_recent_since() + 10;
+        create_session_db(
+            dir.path(),
+            &[
+                ("tgid_state_a", since, since, 1, 1),
+                ("tgid_state_b", since, since, 1, 1),
+            ],
+        );
+        let message_path = create_message_db(
+            dir.path(),
+            &[
+                ("tgid_state_a", 1, since, "a first"),
+                ("tgid_state_b", 1, since, "b first"),
+            ],
+        );
+        ensure_recent_sessions(dir.path(), 1).unwrap();
+
+        update_message_body(&message_path, "tgid_state_a", 1, "a changed");
+        update_message_body(&message_path, "tgid_state_b", 1, "b changed");
+        update_session_last_message(dir.path(), "tgid_state_a", 2, since + 1);
+        let stats = ensure_recent_sessions(dir.path(), 1).unwrap();
+
+        let indexed = Connection::open(dir.path().join(INDEX_FILE)).unwrap();
+        let a_count: i64 = indexed
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE raw_body = 'a changed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let b_old_count: i64 = indexed
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE raw_body = 'b first'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let b_changed_count: i64 = indexed
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE raw_body = 'b changed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            stats,
+            SessionCatchUpStats {
+                changed_sessions: 1,
+                refreshed_tables: 1
+            }
+        );
+        assert_eq!(a_count, 1);
+        assert_eq!(b_old_count, 1);
+        assert_eq!(b_changed_count, 0);
+    }
+
+    #[test]
+    fn explicit_recent_refresh_remains_source_driven_after_session_catch_up() {
+        let dir = tempdir().unwrap();
+        let since = time::default_recent_since() + 10;
+        create_session_db(dir.path(), &[("tgid_source_a", since, since, 1, 1)]);
+        create_message_db(
+            dir.path(),
+            &[
+                ("tgid_source_a", 1, since, "session tracked"),
+                ("tgid_source_b", 1, since, "source only"),
+            ],
+        );
+
+        ensure_recent_sessions(dir.path(), 1).unwrap();
+        let indexed = Connection::open(dir.path().join(INDEX_FILE)).unwrap();
+        let source_states_after_catch_up: i64 = indexed
+            .query_row("SELECT COUNT(*) FROM source_files", [], |row| row.get(0))
+            .unwrap();
+        let source_only_after_catch_up: i64 = indexed
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE raw_body = 'source only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(indexed);
+
+        ensure_recent(dir.path(), 1).unwrap();
+        let catch_up_after_real_refresh = ensure_recent_sessions(dir.path(), 1).unwrap();
+        let indexed = Connection::open(dir.path().join(INDEX_FILE)).unwrap();
+        let source_states_after_real_refresh: i64 = indexed
+            .query_row("SELECT COUNT(*) FROM source_files", [], |row| row.get(0))
+            .unwrap();
+        let source_only_after_real_refresh: i64 = indexed
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE raw_body = 'source only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(source_states_after_catch_up, 0);
+        assert_eq!(source_only_after_catch_up, 0);
+        assert_eq!(catch_up_after_real_refresh, SessionCatchUpStats::default());
+        assert_eq!(source_states_after_real_refresh, 1);
+        assert_eq!(source_only_after_real_refresh, 1);
     }
 }
