@@ -299,17 +299,6 @@ fn refresh_changed_sources(
         .and_then(|path| contact::load_contacts(path).ok())
         .unwrap_or_default();
     let contact_signature = contact_signature(&contacts);
-    let previous_contact_signature = meta_string(conn, "contact_signature")?.unwrap_or_default();
-    let contact_changed = contact_signature != previous_contact_signature;
-    if contact_changed {
-        refreshes.clear();
-        refreshes.extend(sources.iter().cloned().map(|source| SourceRefresh {
-            source,
-            since,
-            mode: index_policy::RefreshMode::FullWindow,
-        }));
-    }
-
     let table_context = table_context(&contacts);
     let previous_tables = previous_table_states(conn)?;
 
@@ -322,44 +311,33 @@ fn refresh_changed_sources(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| format!("Start index update: {}", e))?;
 
-    if contact_changed {
-        tx.execute("DELETE FROM messages", [])
-            .map_err(|e| format!("Clear messages after contact change: {}", e))?;
-        tx.execute("DELETE FROM source_files", [])
-            .map_err(|e| format!("Clear source state after contact change: {}", e))?;
-        tx.execute("DELETE FROM table_states", [])
-            .map_err(|e| format!("Clear table state after contact change: {}", e))?;
-    } else {
-        for key in &removed {
-            tx.execute("DELETE FROM messages WHERE source_db = ?1", params![key])
-                .map_err(|e| format!("Delete removed source {}: {}", key, e))?;
-            tx.execute("DELETE FROM source_files WHERE path = ?1", params![key])
-                .map_err(|e| format!("Delete removed source state {}: {}", key, e))?;
-            tx.execute(
-                "DELETE FROM table_states WHERE source_db = ?1",
-                params![key],
-            )
-            .map_err(|e| format!("Delete removed table state {}: {}", key, e))?;
-        }
+    for key in &removed {
+        tx.execute("DELETE FROM messages WHERE source_db = ?1", params![key])
+            .map_err(|e| format!("Delete removed source {}: {}", key, e))?;
+        tx.execute("DELETE FROM source_files WHERE path = ?1", params![key])
+            .map_err(|e| format!("Delete removed source state {}: {}", key, e))?;
+        tx.execute(
+            "DELETE FROM table_states WHERE source_db = ?1",
+            params![key],
+        )
+        .map_err(|e| format!("Delete removed table state {}: {}", key, e))?;
     }
 
     for (refresh, collected) in refreshes.iter().zip(rows_by_source) {
         let collected = collected?;
-        if !contact_changed {
-            delete_removed_tables(&tx, refresh, &previous_tables, &collected.current_tables)?;
-            for window in &collected.replaced_windows {
-                tx.execute(
-                    "DELETE FROM messages
-                     WHERE source_db = ?1 AND table_name = ?2 AND create_time >= ?3",
-                    params![refresh.source.key, window.table_name, window.since],
+        delete_removed_tables(&tx, refresh, &previous_tables, &collected.current_tables)?;
+        for window in &collected.replaced_windows {
+            tx.execute(
+                "DELETE FROM messages
+                 WHERE source_db = ?1 AND table_name = ?2 AND create_time >= ?3",
+                params![refresh.source.key, window.table_name, window.since],
+            )
+            .map_err(|e| {
+                format!(
+                    "Delete stale table window {}.{}: {}",
+                    refresh.source.key, window.table_name, e
                 )
-                .map_err(|e| {
-                    format!(
-                        "Delete stale table window {}.{}: {}",
-                        refresh.source.key, window.table_name, e
-                    )
-                })?;
-            }
+            })?;
         }
         insert_messages(&tx, &collected.messages)?;
         tx.execute(
@@ -1104,6 +1082,123 @@ mod tests {
         assert_eq!(old_count, 1);
         assert_eq!(new_count, 1);
         assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn contact_change_does_not_promote_cursor_refresh_to_full_window() {
+        let dir = tempdir().unwrap();
+        let contact_dir = dir.path().join("contact");
+        std::fs::create_dir_all(&contact_dir).unwrap();
+        let contact_path = contact_dir.join("contact.db");
+        let contact_conn = Connection::open(&contact_path).unwrap();
+        contact_conn
+            .execute(
+                "CREATE TABLE contact (
+                    username TEXT,
+                    nick_name TEXT,
+                    remark TEXT,
+                    alias TEXT
+                )",
+                [],
+            )
+            .unwrap();
+        contact_conn
+            .execute(
+                "INSERT INTO contact (username, nick_name, remark, alias)
+                 VALUES ('tgid_contact_cursor', 'Before', '', '')",
+                [],
+            )
+            .unwrap();
+        drop(contact_conn);
+
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let message_path = message_dir.join("message_0.db");
+        let conn = Connection::open(&message_path).unwrap();
+        let table = db::msg_table_name("tgid_contact_cursor");
+        let body_col = db::quote_identifier(dictionary::msg_body_column());
+        let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
+        let sender_col = db::quote_identifier(dictionary::msg_sender_column());
+        let packed_col = db::quote_identifier(dictionary::msg_packed_meta_column());
+        conn.execute(
+            &format!(
+                "CREATE TABLE {} (
+                    local_id INTEGER,
+                    local_type INTEGER,
+                    create_time INTEGER,
+                    {} TEXT,
+                    {} INTEGER,
+                    {} INTEGER,
+                    {} BLOB
+                )",
+                table, body_col, marker_col, sender_col, packed_col
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE Name2Id (user_name TEXT)", [])
+            .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {} (local_id, local_type, create_time, {}, {}, {}, {})
+                 VALUES (1, 1, ?1, 'original old row', NULL, 0, x'')",
+                table, body_col, marker_col, sender_col, packed_col
+            ),
+            params![time::default_recent_since() + 10],
+        )
+        .unwrap();
+        drop(conn);
+
+        let index = ensure_recent(dir.path(), 1).unwrap();
+        drop(index);
+
+        let contact_conn = Connection::open(&contact_path).unwrap();
+        contact_conn
+            .execute(
+                "UPDATE contact SET remark = 'After' WHERE username = 'tgid_contact_cursor'",
+                [],
+            )
+            .unwrap();
+        drop(contact_conn);
+
+        std::thread::sleep(Duration::from_millis(2));
+        let conn = Connection::open(&message_path).unwrap();
+        conn.execute(
+            &format!(
+                "UPDATE {} SET {} = 'mutated old row' WHERE local_id = 1",
+                table, body_col
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {} (local_id, local_type, create_time, {}, {}, {}, {})
+                 VALUES (2, 1, ?1, 'new row after contact change', NULL, 0, x'')",
+                table, body_col, marker_col, sender_col, packed_col
+            ),
+            params![time::default_recent_since() + 20],
+        )
+        .unwrap();
+        drop(conn);
+
+        let index = ensure_recent(dir.path(), 1).unwrap();
+        let indexed = Connection::open(index.path).unwrap();
+        let (original_count, mutated_count, new_count): (i64, i64, i64) = indexed
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN raw_body = 'original old row' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN raw_body = 'mutated old row' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN raw_body = 'new row after contact change' THEN 1 ELSE 0 END)
+                 FROM messages",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(original_count, 1);
+        assert_eq!(mutated_count, 0);
+        assert_eq!(new_count, 1);
     }
 
     #[test]
