@@ -2716,7 +2716,7 @@ fn export_json(path: &Path, messages: &[ExportMessage]) -> Result<(), String> {
     Ok(())
 }
 
-/// Export a media file, decrypting .dat files on the fly.
+/// Export a media file, decrypting V2 files on the fly.
 fn export_media_with_decrypt(
     src: &Path,
     output_dir: &Path,
@@ -2726,11 +2726,12 @@ fn export_media_with_decrypt(
     index: usize,
     media_keys: Option<&crate::media_key::MediaKeys>,
 ) -> Result<PathBuf, String> {
-    let use_decrypt = src.extension().and_then(|e| e.to_str()) == Some("dat");
+    let use_decrypt = crate::media_decrypt::file_has_v2_magic(src)?;
 
     if use_decrypt {
         if let Some(keys) = media_keys {
-            // Decrypt directly to the output location with .dat extension
+            // Decrypt directly to a temporary output location, then rename
+            // based on the decrypted payload magic.
             let filename = format!(
                 "{}_{}_{}_{:04}.dat",
                 sanitize_filename(session_name),
@@ -3308,6 +3309,35 @@ mod tests {
         }
     }
 
+    fn fixture_media_keys() -> crate::media_key::MediaKeys {
+        crate::media_key::MediaKeys {
+            aes_key: *b"0123456789abcdef",
+            xor_key: 0,
+        }
+    }
+
+    fn v2_media_fixture(plaintext: &[u8], keys: &crate::media_key::MediaKeys) -> Vec<u8> {
+        use aes::cipher::{BlockEncrypt, KeyInit};
+
+        let mut encrypted = plaintext.to_vec();
+        let remainder = encrypted.len() % 16;
+        let pad_len = if remainder == 0 { 16 } else { 16 - remainder };
+        encrypted.extend(std::iter::repeat_n(pad_len as u8, pad_len));
+
+        let cipher = aes::Aes128::new_from_slice(&keys.aes_key).unwrap();
+        for block in encrypted.chunks_exact_mut(16) {
+            let block = aes::cipher::generic_array::GenericArray::from_mut_slice(block);
+            cipher.encrypt_block(block);
+        }
+
+        let mut data = crate::media_decrypt::V2_MAGIC.to_vec();
+        data.extend_from_slice(&(plaintext.len() as u32).to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.push(1);
+        data.extend_from_slice(&encrypted);
+        data
+    }
+
     #[test]
     fn export_messages_writes_json_in_chronological_order() {
         let decrypted = create_export_decrypted_dir();
@@ -3721,6 +3751,43 @@ mod tests {
             file_extension(Path::new("/tmp/report.bin"), Some("report.pdf")),
             "bin"
         );
+    }
+
+    #[test]
+    fn export_media_with_decrypt_decrypts_extensionless_v2_by_magic() {
+        let temp = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let src = temp.path().join("cached-image");
+        let keys = fixture_media_keys();
+        let jpeg = b"\xff\xd8\xff\xe0fixture-jpeg";
+        std::fs::write(&src, v2_media_fixture(jpeg, &keys)).unwrap();
+
+        let exported =
+            export_media_with_decrypt(&src, output.path(), "session", "Image", 3, 7, Some(&keys))
+                .unwrap();
+
+        assert_eq!(
+            exported.file_name().and_then(OsStr::to_str),
+            Some("session_Image_3_0007.jpg")
+        );
+        assert_eq!(std::fs::read(exported).unwrap(), jpeg);
+    }
+
+    #[test]
+    fn export_media_with_decrypt_still_decrypts_dat_v2_by_magic() {
+        let temp = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let src = temp.path().join("cached-image.dat");
+        let keys = fixture_media_keys();
+        let jpeg = b"\xff\xd8\xff\xe0fixture-jpeg";
+        std::fs::write(&src, v2_media_fixture(jpeg, &keys)).unwrap();
+
+        let exported =
+            export_media_with_decrypt(&src, output.path(), "session", "Image", 3, 8, Some(&keys))
+                .unwrap();
+
+        assert_eq!(exported.extension().and_then(OsStr::to_str), Some("jpg"));
+        assert_eq!(std::fs::read(exported).unwrap(), jpeg);
     }
 
     #[test]

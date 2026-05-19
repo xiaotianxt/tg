@@ -425,6 +425,14 @@ fn discover_media_dirs(
     }
 
     if categories.contains(&"File") {
+        let file_dir = base_path.join("msg/file");
+        if file_dir.is_dir() {
+            dirs.push(MediaDirSpec {
+                path: file_dir,
+                category: "File".to_string(),
+            });
+        }
+
         let attach_dir = base_path.join("msg/attach");
         if attach_dir.is_dir() {
             discover_attach_file_dirs(&attach_dir, session_id, &mut dirs);
@@ -665,6 +673,28 @@ mod tests {
             .join("msg/attach")
             .join(session_dir)
             .join("2026-04/Rec/item/F");
+        fs::create_dir_all(&file_dir).unwrap();
+        fs::write(file_dir.join("report.pdf"), b"pdf").unwrap();
+
+        let index = MediaIndex::load_with_cache_dir(
+            temp.path(),
+            "session",
+            &["File"],
+            1,
+            Some(cache.path()),
+        );
+
+        assert_eq!(
+            index.find("File", "report.pdf").unwrap(),
+            file_dir.join("report.pdf")
+        );
+    }
+
+    #[test]
+    fn indexes_and_finds_msg_file_cached_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let file_dir = temp.path().join("msg/file/2026-04");
         fs::create_dir_all(&file_dir).unwrap();
         fs::write(file_dir.join("report.pdf"), b"pdf").unwrap();
 

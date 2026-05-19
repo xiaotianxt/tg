@@ -22,16 +22,26 @@
 
 use crate::{dictionary, media_key::MediaKeys};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Magic bytes for V2 .dat files.
 pub const V2_MAGIC: [u8; 6] = [0x07, 0x08, 0x56, 0x32, 0x08, 0x07];
 
-/// Check whether a .dat file uses the V2 format.
-pub fn is_v2_dat(header: &[u8]) -> bool {
+/// Check whether a cached media file starts with the V2 magic bytes.
+pub fn is_v2_media_header(header: &[u8]) -> bool {
     header.len() >= 6 && header[..6] == V2_MAGIC
+}
+
+/// Check a cached media file's header without relying on its extension.
+pub fn file_has_v2_magic(src: &Path) -> Result<bool, String> {
+    let mut file = fs::File::open(src).map_err(|e| format!("Read {}: {}", src.display(), e))?;
+    let mut header = [0u8; 6];
+    let len = file
+        .read(&mut header)
+        .map_err(|e| format!("Read {}: {}", src.display(), e))?;
+    Ok(is_v2_media_header(&header[..len]))
 }
 
 /// Detect the output file extension from decrypted content magic bytes.
@@ -72,8 +82,8 @@ pub fn decrypt_v2_dat(src: &Path, dest: &Path, keys: &MediaKeys) -> Result<&'sta
             data.len()
         ));
     }
-    if !is_v2_dat(&data) {
-        return Err(format!("Not a V2 .dat file: {}", src.display()));
+    if !is_v2_media_header(&data) {
+        return Err(format!("Not a V2 media file: {}", src.display()));
     }
 
     let aes_len = u32::from_le_bytes([data[6], data[7], data[8], data[9]]) as usize;
@@ -255,10 +265,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_v2_dat() {
-        assert!(is_v2_dat(&[0x07, 0x08, 0x56, 0x32, 0x08, 0x07]));
-        assert!(!is_v2_dat(&[0x07, 0x08, 0x56, 0x31, 0x08, 0x07]));
-        assert!(!is_v2_dat(&[0; 6]));
+    fn test_is_v2_media_header() {
+        assert!(is_v2_media_header(&[0x07, 0x08, 0x56, 0x32, 0x08, 0x07]));
+        assert!(!is_v2_media_header(&[0x07, 0x08, 0x56, 0x31, 0x08, 0x07]));
+        assert!(!is_v2_media_header(&[0; 6]));
+    }
+
+    #[test]
+    fn test_file_has_v2_magic_does_not_require_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let extensionless = dir.path().join("cached-image");
+        let plain = dir.path().join("plain.dat");
+        std::fs::write(&extensionless, V2_MAGIC).unwrap();
+        std::fs::write(&plain, b"not-v2").unwrap();
+
+        assert!(file_has_v2_magic(&extensionless).unwrap());
+        assert!(!file_has_v2_magic(&plain).unwrap());
     }
 
     #[test]
