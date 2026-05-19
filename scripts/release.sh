@@ -67,80 +67,6 @@ print(match.group(1))
 PY
 }
 
-bump_version() {
-  python3 - "$1" "$2" <<'PY'
-import re
-import sys
-
-version = sys.argv[1]
-kind = sys.argv[2]
-match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
-if not match:
-    raise SystemExit(f"can only auto-bump x.y.z versions, got: {version}")
-
-major, minor, patch = map(int, match.groups())
-if kind == "major":
-    major += 1
-    minor = 0
-    patch = 0
-elif kind == "minor":
-    minor += 1
-    patch = 0
-elif kind == "patch":
-    patch += 1
-else:
-    raise SystemExit(f"unknown bump level: {kind}")
-
-print(f"{major}.{minor}.{patch}")
-PY
-}
-
-set_package_version() {
-  python3 - "$1" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-version = sys.argv[1]
-
-def replace_package_version(path, package_name=None):
-    lines = path.read_text().splitlines(keepends=True)
-    in_package = False
-    saw_name = package_name is None
-
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-
-        if stripped == "[[package]]" or stripped == "[package]":
-            in_package = True
-            saw_name = package_name is None
-            continue
-
-        if in_package and stripped.startswith("[") and stripped not in {"[package]", "[[package]]"}:
-            in_package = False
-            saw_name = package_name is None
-
-        if not in_package:
-            continue
-
-        if package_name is not None:
-            name_match = re.match(r'\s*name\s*=\s*"([^"]+)"', line)
-            if name_match:
-                saw_name = name_match.group(1) == package_name
-                continue
-
-        if saw_name and re.match(r"\s*version\s*=", line):
-            lines[i] = re.sub(r'=\s*"[^"]+"', f'= "{version}"', line, count=1)
-            path.write_text("".join(lines))
-            return
-
-    raise SystemExit(f"package version not found in {path}")
-
-replace_package_version(Path("Cargo.toml"))
-replace_package_version(Path("Cargo.lock"), "tg")
-PY
-}
-
 local_tag_commit() {
   git rev-parse -q --verify "refs/tags/${1}^{}" 2>/dev/null || true
 }
@@ -167,6 +93,17 @@ tag_commit() {
   fi
 
   printf '%s' "$sha"
+}
+
+cargo_release_version() {
+  local level_or_version="$1"
+
+  cargo release "$level_or_version" \
+    --execute \
+    --no-confirm \
+    --no-publish \
+    --no-tag \
+    --no-push
 }
 
 release_asset_sha() {
@@ -239,6 +176,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 need_cmd cargo
+need_cmd cargo-release
 need_cmd git
 need_cmd gh
 need_cmd python3
@@ -281,28 +219,29 @@ if [[ "$HEAD_SHA" != "$ORIGIN_MAIN_SHA" ]]; then
 fi
 
 CURRENT_VERSION="$(package_version)"
+[[ -n "$CURRENT_VERSION" ]] || die "Cargo.toml version not found"
 CURRENT_TAG="v${CURRENT_VERSION}"
 CURRENT_TAG_SHA="$(tag_commit "$CURRENT_TAG")"
-VERSION="$CURRENT_VERSION"
 
-if [[ -n "$VERSION_OVERRIDE" ]]; then
-  VERSION="$VERSION_OVERRIDE"
+if [[ -n "$VERSION_OVERRIDE" && "$VERSION_OVERRIDE" != "$CURRENT_VERSION" ]]; then
+  TAG_SHA="$(tag_commit "v${VERSION_OVERRIDE}")"
+  [[ -z "$TAG_SHA" ]] || die "tag v${VERSION_OVERRIDE} already exists at ${TAG_SHA}; choose a different version"
+  log "bumping Cargo version ${CURRENT_VERSION} -> ${VERSION_OVERRIDE} with cargo-release"
+  cargo_release_version "$VERSION_OVERRIDE"
 elif [[ -n "$CURRENT_TAG_SHA" && "$CURRENT_TAG_SHA" != "$HEAD_SHA" ]]; then
-  VERSION="$(bump_version "$CURRENT_VERSION" "$BUMP_KIND")"
-fi
-
-TAG="v${VERSION}"
-if [[ "$VERSION" != "$CURRENT_VERSION" ]]; then
-  TAG_SHA="$(tag_commit "$TAG")"
-  [[ -z "$TAG_SHA" ]] || die "tag ${TAG} already exists at ${TAG_SHA}; choose a different version"
-
-  log "bumping Cargo version ${CURRENT_VERSION} -> ${VERSION}"
-  set_package_version "$VERSION"
+  log "current version ${CURRENT_VERSION} is already tagged; bumping ${BUMP_KIND} with cargo-release"
+  cargo_release_version "$BUMP_KIND"
 else
-  log "using Cargo version ${VERSION}"
+  log "using Cargo version ${CURRENT_VERSION}"
 fi
 
+[[ -z "$(git status --porcelain -- Cargo.toml Cargo.lock)" ]] || die "cargo-release left uncommitted Cargo version changes"
+
+VERSION="$(package_version)"
+[[ -n "$VERSION" ]] || die "Cargo.toml version not found"
+TAG="v${VERSION}"
 TAG_SHA="$(tag_commit "$TAG")"
+HEAD_SHA="$(git rev-parse HEAD)"
 if [[ -n "$TAG_SHA" && "$TAG_SHA" != "$HEAD_SHA" ]]; then
   die "tag ${TAG} points to ${TAG_SHA}, not HEAD ${HEAD_SHA}; choose a different version"
 fi
@@ -310,14 +249,6 @@ fi
 if [[ "$RUN_CHECKS" -eq 1 ]]; then
   log "running make check"
   make check
-fi
-
-if ! git diff --quiet -- Cargo.toml Cargo.lock; then
-  log "committing version bump"
-  git diff --check -- Cargo.toml Cargo.lock
-  git add Cargo.toml Cargo.lock
-  git commit -m "chore: bump tg version to ${VERSION}"
-  HEAD_SHA="$(git rev-parse HEAD)"
 fi
 
 if [[ "$HEAD_SHA" != "$(git rev-parse origin/main)" ]]; then

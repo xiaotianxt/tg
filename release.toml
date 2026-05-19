@@ -1,0 +1,7 @@
+allow-branch = ["main"]
+publish = false
+tag = false
+push = false
+pre-release-commit-message = "chore: bump {{crate_name}} version to {{version}}"
+tag-name = "v{{version}}"
+tag-message = "v{{version}}"
