@@ -301,16 +301,39 @@ fn try_run_indexed_messages_with_output<W: Write>(
         return Ok(None);
     }
 
-    if let Err(e) = message_index::ensure_recent_sessions(options.decrypted_dir, options.jobs) {
-        log::warn!(
-            "Message index session catch-up failed; falling back if needed: {}",
-            e
-        );
-    }
-
     let Some(index) = existing_answerable_index(options) else {
         return Ok(None);
     };
+    let has_current_derived_semantics =
+        message_index::has_current_derived_semantics(&index).unwrap_or(false);
+
+    if !has_current_derived_semantics {
+        let Some(index) = source_validated_answerable_index(options) else {
+            return Ok(None);
+        };
+        let rows = query_indexed_messages(&index, options)?;
+        let displayed = rows.len();
+        write_message_rows(
+            out,
+            &rows,
+            &options.fields,
+            options.format,
+            options.max_cell_chars,
+        )?;
+        out.flush()?;
+        return Ok(Some(displayed));
+    }
+
+    if has_current_derived_semantics {
+        if let Err(e) = message_index::ensure_recent_sessions(options.decrypted_dir, options.jobs) {
+            log::warn!(
+                "Message index session catch-up failed; falling back if needed: {}",
+                e
+            );
+        }
+    }
+
+    let index = existing_answerable_index(options).unwrap_or(index);
 
     let rows = query_indexed_messages(&index, options)?;
     let displayed = rows.len();
@@ -361,8 +384,13 @@ fn answerable_index(
         }
     };
 
+    let has_current_derived_semantics =
+        message_index::has_current_derived_semantics(&index).unwrap_or(false);
+    if !has_current_derived_semantics && !index_has_raw_body(&index).unwrap_or(false) {
+        return None;
+    }
     if (!options.contains.is_empty() || !options.not_contains.is_empty())
-        && !index_has_decoded_body(&index).unwrap_or(false)
+        && (!has_current_derived_semantics || !index_has_decoded_body(&index).unwrap_or(false))
     {
         return None;
     }
@@ -465,9 +493,17 @@ fn indexed_query_needs_post_filtering(
 }
 
 fn index_has_decoded_body(index: &message_index::HotIndex) -> Result<bool, String> {
+    index_has_message_column(index, "decoded_body")
+}
+
+fn index_has_raw_body(index: &message_index::HotIndex) -> Result<bool, String> {
+    index_has_message_column(index, "raw_body")
+}
+
+fn index_has_message_column(index: &message_index::HotIndex, column: &str) -> Result<bool, String> {
     let conn = Connection::open(&index.path)
         .map_err(|e| format!("Cannot open message index {}: {}", index.path.display(), e))?;
-    Ok(db::table_has_column(&conn, "messages", "decoded_body"))
+    Ok(db::table_has_column(&conn, "messages", column))
 }
 
 fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryContext, String> {
@@ -677,6 +713,7 @@ fn query_message_table(
     Ok(mapped
         .filter_map(|row| row.ok())
         .filter(|row| message_row_matches_filters(row, options))
+        .take(result_window)
         .collect())
 }
 
@@ -713,13 +750,17 @@ fn query_indexed_messages(
     } else {
         "body"
     };
-    let has_decoded_body = db::table_has_column(&conn, "messages", "decoded_body");
+    let has_current_derived_semantics =
+        message_index::has_current_derived_semantics(index).unwrap_or(false);
+    let has_decoded_body =
+        has_current_derived_semantics && db::table_has_column(&conn, "messages", "decoded_body");
     let decoded_body_col = if has_decoded_body {
         "decoded_body"
     } else {
-        "body"
+        raw_body_col
     };
-    let has_media_type = db::table_has_column(&conn, "messages", "media_type");
+    let has_media_type =
+        has_current_derived_semantics && db::table_has_column(&conn, "messages", "media_type");
     let local_id_col = if db::table_has_column(&conn, "messages", "local_id") {
         "local_id"
     } else {
@@ -848,9 +889,7 @@ fn query_indexed_messages(
     Ok(mapped
         .filter_map(|row| row.ok())
         .filter(|row| {
-            if has_media_type {
-                true
-            } else if has_decoded_body {
+            if has_decoded_body {
                 message_row_matches_media_filters(row, options)
             } else {
                 message_row_matches_filters(row, options)
@@ -1382,7 +1421,7 @@ fn escape_table_cell(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::params;
+    use rusqlite::{params, OptionalExtension};
     use tempfile::{tempdir, TempDir};
 
     fn create_query_test_dir() -> TempDir {
@@ -1630,6 +1669,14 @@ mod tests {
             params![file_type],
         )
         .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+                 VALUES (?1, 1005, '<msg><appmsg><title>我拍了拍 \"Bob\"</title><type>62</type><patinfo><template>我拍了拍 \"${{tgid_bob}}\"</template></patinfo></appmsg></msg>', NULL, 7, x'')"
+            ),
+            params![(62_i64 << 32) | 49],
+        )
+        .unwrap();
         drop(conn);
 
         let has = vec![QueryMediaType::File];
@@ -1644,6 +1691,7 @@ mod tests {
 
         assert_eq!(count, 1);
         assert!(output.contains("report.pdf"));
+        assert!(!output.contains("拍了拍"));
         assert!(!output.contains("[语音"));
     }
 
@@ -1791,7 +1839,8 @@ mod tests {
         let index_path = dir.path().join(".tg_index.db");
         let conn = Connection::open(&index_path).unwrap();
         conn.execute_batch(
-            "PRAGMA user_version = 4;
+            "PRAGMA user_version = 8;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE messages (
                  id INTEGER PRIMARY KEY,
                  source_db TEXT NOT NULL,
@@ -1813,14 +1862,19 @@ mod tests {
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('derived_semantics_version', ?1)",
+            params![message_index::DERIVED_SEMANTICS_VERSION.to_string()],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO messages (
                 source_db, table_name, session_id, session_display,
                 sender_account, sender_display, local_id, local_type,
                 media_type, create_time, raw_body, decoded_body, body, marker, packed_info
              ) VALUES (
                 'message/message_0.db', 'Msg_test', 'tgid_test', 'Test',
-                '', '', 1, 49, 'file', ?1, '<msg><appmsg><type>5</type></appmsg></msg>',
-                '[文件] report.pdf', '<msg><appmsg><type>5</type></appmsg></msg>', NULL, x''
+                '', '', 1, 49, 'file', ?1, '<msg><appmsg><title>report.pdf</title><type>6</type></appmsg></msg>',
+                '[文件] report.pdf', '<msg><appmsg><title>report.pdf</title><type>6</type></appmsg></msg>', NULL, x''
              )",
             params![crate::time::default_recent_since() + 1],
         )
@@ -1840,6 +1894,193 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].body, "[文件] report.pdf");
+    }
+
+    #[test]
+    fn message_query_ignores_stale_indexed_media_type_without_semantics_meta() {
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join(".tg_index.db");
+        let conn = Connection::open(&index_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 8;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 source_db TEXT NOT NULL,
+                 table_name TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 session_display TEXT NOT NULL,
+                 sender_account TEXT NOT NULL,
+                 sender_display TEXT NOT NULL,
+                 local_id INTEGER,
+                 local_type INTEGER NOT NULL,
+                 media_type TEXT NOT NULL,
+                 create_time INTEGER NOT NULL,
+                 raw_body TEXT NOT NULL,
+                 decoded_body TEXT NOT NULL,
+                 marker INTEGER,
+                 packed_info BLOB NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (
+                source_db, table_name, session_id, session_display,
+                sender_account, sender_display, local_id, local_type,
+                media_type, create_time, raw_body, decoded_body, marker, packed_info
+             ) VALUES (
+                'message/message_0.db', 'Msg_test', 'tgid_test', 'Test',
+                '', '', 1, ?1, 'file', ?2,
+                '<msg><appmsg><title>我拍了拍 \"Bob\"</title><type>62</type><patinfo><template>我拍了拍 \"${tgid_bob}\"</template></patinfo></appmsg></msg>',
+                '[文件] 我拍了拍 \"Bob\"', NULL, x''
+             )",
+            params![(62_i64 << 32) | 49, crate::time::default_recent_since() + 1],
+        )
+        .unwrap();
+        drop(conn);
+
+        let index = message_index::HotIndex {
+            path: index_path,
+            since: crate::time::default_recent_since(),
+        };
+        let has = vec![QueryMediaType::File];
+        let mut options = default_query_options(dir.path(), &[], &[]);
+        options.has = &has;
+        options.since = Some(crate::time::default_recent_since());
+
+        let rows = query_indexed_messages(&index, &options).unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn message_query_does_not_upgrade_stale_semantics_index() {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        drop(Connection::open(message_dir.join("message_0.db")).unwrap());
+        let index_path = dir.path().join(".tg_index.db");
+        let conn = Connection::open(&index_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 8;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('index_since', '1');
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 source_db TEXT NOT NULL,
+                 table_name TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 session_display TEXT NOT NULL,
+                 sender_account TEXT NOT NULL,
+                 sender_display TEXT NOT NULL,
+                 local_id INTEGER,
+                 local_type INTEGER NOT NULL,
+                 media_type TEXT NOT NULL,
+                 create_time INTEGER NOT NULL,
+                 raw_body TEXT NOT NULL,
+                 decoded_body TEXT NOT NULL,
+                 marker INTEGER,
+                 packed_info BLOB NOT NULL
+             );
+             INSERT INTO messages (
+                 source_db, table_name, session_id, session_display,
+                 sender_account, sender_display, local_id, local_type,
+                 media_type, create_time, raw_body, decoded_body, marker, packed_info
+             ) VALUES (
+                 'message/message_0.db', 'Msg_test', 'tgid_test', 'Test',
+                 '', '', 1, 49, 'file', 2,
+                 '<msg><appmsg><title>report.pdf</title><type>6</type></appmsg></msg>',
+                 '[文件] report.pdf', NULL, x''
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let has = vec![QueryMediaType::File];
+        let mut bytes = Vec::new();
+        let mut out = output::Output::new(&mut bytes);
+        let mut options = default_query_options(dir.path(), &[], &[]);
+        options.has = &has;
+        options.since = Some(1);
+        let count = run_messages_with_output(options, &mut out).unwrap();
+        out.flush().unwrap();
+        drop(out);
+
+        let conn = Connection::open(&index_path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let derived_version: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'derived_semantics_version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+
+        assert_eq!(count, 0);
+        assert_eq!(version, 8);
+        assert!(derived_version.is_none());
+    }
+
+    #[test]
+    fn message_query_rejects_stale_index_without_raw_body() {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        drop(Connection::open(message_dir.join("message_0.db")).unwrap());
+        let index_path = dir.path().join(".tg_index.db");
+        let conn = Connection::open(&index_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 5;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('index_since', '1');
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 source_db TEXT NOT NULL,
+                 table_name TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 session_display TEXT NOT NULL,
+                 sender_account TEXT NOT NULL,
+                 sender_display TEXT NOT NULL,
+                 local_type INTEGER NOT NULL,
+                 media_type TEXT NOT NULL,
+                 create_time INTEGER NOT NULL,
+                 body TEXT NOT NULL,
+                 marker INTEGER,
+                 packed_info BLOB NOT NULL
+             );
+             INSERT INTO messages (
+                 source_db, table_name, session_id, session_display,
+                 sender_account, sender_display, local_type,
+                 media_type, create_time, body, marker, packed_info
+             ) VALUES (
+                 'message/message_0.db', 'Msg_test', 'tgid_test', 'Test',
+                 '', '', 266287972401, 'file', 2,
+                 '[文件] 我拍了拍 \"Bob\"', NULL, x''
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let has = vec![QueryMediaType::File];
+        let mut bytes = Vec::new();
+        let mut out = output::Output::new(&mut bytes);
+        let mut options = default_query_options(dir.path(), &[], &[]);
+        options.has = &has;
+        options.since = Some(1);
+        let count = run_messages_with_output(options, &mut out).unwrap();
+        out.flush().unwrap();
+        drop(out);
+
+        let conn = Connection::open(&index_path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(count, 0);
+        assert_eq!(version, 5);
     }
 
     #[test]

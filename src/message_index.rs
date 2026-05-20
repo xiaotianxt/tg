@@ -9,6 +9,7 @@ use crate::{
 
 const INDEX_FILE: &str = ".tg_index.db";
 const SCHEMA_VERSION: i64 = 8;
+pub(crate) const DERIVED_SEMANTICS_VERSION: i64 = 2;
 const REFRESH_OVERLAP_SECS: i64 = 7 * 86400;
 
 pub(crate) struct HotIndex {
@@ -107,7 +108,9 @@ pub(crate) fn ensure_recent(decrypted_dir: &Path, jobs: usize) -> Result<HotInde
 
     let build_since = time::default_recent_since();
     let current_since = meta_i64(&conn, "index_since")?;
-    if current_since.is_none_or(|since| since > build_since) {
+    let current_derived_semantics =
+        meta_i64(&conn, "derived_semantics_version")? == Some(DERIVED_SEMANTICS_VERSION);
+    if current_since.is_none_or(|since| since > build_since) || !current_derived_semantics {
         rebuild_all(&mut conn, decrypted_dir, build_since, jobs)?;
     } else {
         refresh_changed_sources(&mut conn, decrypted_dir, build_since, jobs)?;
@@ -284,6 +287,13 @@ pub(crate) fn open_existing_query_index(decrypted_dir: &Path) -> Result<Option<H
     }))
 }
 
+pub(crate) fn has_current_derived_semantics(index: &HotIndex) -> Result<bool, String> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(&index.path, flags)
+        .map_err(|e| format!("Cannot open message index {}: {}", index.path.display(), e))?;
+    Ok(meta_i64(&conn, "derived_semantics_version")? == Some(DERIVED_SEMANTICS_VERSION))
+}
+
 fn index_matches_sources(conn: &Connection, decrypted_dir: &Path) -> Result<bool, String> {
     let (_, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
     let sources = source_files(decrypted_dir, message_dbs);
@@ -395,7 +405,12 @@ fn rebuild_all(
     set_meta_i64_tx(&tx, "index_since", since)?;
     tx.commit()
         .map_err(|e| format!("Commit index reset: {}", e))?;
-    refresh_changed_sources(conn, decrypted_dir, since, jobs)
+    refresh_changed_sources(conn, decrypted_dir, since, jobs)?;
+    set_current_derived_semantics(conn)
+}
+
+fn set_current_derived_semantics(conn: &Connection) -> Result<(), String> {
+    set_meta_i64_tx(conn, "derived_semantics_version", DERIVED_SEMANTICS_VERSION)
 }
 
 fn refresh_changed_sources(
@@ -1753,6 +1768,7 @@ mod tests {
         let version: i64 = indexed
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
+        let derived_version = meta_i64(&indexed, "derived_semantics_version").unwrap();
         let (raw_body, decoded_body, media_type): (String, String, String) = indexed
             .query_row(
                 "SELECT raw_body, decoded_body, media_type FROM messages",
@@ -1762,6 +1778,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(derived_version, Some(DERIVED_SEMANTICS_VERSION));
         assert!(!db::table_has_column(&indexed, "messages", "body"));
         assert_eq!(raw_body, "");
         assert_eq!(decoded_body, "[voice:42]");

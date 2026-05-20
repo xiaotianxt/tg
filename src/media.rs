@@ -243,6 +243,10 @@ impl FileInfo {
 }
 
 pub(crate) fn message_media_type(local_type: i64, raw_body: &str) -> Option<&'static str> {
+    if is_pat_app_message(raw_body) {
+        return None;
+    }
+
     match local_type_low32(local_type) {
         3 => Some("image"),
         34 => Some("voice"),
@@ -259,8 +263,9 @@ pub(crate) fn local_type_low32(local_type: i64) -> i64 {
 }
 
 fn is_file_app_message(local_type: i64, raw_body: &str) -> bool {
-    matches!(app_message_subtype(local_type), Some(6 | 62))
-        || matches!(extract_xml_tag_int(raw_body, "type"), Some(6 | 62))
+    !is_pat_app_message(raw_body)
+        && (matches!(app_message_subtype(local_type), Some(6 | 62))
+            || matches!(extract_xml_tag_int(raw_body, "type"), Some(6 | 62)))
 }
 
 fn app_message_subtype(local_type: i64) -> Option<i64> {
@@ -403,6 +408,9 @@ pub(crate) fn parse_mini_program_info(xml: &str) -> Option<MiniProgramInfo> {
 }
 
 pub(crate) fn parse_file_info(xml: &str) -> Option<FileInfo> {
+    if is_pat_app_message(xml) {
+        return None;
+    }
     if !xml.contains("<type>6</type>") && !xml.contains("<type>62</type>") {
         return None;
     }
@@ -413,6 +421,10 @@ pub(crate) fn parse_file_info(xml: &str) -> Option<FileInfo> {
             .unwrap_or(0),
         file_ext: extract_xml_tag(xml, "fileext").unwrap_or_default(),
     })
+}
+
+pub(crate) fn is_pat_app_message(xml: &str) -> bool {
+    xml.contains("<patinfo")
 }
 
 pub(crate) fn format_file_size(bytes: u64) -> String {
@@ -744,5 +756,13 @@ mod tests {
             message_media_type(49, "<msg><appmsg><type>5</type></appmsg></msg>"),
             None
         );
+    }
+
+    #[test]
+    fn test_pat_app_message_is_not_file_media() {
+        let xml = r#"<msg><appmsg><title>我拍了拍 "Bob"</title><type>62</type><appattach><totallen>0</totallen></appattach><patinfo><template>我拍了拍 "${tgid_bob}"</template></patinfo></appmsg></msg>"#;
+
+        assert!(parse_file_info(xml).is_none());
+        assert_eq!(message_media_type((62_i64 << 32) | 49, xml), None);
     }
 }

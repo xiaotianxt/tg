@@ -563,6 +563,10 @@ fn decode_link_content(
         return format!("[链接] {}", content);
     }
 
+    if media::is_pat_app_message(content) {
+        return decode_pat_content(content);
+    }
+
     let sub_type = crate::media::extract_xml_tag_int(content, "type").unwrap_or(0);
     match sub_type {
         5 => decode_app_link_content(content),
@@ -592,6 +596,17 @@ fn decode_link_content(
             format!("[引用: {}]", title)
         }
         _ => decode_app_card_fallback(sub_type, "卡片", content),
+    }
+}
+
+fn decode_pat_content(content: &str) -> String {
+    let title = safe_xml_tag(content, "title")
+        .or_else(|| safe_xml_tag(content, "template"))
+        .unwrap_or_default();
+    if title.is_empty() {
+        "[拍一拍]".to_string()
+    } else {
+        format!("[拍一拍] {}", title)
     }
 }
 
@@ -1448,6 +1463,14 @@ mod tests {
         let xml = r#"<msg><appmsg><title>report.pdf</title><type>62</type><appattach><totallen>4096</totallen><fileext>pdf</fileext></appattach></appmsg></msg>"#;
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
         assert_eq!(d.content, "[文件] report.pdf (4KB)");
+    }
+
+    #[test]
+    fn test_decode_pat_app_message_not_as_file() {
+        let xml = r#"<msg><appmsg><title>我拍了拍 "Bob" 放了个炮[爆竹]</title><type>62</type><appattach><totallen>0</totallen><fileext></fileext></appattach><patinfo><fromusername>tgid_me</fromusername><pattedusername>tgid_bob</pattedusername><template>我拍了拍 "${tgid_bob}" 放了个炮[爆竹]</template></patinfo></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Bob", None, &[], |id| id.to_string());
+
+        assert_eq!(d.content, r#"[拍一拍] 我拍了拍 "Bob" 放了个炮[爆竹]"#);
     }
 
     #[test]

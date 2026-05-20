@@ -1076,42 +1076,44 @@ fn load_file_messages(
                     OR (local_type = 49 AND {marker_col} IS NOT 4 \
                         AND ({body_col} LIKE '%<type>6</type>%' OR {body_col} LIKE '%<type>62</type>%')))\
                {since_clause} \
-             ORDER BY create_time DESC LIMIT {limit}"
+             ORDER BY create_time DESC"
         );
 
-        let rows: Vec<(i64, i64, String, Vec<u8>)> = match conn.prepare(&sql) {
-            Ok(mut stmt) => match stmt.query_map([], |row| {
-                let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
-                let content: String = if compression_marker == Some(4) {
-                    if let Ok(b) = row.get::<_, Vec<u8>>(2) {
-                        message::try_decompress(&b).unwrap_or_default()
-                    } else {
-                        String::new()
-                    }
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            return messages;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
+            let content: String = if compression_marker == Some(4) {
+                if let Ok(b) = row.get::<_, Vec<u8>>(2) {
+                    message::try_decompress(&b).unwrap_or_default()
                 } else {
-                    match row.get::<_, Option<String>>(2) {
-                        Ok(Some(s)) => s,
-                        _ => match row.get::<_, Option<Vec<u8>>>(2) {
-                            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                            _ => String::new(),
-                        },
-                    }
-                };
-                let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
-                Ok((
-                    row.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    content,
-                    packed_info,
-                ))
-            }) {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                Err(_) => vec![],
-            },
-            Err(_) => vec![],
+                    String::new()
+                }
+            } else {
+                match row.get::<_, Option<String>>(2) {
+                    Ok(Some(s)) => s,
+                    _ => match row.get::<_, Option<Vec<u8>>>(2) {
+                        Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
+                        _ => String::new(),
+                    },
+                }
+            };
+            let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
+            Ok((
+                row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                content,
+                packed_info,
+            ))
+        }) else {
+            return messages;
         };
 
-        for (msg_type, timestamp, raw_content, packed_info) in rows {
+        for row in rows {
+            let Ok((msg_type, timestamp, raw_content, packed_info)) = row else {
+                continue;
+            };
             if !is_file_message_parts(msg_type, &raw_content) {
                 continue;
             }
@@ -1123,6 +1125,9 @@ fn load_file_messages(
                 packed_info,
                 msg_type,
             });
+            if messages.len() >= limit {
+                break;
+            }
         }
         messages
     });
@@ -1300,13 +1305,7 @@ fn is_file_message(message: &ExportMessage) -> bool {
 }
 
 fn is_file_message_parts(msg_type: i64, raw_content: &str) -> bool {
-    msg_type == 62
-        || matches!(app_message_subtype(msg_type), Some(6 | 62))
-        || (((msg_type as u64) & 0xffff_ffff) == 49
-            && matches!(
-                media::extract_xml_tag_int(raw_content, "type"),
-                Some(6 | 62)
-            ))
+    media::message_media_type(msg_type, raw_content) == Some("file")
 }
 
 fn app_message_subtype(local_type: i64) -> Option<i64> {
@@ -3160,6 +3159,12 @@ mod tests {
                 r#"<msg><appmsg><title>alt.pdf</title><type>62</type><totallen>4096</totallen></appmsg></msg>"#,
                 packed_file("alt.pdf"),
             ),
+            (
+                app_file_alt_type,
+                1004,
+                r#"<msg><appmsg><title>我拍了拍 "Bob"</title><type>62</type><appattach><totallen>0</totallen></appattach><patinfo><template>我拍了拍 "${tgid_bob}"</template></patinfo></appmsg></msg>"#,
+                Vec::new(),
+            ),
         ] {
             message_conn
                 .execute(
@@ -3727,6 +3732,18 @@ mod tests {
         assert_eq!(file_identifier(&message).as_deref(), Some("alt.pdf"));
         assert!(is_file_message(&message));
         assert_eq!(file_export_type(message.msg_type), 62);
+    }
+
+    #[test]
+    fn pat_app_message_is_not_file_export_candidate() {
+        let message = export_message(
+            app_local_type(62),
+            r#"<msg><appmsg><title>我拍了拍 "Bob"</title><type>62</type><appattach><totallen>0</totallen></appattach><patinfo><template>我拍了拍 "${tgid_bob}"</template></patinfo></appmsg></msg>"#,
+            Vec::new(),
+        );
+
+        assert_eq!(file_identifier(&message), None);
+        assert!(!is_file_message(&message));
     }
 
     #[test]
