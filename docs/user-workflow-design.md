@@ -8,7 +8,7 @@ tg should feel like a chat-history tool, not a database recovery toolkit. The ma
 tg "张三"
 tg "产品讨论群" --since today
 tg search "项目"
-tg export "张三" --format json
+tg export "张三"
 ```
 
 Lower-level steps such as key extraction and database decryption remain available, but they should move into maintenance and diagnostic flows.

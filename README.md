@@ -53,9 +53,11 @@ Showing latest 4 messages
 导出聊天：
 
 ```bash
-$ tg export "张三" --format json --output exported/zhangsan
+$ tg export "张三" --output exported/zhangsan
 Exported 2381 messages for 张三 (tgid_abcd1234)
 Exported to:
+  [txt] exported/zhangsan/chat.txt
+  [csv] exported/zhangsan/chat.csv
   [json] exported/zhangsan/chat.json
 ```
 
@@ -97,14 +99,14 @@ tg "产品讨论群" --since today
 tg unread
 tg search "关键词"
 tg query --session "产品讨论群" --contains "项目" --not "取消" --fields time,sender,body
-tg export "张三" --format json --output exported/zhangsan
+tg export "张三" --output exported/zhangsan
 tg image "产品讨论群" --list
 tg file "产品讨论群" --list
 tg sticker "产品讨论群" --list
 tg voice "产品讨论群" --list
 ```
 
-`search`、`query`、`export` 默认只处理最近 365 天，这是当前版本为速度和常见需求做的默认路径。需要全量历史时加 `--all-time`；需要更窄范围时用 `--since today`、`--since 30d` 或具体日期。
+`search`、`query` 默认只处理最近 365 天，这是当前版本为速度和常见需求做的默认路径。需要全量历史时加 `--all-time`；需要更窄范围时用 `--since today`、`--since 30d` 或具体日期。`export` 是完整归档入口，默认导出整个会话。
 
 如果结果看起来不完整，先跑：
 
@@ -127,8 +129,8 @@ tg refresh
 | 未读 | `sessions` 显示未读数；`unread` 只列有未读消息的会话 |
 | 消息读取 | 文本、群聊发送者、系统提示、撤回提示、引用、链接、小程序、聊天记录卡片展开、位置、文件卡片、图片/视频/语音/表情的可读摘要 |
 | 搜索 | 全局关键词搜索，单个会话内关键词搜索，结构化检索；支持包含词、排除词、时间范围、字段选择和 JSON 行输出 |
-| 导出 | `txt`、`csv`、`json` |
-| 媒体 | 尝试导出本地缓存图片、视频、表情和普通文件附件；`.dat` 图片/视频会尝试解密；表情可通过 `sticker` 单独导出；语音可通过 `voice` 导出为 `.voice` |
+| 导出 | 完整会话归档；同时写出 `txt`、`csv`、`json` |
+| 媒体 | `export` 会尝试导出本地缓存图片、视频、表情、普通文件附件和可解码语音；`.dat` 图片/视频会尝试解密；语音默认导出为可播放 WAV |
 | 增量更新 | 默认只解密变化过的数据库 |
 
 暂不支持或不保证：
@@ -136,7 +138,7 @@ tg refresh
 - 不支持 Windows、iOS、Android、网页版 Telegram。
 - 不恢复 Telegram 本地数据库里已经没有的消息。
 - 不保证导出所有媒体。Telegram 没有缓存、缓存被清理、文件未下载时，只能显示消息摘要。
-- `export --media-dir` 会尝试导出图片、视频、表情和普通文件附件；语音请用 `tg voice`。
+- `export` 会把可导出的媒体放到输出目录的 `media/` 子目录；Telegram 没有缓存、缓存被清理或解码器不可用时，对应媒体只能保留消息摘要。
 - 表情导出可能根据消息里的 URL 用 `curl` 下载；普通读取、解密、搜索不会上传聊天数据。
 - `tggf` 表情转换需要本机可用的 `ffmpeg`。
 - 不做 OCR、语义搜索、拼音搜索。
@@ -226,10 +228,10 @@ xcode-select --install
 tg "联系人或群名" --limit 50
 tg search "关键词"
 tg query --session "联系人或群名" --contains "关键词" --fields time,sender,body --limit 20
-tg export "联系人或群名" --format json
+tg export "联系人或群名"
 ```
 
-`search`、`query`、`export` 默认只看最近 365 天，这是大多数查询和导出的热路径。需要全量历史时加 `--all-time`；需要更窄窗口时加 `--since today`、`--since 30d` 或具体日期。
+`search`、`query` 默认只看最近 365 天，这是大多数查询的热路径。需要全量历史时加 `--all-time`；需要更窄窗口时加 `--since today`、`--since 30d` 或具体日期。`export` 默认就是全量归档。
 
 `sessions` 和 `unread` 会优先用轻量会话缓存列出最近活跃会话和未读数，不需要扫描 numbered message 数据库。`search`、`query`、`schema`、`export` 在读取前会尝试静默增量刷新 `~/.tg/decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
 
@@ -335,16 +337,14 @@ tg doctor "张三"
 导出聊天：
 
 ```bash
-tg export "张三" --format txt
-tg export "张三" --format csv --since 30d --output exported/zhangsan
-tg export "张三" --format json --limit 1000 --output exported/zhangsan
-tg export "张三" --format json --all-time --output exported/zhangsan
+tg export "张三"
+tg export "张三" --output exported/zhangsan
 ```
 
-导出聊天并尝试导出本地缓存媒体：
+`export` 会完整导出会话，写出 `chat.txt`、`chat.csv`、`chat.json`，并把可导出的本地缓存媒体放到 `media/`：
 
 ```bash
-tg export "产品讨论群" --format json --output exported/group --media-dir exported/group/media --anonymous
+tg export "产品讨论群" --output exported/group
 ```
 
 导出图片：
@@ -478,11 +478,11 @@ tg messages "tgid_abcd1234" --limit 50
 
 ### 图片、视频或文件导不出来
 
-媒体导出依赖 Telegram 本地缓存。可以先在 Telegram 里打开对应图片、视频、表情或文件，让 Telegram 把文件下载到本机，再重新运行 `tg image`、`tg sticker`、`tg file` 或 `tg export --media-dir ...`。
+媒体导出依赖 Telegram 本地缓存。可以先在 Telegram 里打开对应图片、视频、表情或文件，让 Telegram 把文件下载到本机，再重新运行 `tg export "联系人或群名"`，或用 `tg image`、`tg sticker`、`tg file` 单独定位。
 
 ### 语音导出后不能直接播放
 
-`tg voice` 默认导出 `.voice`，这是语音消息的原始编码，不是 macOS 系统播放器通常能直接打开的格式。Homebrew 安装的 `tg` 会一并安装默认解码器，可以直接用 `tg voice "张三" --id <ID> --format wav` 导出 WAV；需要 `mp3` 时再让 `ffmpeg` 处理这个 WAV。
+`tg export` 会把可解码语音导出为 WAV，放在输出目录的 `media/` 子目录。`tg voice` 仍可用于单独定位某条语音；它默认导出 `.voice` 原始编码，也可以用 `tg voice "张三" --id <ID> --format wav` 导出 WAV。Homebrew 安装的 `tg` 会一并安装默认解码器；需要 `mp3` 时再让 `ffmpeg` 处理 WAV。
 
 ### `tggf` 表情转换失败
 
@@ -495,7 +495,7 @@ brew install ffmpeg
 如果 `ffmpeg` 不在 `PATH`，可以指定：
 
 ```bash
-TG_FFMPEG=/path/to/ffmpeg tg export "张三" --media-dir exported/media
+TG_FFMPEG=/path/to/ffmpeg tg export "张三" --output exported/zhangsan
 ```
 
 ## 日志

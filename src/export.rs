@@ -14,7 +14,6 @@ use crate::dictionary;
 use crate::media;
 use crate::media_index::MediaIndex;
 use crate::message;
-use crate::message_index;
 use crate::parallel;
 use crate::time;
 
@@ -104,12 +103,7 @@ pub struct VoiceExportConfig<'a> {
 pub struct MessageExportConfig<'a> {
     pub decrypted_dir: &'a Path,
     pub session_query: &'a str,
-    pub format: &'a str,
     pub output_dir: &'a Path,
-    pub media_dir: Option<&'a Path>,
-    pub since: Option<i64>,
-    pub limit: Option<usize>,
-    pub name_mode: contact::DisplayNameMode,
     pub jobs: usize,
 }
 
@@ -255,6 +249,8 @@ struct VoicePayload<'a> {
     format: VoiceFormat,
 }
 
+const DEFAULT_VOICE_SAMPLE_RATE: u32 = 24_000;
+
 /// Export messages for a session.
 pub fn export_messages(
     config: MessageExportConfig<'_>,
@@ -262,12 +258,7 @@ pub fn export_messages(
     let MessageExportConfig {
         decrypted_dir,
         session_query,
-        format,
         output_dir,
-        media_dir,
-        since,
-        limit,
-        name_mode,
         jobs,
     } = config;
 
@@ -284,154 +275,101 @@ pub fn export_messages(
         .unwrap_or_default();
     let display_name = contacts
         .get(&username)
-        .map(|c| c.display_name(name_mode))
+        .map(|c| c.display_name(contact::DisplayNameMode::PersonalRemark))
         .unwrap_or(&username);
-    let room_member_names = if name_mode == contact::DisplayNameMode::Anonymous {
-        contact_db_path
-            .and_then(|p| contact::load_chat_room_member_names(p, &username).ok())
-            .unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
+    let room_member_names = HashMap::new();
     let display_context = MessageDisplayContext {
         chat_name: display_name,
         contacts: &contacts,
-        name_mode,
+        name_mode: contact::DisplayNameMode::PersonalRemark,
         room_member_names: &room_member_names,
     };
 
     // Table name
     let table_name = db::msg_table_name(&username);
-    let since_clause = since
-        .map(|ts| format!(" AND create_time >= {}", ts))
-        .unwrap_or_default();
-    let order_dir = if limit.is_some() { "DESC" } else { "ASC" };
-    let limit_clause = limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default();
-
-    let mut used_index = false;
-    let mut all_messages: Vec<ExportMessage> = if let Some(since_ts) = since {
-        match message_index::open_existing_recent(decrypted_dir) {
-            Ok(Some(index)) if index.covers(since_ts) => {
-                match load_indexed_export_messages(
-                    &index,
-                    &username,
-                    &display_context,
-                    since_ts,
-                    limit,
-                ) {
-                    Ok(messages) => {
-                        used_index = true;
-                        messages
-                    }
-                    Err(e) => {
-                        log::warn!("Message index export failed; falling back: {}", e);
-                        Vec::new()
-                    }
-                }
-            }
-            Ok(_) => Vec::new(),
-            Err(e) => {
-                log::warn!("Message index read failed; falling back: {}", e);
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
+    let mut all_messages: Vec<ExportMessage> = Vec::new();
 
     let db_jobs = parallel::job_count(jobs, 8);
-    let per_db_messages = if used_index {
-        Vec::new()
-    } else {
-        parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
-            let mut messages = Vec::new();
-            let conn = match Connection::open(&db_path) {
-                Ok(c) => c,
-                Err(_) => return messages,
-            };
+    let per_db_messages = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
+        let mut messages = Vec::new();
+        let conn = match Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(_) => return messages,
+        };
 
-            let body_col = dictionary::msg_body_column();
-            let marker_col = dictionary::msg_compression_marker_column();
-            let packed_col = dictionary::msg_packed_meta_column();
-            let table = db::quote_identifier(&table_name);
-            let sql = format!(
+        let body_col = dictionary::msg_body_column();
+        let marker_col = dictionary::msg_compression_marker_column();
+        let packed_col = dictionary::msg_packed_meta_column();
+        let table = db::quote_identifier(&table_name);
+        let sql = format!(
             "SELECT local_type, create_time, {body_col}, {marker_col}, {packed_col} \
-             FROM {table} WHERE create_time > 0{since_clause} ORDER BY create_time {order_dir}{limit_clause}"
+             FROM {table} WHERE create_time > 0 ORDER BY create_time ASC"
         );
 
-            let rows: Vec<ExportMessageRow> = match conn.prepare(&sql) {
-                Ok(mut stmt) => match stmt.query_map([], |row| {
-                    let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
-                    let content: String = if compression_marker == Some(4) {
-                        if let Ok(b) = row.get::<_, Vec<u8>>(2) {
-                            message::try_decompress(&b).unwrap_or_default()
-                        } else {
-                            String::new()
-                        }
+        let rows: Vec<ExportMessageRow> = match conn.prepare(&sql) {
+            Ok(mut stmt) => match stmt.query_map([], |row| {
+                let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
+                let content: String = if compression_marker == Some(4) {
+                    if let Ok(b) = row.get::<_, Vec<u8>>(2) {
+                        message::try_decompress(&b).unwrap_or_default()
                     } else {
-                        match row.get::<_, Option<String>>(2) {
-                            Ok(Some(s)) => s,
-                            _ => match row.get::<_, Option<Vec<u8>>>(2) {
-                                Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                                _ => String::new(),
-                            },
-                        }
-                    };
-                    let packed_info: Vec<u8> =
-                        row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
-                    Ok((
-                        row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
-                        row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                        content,
-                        compression_marker,
-                        packed_info,
-                    ))
-                }) {
-                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                    Err(_) => vec![],
-                },
-                Err(_) => vec![],
-            };
-
-            for (local_type, create_time, content, compression_marker, packed_info) in rows {
-                let time_str = time::format_local_timestamp(create_time);
-
-                let decoded = message::decode_message(
-                    local_type as i32,
-                    &content,
-                    display_context.chat_name,
+                        String::new()
+                    }
+                } else {
+                    match row.get::<_, Option<String>>(2) {
+                        Ok(Some(s)) => s,
+                        _ => match row.get::<_, Option<Vec<u8>>>(2) {
+                            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
+                            _ => String::new(),
+                        },
+                    }
+                };
+                let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    content,
                     compression_marker,
-                    &packed_info,
-                    |id| display_context.resolve_sender(id),
-                );
-
-                messages.push(ExportMessage {
-                    time: time_str,
-                    timestamp: create_time,
-                    sender: decoded.display_name,
-                    msg_type: local_type,
-                    type_name: decoded.msg_type.to_string(),
-                    content: decoded.content,
-                    raw_content: content,
                     packed_info,
-                });
-            }
-            messages
-        })
-    };
+                ))
+            }) {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(_) => vec![],
+            },
+            Err(_) => vec![],
+        };
+
+        for (local_type, create_time, content, compression_marker, packed_info) in rows {
+            let time_str = time::format_local_timestamp(create_time);
+
+            let decoded = message::decode_message(
+                local_type as i32,
+                &content,
+                display_context.chat_name,
+                compression_marker,
+                &packed_info,
+                |id| display_context.resolve_sender(id),
+            );
+
+            messages.push(ExportMessage {
+                time: time_str,
+                timestamp: create_time,
+                sender: decoded.display_name,
+                msg_type: local_type,
+                type_name: decoded.msg_type.to_string(),
+                content: decoded.content,
+                raw_content: content,
+                packed_info,
+            });
+        }
+        messages
+    });
 
     for messages in per_db_messages {
         all_messages.extend(messages);
     }
 
     all_messages.sort_by_key(|message| message.timestamp);
-    if let Some(limit) = limit {
-        if all_messages.len() > limit {
-            all_messages.sort_by_key(|message| Reverse(message.timestamp));
-            all_messages.truncate(limit);
-            all_messages.sort_by_key(|message| message.timestamp);
-        }
-    }
 
     if all_messages.is_empty() {
         return Err(format!("No messages found for '{}'", username));
@@ -442,51 +380,27 @@ pub fn export_messages(
 
     let mut results = Vec::new();
 
-    match format {
-        "txt" => {
-            let path = output_dir.join("chat.txt");
-            export_txt(&path, &username, display_name, &all_messages)?;
-            results.push(("txt", path));
-        }
-        "csv" => {
-            let path = output_dir.join("chat.csv");
-            export_csv(&path, &all_messages)?;
-            results.push(("csv", path));
-        }
-        "json" => {
-            let path = output_dir.join("chat.json");
-            export_json(&path, &all_messages)?;
-            results.push(("json", path));
-        }
-        _ => {
-            // Default: export all formats
-            let path_txt = output_dir.join("chat.txt");
-            export_txt(&path_txt, &username, display_name, &all_messages)?;
-            results.push(("txt", path_txt));
+    let path_txt = output_dir.join("chat.txt");
+    export_txt(&path_txt, &username, display_name, &all_messages)?;
+    results.push(("txt", path_txt));
 
-            let path_csv = output_dir.join("chat.csv");
-            export_csv(&path_csv, &all_messages)?;
-            results.push(("csv", path_csv));
+    let path_csv = output_dir.join("chat.csv");
+    export_csv(&path_csv, &all_messages)?;
+    results.push(("csv", path_csv));
 
-            let path_json = output_dir.join("chat.json");
-            export_json(&path_json, &all_messages)?;
-            results.push(("json", path_json));
-        }
-    }
+    let path_json = output_dir.join("chat.json");
+    export_json(&path_json, &all_messages)?;
+    results.push(("json", path_json));
 
     let stdout = std::io::stdout();
     let mut out = crate::output::Output::new(stdout.lock());
 
-    // Export media files if requested
-    if let Some(mdir) = media_dir {
-        let telegram_base = match media::find_telegram_base_path() {
-            Some(p) => p,
-            None => {
-                log::warn!("Telegram data directory not found, media export skipped");
-                return Ok(results);
-            }
-        };
+    let mdir = output_dir.join("media");
+    let mut exported = 0;
 
+    // Export cached media files when local Telegram media cache is available.
+    let mut next_index = 1usize;
+    if let Some(telegram_base) = media::find_telegram_base_path() {
         // Derive media decryption keys (V2 .dat)
         let media_keys = crate::media_key::find_media_keys(&telegram_base);
         if let Err(ref e) = media_keys {
@@ -500,7 +414,6 @@ pub fn export_messages(
         let media_index = MediaIndex::load(&telegram_base, &username, &index_categories, jobs);
 
         let mut media_jobs = Vec::new();
-        let mut next_index = 1usize;
         let category_map = [("Image", 3), ("Video", 43)];
 
         for (cat_name, local_type) in &category_map {
@@ -577,7 +490,7 @@ pub fn export_messages(
                 is_sticker: false,
                 result: export_media_with_decrypt(
                     &src,
-                    mdir,
+                    &mdir,
                     &username,
                     category,
                     msg_type,
@@ -588,11 +501,10 @@ pub fn export_messages(
             MediaExportJob::Sticker { index, message } => MediaExportResult {
                 index,
                 is_sticker: true,
-                result: export_sticker_message(&message, &telegram_base, mdir, &username, index),
+                result: export_sticker_message(&message, &telegram_base, &mdir, &username, index),
             },
         });
 
-        let mut exported = 0;
         for media_result in media_results {
             match media_result.result {
                 Ok(path) => {
@@ -612,10 +524,26 @@ pub fn export_messages(
                 }
             }
         }
+    } else {
+        log::warn!("Telegram data directory not found, cached image/video/file export skipped");
+    }
 
-        if exported > 0 {
-            out.line(format_args!("Exported {} media files", exported))?;
+    match export_all_voice_messages(decrypted_dir, &username, &mdir, jobs, next_index, None) {
+        Ok(voice_paths) => {
+            for (index, path) in voice_paths {
+                out.line(format_args!(
+                    "  Media #{}: {}",
+                    index,
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                ))?;
+                exported += 1;
+            }
         }
+        Err(e) => log::warn!("Voice media export skipped: {}", e),
+    }
+
+    if exported > 0 {
+        out.line(format_args!("Exported {} media files", exported))?;
     }
 
     out.line(format_args!(
@@ -626,66 +554,6 @@ pub fn export_messages(
     ))?;
     out.flush()?;
     Ok(results)
-}
-
-fn load_indexed_export_messages(
-    index: &message_index::HotIndex,
-    username: &str,
-    display_context: &MessageDisplayContext<'_>,
-    since: i64,
-    limit: Option<usize>,
-) -> Result<Vec<ExportMessage>, String> {
-    let conn = Connection::open(&index.path)
-        .map_err(|e| format!("Cannot open message index {}: {}", index.path.display(), e))?;
-    let limit_clause = limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default();
-    let sql = format!(
-        "SELECT local_type, create_time, body, marker, packed_info
-         FROM messages
-         WHERE session_id = ?1 AND create_time >= ?2
-         ORDER BY create_time DESC{limit_clause}"
-    );
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| format!("Prepare indexed export: {}", e))?;
-    let rows = stmt
-        .query_map(params![username, since], |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
-                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
-            ))
-        })
-        .map_err(|e| format!("Read indexed export: {}", e))?;
-
-    let mut messages = rows
-        .filter_map(|row| row.ok())
-        .map(
-            |(local_type, create_time, content, compression_marker, packed_info)| {
-                let decoded = message::decode_message(
-                    local_type as i32,
-                    &content,
-                    display_context.chat_name,
-                    compression_marker,
-                    &packed_info,
-                    |id| display_context.resolve_sender(id),
-                );
-                ExportMessage {
-                    time: time::format_local_timestamp(create_time),
-                    timestamp: create_time,
-                    sender: decoded.display_name,
-                    msg_type: local_type,
-                    type_name: decoded.msg_type.to_string(),
-                    content: decoded.content,
-                    raw_content: content,
-                    packed_info,
-                }
-            },
-        )
-        .collect::<Vec<_>>();
-    messages.sort_by_key(|message| message.timestamp);
-    Ok(messages)
 }
 
 /// Export readable image files for a session.
@@ -2028,7 +1896,7 @@ pub fn export_voices(
         decrypted_dir,
         session_query,
         config.since,
-        scan_limit,
+        Some(scan_limit),
         config.jobs,
     )?;
     if messages.is_empty() {
@@ -2176,6 +2044,36 @@ fn export_cached_voices(
         return Err("No voices were exported".to_string());
     }
 
+    Ok(paths)
+}
+
+fn export_all_voice_messages(
+    decrypted_dir: &Path,
+    session_query: &str,
+    output_dir: &Path,
+    jobs: usize,
+    start_index: usize,
+    decoder: Option<&Path>,
+) -> Result<Vec<(usize, PathBuf)>, String> {
+    let (_, mut messages) = load_voice_messages(decrypted_dir, session_query, None, None, jobs)?;
+    messages.sort_by_key(|message| (message.timestamp, message.local_id, message.svr_id));
+
+    let mut paths = Vec::new();
+    for (offset, message) in messages.iter().enumerate() {
+        let index = start_index + offset;
+        match export_voice_file(
+            output_dir,
+            session_query,
+            index,
+            message,
+            VoiceOutputFormat::Wav,
+            decoder,
+            DEFAULT_VOICE_SAMPLE_RATE,
+        ) {
+            Ok(path) => paths.push((index, path)),
+            Err(e) => log::warn!("Voice #{} export failed: {}", index, e),
+        }
+    }
     Ok(paths)
 }
 
@@ -2522,7 +2420,7 @@ fn load_voice_messages(
     decrypted_dir: &Path,
     session_query: &str,
     since: Option<i64>,
-    limit: usize,
+    limit: Option<usize>,
     jobs: usize,
 ) -> Result<(String, Vec<VoiceMessage>), String> {
     let (username, conn, chat_name_id) =
@@ -2534,12 +2432,13 @@ fn load_voice_messages(
     let since_clause = since
         .map(|ts| format!(" AND create_time >= {}", ts))
         .unwrap_or_default();
+    let limit_clause = limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default();
     let sql = format!(
         "SELECT create_time, local_id, svr_id, voice_data \
          FROM VoiceInfo \
          WHERE chat_name_id = {} AND create_time > 0{} \
-         ORDER BY create_time DESC LIMIT {}",
-        chat_name_id, since_clause, limit
+         ORDER BY create_time DESC{}",
+        chat_name_id, since_clause, limit_clause
     );
 
     let mut stmt = conn
@@ -2557,7 +2456,9 @@ fn load_voice_messages(
             Reverse(message.svr_id),
         )
     });
-    messages.truncate(limit);
+    if let Some(limit) = limit {
+        messages.truncate(limit);
+    }
     Ok((username, messages))
 }
 
@@ -2953,6 +2854,7 @@ fn escape_csv(s: &str) -> String {
 mod tests {
     use super::*;
     use rusqlite::params;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::{tempdir, TempDir};
 
     fn packed_image(filename: &str) -> Vec<u8> {
@@ -3351,18 +3253,15 @@ mod tests {
         let results = export_messages(MessageExportConfig {
             decrypted_dir: decrypted.path(),
             session_query: "tgid_export",
-            format: "json",
             output_dir: output.path(),
-            media_dir: None,
-            since: None,
-            limit: None,
-            name_mode: contact::DisplayNameMode::PersonalRemark,
             jobs: 1,
         })
         .unwrap();
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, "json");
+        assert_eq!(
+            results.iter().map(|(fmt, _)| *fmt).collect::<Vec<_>>(),
+            vec!["txt", "csv", "json"]
+        );
         let data: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(output.path().join("chat.json")).unwrap(),
         )
@@ -3378,19 +3277,14 @@ mod tests {
     }
 
     #[test]
-    fn export_messages_anonymous_uses_public_name() {
+    fn export_messages_uses_personal_display_name() {
         let decrypted = create_export_decrypted_dir();
         let output = tempdir().unwrap();
 
         export_messages(MessageExportConfig {
             decrypted_dir: decrypted.path(),
             session_query: "tgid_export",
-            format: "json",
             output_dir: output.path(),
-            media_dir: None,
-            since: None,
-            limit: None,
-            name_mode: contact::DisplayNameMode::Anonymous,
             jobs: 1,
         })
         .unwrap();
@@ -3400,8 +3294,7 @@ mod tests {
         )
         .unwrap();
         let messages = data.as_array().unwrap();
-        assert_eq!(messages[0]["sender"], "Export Nick");
-        assert_ne!(messages[0]["sender"], "Export Remark");
+        assert_eq!(messages[0]["sender"], "Export Remark");
     }
 
     #[test]
@@ -3412,12 +3305,7 @@ mod tests {
         let results = export_messages(MessageExportConfig {
             decrypted_dir: decrypted.path(),
             session_query: "tgid_export",
-            format: "all",
             output_dir: output.path(),
-            media_dir: None,
-            since: None,
-            limit: None,
-            name_mode: contact::DisplayNameMode::PersonalRemark,
             jobs: 1,
         })
         .unwrap();
@@ -3437,19 +3325,14 @@ mod tests {
     }
 
     #[test]
-    fn export_messages_respects_since_and_limit() {
+    fn export_messages_always_exports_full_history() {
         let decrypted = create_export_decrypted_dir();
         let output = tempdir().unwrap();
 
         export_messages(MessageExportConfig {
             decrypted_dir: decrypted.path(),
             session_query: "tgid_export",
-            format: "json",
             output_dir: output.path(),
-            media_dir: None,
-            since: Some(1000),
-            limit: Some(1),
-            name_mode: contact::DisplayNameMode::PersonalRemark,
             jobs: 1,
         })
         .unwrap();
@@ -3459,8 +3342,9 @@ mod tests {
         )
         .unwrap();
         let messages = data.as_array().unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["timestamp"], 1001);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["timestamp"], 1000);
+        assert_eq!(messages[1]["timestamp"], 1001);
     }
 
     #[test]
@@ -3600,7 +3484,7 @@ mod tests {
         let decrypted = create_voice_decrypted_dir();
 
         let (username, messages) =
-            load_voice_messages(decrypted.path(), "tgid_voices", None, 10, 1).unwrap();
+            load_voice_messages(decrypted.path(), "tgid_voices", None, Some(10), 1).unwrap();
 
         assert_eq!(username, "tgid_voices");
         assert_eq!(
@@ -3656,6 +3540,42 @@ mod tests {
         let bytes = std::fs::read(&results[0]).unwrap();
         assert!(bytes.starts_with(&native_voice_header()));
         assert_ne!(bytes.first(), Some(&2));
+    }
+
+    #[test]
+    fn export_all_voice_messages_writes_wav_media() {
+        let decrypted = create_voice_decrypted_dir();
+        let output = tempdir().unwrap();
+        let decoder_dir = tempdir().unwrap();
+        let decoder = decoder_dir
+            .path()
+            .join(format!("rust-{}", native_codec_token()));
+        std::fs::write(
+            &decoder,
+            "#!/bin/sh\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '-o' ]; then\n    shift\n    out=\"$1\"\n  fi\n  shift\ndone\nprintf 'RIFFfakeWAVE' > \"$out\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&decoder).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&decoder, permissions).unwrap();
+
+        let results = export_all_voice_messages(
+            decrypted.path(),
+            "tgid_voices",
+            output.path(),
+            1,
+            3,
+            Some(&decoder),
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 3);
+        assert_eq!(
+            results[0].1.extension().and_then(OsStr::to_str),
+            Some("wav")
+        );
+        assert!(std::fs::read(&results[0].1).unwrap().starts_with(b"RIFF"));
     }
 
     #[test]

@@ -407,9 +407,9 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         jobs: usize,
     },
-    /// Export messages to file
+    /// Export a complete chat archive
     Export {
-        /// Session username (tgid_xxx)
+        /// Session username (tgid_xxx) or display name to search
         session: String,
         /// Path to decrypted databases
         #[arg(
@@ -418,13 +418,6 @@ enum Commands {
             value_hint = clap::ValueHint::DirPath
         )]
         decrypted_dir: PathBuf,
-        /// Output format: txt, csv, or json
-        #[arg(
-            long,
-            default_value = "txt",
-            value_parser = completion_values::export_formats()
-        )]
-        format: String,
         /// Output directory
         #[arg(
             long,
@@ -432,21 +425,6 @@ enum Commands {
             value_hint = clap::ValueHint::DirPath
         )]
         output: PathBuf,
-        /// Directory to save decoded media files (images, stickers, videos, files)
-        #[arg(long, value_hint = clap::ValueHint::DirPath)]
-        media_dir: Option<PathBuf>,
-        /// Export messages after this time (defaults to the recent window)
-        #[arg(long, conflicts_with = "all_time")]
-        since: Option<String>,
-        /// Export at most this many latest messages from the selected window
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Export the full history instead of the default recent window
-        #[arg(long)]
-        all_time: bool,
-        /// Use public names instead of your contact remarks in exported messages
-        #[arg(long)]
-        anonymous: bool,
         /// Number of parallel jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
@@ -1133,51 +1111,28 @@ fn main() {
         Commands::Export {
             session,
             decrypted_dir,
-            format,
             output,
-            media_dir,
-            since,
-            limit,
-            all_time,
-            anonymous,
             jobs,
         } => {
-            let since_ts = match time::parse_since_opt(since.as_deref()) {
-                Ok(ts) => ts,
-                Err(e) => {
-                    log::error!("Error parsing --since: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let since_ts = if all_time {
-                since_ts
-            } else {
-                Some(since_ts.unwrap_or_else(time::default_recent_since))
-            };
-            if limit == Some(0) {
-                log::error!("Error: --limit must be greater than 0");
-                std::process::exit(1);
-            }
-            let refresh = cache::refresh_message_decrypted(&decrypted_dir, jobs);
-            if cache::needs_message_key_retry(&refresh) {
+            let mut refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
+            if cache::needs_export_key_retry(&refresh) {
                 log::warn!(
-                    "Decrypted message cache refresh had issues ({}). Export may be stale.",
-                    cache::retry_reason(&refresh)
+                    "Decrypted cache refresh had issues ({}). Refreshing keys and retrying export refresh.",
+                    cache::export_refresh_error(&refresh).unwrap_or_else(|| "unknown".to_string())
                 );
+                refresh = cache::refresh_keys_and_decrypted(&decrypted_dir, jobs);
+            }
+            if let Some(e) = cache::export_refresh_error(&refresh) {
+                log::error!(
+                    "Error: export needs a complete decrypted cache, but refresh is incomplete: {}",
+                    e
+                );
+                std::process::exit(1);
             }
             match export::export_messages(export::MessageExportConfig {
                 decrypted_dir: &decrypted_dir,
                 session_query: &session,
-                format: &format,
                 output_dir: &output,
-                media_dir: media_dir.as_deref(),
-                since: since_ts,
-                limit,
-                name_mode: if anonymous {
-                    contact::DisplayNameMode::Anonymous
-                } else {
-                    contact::DisplayNameMode::PersonalRemark
-                },
                 jobs,
             }) {
                 Ok(paths) => {
@@ -1477,11 +1432,23 @@ mod tests {
             Commands::Query { anonymous, .. } => assert!(anonymous),
             _ => panic!("expected query command"),
         }
+    }
 
-        let cli = Cli::parse_from(args(&["tg", "export", "room", "--anonymous"]));
-        match cli.command {
-            Commands::Export { anonymous, .. } => assert!(anonymous),
-            _ => panic!("expected export command"),
+    #[test]
+    fn export_rejects_filter_and_format_options() {
+        for option in [
+            "--anonymous",
+            "--format",
+            "--media-dir",
+            "--since",
+            "--limit",
+            "--all-time",
+        ] {
+            let mut argv = args(&["tg", "export", "room", option]);
+            if matches!(option, "--format" | "--media-dir" | "--since" | "--limit") {
+                argv.push("value".into());
+            }
+            assert!(Cli::try_parse_from(argv).is_err());
         }
     }
 

@@ -73,10 +73,30 @@ pub(crate) fn needs_message_key_retry(refresh: &Result<decrypt::DecryptStats, St
     }
 }
 
+pub(crate) fn needs_export_key_retry(refresh: &Result<decrypt::DecryptStats, String>) -> bool {
+    match refresh {
+        Ok(stats) => failures_can_affect_export(stats),
+        Err(e) => !decrypt::is_refresh_lock_busy_error(e),
+    }
+}
+
 pub(crate) fn retry_reason(refresh: &Result<decrypt::DecryptStats, String>) -> String {
     match refresh {
         Ok(_) => "contact/message database failed to decrypt".to_string(),
         Err(e) => e.clone(),
+    }
+}
+
+pub(crate) fn export_refresh_error(
+    refresh: &Result<decrypt::DecryptStats, String>,
+) -> Option<String> {
+    match refresh {
+        Ok(stats) if failures_can_affect_export(stats) => Some(format!(
+            "export-critical database failed to decrypt: {}",
+            export_failure_summary(stats)
+        )),
+        Err(e) => Some(e.clone()),
+        _ => None,
     }
 }
 
@@ -129,6 +149,32 @@ pub(crate) fn failures_can_affect_search(stats: &decrypt::DecryptStats) -> bool 
         .any(|path| failure_can_affect_messages(path) || failure_can_affect_telegram_fts(path))
 }
 
+pub(crate) fn failures_can_affect_export(stats: &decrypt::DecryptStats) -> bool {
+    stats
+        .failed_paths
+        .iter()
+        .any(|path| failure_can_affect_export(path))
+}
+
+pub(crate) fn export_failure_summary(stats: &decrypt::DecryptStats) -> String {
+    let paths: Vec<&str> = stats
+        .failed_paths
+        .iter()
+        .filter(|path| failure_can_affect_export(path))
+        .map(String::as_str)
+        .collect();
+
+    if paths.is_empty() {
+        return "none".to_string();
+    }
+
+    let mut summary = paths.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+    if paths.len() > 5 {
+        summary.push_str(&format!(" ... {} total", paths.len()));
+    }
+    summary
+}
+
 pub(crate) fn failures_can_affect_telegram_fts(stats: &decrypt::DecryptStats) -> bool {
     stats
         .failed_paths
@@ -145,6 +191,10 @@ fn failure_can_affect_messages(path: &str) -> bool {
 
 fn failure_can_affect_telegram_fts(path: &str) -> bool {
     path == "message/message_fts.db"
+}
+
+fn failure_can_affect_export(path: &str) -> bool {
+    failure_can_affect_messages(path) || path == "message/media_0.db"
 }
 
 #[cfg(test)]
@@ -197,6 +247,29 @@ mod tests {
                 "contact/contact.db",
             ])),
             "message/message_1.db, contact/contact.db"
+        );
+    }
+
+    #[test]
+    fn export_retry_considers_voice_media_db_relevant() {
+        assert!(failures_can_affect_export(&stats_with_failed_paths(&[
+            "message/media_0.db"
+        ])));
+        assert!(needs_export_key_retry(&Ok(stats_with_failed_paths(&[
+            "message/media_0.db"
+        ]))));
+    }
+
+    #[test]
+    fn export_failure_summary_lists_relevant_paths_only() {
+        assert_eq!(
+            export_failure_summary(&stats_with_failed_paths(&[
+                "favorite/favorite.db",
+                "message/message_1.db",
+                "message/media_0.db",
+                "message/message_fts.db",
+            ])),
+            "message/message_1.db, message/media_0.db"
         );
     }
 

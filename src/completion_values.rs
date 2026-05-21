@@ -18,15 +18,6 @@ pub(crate) fn query_formats() -> PossibleValuesParser {
     parser(&[("table", "Table output"), ("json", "JSON output")])
 }
 
-pub(crate) fn export_formats() -> PossibleValuesParser {
-    parser(&[
-        ("txt", "Text export"),
-        ("csv", "CSV export"),
-        ("json", "JSON export"),
-        ("all", "All export formats"),
-    ])
-}
-
 pub(crate) fn voice_formats() -> PossibleValuesParser {
     parser(&[
         ("native", "Native voice output"),
