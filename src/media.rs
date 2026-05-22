@@ -242,6 +242,22 @@ impl FileInfo {
     }
 }
 
+/// Parsed info about a short video app message (type 49, subtype 51).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ShortVideoFeedInfo {
+    pub(crate) title: String,
+    pub(crate) nickname: String,
+    pub(crate) description: String,
+    feed_type: Option<i64>,
+    media_type: Option<i64>,
+}
+
+impl ShortVideoFeedInfo {
+    pub(crate) fn is_video(&self) -> bool {
+        self.media_type == Some(4) || self.feed_type == Some(4)
+    }
+}
+
 pub(crate) fn message_media_type(local_type: i64, raw_body: &str) -> Option<&'static str> {
     if is_pat_app_message(raw_body) {
         return None;
@@ -253,6 +269,7 @@ pub(crate) fn message_media_type(local_type: i64, raw_body: &str) -> Option<&'st
         43 => Some("video"),
         47 => Some("sticker"),
         62 => Some("file"),
+        49 if is_short_video_app_message(raw_body) => Some("video"),
         49 if is_file_app_message(local_type, raw_body) => Some("file"),
         _ => None,
     }
@@ -421,6 +438,25 @@ pub(crate) fn parse_file_info(xml: &str) -> Option<FileInfo> {
             .unwrap_or(0),
         file_ext: extract_xml_tag(xml, "fileext").unwrap_or_default(),
     })
+}
+
+pub(crate) fn parse_short_video_feed_info(xml: &str) -> Option<ShortVideoFeedInfo> {
+    if !xml.contains("<type>51</type>") {
+        return None;
+    }
+    let feed = extract_xml_tag(xml, "finderFeed")?;
+    let media = extract_xml_tag(&feed, "media").unwrap_or_default();
+    Some(ShortVideoFeedInfo {
+        title: short_video_title(xml, &feed, &media).unwrap_or_default(),
+        nickname: extract_clean_xml_tag(&feed, "nickname").unwrap_or_default(),
+        description: extract_clean_xml_tag(&feed, "desc").unwrap_or_default(),
+        feed_type: extract_xml_tag_int(&feed, "feedType"),
+        media_type: extract_xml_tag_int(&media, "mediaType"),
+    })
+}
+
+pub(crate) fn is_short_video_app_message(xml: &str) -> bool {
+    parse_short_video_feed_info(xml).is_some_and(|info| info.is_video())
 }
 
 pub(crate) fn is_pat_app_message(xml: &str) -> bool {
@@ -648,6 +684,37 @@ pub(crate) fn extract_xml_tag_int(xml: &str, tag: &str) -> Option<i64> {
     text.parse::<i64>().ok()
 }
 
+fn extract_clean_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    extract_xml_tag(xml, tag).and_then(clean_xml_text)
+}
+
+fn clean_xml_text(value: String) -> Option<String> {
+    let value = strip_cdata(&value).trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn short_video_title(xml: &str, feed: &str, media: &str) -> Option<String> {
+    extract_clean_xml_tag(feed, "title")
+        .or_else(|| extract_clean_xml_tag(media, "title"))
+        .or_else(|| extract_clean_xml_tag(xml, "title").filter(|title| !is_upgrade_title(title)))
+}
+
+fn is_upgrade_title(value: &str) -> bool {
+    value.contains("不支持展示该内容") || value.contains("升级至最新版本")
+}
+
+fn strip_cdata(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix("<![CDATA[")
+        .and_then(|s| s.strip_suffix("]]>"))
+        .unwrap_or(trimmed)
+}
+
 fn decode_xml_entities(s: &str) -> String {
     s.replace("&amp;", "&")
         .replace("&quot;", "\"")
@@ -756,6 +823,35 @@ mod tests {
             message_media_type(49, "<msg><appmsg><type>5</type></appmsg></msg>"),
             None
         );
+    }
+
+    #[test]
+    fn test_short_video_feed_is_video_media() {
+        let xml = r#"<msg><appmsg><title>当前版本不支持展示该内容，请升级至最新版本。</title><type>51</type><finderFeed><feedType>4</feedType><title><![CDATA[Short Title]]></title><nickname><![CDATA[Alice]]></nickname><desc><![CDATA[short clip]]></desc><mediaList><media><mediaType>4</mediaType></media></mediaList></finderFeed></appmsg></msg>"#;
+
+        let info = parse_short_video_feed_info(xml).unwrap();
+        assert_eq!(info.title, "Short Title");
+        assert_eq!(info.nickname, "Alice");
+        assert_eq!(info.description, "short clip");
+        assert!(info.is_video());
+        assert_eq!(message_media_type((51_i64 << 32) | 49, xml), Some("video"));
+    }
+
+    #[test]
+    fn test_short_video_ignores_upgrade_placeholder_title() {
+        let xml = r#"<msg><appmsg><title>当前版本不支持展示该内容，请升级至最新版本。</title><type>51</type><finderFeed><feedType>4</feedType><nickname>Alice</nickname><desc>short clip</desc><mediaList><media><mediaType>4</mediaType></media></mediaList></finderFeed></appmsg></msg>"#;
+
+        let info = parse_short_video_feed_info(xml).unwrap();
+        assert_eq!(info.title, "");
+        assert_eq!(info.description, "short clip");
+    }
+
+    #[test]
+    fn test_non_feed_subtype_51_is_not_video_media() {
+        let xml = r#"<msg><appmsg><title>Chat History</title><type>51</type></appmsg></msg>"#;
+
+        assert!(parse_short_video_feed_info(xml).is_none());
+        assert_eq!(message_media_type((51_i64 << 32) | 49, xml), None);
     }
 
     #[test]

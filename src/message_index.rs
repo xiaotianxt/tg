@@ -9,7 +9,7 @@ use crate::{
 
 const INDEX_FILE: &str = ".tg_index.db";
 const SCHEMA_VERSION: i64 = 8;
-pub(crate) const DERIVED_SEMANTICS_VERSION: i64 = 2;
+pub(crate) const DERIVED_SEMANTICS_VERSION: i64 = 3;
 const REFRESH_OVERLAP_SECS: i64 = 7 * 86400;
 
 pub(crate) struct HotIndex {

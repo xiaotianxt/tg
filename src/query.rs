@@ -482,14 +482,21 @@ fn message_query_window(options: &QueryOptions<'_>) -> Result<usize, String> {
 fn query_needs_post_filtering(options: &QueryOptions<'_>) -> bool {
     !options.contains.is_empty()
         || !options.not_contains.is_empty()
-        || options.has.contains(&QueryMediaType::File)
+        || media_filters_need_post_filtering(options)
 }
 
 fn indexed_query_needs_post_filtering(
     options: &QueryOptions<'_>,
     has_indexed_media_type: bool,
 ) -> bool {
-    !has_indexed_media_type && options.has.contains(&QueryMediaType::File)
+    !has_indexed_media_type && media_filters_need_post_filtering(options)
+}
+
+fn media_filters_need_post_filtering(options: &QueryOptions<'_>) -> bool {
+    options
+        .has
+        .iter()
+        .any(|media_type| matches!(media_type, QueryMediaType::File | QueryMediaType::Video))
 }
 
 fn index_has_decoded_body(index: &message_index::HotIndex) -> Result<bool, String> {
@@ -996,7 +1003,9 @@ fn legacy_indexed_media_clause(media_type: QueryMediaType, raw_body_col: &str) -
         QueryMediaType::Voice => "((local_type & 4294967295) = 34)".to_string(),
         QueryMediaType::Image => "((local_type & 4294967295) = 3)".to_string(),
         QueryMediaType::Sticker => "((local_type & 4294967295) = 47)".to_string(),
-        QueryMediaType::Video => "((local_type & 4294967295) = 43)".to_string(),
+        QueryMediaType::Video => format!(
+            "((local_type & 4294967295) = 43 OR ((local_type & 4294967295) = 49 AND (local_type >> 32) = 51) OR ((local_type & 4294967295) = 49 AND {raw_body_col} LIKE '%<finderFeed>%'))"
+        ),
         QueryMediaType::File => format!(
             "((local_type & 4294967295) = 62 OR (local_type & 4294967295) = 49 OR {raw_body_col} LIKE '%<type>6</type>%' OR {raw_body_col} LIKE '%<type>62</type>%')"
         ),
@@ -1653,6 +1662,7 @@ mod tests {
         let marker_col = dictionary::msg_compression_marker_column();
         let packed_col = dictionary::msg_packed_meta_column();
         let file_type = (6_i64 << 32) | 49;
+        let short_video_type = (51_i64 << 32) | 49;
         conn.execute(
             &format!(
                 "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
@@ -1677,6 +1687,22 @@ mod tests {
             params![(62_i64 << 32) | 49],
         )
         .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+                 VALUES (?1, 1006, '<msg><appmsg><title>当前版本不支持展示该内容，请升级至最新版本。</title><type>51</type><finderFeed><feedType>4</feedType><nickname>Alice</nickname><desc>short clip</desc><mediaList><media><mediaType>4</mediaType></media></mediaList></finderFeed></appmsg></msg>', NULL, 7, x'')"
+            ),
+            params![short_video_type],
+        )
+        .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO Msg_test (local_type, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+                 VALUES (?1, 1007, '<msg><appmsg><title>Chat History</title><type>51</type></appmsg></msg>', NULL, 7, x'')"
+            ),
+            params![short_video_type],
+        )
+        .unwrap();
         drop(conn);
 
         let has = vec![QueryMediaType::File];
@@ -1693,6 +1719,21 @@ mod tests {
         assert!(output.contains("report.pdf"));
         assert!(!output.contains("拍了拍"));
         assert!(!output.contains("[语音"));
+
+        let has = vec![QueryMediaType::Video];
+        let mut bytes = Vec::new();
+        let mut out = output::Output::new(&mut bytes);
+        let mut options = default_query_options(dir.path(), &[], &[]);
+        options.has = &has;
+        let count = run_messages_with_output(options, &mut out).unwrap();
+        out.flush().unwrap();
+        drop(out);
+        let output = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(count, 1);
+        assert!(output.contains("short clip"));
+        assert!(!output.contains("Chat History"));
+        assert!(!output.contains("report.pdf"));
     }
 
     #[test]

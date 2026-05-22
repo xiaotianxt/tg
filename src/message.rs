@@ -590,11 +590,7 @@ fn decode_link_content(
         57 => decode_quote_content(content, time_bucket, resolve_display_name),
         2000 => decode_app_card_fallback(sub_type, "转账", content),
         2001 => decode_app_card_fallback(sub_type, "红包", content),
-        51 => {
-            let title = crate::media::extract_xml_tag(content, "title")
-                .unwrap_or_else(|| "聊天记录".to_string());
-            format!("[引用: {}]", title)
-        }
+        51 => decode_short_video_or_legacy_reference_content(content),
         _ => decode_app_card_fallback(sub_type, "卡片", content),
     }
 }
@@ -627,6 +623,46 @@ fn display_link_info(info: &media::LinkInfo) -> String {
     } else {
         append_url_line(display, Some(url))
     }
+}
+
+fn decode_short_video_or_legacy_reference_content(content: &str) -> String {
+    if let Some(info) = media::parse_short_video_feed_info(content) {
+        return display_short_video_feed_info(&info);
+    }
+
+    let title =
+        crate::media::extract_xml_tag(content, "title").unwrap_or_else(|| "聊天记录".to_string());
+    format!("[引用: {}]", title)
+}
+
+fn display_short_video_feed_info(info: &media::ShortVideoFeedInfo) -> String {
+    let label = if info.is_video() {
+        "视频"
+    } else {
+        "视频号"
+    };
+    let title = truncate_display(info.title.trim(), 200);
+    let desc = truncate_display(info.description.trim(), 200);
+    let nickname = info.nickname.trim();
+
+    let mut summary = if !title.is_empty() && !desc.is_empty() && title != desc {
+        format!("{} - {}", title, desc)
+    } else if !title.is_empty() {
+        title
+    } else if !desc.is_empty() {
+        desc
+    } else if !nickname.is_empty() {
+        format!("@{}", nickname)
+    } else {
+        "视频号内容".to_string()
+    };
+
+    if !nickname.is_empty() && !summary.contains(nickname) {
+        summary.push_str(" - @");
+        summary.push_str(nickname);
+    }
+
+    format!("[{}] {}", label, summary)
 }
 
 fn decode_app_card_fallback(sub_type: i64, label: &str, content: &str) -> String {
@@ -1441,6 +1477,39 @@ mod tests {
             d.content,
             "[视频] 她有时候只是激素影响，并不是故意的 - @有趣小剧场's note\n38.2k Shares\n  https://www.example.com/video/1"
         );
+    }
+
+    #[test]
+    fn test_decode_short_video_subtype_51_as_video_card() {
+        let xml = r#"<?xml version="1.0"?>
+<msg>
+        <appmsg appid="" sdkver="0">
+                <title>当前版本不支持展示该内容，请升级至最新版本。</title>
+                <type>51</type>
+                <url>https://support.weixin.qq.com/security/readtemplate?t=upgrade</url>
+                <finderFeed>
+                        <feedType>4</feedType>
+                        <title><![CDATA[货币周期]]></title>
+                        <nickname><![CDATA[混哥趋势观]]></nickname>
+                        <desc><![CDATA[接下来的几年，央妈要靠什么印钱？ #通胀 #AI]]></desc>
+                        <mediaList><media><mediaType>4</mediaType></media></mediaList>
+                </finderFeed>
+        </appmsg>
+</msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+
+        assert_eq!(
+            d.content,
+            "[视频] 货币周期 - 接下来的几年，央妈要靠什么印钱？ #通胀 #AI - @混哥趋势观"
+        );
+    }
+
+    #[test]
+    fn test_decode_legacy_subtype_51_as_reference_card() {
+        let xml = r#"<msg><appmsg><title>Chat History</title><type>51</type></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+
+        assert_eq!(d.content, "[引用: Chat History]");
     }
 
     #[test]
