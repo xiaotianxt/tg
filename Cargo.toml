@@ -27,7 +27,7 @@ clap = { version = "4", features = ["derive"] }
 rusqlite = "0.31"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-aes = "0.8"
+aes = "0.9"
 cbc = "0.1"
 hmac = "0.12"
 sha2 = "0.10"
