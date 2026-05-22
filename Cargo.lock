@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "tg"
-version = "1.4.21"
+version = "1.4.22"
 dependencies = [
  "aes",
  "cbc",
