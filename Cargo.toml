@@ -34,7 +34,7 @@ sha2 = "0.10"
 pbkdf2 = "0.12"
 md-5 = "0.10"
 hex = "0.4"
-cipher = "0.4"
+cipher = "0.5"
 tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
