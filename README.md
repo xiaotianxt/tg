@@ -16,6 +16,21 @@ tg 是一个 macOS/Linux 本地 Telegram 聊天记录读取 CLI。它把本机 T
 
 默认数据只留在本机。`~/.tg/all_keys.json`、`~/.tg/decrypted/`、`exported/` 都是敏感文件，请当作聊天原文保存和处理。
 
+## Agent Skill
+
+安装随 `tg` 打包的本地 Codex/agent skill：
+
+```bash
+tg skill install
+```
+
+这个命令会从 `tg` 的公开 skill 模板生成本机安装版本，并按本机 dictionary
+渲染应用显示名。只想安装公开的 central skill 模板时，也可以用：
+
+```bash
+npx -y github:xiaotianxt/skills tg
+```
+
 ## 先看效果
 
 列出会话：
