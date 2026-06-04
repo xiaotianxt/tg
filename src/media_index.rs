@@ -396,7 +396,7 @@ fn cache_file_path(base_path: &Path, cache_dir: Option<&Path>) -> Option<PathBuf
     let mut hasher = Md5::new();
     hasher.update(base_path.to_string_lossy().as_bytes());
     let digest = hasher.finalize();
-    Some(cache_dir.join(format!("media-index-{:x}.sqlite3", digest)))
+    Some(cache_dir.join(format!("media-index-{}.sqlite3", hex::encode(digest))))
 }
 
 fn discover_media_dirs(
@@ -517,7 +517,7 @@ fn discover_attach_file_dirs(attach_dir: &Path, session_id: &str, dirs: &mut Vec
 fn session_attach_dir_name(session_id: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(session_id.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn scan_media_dir(spec: MediaDirSpec, fingerprint: DirFingerprint) -> ScannedMediaDir {

@@ -5,7 +5,7 @@
 //!
 //! Derives the AES key from Telegram kvcomm files, decrypts, and writes to /tmp/.
 
-use aes::cipher::{BlockDecrypt, KeyInit};
+use aes::cipher::{Block, BlockCipherDecrypt, KeyInit};
 use aes::Aes128;
 use std::fs;
 
@@ -85,9 +85,11 @@ fn main() {
                     let cipher =
                         Aes128::new_from_slice(aes_key).expect("derived AES-128 key is 16 bytes");
                     let mut block = data[15..31].to_vec();
-                    cipher.decrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(
-                        &mut block,
-                    ));
+                    let block_ref: &mut Block<Aes128> = block
+                        .as_mut_slice()
+                        .try_into()
+                        .expect("first encrypted block is 16 bytes");
+                    cipher.decrypt_block(block_ref);
                     let is_jpeg = block[0] == 0xFF && block[1] == 0xD8;
                     let is_png = block[0] == 0x89
                         && block[1] == 0x50
@@ -105,7 +107,8 @@ fn main() {
                         let encrypted = &data[15..15 + aes_cipher_len];
                         let mut decrypted = encrypted.to_vec();
                         for chunk in decrypted.chunks_exact_mut(16) {
-                            let b = aes::cipher::generic_array::GenericArray::from_mut_slice(chunk);
+                            let b: &mut Block<Aes128> =
+                                chunk.try_into().expect("AES block chunk is 16 bytes");
                             cipher.decrypt_block(b);
                         }
                         // PKCS7 unpad
@@ -165,7 +168,8 @@ fn derive_key(code: u64, account_id: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(code.to_string().as_bytes());
     hasher.update(account_id.as_bytes());
-    format!("{:x}", &hasher.finalize())[..16].to_string()
+    let hex = hex::encode(hasher.finalize());
+    hex[..16].to_string()
 }
 
 fn find_account_id() -> Option<String> {

@@ -569,7 +569,7 @@ fn find_file_named(dir: &Path, target: &str) -> Option<PathBuf> {
 pub fn decrypt_sticker_aes_cbc(data: &[u8], aes_key_hex: &str) -> Option<Vec<u8>> {
     use aes::Aes128;
     use cbc::Decryptor;
-    use cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+    use cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
 
     let key = hex::decode(aes_key_hex).ok()?;
     if key.len() != 16 || data.is_empty() || !data.len().is_multiple_of(16) {
@@ -578,7 +578,7 @@ pub fn decrypt_sticker_aes_cbc(data: &[u8], aes_key_hex: &str) -> Option<Vec<u8>
 
     let mut buf = data.to_vec();
     let cipher = Decryptor::<Aes128>::new_from_slices(&key, &key).ok()?;
-    let plaintext = cipher.decrypt_padded_mut::<Pkcs7>(&mut buf).ok()?;
+    let plaintext = cipher.decrypt_padded::<Pkcs7>(&mut buf).ok()?;
     Some(plaintext.to_vec())
 }
 
