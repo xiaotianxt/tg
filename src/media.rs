@@ -715,7 +715,7 @@ fn strip_cdata(value: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
-fn decode_xml_entities(s: &str) -> String {
+pub(crate) fn decode_xml_entities(s: &str) -> String {
     s.replace("&amp;", "&")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
