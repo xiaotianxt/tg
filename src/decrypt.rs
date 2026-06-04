@@ -1,7 +1,7 @@
 use aes::Aes256;
 use cbc::Decryptor;
-use cipher::{block_padding::NoPadding, generic_array::GenericArray, BlockDecryptMut, KeyIvInit};
-use hmac::{Hmac, Mac};
+use cipher::{block_padding::NoPadding, BlockModeDecrypt, KeyIvInit};
+use hmac::{Hmac, KeyInit, Mac};
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha512;
 use std::collections::HashMap;
@@ -400,11 +400,9 @@ fn decrypt_page_into(enc_key: &[u8], page_data: &[u8], pgno: u32, out: &mut [u8]
 
     out[payload_start..PAGE_SZ - RESERVE_SZ].copy_from_slice(encrypted);
 
-    let key_arr = GenericArray::from_slice(enc_key);
-    let iv_arr = GenericArray::from_slice(iv);
-    let decryptor = Aes256CbcDec::new(key_arr, iv_arr);
+    let decryptor = Aes256CbcDec::new_from_slices(enc_key, iv).ok()?;
     decryptor
-        .decrypt_padded_mut::<NoPadding>(&mut out[payload_start..PAGE_SZ - RESERVE_SZ])
+        .decrypt_padded::<NoPadding>(&mut out[payload_start..PAGE_SZ - RESERVE_SZ])
         .ok()?;
 
     if pgno == 1 {

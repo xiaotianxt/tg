@@ -3224,7 +3224,7 @@ mod tests {
     }
 
     fn v2_media_fixture(plaintext: &[u8], keys: &crate::media_key::MediaKeys) -> Vec<u8> {
-        use aes::cipher::{BlockEncrypt, KeyInit};
+        use aes::cipher::{Block, BlockCipherEncrypt, KeyInit};
 
         let mut encrypted = plaintext.to_vec();
         let remainder = encrypted.len() % 16;
@@ -3233,7 +3233,8 @@ mod tests {
 
         let cipher = aes::Aes128::new_from_slice(&keys.aes_key).unwrap();
         for block in encrypted.chunks_exact_mut(16) {
-            let block = aes::cipher::generic_array::GenericArray::from_mut_slice(block);
+            let block: &mut Block<aes::Aes128> =
+                block.try_into().expect("AES block chunk is 16 bytes");
             cipher.encrypt_block(block);
         }
 

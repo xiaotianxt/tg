@@ -38,7 +38,7 @@ fn derive_aes_key(code: u64, account_id: &str) -> [u8; 16] {
     hasher.update(code.to_string().as_bytes());
     hasher.update(account_id.as_bytes());
     let digest = hasher.finalize();
-    let hex = format!("{:x}", digest);
+    let hex = hex::encode(digest);
     let hex16 = &hex[..16];
     let mut key = [0u8; 16];
     key.copy_from_slice(hex16.as_bytes());

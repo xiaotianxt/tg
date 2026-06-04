@@ -177,7 +177,7 @@ pub(crate) fn msg_table_name(username: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(username.as_bytes());
     let hash = hasher.finalize();
-    format!("Msg_{:x}", hash)
+    format!("Msg_{}", hex::encode(hash))
 }
 
 pub(crate) fn quote_identifier(name: &str) -> String {

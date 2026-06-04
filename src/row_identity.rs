@@ -67,7 +67,7 @@ pub(crate) fn contact_fingerprint(
         hash_text(&mut hasher, entry.alias);
         hasher.update([u8::from(entry.is_stranger)]);
     }
-    ContactFingerprint(format!("{:x}", hasher.finalize()))
+    ContactFingerprint(hex::encode(hasher.finalize()))
 }
 
 fn hash_text(hasher: &mut Md5, value: &str) {
