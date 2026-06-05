@@ -211,6 +211,19 @@ xcode-select --install
 1. 打开并登录本机 Telegram 桌面版。
 2. 提取数据库密钥：
 
+   macOS 推荐先走冷启动提取路径。注意：`codesign` 只影响下一次启动的进程；如果 Telegram 已经在运行，对正在运行的 PID 重签没有用。
+
+   ```bash
+   osascript -e 'quit app "Telegram"'
+   while pgrep -x Telegram >/dev/null; do sleep 1; done
+   sudo codesign --force --deep --sign - /Applications/Telegram.app
+   sudo tg keys --method lldb-cold --timeout 90
+   ```
+
+   `lldb-cold` 会重新打开 Telegram 并在启动路径里捕获 key。它需要 Apple Command Line Tools；如果本机没有 `lldb`，先运行 `xcode-select --install`。如果你的 Telegram 不在 `/Applications/Telegram.app`，把上面的 App 路径换成实际路径。
+
+   Linux 或已经完成 macOS 重签并打开客户端时，也可以用默认内存扫描：
+
    ```bash
    sudo tg keys
    ```
@@ -250,13 +263,16 @@ tg export "联系人或群名"
 
 `sessions` 和 `unread` 会优先用轻量会话缓存列出最近活跃会话和未读数，不需要扫描 numbered message 数据库。`search`、`query`、`schema`、`export` 在读取前会尝试静默增量刷新 `~/.tg/decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
 
-macOS 上如果 `sudo tg keys` 遇到 `task_for_pid failed` 或权限问题，退出 Telegram 后重新签名一次：
+macOS 上如果 `sudo tg keys` 遇到 `task_for_pid failed` 或权限问题，不要在 Telegram 正在运行时直接重签后继续扫同一个进程。按这个顺序重来：
 
 ```bash
+osascript -e 'quit app "Telegram"'
+while pgrep -x Telegram >/dev/null; do sleep 1; done
 sudo codesign --force --deep --sign - /Applications/Telegram.app
+sudo tg keys --method lldb-cold --timeout 90
 ```
 
-如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径。重新打开 Telegram 后再运行 `sudo tg keys` 或 `tg refresh --keys`。
+如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径。`lldb-cold` 会自己重新打开 Telegram；如果仍要用默认内存扫描，则在重签后手动打开 Telegram，再运行 `sudo tg keys` 或 `tg refresh --keys`。
 
 Linux 上需要保持桌面客户端打开；如果普通用户无法读取进程内存，直接运行 `sudo tg keys`。
 
@@ -463,13 +479,22 @@ rm -rf ~/.tg exported
 
 ### `task_for_pid failed`
 
-先确认用了 `sudo tg keys`。如果仍失败，退出 Telegram 后重新签名：
+先确认用了 `sudo tg keys`。如果仍失败，通常是因为正在运行的 Telegram 进程没有调试权限。重签必须发生在 Telegram 完全退出之后，因为 `codesign` 只影响之后新启动的进程：
 
 ```bash
+osascript -e 'quit app "Telegram"'
+while pgrep -x Telegram >/dev/null; do sleep 1; done
 sudo codesign --force --deep --sign - /Applications/Telegram.app
+sudo tg keys --method lldb-cold --timeout 90
 ```
 
-然后重新打开 Telegram，再运行 `sudo tg keys`。
+如果本机没有 Apple `lldb`，先安装 Command Line Tools：
+
+```bash
+xcode-select --install
+```
+
+如果继续用默认内存扫描，重签后要先重新打开 Telegram，再运行 `sudo tg keys`。
 
 ### `No sessions found`
 
