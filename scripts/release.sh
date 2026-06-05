@@ -345,6 +345,14 @@ desc = keep_line(r'^  desc .*$')
 homepage = keep_line(r'^  homepage .*$')
 license_line = keep_line(r'^  license .*$')
 native_decoder_dep = '  depends_on "rust-" + "si" + "lk"\n'
+caveats = '''  def caveats
+    <<~EOS
+      `tg keys --method lldb-cold` uses Apple's lldb/debugserver.
+      Install Apple Command Line Tools when that mode is needed:
+        xcode-select --install
+    EOS
+  end
+'''
 
 path.write_text(f'''class Tg < Formula
 {desc}
@@ -374,6 +382,7 @@ path.write_text(f'''class Tg < Formula
   end
 
 {native_decoder_dep}
+{caveats}
   def install
     bin.install "tg"
     generate_completions_from_executable(bin/"tg", "completions")

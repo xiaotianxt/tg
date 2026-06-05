@@ -437,6 +437,23 @@ fn verify_and_decrypt_page1(enc_key: &[u8], page1: &[u8]) -> bool {
     mac.verify_slice(stored_hmac).is_ok()
 }
 
+pub(crate) fn read_encrypted_page1(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let mut file =
+        fs::File::open(path).map_err(|e| format!("Cannot open {}: {}", path.display(), e))?;
+    let mut page1 = vec![0u8; PAGE_SZ];
+    file.read_exact(&mut page1)
+        .map_err(|e| format!("Cannot read page 1 from {}: {}", path.display(), e))?;
+    if &page1[..SQLITE_HDR.len()] == SQLITE_HDR {
+        return Ok(None);
+    }
+
+    Ok(Some(page1))
+}
+
+pub(crate) fn key_bytes_match_page1(enc_key: &[u8], page1: &[u8]) -> bool {
+    enc_key.len() == KEY_SZ && verify_and_decrypt_page1(enc_key, page1)
+}
+
 fn page_cache_path(out_path: &Path) -> PathBuf {
     let Some(file_name) = out_path.file_name() else {
         return out_path.with_extension("tg-pages");

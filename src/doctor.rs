@@ -54,15 +54,19 @@ fn write_keys_status<W: std::io::Write>(
                     return Ok(None);
                 }
             };
-            let key_count = keys
-                .values()
-                .filter(|entry| entry.contains_key("enc_key"))
-                .count();
-            out.line(format_args!(
-                "keys: OK ({} keys in {})",
-                key_count,
-                path.display()
-            ))?;
+            let key_count = usable_key_count(&keys);
+            if key_count == 0 {
+                out.line(format_args!(
+                    "keys: ERROR (0 usable keys in {}; rerun key extraction)",
+                    path.display()
+                ))?;
+            } else {
+                out.line(format_args!(
+                    "keys: OK ({} keys in {})",
+                    key_count,
+                    path.display()
+                ))?;
+            }
             Ok(Some(keys))
         }
         Err(_) => {
@@ -189,13 +193,24 @@ fn missing_message_key_paths(
 ) -> Vec<String> {
     source_message_dbs
         .iter()
-        .filter(|file| {
-            decrypt::database_key_entry(keys, &file.rel_path)
-                .and_then(|entry| entry.get("enc_key"))
-                .is_none()
-        })
+        .filter(
+            |file| match decrypt::database_key_entry(keys, &file.rel_path) {
+                Some(entry) => !has_usable_enc_key(entry),
+                None => true,
+            },
+        )
         .map(|file| file.rel_path.clone())
         .collect()
+}
+
+fn usable_key_count(keys: &decrypt::DatabaseKeys) -> usize {
+    keys.values()
+        .filter(|entry| has_usable_enc_key(entry))
+        .count()
+}
+
+fn has_usable_enc_key(entry: &std::collections::HashMap<String, String>) -> bool {
+    entry.get("enc_key").is_some_and(|key| !key.is_empty())
 }
 
 fn format_path_list(paths: &[String]) -> String {
@@ -380,6 +395,23 @@ mod tests {
             missing_message_key_paths(&source_message_dbs, &keys),
             vec!["message/message_1.db".to_string()]
         );
+    }
+
+    #[test]
+    fn missing_message_key_paths_treats_empty_keys_as_missing() {
+        let files = vec![source(
+            "message/message_0.db",
+            PathBuf::from("message_0.db"),
+        )];
+        let source_message_dbs = numbered_message_sources(&files);
+        let mut keys = decrypt::DatabaseKeys::new();
+        keys.insert("message/message_0.db".to_string(), key_entry(""));
+
+        assert_eq!(
+            missing_message_key_paths(&source_message_dbs, &keys),
+            vec!["message/message_0.db".to_string()]
+        );
+        assert_eq!(usable_key_count(&keys), 0);
     }
 
     #[test]

@@ -1486,7 +1486,7 @@ mod tests {
         <appmsg appid="" sdkver="0">
                 <title>当前版本不支持展示该内容，请升级至最新版本。</title>
                 <type>51</type>
-                <url>https://support.weixin.qq.com/security/readtemplate?t=upgrade</url>
+                <url>https://www.example.com/security/readtemplate?t=upgrade</url>
                 <finderFeed>
                         <feedType>4</feedType>
                         <title><![CDATA[货币周期]]></title>

@@ -131,6 +131,9 @@ enum Commands {
         /// Timeout in seconds
         #[arg(long, default_value = "30")]
         timeout: u64,
+        /// Key extraction method
+        #[arg(long, value_enum, default_value_t = KeyExtractionMethod::Memory)]
+        method: KeyExtractionMethod,
     },
     /// Decrypt all encrypted databases using extracted keys
     Decrypt {
@@ -666,13 +669,25 @@ enum CompleteKind {
     Words,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum KeyExtractionMethod {
+    Memory,
+    LldbCold,
+}
+
 fn main() {
     logger::init();
     scanner::maybe_run_internal_scanner();
     let cli = Cli::parse_from(normalize_args_for_default_messages(std::env::args_os()));
 
     match cli.command {
-        Commands::Keys { timeout } => match scanner::extract_keys(timeout) {
+        Commands::Keys { timeout, method } => match scanner::extract_keys_with_method(
+            timeout,
+            match method {
+                KeyExtractionMethod::Memory => scanner::KeyExtractionMethod::Memory,
+                KeyExtractionMethod::LldbCold => scanner::KeyExtractionMethod::LldbCold,
+            },
+        ) {
             Ok(path) => print_output(format_args!("Keys saved to: {}", path)),
             Err(e) => {
                 log::error!("Error: {}", e);

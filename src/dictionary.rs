@@ -68,6 +68,17 @@ pub(crate) fn sticker_magic() -> &'static [u8] {
     cached_bytes(&VALUE, &[45, 34, 61, 60])
 }
 
+pub(crate) fn target_module_suffix() -> &'static str {
+    static VALUE: OnceLock<String> = OnceLock::new();
+    cached_text(
+        &VALUE,
+        &[
+            117, 8, 63, 41, 53, 47, 40, 57, 63, 41, 117, 45, 63, 57, 50, 59, 46, 116, 62, 35, 54,
+            51, 56,
+        ],
+    )
+}
+
 pub(crate) fn msg_body_column() -> &'static str {
     static VALUE: OnceLock<String> = OnceLock::new();
     cached_text(
