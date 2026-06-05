@@ -7,7 +7,9 @@ use std::os::raw::{c_char, c_int};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(target_os = "macos")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     decrypt::{self, DatabaseKeys},
@@ -603,6 +605,7 @@ fn find_lldb_command() -> Result<PathBuf, String> {
     ))
 }
 
+#[cfg(target_os = "macos")]
 fn wait_child_with_output(
     mut child: std::process::Child,
     timeout_secs: u64,
