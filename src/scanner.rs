@@ -373,10 +373,10 @@ fn extract_keys_with_lldb_cold(timeout_secs: u64) -> Result<String, String> {
             let stderr = String::from_utf8_lossy(&output.stderr);
             append_labeled_output(&mut combined_stdout, "lldb error output", &stderr);
             if !output.status.success() && !candidate_file_has_keys(&candidate_path) {
-                return Err(format!(
-                    "lldb key capture failed with exit code {:?}.{}",
+                return Err(lldb_capture_failure_message(
                     output.status.code(),
-                    combined_stdout
+                    &combined_stdout,
+                    &stderr,
                 ));
             }
         }
@@ -542,6 +542,7 @@ fn run_lldb_key_capture(request: LldbCaptureRequest<'_>) -> Result<Output, Strin
     let mut cmd = Command::new("sudo");
     cmd.arg("-n")
         .arg("env")
+        .arg("TERM=dumb")
         .arg(format!(
             "TG_LLDB_DB_STORAGE={}",
             request.db_storage.display()
@@ -1235,6 +1236,39 @@ fn scanner_failure_message(code: Option<i32>, stdout: &str, stderr: &str) -> Str
 }
 
 #[cfg(target_os = "macos")]
+fn lldb_capture_failure_message(code: Option<i32>, output: &str, error_output: &str) -> String {
+    let mut message = format!(
+        "lldb key capture failed with exit code {:?}.{}",
+        code, output
+    );
+    append_lldb_recovery_hint(&mut message, error_output);
+    message
+}
+
+#[cfg(target_os = "macos")]
+fn append_lldb_recovery_hint(message: &mut String, error_output: &str) {
+    let lower = error_output.to_ascii_lowercase();
+    if !lower.contains("not allowed to attach")
+        && !lower.contains("attach failed")
+        && !lower.contains("task_for_pid")
+    {
+        return;
+    }
+
+    message.push_str(
+        "\n\nmacOS denied the lldb/debugserver attach. This usually means Developer Tools \
+         permission is not enabled for this terminal.\n\n",
+    );
+    message.push_str("Run once:\n\n");
+    message.push_str("  sudo DevToolsSecurity -enable\n\n");
+    message.push_str(
+        "Then open System Settings -> Privacy & Security -> Developer Tools and enable your terminal app. \
+         Quit and reopen that terminal, then rerun:\n\n",
+    );
+    message.push_str("  sudo tg keys --method lldb-cold --timeout 90");
+}
+
+#[cfg(target_os = "macos")]
 fn append_scanner_recovery_hint(message: &mut String) {
     message.push_str("\n\nIf key extraction failed with `task_for_pid failed` or another macOS process permission error, quit Telegram, re-sign it, reopen it, then retry:\n\n");
     message.push_str("  sudo codesign --force --deep --sign - /Applications/Telegram.app\n");
@@ -1547,6 +1581,21 @@ mod tests {
         assert!(message.contains("Output:\nTelegram PID: 123"));
         assert!(message.contains("Error output:\ntask_for_pid failed: 5"));
         assert!(message.contains("sudo tg keys"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lldb_attach_denial_message_points_to_developer_tools_permission() {
+        let message = lldb_capture_failure_message(
+            Some(1),
+            "\nlldb output:\n(lldb) process attach --pid 123\n",
+            "error: attach failed (Not allowed to attach to process.)",
+        );
+
+        assert!(message.contains("lldb key capture failed with exit code Some(1)."));
+        assert!(message.contains("sudo DevToolsSecurity -enable"));
+        assert!(message.contains("Developer Tools"));
+        assert!(message.contains("sudo tg keys --method lldb-cold --timeout 90"));
     }
 
     #[test]

@@ -214,13 +214,14 @@ xcode-select --install
    macOS 推荐先走冷启动提取路径。注意：`codesign` 只影响下一次启动的进程；如果 Telegram 已经在运行，对正在运行的 PID 重签没有用。
 
    ```bash
+   sudo DevToolsSecurity -enable
    osascript -e 'quit app "Telegram"'
    while pgrep -x Telegram >/dev/null; do sleep 1; done
    sudo codesign --force --deep --sign - /Applications/Telegram.app
    sudo tg keys --method lldb-cold --timeout 90
    ```
 
-   `lldb-cold` 会重新打开 Telegram 并在启动路径里捕获 key。它需要 Apple Command Line Tools；如果本机没有 `lldb`，先运行 `xcode-select --install`。如果你的 Telegram 不在 `/Applications/Telegram.app`，把上面的 App 路径换成实际路径。
+   `lldb-cold` 会重新打开 Telegram 并在启动路径里捕获 key。它需要 Apple Command Line Tools；如果本机没有 `lldb`，先运行 `xcode-select --install`。如果 macOS 弹出 Developer Tools 权限提示，请允许当前终端应用；如果没有弹窗但报 `Not allowed to attach to process`，到 System Settings -> Privacy & Security -> Developer Tools 里启用当前终端应用，退出并重新打开终端后再重试。如果你的 Telegram 不在 `/Applications/Telegram.app`，把上面的 App 路径换成实际路径。
 
    Linux 或已经完成 macOS 重签并打开客户端时，也可以用默认内存扫描：
 
@@ -266,11 +267,14 @@ tg export "联系人或群名"
 macOS 上如果 `sudo tg keys` 遇到 `task_for_pid failed` 或权限问题，不要在 Telegram 正在运行时直接重签后继续扫同一个进程。按这个顺序重来：
 
 ```bash
+sudo DevToolsSecurity -enable
 osascript -e 'quit app "Telegram"'
 while pgrep -x Telegram >/dev/null; do sleep 1; done
 sudo codesign --force --deep --sign - /Applications/Telegram.app
 sudo tg keys --method lldb-cold --timeout 90
 ```
+
+如果输出里有 `Not allowed to attach to process`，打开 System Settings -> Privacy & Security -> Developer Tools，启用当前终端应用，退出并重新打开终端后再运行上面的命令。
 
 如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径。`lldb-cold` 会自己重新打开 Telegram；如果仍要用默认内存扫描，则在重签后手动打开 Telegram，再运行 `sudo tg keys` 或 `tg refresh --keys`。
 
@@ -482,6 +486,7 @@ rm -rf ~/.tg exported
 先确认用了 `sudo tg keys`。如果仍失败，通常是因为正在运行的 Telegram 进程没有调试权限。重签必须发生在 Telegram 完全退出之后，因为 `codesign` 只影响之后新启动的进程：
 
 ```bash
+sudo DevToolsSecurity -enable
 osascript -e 'quit app "Telegram"'
 while pgrep -x Telegram >/dev/null; do sleep 1; done
 sudo codesign --force --deep --sign - /Applications/Telegram.app
@@ -493,6 +498,8 @@ sudo tg keys --method lldb-cold --timeout 90
 ```bash
 xcode-select --install
 ```
+
+如果 `lldb` 输出 `Not allowed to attach to process`，打开 System Settings -> Privacy & Security -> Developer Tools，启用当前终端应用，退出并重新打开终端后再重试。
 
 如果继续用默认内存扫描，重签后要先重新打开 Telegram，再运行 `sudo tg keys`。
 
