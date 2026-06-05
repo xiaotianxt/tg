@@ -586,7 +586,7 @@ fn decode_link_content(
         }
         6 => decode_file_content(content, packed_info),
         62 => decode_file_content(content, packed_info),
-        19 => decode_chat_history_content(content, time_bucket),
+        19 => decode_chat_history_content(content, time_bucket, 0),
         57 => decode_quote_content(content, time_bucket, resolve_display_name),
         2000 => decode_app_card_fallback(sub_type, "转账", content),
         2001 => decode_app_card_fallback(sub_type, "红包", content),
@@ -726,15 +726,43 @@ struct ChatHistoryItem {
     body: String,
 }
 
-fn decode_chat_history_content(content: &str, time_bucket: time::MessageTimeBucket) -> String {
+/// Maximum nesting depth for recursively expanding forwarded chat records.
+/// In practice WeChat XML is finite so recursion always terminates, but we
+/// keep a generous upper bound as a safety net against malformed data.
+const MAX_CHAT_HISTORY_DEPTH: usize = 32;
+
+fn decode_chat_history_content(
+    content: &str,
+    time_bucket: time::MessageTimeBucket,
+    depth: usize,
+) -> String {
     let title = crate::media::extract_xml_tag(content, "title")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "聊天记录".to_string());
-    let record_item = crate::media::extract_xml_tag(content, "recorditem")
-        .map(|s| strip_cdata(&s).to_string())
-        .unwrap_or_default();
 
-    let items = parse_chat_history_items(&record_item);
+    // Extract the <datalist> content to limit parsing scope.
+    // This prevents finding nested <dataitem> inside <recordxml> sub-records.
+    let datalist_content = extract_nested_xml_tag(content, "datalist");
+    let mut items = if let Some(ref dl) = datalist_content {
+        parse_chat_history_items(dl, depth)
+    } else {
+        Vec::new()
+    };
+
+    // If no items found via datalist, try extracting from a <recorditem> wrapper.
+    if items.is_empty() {
+        let record_item = extract_nested_xml_tag(content, "recorditem")
+            .map(|s| strip_cdata(&s).to_string());
+        if let Some(ref source) = record_item {
+            let dl = extract_nested_xml_tag(source, "datalist");
+            items = if let Some(ref dl_content) = dl {
+                parse_chat_history_items(dl_content, depth)
+            } else {
+                // Fallback: parse items directly from recorditem content
+                parse_chat_history_items(source, depth)
+            };
+        }
+    }
     if items.is_empty() {
         let desc = crate::media::extract_xml_tag(content, "des").unwrap_or_default();
         if desc.is_empty() {
@@ -744,7 +772,7 @@ fn decode_chat_history_content(content: &str, time_bucket: time::MessageTimeBuck
     }
 
     let mut out = format!("[聊天记录] {} ({}条)", title, items.len());
-    render_chat_history_items(&mut out, &items, time_bucket);
+    render_chat_history_items(&mut out, &items, time_bucket, depth);
     out
 }
 
@@ -756,22 +784,25 @@ fn strip_cdata(value: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
-fn parse_chat_history_items(record_info: &str) -> Vec<ChatHistoryItem> {
+fn parse_chat_history_items(record_info: &str, depth: usize) -> Vec<ChatHistoryItem> {
     let mut items = Vec::new();
     let mut rest = record_info;
 
-    while let Some(start) = rest.find("<dataitem") {
+    while let Some(start) = find_exact_tag_open(rest, "<dataitem", 0) {
         rest = &rest[start..];
         let Some(open_end) = rest.find('>') else {
             break;
         };
-        let Some(close_start) = rest[open_end + 1..].find("</dataitem>") else {
-            break;
+        // Find the matching </dataitem> accounting for nested <dataitem> tags
+        let after_open = &rest[open_end + 1..];
+        let close_start = match find_matching_close(after_open, "dataitem") {
+            Some(pos) => pos,
+            None => break,
         };
         let item_end = open_end + 1 + close_start + "</dataitem>".len();
         let item_xml = &rest[..item_end];
 
-        if let Some(item) = parse_chat_history_item(item_xml) {
+        if let Some(item) = parse_chat_history_item(item_xml, depth) {
             items.push(item);
         }
 
@@ -781,7 +812,81 @@ fn parse_chat_history_items(record_info: &str) -> Vec<ChatHistoryItem> {
     items
 }
 
-fn parse_chat_history_item(item_xml: &str) -> Option<ChatHistoryItem> {
+/// Extract the content of an XML tag, handling nested tags of the same name
+/// by counting open/close pairs.  Supports tags with attributes (e.g. `<datalist count="3">`).
+fn extract_nested_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    // Find the opening tag — could be <tag> or <tag ...attributes...>
+    let open_prefix = format!("<{}", tag);
+    let start = find_exact_tag_open(xml, &open_prefix, 0)?;
+    // Find the end of the opening tag (the '>')
+    let tag_close = xml[start..].find('>')?;
+    let value_start = start + tag_close + 1;
+    if value_start >= xml.len() {
+        return None;
+    }
+    let rest = &xml[value_start..];
+    let value_end = find_matching_close(rest, tag)?;
+    let value = crate::media::decode_xml_entities(rest[..value_end].trim());
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Find the position of the matching closing tag `</tag>` in `s`, accounting
+/// for nested occurrences of `<tag` ... `</tag>`.  Returns the byte offset
+/// within `s` of the start of the closing tag, or `None` if not found.
+fn find_matching_close(s: &str, tag: &str) -> Option<usize> {
+    let open_prefix = format!("<{}", tag);
+    let close_tag = format!("</{}>", tag);
+    let mut depth: usize = 0;
+    let mut cursor: usize = 0;
+
+    loop {
+        let next_close = s[cursor..].find(&close_tag).map(|p| cursor + p);
+        let next_close = match next_close {
+            Some(c) => c,
+            None => return None,
+        };
+        // Find all opens between cursor and next_close
+        let mut opens_before_close = 0;
+        let mut scan = cursor;
+        while let Some(pos) = find_exact_tag_open(s, &open_prefix, scan) {
+            if pos >= next_close {
+                break;
+            }
+            opens_before_close += 1;
+            scan = pos + open_prefix.len();
+        }
+        depth += opens_before_close;
+        if depth == 0 {
+            return Some(next_close);
+        }
+        depth -= 1;
+        cursor = next_close + close_tag.len();
+    }
+}
+
+/// Find the next occurrence of `prefix` in `s` starting at `from` that is
+/// actually a tag open (followed by '>', ' ', '/', '\t', '\n', '\r' or EOF).
+/// This avoids matching `<dataitemsource>` when searching for `<dataitem`.
+fn find_exact_tag_open(s: &str, prefix: &str, from: usize) -> Option<usize> {
+    let mut search_from = from;
+    loop {
+        let pos = s[search_from..].find(prefix).map(|p| search_from + p)?;
+        let after = pos + prefix.len();
+        if after >= s.len() {
+            return Some(pos);
+        }
+        match s.as_bytes()[after] {
+            b'>' | b' ' | b'/' | b'\t' | b'\n' | b'\r' => return Some(pos),
+            _ => search_from = after,
+        }
+    }
+}
+
+fn parse_chat_history_item(item_xml: &str, depth: usize) -> Option<ChatHistoryItem> {
     let source_name = crate::media::extract_xml_tag(item_xml, "sourcename")
         .or_else(|| crate::media::extract_xml_tag(item_xml, "sourcedisplayname"))
         .unwrap_or_else(|| "未知".to_string());
@@ -791,7 +896,7 @@ fn parse_chat_history_item(item_xml: &str) -> Option<ChatHistoryItem> {
         .and_then(time::parse_local_timestamp_minutes);
     let datatype =
         crate::media::extract_xml_attr(item_xml, "datatype").and_then(|s| s.parse::<i64>().ok());
-    let body = decode_chat_history_item_body(item_xml, datatype);
+    let body = decode_chat_history_item_body(item_xml, datatype, depth);
     if body.is_empty() {
         return None;
     }
@@ -804,10 +909,46 @@ fn parse_chat_history_item(item_xml: &str) -> Option<ChatHistoryItem> {
     })
 }
 
-fn decode_chat_history_item_body(item_xml: &str, datatype: Option<i64>) -> String {
+fn decode_chat_history_item_body(item_xml: &str, datatype: Option<i64>, depth: usize) -> String {
+    // Check for nested chat record FIRST. WeChat uses two formats:
+    // 1. <recorditem><![CDATA[<recordinfo>...</recordinfo>]]></recorditem>
+    //    (used in top-level forwarded messages)
+    // 2. <recordxml><recordinfo>...</recordinfo></recordxml>
+    //    (used in nested forwarded records with datatype="17")
+    // Both must be handled before falling through to <datadesc>.
+    if depth < MAX_CHAT_HISTORY_DEPTH {
+        // Try <recordxml> first (nested forward with datatype=17)
+        if item_xml.contains("<recordxml>") {
+            if let Some(nested_record) = extract_nested_xml_tag(item_xml, "recordxml") {
+                return decode_chat_history_content(
+                    &nested_record,
+                    time::MessageTimeBucket::Minute(1),
+                    depth + 1,
+                );
+            }
+        }
+        // Try <recorditem> (top-level forward style)
+        if item_xml.contains("<recorditem>") {
+            if let Some(nested_record) = extract_nested_xml_tag(item_xml, "recorditem") {
+                let nested_xml = strip_cdata(&nested_record);
+                return decode_chat_history_content(
+                    nested_xml,
+                    time::MessageTimeBucket::Minute(1),
+                    depth + 1,
+                );
+            }
+        }
+    } else if item_xml.contains("<recordxml>") || item_xml.contains("<recorditem>") {
+        // Depth limit reached — show fallback tag.
+        let title = crate::media::extract_xml_tag(item_xml, "datatitle")
+            .or_else(|| crate::media::extract_xml_tag(item_xml, "title"))
+            .unwrap_or_default();
+        return fallback_tag_with_title("记录", &title);
+    }
+
     let desc = crate::media::extract_xml_tag(item_xml, "datadesc").unwrap_or_default();
     if !desc.is_empty() {
-        return decode_embedded_history_text(&desc);
+        return decode_embedded_history_text(&desc, depth);
     }
 
     let title = crate::media::extract_xml_tag(item_xml, "datatitle")
@@ -821,13 +962,17 @@ fn decode_chat_history_item_body(item_xml: &str, datatype: Option<i64>) -> Strin
         Some(5) => fallback_tag_with_title("链接", &title),
         Some(6) => fallback_tag_with_title("位置", &title),
         Some(8) => fallback_tag_with_title("文件", &title),
-        _ if !title.is_empty() => decode_embedded_history_text(&title),
+        _ if !title.is_empty() => decode_embedded_history_text(&title, depth),
         Some(t) => format!("[记录:{}]", t),
         None => "[记录]".to_string(),
     }
 }
 
-fn decode_embedded_history_text(value: &str) -> String {
+fn decode_embedded_history_text(value: &str, depth: usize) -> String {
+    // Check for nested chat history (recordinfo XML inside text)
+    if depth < MAX_CHAT_HISTORY_DEPTH && value.contains("<recordinfo") {
+        return decode_chat_history_content(value, time::MessageTimeBucket::Minute(1), depth + 1);
+    }
     if contains_internal_xml_marker(value) {
         decode_text_with_internal_xml(value, time::MessageTimeBucket::Minute(1), &|id| {
             id.to_string()
@@ -861,10 +1006,11 @@ fn render_chat_history_items(
     out: &mut String,
     items: &[ChatHistoryItem],
     time_bucket: time::MessageTimeBucket,
+    depth: usize,
 ) {
     if time_bucket == time::MessageTimeBucket::PerMessage {
         for item in items {
-            append_chat_history_item(out, item, true, item.source_time.as_deref());
+            append_chat_history_item(out, item, true, item.source_time.as_deref(), depth);
         }
         return;
     }
@@ -876,14 +1022,14 @@ fn render_chat_history_items(
         let time_label = chat_history_time_label(item, time_bucket);
         if time_label != last_time_label {
             if let Some(label) = &time_label {
-                append_chat_history_line(out, &format!("[{}]", label));
+                append_chat_history_line(out, &format!("[{}]", label), depth);
             }
             last_time_label = time_label;
             last_sender = None;
         }
 
         let show_sender = last_sender.as_deref() != Some(item.source_name.as_str());
-        append_chat_history_item(out, item, show_sender, None);
+        append_chat_history_item(out, item, show_sender, None, depth);
         last_sender = Some(item.source_name.clone());
     }
 }
@@ -906,6 +1052,7 @@ fn append_chat_history_item(
     item: &ChatHistoryItem,
     show_sender: bool,
     inline_time: Option<&str>,
+    depth: usize,
 ) {
     let mut lines = item.body.lines();
     let Some(first) = lines.next() else {
@@ -918,7 +1065,7 @@ fn append_chat_history_item(
         (None, true) => format!("{}: {}", item.source_name, first),
         (None, false) => format!(" {}", first),
     };
-    append_chat_history_line(out, &first_line);
+    append_chat_history_line(out, &first_line, depth);
 
     for line in lines {
         let continuation = if show_sender {
@@ -926,13 +1073,15 @@ fn append_chat_history_item(
         } else {
             format!(" {}", line)
         };
-        append_chat_history_line(out, &continuation);
+        append_chat_history_line(out, &continuation, depth);
     }
 }
 
-fn append_chat_history_line(out: &mut String, line: &str) {
+fn append_chat_history_line(out: &mut String, line: &str, depth: usize) {
     out.push('\n');
-    out.push_str("        ");
+    for _ in 0..=depth {
+        out.push_str("        ");
+    }
     out.push_str(line);
 }
 
@@ -1675,6 +1824,54 @@ continues</datadesc></dataitem><dataitem datatype="1" dataid="c"><sourcename>B</
     }
 
     #[test]
+    fn test_decode_nested_chat_history() {
+        // A chat history item that itself contains a nested forwarded chat record.
+        // The inner <recorditem> is inside a <dataitem> (not wrapped in CDATA).
+        let xml = r#"<msg><appmsg><title>Outer History</title><type>19</type><recorditem><![CDATA[<recordinfo><datalist count="2"><dataitem datatype="1" dataid="a"><sourcename>A</sourcename><sourcetime>2026-05-01 10:00</sourcetime><datadesc>hello</datadesc></dataitem><dataitem datatype="19" dataid="nested"><sourcename>B</sourcename><sourcetime>2026-05-01 10:05</sourcetime><recorditem><recordinfo><title>Inner Record</title><datalist count="2"><dataitem datatype="1" dataid="x"><sourcename>C</sourcename><sourcetime>2026-05-01 09:00</sourcetime><datadesc>inner msg 1</datadesc></dataitem><dataitem datatype="1" dataid="y"><sourcename>D</sourcename><sourcetime>2026-05-01 09:01</sourcetime><datadesc>inner msg 2</datadesc></dataitem></datalist></recordinfo></recorditem></dataitem></datalist></recordinfo>]]></recorditem></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+
+        // The outer record has 2 items, the second contains a nested chat record
+        // which should be recursively expanded with deeper indentation
+        assert!(
+            d.content.starts_with("[聊天记录] Outer History (2条)"),
+            "content was: {}",
+            d.content
+        );
+        assert!(d.content.contains("A: hello"), "content was: {}", d.content);
+        assert!(
+            d.content.contains("[聊天记录] Inner Record (2条)"),
+            "content was: {}",
+            d.content
+        );
+        assert!(
+            d.content.contains("C: inner msg 1"),
+            "content was: {}",
+            d.content
+        );
+        assert!(
+            d.content.contains("D: inner msg 2"),
+            "content was: {}",
+            d.content
+        );
+    }
+
+    #[test]
+    fn test_decode_nested_chat_history_depth_limit() {
+        // With MAX_CHAT_HISTORY_DEPTH=32, all reasonable nesting levels are
+        // expanded. Build a 5-level deep nesting to verify full expansion.
+        let xml = r#"<msg><appmsg><title>L0</title><type>19</type><recorditem><![CDATA[<recordinfo><datalist count="1"><dataitem datatype="19" dataid="l1"><sourcename>A</sourcename><sourcetime>2026-05-01 10:00</sourcetime><recorditem><recordinfo><title>L1</title><datalist count="1"><dataitem datatype="19" dataid="l2"><sourcename>B</sourcename><sourcetime>2026-05-01 10:01</sourcetime><recorditem><recordinfo><title>L2</title><datalist count="1"><dataitem datatype="19" dataid="l3"><sourcename>C</sourcename><sourcetime>2026-05-01 10:02</sourcetime><recorditem><recordinfo><title>L3</title><datalist count="1"><dataitem datatype="19" dataid="l4"><sourcename>D</sourcename><sourcetime>2026-05-01 10:03</sourcetime><recorditem><recordinfo><title>L4</title><datalist count="1"><dataitem datatype="1" dataid="deep"><sourcename>E</sourcename><sourcetime>2026-05-01 10:04</sourcetime><datadesc>deepest</datadesc></dataitem></datalist></recordinfo></recorditem></dataitem></datalist></recordinfo></recorditem></dataitem></datalist></recordinfo></recorditem></dataitem></datalist></recordinfo></recorditem></dataitem></datalist></recordinfo>]]></recorditem></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+
+        // All levels should be fully expanded
+        assert!(d.content.contains("[聊天记录] L0"), "content was: {}", d.content);
+        assert!(d.content.contains("[聊天记录] L1"), "content was: {}", d.content);
+        assert!(d.content.contains("[聊天记录] L2"), "content was: {}", d.content);
+        assert!(d.content.contains("[聊天记录] L3"), "content was: {}", d.content);
+        assert!(d.content.contains("[聊天记录] L4"), "content was: {}", d.content);
+        assert!(d.content.contains("deepest"), "deepest msg should appear, content was: {}", d.content);
+    }
+
+    #[test]
     fn test_decode_quote_message() {
         let xml = r#"<msg><appmsg><title>回复内容</title><type>57</type><refermsg><type>1</type><displayname>Bob</displayname><content>引用内容</content></refermsg></appmsg></msg>"#;
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
@@ -1742,3 +1939,5 @@ continues</datadesc></dataitem><dataitem datatype="1" dataid="c"><sourcename>B</
         assert!(!d.content.contains("<appmsg"));
     }
 }
+
+
