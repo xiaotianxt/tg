@@ -41,12 +41,15 @@ If Telegram is installed somewhere else, use that `.app` path instead.
 Then run:
 
 ```bash
-sudo tg keys
+open -a Telegram
+sudo tg keys --method lldb-login --timeout 180
 tg refresh
 tg sessions --top 50
 tg "联系人" --limit 50
 tg "群名" --limit 50 --anonymous
 ```
+
+While `lldb-login` is waiting, log out of the account in Telegram and log back in once. After the captured account material validates against the local databases, later `tg keys` and `tg refresh --keys` derive keys for new database salts without another attach.
 
 ## Common Commands
 
@@ -165,7 +168,7 @@ Date, datetime, and displayed message times use the current system time zone.
 ## Troubleshooting
 
 - `Telegram is not running`: open and log in to macOS Telegram, then run `sudo tg keys`.
-- `task_for_pid failed`: quit Telegram, run `sudo codesign --force --deep --sign - /Applications/Telegram.app`, reopen Telegram, then run `sudo tg keys`.
+- `task_for_pid failed`: quit Telegram, run `sudo codesign --force --deep --sign - /Applications/Telegram.app`, reopen Telegram, then run `sudo tg keys --method lldb-login --timeout 180` and log out/in once while it waits.
 - No chats or messages found: run `tg refresh --keys`, then `tg sessions --top 50`.
 - Wrong chat matched: use `tg sessions --top 100` and rerun with the exact `tgid_...` or `...@chatroom`.
 - Missing media: open or download the media in Telegram first, then retry `tg image` or `tg export --media-dir ...`.

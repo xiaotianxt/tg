@@ -8,20 +8,24 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
-#[cfg(target_os = "macos")]
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
+    database_keys,
     decrypt::{self, DatabaseKeys},
-    dictionary, paths,
+    dictionary, key_material, paths,
 };
+
+#[cfg(target_os = "macos")]
+mod lldb;
 
 const INTERNAL_SCAN_ARG: &str = "__tg-scan-keys";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum KeyExtractionMethod {
+    Auto,
     Memory,
-    LldbCold,
+    #[value(name = "lldb-login", alias = "lldb-cold")]
+    LldbLogin,
 }
 
 #[cfg(target_os = "macos")]
@@ -195,20 +199,66 @@ fn find_db_storage_dir() -> Option<PathBuf> {
     None
 }
 
-/// Extract DB encryption keys from Telegram process memory.
-/// Runs tg's embedded macOS scanner, wrapping with sudo if not already root.
+/// Refresh database keys using cached account material when possible.
 pub fn extract_keys(timeout_secs: u64) -> Result<String, String> {
-    extract_keys_with_method(timeout_secs, KeyExtractionMethod::Memory)
+    extract_keys_with_method_and_jobs(timeout_secs, KeyExtractionMethod::Auto, 0)
 }
 
-pub(crate) fn extract_keys_with_method(
+pub(crate) fn extract_keys_with_method_and_jobs(
     timeout_secs: u64,
     method: KeyExtractionMethod,
+    jobs: usize,
 ) -> Result<String, String> {
     match method {
+        KeyExtractionMethod::Auto => extract_keys_auto(timeout_secs, jobs),
         KeyExtractionMethod::Memory => extract_keys_from_memory(timeout_secs),
-        KeyExtractionMethod::LldbCold => extract_keys_with_lldb_cold(timeout_secs),
+        KeyExtractionMethod::LldbLogin => extract_keys_with_lldb_login(timeout_secs, jobs),
     }
+}
+
+fn extract_keys_auto(timeout_secs: u64, jobs: usize) -> Result<String, String> {
+    if let Some(path) = extract_keys_from_cached_material(jobs)? {
+        return Ok(path);
+    }
+
+    extract_keys_from_memory(timeout_secs).map_err(|error| {
+        format!(
+            "{error}\n\nFor newer desktop clients, capture account key material once with:\n\n  \
+             sudo tg keys --method lldb-login --timeout 180"
+        )
+    })
+}
+
+fn extract_keys_from_cached_material(jobs: usize) -> Result<Option<String>, String> {
+    let material_path = paths::default_key_material_path();
+    let material = match key_material::load(&material_path) {
+        Ok(Some(material)) => material,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            log::warn!("Cannot use cached account key material: {error}");
+            return Ok(None);
+        }
+    };
+    let Some(db_storage) = find_db_storage_dir() else {
+        return Ok(None);
+    };
+    let keys_path = paths::default_keys_path();
+    let existing = load_existing_keys(&keys_path)?;
+    let outcome =
+        database_keys::derive_from_storage(material.as_bytes(), &db_storage, &existing, jobs)?;
+    if outcome.is_complete() || outcome.derived_databases > 0 {
+        log_derivation_outcome("cached account material", &outcome);
+        write_derivation_outcome(&keys_path, outcome)?;
+        return Ok(Some(keys_path.to_string_lossy().to_string()));
+    }
+
+    if outcome.total_databases > 0 {
+        log::warn!(
+            "Cached account key material did not cover {} database(s); a new capture is required.",
+            outcome.missing_paths.len()
+        );
+    }
+    Ok(None)
 }
 
 fn extract_keys_from_memory(timeout_secs: u64) -> Result<String, String> {
@@ -329,91 +379,95 @@ fn extract_keys_from_memory(timeout_secs: u64) -> Result<String, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn extract_keys_with_lldb_cold(timeout_secs: u64) -> Result<String, String> {
+fn extract_keys_with_lldb_login(timeout_secs: u64, jobs: usize) -> Result<String, String> {
     let db_storage = find_db_storage_dir()
         .ok_or_else(|| "Cannot find local db_storage directory.".to_string())?;
     validate_sudo_credentials(timeout_secs)?;
-
-    let app_name = dictionary::desktop_app_name();
-    quit_desktop_app_if_running(app_name)?;
+    let pid = find_telegram_pid().map_err(|e| format!("Cannot find desktop process: {e}"))?;
     let lldb_path = find_lldb_command()?;
+    let work_dir = tempfile::Builder::new()
+        .prefix("tg-lldb-material-")
+        .tempdir()
+        .map_err(|e| format!("Cannot create lldb capture directory: {e}"))?;
 
-    let work_dir = create_lldb_work_dir()?;
-    let script_path = work_dir.join("capture_keys.py");
-    let candidate_path = work_dir.join("candidate_keys.txt");
-    let log_path = work_dir.join("lldb-capture.log");
-
-    std::fs::write(&script_path, LLDB_KEY_CAPTURE_SCRIPT)
-        .map_err(|e| format!("Cannot write lldb capture script: {}", e))?;
-    restrict_key_file_permissions(&script_path);
-
-    Command::new("open")
-        .arg("-a")
-        .arg(app_name)
-        .status()
-        .map_err(|e| format!("Cannot open desktop client: {}", e))?;
-
-    let pid = wait_for_process(app_name, Duration::from_secs(10))?;
-    let capture_result = run_lldb_key_capture(LldbCaptureRequest {
+    log::info!("Waiting for account key derivation in the desktop client.");
+    log::info!("Log out of the account, then log back in within {timeout_secs} seconds.");
+    let material = lldb::capture_account_material(lldb::CaptureRequest {
         pid,
         lldb_path: &lldb_path,
-        script_path: &script_path,
-        candidate_path: &candidate_path,
-        log_path: &log_path,
-        db_storage: &db_storage,
-        work_dir: &work_dir,
+        work_dir: work_dir.path(),
         timeout_secs,
-    });
-
-    let mut combined_stdout = String::new();
-    match capture_result {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            append_labeled_output(&mut combined_stdout, "lldb output", &stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            append_labeled_output(&mut combined_stdout, "lldb error output", &stderr);
-            if !output.status.success() && !candidate_file_has_keys(&candidate_path) {
-                return Err(lldb_capture_failure_message(
-                    output.status.code(),
-                    &combined_stdout,
-                    &stderr,
-                ));
-            }
-        }
-        Err(e) => {
-            if !candidate_file_has_keys(&candidate_path) {
-                return Err(format!("{}.{}", e, lldb_log_summary(&log_path)));
-            }
-            log::warn!(
-                "lldb key capture did not exit cleanly: {}. Using captured key candidates.",
-                e
-            );
-        }
-    }
-
-    let matched = match_raw_candidate_keys(&[candidate_path], &db_storage)?;
-    let content = serde_json::to_string_pretty(&matched)
-        .map_err(|e| format!("Cannot encode keys JSON: {}", e))?
-        + "\n";
-    let key_count = count_encryption_keys(&content)?;
-    if key_count == 0 {
-        let log_summary = lldb_log_summary(&log_path);
-        return Err(format!(
-            "lldb key capture completed but found 0 matching database keys.{}{}",
-            combined_stdout, log_summary
-        ));
-    }
+    })?;
 
     let keys_path = paths::default_keys_path();
-    write_keys_file(&keys_path, &content)?;
-    cleanup_lldb_work_dir(&work_dir);
-    log::info!("Found {} database keys with lldb.", key_count);
+    let existing = load_existing_keys(&keys_path)?;
+    let outcome =
+        database_keys::derive_from_storage(material.as_bytes(), &db_storage, &existing, jobs)?;
+    if outcome.derived_databases == 0
+        && !database_keys::validates_against_storage(material.as_bytes(), &db_storage)?
+    {
+        return Err(
+            "Captured account key material did not validate against any local database."
+                .to_string(),
+        );
+    }
+
+    key_material::store(&paths::default_key_material_path(), &material)?;
+    log_derivation_outcome("captured account material", &outcome);
+    write_derivation_outcome(&keys_path, outcome)?;
     Ok(keys_path.to_string_lossy().to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn extract_keys_with_lldb_cold(_timeout_secs: u64) -> Result<String, String> {
-    Err("lldb cold key extraction is only supported on macOS.".to_string())
+fn extract_keys_with_lldb_login(_timeout_secs: u64, _jobs: usize) -> Result<String, String> {
+    Err("lldb login key extraction is only supported on macOS.".to_string())
+}
+
+fn load_existing_keys(path: &Path) -> Result<DatabaseKeys, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DatabaseKeys::new())
+        }
+        Err(error) => {
+            return Err(format!(
+                "Cannot read existing database keys {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    serde_json::from_str(&content)
+        .map_err(|error| format!("Invalid database keys file {}: {error}", path.display()))
+}
+
+fn log_derivation_outcome(label: &str, outcome: &database_keys::DerivationOutcome) {
+    log::info!(
+        "Database keys from {label}: {} reused, {} derived across {} new salt(s), {} total.",
+        outcome.reused_databases,
+        outcome.derived_databases,
+        outcome.derived_salts,
+        outcome.total_databases
+    );
+    if !outcome.missing_paths.is_empty() {
+        log::warn!(
+            "No verified key for {} database(s). Run with debug logging for source details.",
+            outcome.missing_paths.len()
+        );
+        log::debug!(
+            "Databases without a verified key: {:?}",
+            outcome.missing_paths
+        );
+    }
+}
+
+fn write_derivation_outcome(
+    path: &Path,
+    outcome: database_keys::DerivationOutcome,
+) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(&outcome.keys)
+        .map_err(|error| format!("Cannot encode database keys: {error}"))?
+        + "\n";
+    write_keys_file(path, &content)
 }
 
 fn run_scanner_process(
@@ -526,61 +580,6 @@ fn attach_sudo_tty(cmd: &mut Command) {
 }
 
 #[cfg(target_os = "macos")]
-struct LldbCaptureRequest<'a> {
-    pid: i32,
-    lldb_path: &'a Path,
-    script_path: &'a Path,
-    candidate_path: &'a Path,
-    log_path: &'a Path,
-    db_storage: &'a Path,
-    work_dir: &'a Path,
-    timeout_secs: u64,
-}
-
-#[cfg(target_os = "macos")]
-fn run_lldb_key_capture(request: LldbCaptureRequest<'_>) -> Result<Output, String> {
-    let mut cmd = Command::new("sudo");
-    cmd.arg("-n")
-        .arg("env")
-        .arg("TERM=dumb")
-        .arg(format!(
-            "TG_LLDB_DB_STORAGE={}",
-            request.db_storage.display()
-        ))
-        .arg(format!(
-            "TG_LLDB_CANDIDATE_KEYS={}",
-            request.candidate_path.display()
-        ))
-        .arg(format!("TG_LLDB_LOG={}", request.log_path.display()))
-        .arg(format!("TG_LLDB_TIMEOUT_SECONDS={}", request.timeout_secs))
-        .arg(format!(
-            "TG_LLDB_TARGET_MODULE_SUFFIX={}",
-            dictionary::target_module_suffix()
-        ))
-        .arg(request.lldb_path)
-        .arg("-b")
-        .arg("-o")
-        .arg(format!(
-            "command script import {}",
-            request.script_path.display()
-        ))
-        .arg("-o")
-        .arg(format!("process attach --pid {}", request.pid))
-        .arg("-o")
-        .arg("capture_tg_lldb_keys")
-        .arg("-o")
-        .arg("process continue")
-        .current_dir(request.work_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to run lldb key capture: {}", e))?;
-    wait_child_with_output(child, request.timeout_secs + 20, "lldb key capture")
-}
-
-#[cfg(target_os = "macos")]
 fn find_lldb_command() -> Result<PathBuf, String> {
     let output = Command::new("xcrun")
         .args(["--find", "lldb"])
@@ -602,7 +601,7 @@ fn find_lldb_command() -> Result<PathBuf, String> {
         format!(" xcrun said: {detail}")
     };
     Err(format!(
-        "lldb is required for `keys --method lldb-cold`; install Apple Command Line Tools with `xcode-select --install`.{detail}"
+        "lldb is required for `keys --method lldb-login`; install Apple Command Line Tools with `xcode-select --install`.{detail}"
     ))
 }
 
@@ -634,387 +633,6 @@ fn wait_child_with_output(
         .wait_with_output()
         .map_err(|e| format!("Failed to read {} output: {}", label, e))
 }
-
-#[cfg(target_os = "macos")]
-fn quit_desktop_app_if_running(app_name: &str) -> Result<(), String> {
-    if !process_is_running(app_name) {
-        return Ok(());
-    }
-
-    let script = format!(
-        "tell application \"{}\" to quit",
-        app_name.replace('"', "\\\"")
-    );
-    let _ = Command::new("osascript").arg("-e").arg(script).status();
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(15) {
-        if !process_is_running(app_name) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-
-    Err(format!(
-        "{} is still running. Quit it, then rerun `keys --method lldb-cold`.",
-        app_name
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn wait_for_process(app_name: &str, timeout: Duration) -> Result<i32, String> {
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        if let Ok(pid) = find_telegram_pid() {
-            return Ok(pid);
-        }
-        let output = Command::new("pgrep")
-            .arg("-x")
-            .arg(app_name)
-            .output()
-            .map_err(|e| format!("Failed to run pgrep: {}", e))?;
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(pid) = stdout
-                .lines()
-                .next()
-                .and_then(|line| line.trim().parse::<i32>().ok())
-            {
-                return Ok(pid);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Err(format!("Timed out waiting for {} to start.", app_name))
-}
-
-#[cfg(target_os = "macos")]
-fn process_is_running(app_name: &str) -> bool {
-    Command::new("pgrep")
-        .arg("-x")
-        .arg(app_name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "macos")]
-fn create_lldb_work_dir() -> Result<PathBuf, String> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("System clock error: {}", e))?
-        .as_nanos();
-    let path = PathBuf::from(format!(
-        "/private/tmp/tg-lldb-keys-{}-{}",
-        std::process::id(),
-        nanos
-    ));
-    std::fs::create_dir_all(&path)
-        .map_err(|e| format!("Cannot create lldb work dir {}: {}", path.display(), e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
-    }
-    Ok(path)
-}
-
-#[cfg(target_os = "macos")]
-fn cleanup_lldb_work_dir(path: &Path) {
-    if std::env::var_os("TG_LLDB_KEEP_WORKDIR").is_some() {
-        log::info!("Keeping lldb work dir: {}", path.display());
-        return;
-    }
-    let _ = std::fs::remove_dir_all(path);
-}
-
-#[cfg(target_os = "macos")]
-fn lldb_log_summary(path: &Path) -> String {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return String::new();
-    };
-    let mut installed = false;
-    let mut hits = 0usize;
-    let mut candidates = 0usize;
-    let mut matched = 0usize;
-    let mut detach_reason = None;
-    for line in content.lines() {
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        match record.get("event").and_then(|value| value.as_str()) {
-            Some("installed") => installed = true,
-            Some("key_setup") => {
-                hits += 1;
-                if record
-                    .get("candidate")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false)
-                {
-                    candidates += 1;
-                }
-                matched = matched.max(
-                    record
-                        .get("matched_count")
-                        .and_then(|value| value.as_u64())
-                        .unwrap_or(0) as usize,
-                );
-            }
-            Some("detach") => {
-                detach_reason = record
-                    .get("reason")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string);
-            }
-            _ => {}
-        }
-    }
-    format!(
-        "\nlldb summary: installed={}, key_setup_hits={}, candidates={}, matched_dbs={}, detach={}",
-        installed,
-        hits,
-        candidates,
-        matched,
-        detach_reason.unwrap_or_else(|| "unknown".to_string())
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn candidate_file_has_keys(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|content| {
-            content.lines().any(|line| {
-                let key = line.trim();
-                key.len() == 64 && key.as_bytes().iter().copied().all(is_hex_byte)
-            })
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "macos")]
-const LLDB_KEY_CAPTURE_SCRIPT: &str = r#"
-import binascii
-import glob
-import hashlib
-import hmac
-import json
-import os
-import threading
-import time
-from pathlib import Path
-
-import lldb
-
-KEY_SETUP_OFFSET = 0x4B287C4
-PAGE_SZ = 4096
-SALT_SZ = 16
-HMAC_SZ = 64
-MAX_HITS = 96
-
-DB_STORAGE = os.environ["TG_LLDB_DB_STORAGE"]
-CANDIDATE_PATH = os.environ["TG_LLDB_CANDIDATE_KEYS"]
-LOG_PATH = os.environ["TG_LLDB_LOG"]
-TIMEOUT_SECONDS = int(os.environ.get("TG_LLDB_TIMEOUT_SECONDS", "60"))
-TARGET_MODULE_SUFFIX = os.environ["TG_LLDB_TARGET_MODULE_SUFFIX"]
-
-_hits = 0
-_seen_keys = set()
-_matched = set()
-_db_pages = []
-_timer_started = False
-
-
-def _log(record):
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
-        f.flush()
-
-
-def _make_private_to_invoking_user(path):
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-    try:
-        uid = int(os.environ.get("SUDO_UID", ""))
-        gid = int(os.environ.get("SUDO_GID", ""))
-    except ValueError:
-        return
-    try:
-        os.chown(path, uid, gid)
-    except OSError:
-        pass
-
-
-def _db_rel_path(path):
-    text = str(path)
-    marker = "/db_storage/"
-    if marker in text:
-        return text.split(marker, 1)[1]
-    try:
-        return str(path.relative_to(DB_STORAGE))
-    except Exception:
-        return path.name
-
-
-def _load_db_pages():
-    pages = []
-    for path_text in glob.glob(os.path.join(DB_STORAGE, "**", "*.db"), recursive=True):
-        path = Path(path_text)
-        try:
-            page = path.read_bytes()[:PAGE_SZ]
-        except OSError:
-            continue
-        if len(page) != PAGE_SZ or page[:16] == b"SQLite format 3\x00":
-            continue
-        pages.append((_db_rel_path(path), page))
-    return pages
-
-
-def _key_matches_page(key, page):
-    salt = page[:SALT_SZ]
-    page1 = page[SALT_SZ:PAGE_SZ]
-    mac_salt = bytes(byte ^ 0x3A for byte in salt)
-    mac_key = hashlib.pbkdf2_hmac("sha512", key, mac_salt, 2, 32)
-    digest = hmac.new(mac_key, page1[:-HMAC_SZ] + b"\x01\x00\x00\x00", "sha512").digest()
-    return hmac.compare_digest(digest, page1[-HMAC_SZ:])
-
-
-def _matches_for_key(key):
-    return [rel for rel, page in _db_pages if _key_matches_page(key, page)]
-
-
-def _read_memory(process, address, size):
-    if not address or size <= 0:
-        return None
-    error = lldb.SBError()
-    data = process.ReadMemory(address, size, error)
-    if not error.Success() or not data:
-        return None
-    return data
-
-
-def _candidate_key(raw):
-    if not raw:
-        return None
-    if raw.startswith(b"x'"):
-        raw = raw[2:]
-    raw = raw.rstrip(b"'")
-    try:
-        if len(raw) >= 64 and all(chr(byte).lower() in "0123456789abcdef" for byte in raw[:64]):
-            key = bytes.fromhex(raw[:64].decode("ascii"))
-        else:
-            key = raw[:32]
-    except Exception:
-        key = raw[:32]
-    if len(key) != 32:
-        return None
-    return key
-
-
-def _target_module_text_load(target):
-    for module in target.module_iter():
-        file_spec = module.GetFileSpec()
-        path = os.path.join(file_spec.GetDirectory() or "", file_spec.GetFilename() or "")
-        if path.endswith(TARGET_MODULE_SUFFIX):
-            text = module.FindSection("__TEXT")
-            if text and text.IsValid():
-                return text.GetLoadAddress(target), path
-    return None, None
-
-
-def _detach_and_exit(debugger, reason):
-    _log({"event": "detach", "reason": reason, "matched_count": len(_matched), "hits": _hits})
-    process = debugger.GetSelectedTarget().GetProcess()
-    if process and process.IsValid():
-        process.Detach()
-    os._exit(0)
-
-
-def _start_timeout(debugger):
-    global _timer_started
-    if _timer_started:
-        return
-    _timer_started = True
-
-    def worker():
-        time.sleep(TIMEOUT_SECONDS)
-        _detach_and_exit(debugger, "timeout")
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-
-
-def on_key_setup(frame, bp_loc, internal_dict):
-    global _hits
-    _hits += 1
-    process = frame.GetThread().GetProcess()
-    key_ptr = frame.FindRegister("x1").GetValueAsUnsigned()
-    key_len = frame.FindRegister("x2").GetValueAsUnsigned()
-    key = None
-    if key_ptr and key_len in (32, 48, 64, 66, 67, 96, 99):
-        key = _candidate_key(_read_memory(process, key_ptr, int(key_len)))
-
-    matches = []
-    candidate = False
-    if key:
-        key_hex = binascii.hexlify(key).decode("ascii")
-        if key_hex not in _seen_keys:
-            _seen_keys.add(key_hex)
-            candidate = True
-            with open(CANDIDATE_PATH, "a", encoding="utf-8") as f:
-                f.write(key_hex + "\n")
-                f.flush()
-        matches = _matches_for_key(key)
-        _matched.update(matches)
-
-    _log({
-        "event": "key_setup",
-        "key_len": key_len,
-        "candidate": candidate,
-        "matches": matches,
-        "matched_count": len(_matched),
-        "hits": _hits,
-    })
-
-    debugger = process.GetTarget().GetDebugger()
-    if len(_matched) >= len(_db_pages) and _db_pages:
-        _detach_and_exit(debugger, "all_dbs_matched")
-    if _hits >= MAX_HITS:
-        _detach_and_exit(debugger, "max_hits")
-    return False
-
-
-def install(debugger, command, result, internal_dict):
-    global _db_pages
-    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-    open(LOG_PATH, "w", encoding="utf-8").close()
-    open(CANDIDATE_PATH, "w", encoding="utf-8").close()
-    _make_private_to_invoking_user(LOG_PATH)
-    _make_private_to_invoking_user(CANDIDATE_PATH)
-    _db_pages = _load_db_pages()
-    target = debugger.GetSelectedTarget()
-    _start_timeout(debugger)
-    text_load, module_path = _target_module_text_load(target)
-    if text_load is None:
-        result.SetError("cannot find target database module text load address")
-        return
-    bp = target.BreakpointCreateByAddress(text_load + KEY_SETUP_OFFSET)
-    bp.SetScriptCallbackFunction("capture_keys.on_key_setup")
-    bp.SetAutoContinue(True)
-    _log({
-        "event": "installed",
-        "db_pages": len(_db_pages),
-        "locations": bp.GetNumLocations(),
-        "offset": hex(KEY_SETUP_OFFSET),
-    })
-    result.PutCString("installed lldb key capture")
-
-
-def __lldb_init_module(debugger, internal_dict):
-    debugger.HandleCommand("command script add -f capture_keys.install capture_tg_lldb_keys")
-"#;
 
 fn append_scan_log(target: &mut String, pid: i32, text: &str) {
     if text.trim().is_empty() {
@@ -1115,7 +733,18 @@ fn write_keys_file(keys_path: &std::path::Path, content: &str) -> Result<(), Str
     }
     std::fs::write(keys_path, content)
         .map_err(|e| format!("Cannot write keys file {}: {}", keys_path.display(), e))?;
-    restrict_key_file_permissions(keys_path);
+    restrict_key_file_permissions(keys_path).map_err(|e| {
+        format!(
+            "Cannot restrict database key permissions for {}: {e}",
+            keys_path.display()
+        )
+    })?;
+    paths::restore_invoking_user_ownership(keys_path).map_err(|e| {
+        format!(
+            "Cannot restore database key ownership for {}: {e}",
+            keys_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -1142,7 +771,7 @@ fn match_raw_candidate_keys(
         return Ok(matched);
     }
 
-    for source in load_source_db_pages(db_storage)? {
+    for source in database_keys::load_encrypted_database_pages(db_storage)? {
         for candidate in &candidates {
             if decrypt::key_bytes_match_page1(&candidate.bytes, &source.page1) {
                 matched
@@ -1161,11 +790,6 @@ struct CandidateKey {
     bytes: Vec<u8>,
 }
 
-struct SourceDbPage {
-    rel_path: String,
-    page1: Vec<u8>,
-}
-
 fn decode_candidate_keys(candidate_set: BTreeSet<String>) -> Result<Vec<CandidateKey>, String> {
     candidate_set
         .into_iter()
@@ -1175,19 +799,6 @@ fn decode_candidate_keys(candidate_set: BTreeSet<String>) -> Result<Vec<Candidat
             Ok(CandidateKey { hex, bytes })
         })
         .collect()
-}
-
-fn load_source_db_pages(db_storage: &std::path::Path) -> Result<Vec<SourceDbPage>, String> {
-    let mut pages = Vec::new();
-    for source in decrypt::collect_db_files(db_storage) {
-        if let Some(page1) = decrypt::read_encrypted_page1(&source.full_path)? {
-            pages.push(SourceDbPage {
-                rel_path: source.rel_path,
-                page1,
-            });
-        }
-    }
-    Ok(pages)
 }
 
 fn read_raw_candidate_keys(path: &std::path::Path) -> Result<Vec<String>, String> {
@@ -1218,14 +829,16 @@ fn zero_key_scan_message(stdout: &str, stderr: &str, keys_path: &std::path::Path
 }
 
 #[cfg(unix)]
-fn restrict_key_file_permissions(path: &std::path::Path) {
+fn restrict_key_file_permissions(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(not(unix))]
-fn restrict_key_file_permissions(_path: &std::path::Path) {}
+fn restrict_key_file_permissions(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 fn scanner_failure_message(code: Option<i32>, stdout: &str, stderr: &str) -> String {
     let mut message = format!("Scanner failed with exit code {:?}.", code);
@@ -1235,40 +848,6 @@ fn scanner_failure_message(code: Option<i32>, stdout: &str, stderr: &str) -> Str
     message
 }
 
-#[cfg(target_os = "macos")]
-fn lldb_capture_failure_message(code: Option<i32>, output: &str, error_output: &str) -> String {
-    let mut message = format!(
-        "lldb key capture failed with exit code {:?}.{}",
-        code, output
-    );
-    append_lldb_recovery_hint(&mut message, error_output);
-    message
-}
-
-#[cfg(target_os = "macos")]
-fn append_lldb_recovery_hint(message: &mut String, error_output: &str) {
-    let lower = error_output.to_ascii_lowercase();
-    if !lower.contains("not allowed to attach")
-        && !lower.contains("attach failed")
-        && !lower.contains("task_for_pid")
-    {
-        return;
-    }
-
-    message.push_str(
-        "\n\nmacOS denied the lldb/debugserver attach. This usually means Developer Tools \
-         permission is not enabled for this terminal.\n\n",
-    );
-    message.push_str("Run once:\n\n");
-    message.push_str("  sudo DevToolsSecurity -enable\n\n");
-    message.push_str(
-        "Then open System Settings -> Privacy & Security -> Developer Tools and enable your terminal app. \
-         Quit and reopen that terminal, then rerun:\n\n",
-    );
-    message.push_str("  sudo tg keys --method lldb-cold --timeout 90");
-}
-
-#[cfg(target_os = "macos")]
 fn append_scanner_recovery_hint(message: &mut String) {
     message.push_str("\n\nIf key extraction failed with `task_for_pid failed` or another macOS process permission error, quit Telegram, re-sign it, reopen it, then retry:\n\n");
     message.push_str("  sudo codesign --force --deep --sign - /Applications/Telegram.app\n");
@@ -1581,21 +1160,6 @@ mod tests {
         assert!(message.contains("Output:\nTelegram PID: 123"));
         assert!(message.contains("Error output:\ntask_for_pid failed: 5"));
         assert!(message.contains("sudo tg keys"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn lldb_attach_denial_message_points_to_developer_tools_permission() {
-        let message = lldb_capture_failure_message(
-            Some(1),
-            "\nlldb output:\n(lldb) process attach --pid 123\n",
-            "error: attach failed (Not allowed to attach to process.)",
-        );
-
-        assert!(message.contains("lldb key capture failed with exit code Some(1)."));
-        assert!(message.contains("sudo DevToolsSecurity -enable"));
-        assert!(message.contains("Developer Tools"));
-        assert!(message.contains("sudo tg keys --method lldb-cold --timeout 90"));
     }
 
     #[test]

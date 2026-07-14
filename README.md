@@ -211,25 +211,26 @@ xcode-select --install
 1. 打开并登录本机 Telegram 桌面版。
 2. 提取数据库密钥：
 
-   macOS 推荐先走冷启动提取路径。注意：`codesign` 只影响下一次启动的进程；如果 Telegram 已经在运行，对正在运行的 PID 重签没有用。
+   macOS 新版客户端只在登录时使用账号级 key material 派生每个数据库的独立 key。注意：`codesign` 只影响下一次启动的进程；如果 Telegram 已经在运行，对正在运行的 PID 重签没有用。
 
    ```bash
    sudo DevToolsSecurity -enable
    osascript -e 'quit app "Telegram"'
    while pgrep -x Telegram >/dev/null; do sleep 1; done
    sudo codesign --force --deep --sign - /Applications/Telegram.app
-   sudo tg keys --method lldb-cold --timeout 90
+   open -a Telegram
+   sudo tg keys --method lldb-login --timeout 180
    ```
 
-   `lldb-cold` 会重新打开 Telegram 并在启动路径里捕获 key。它需要 Apple Command Line Tools；如果本机没有 `lldb`，先运行 `xcode-select --install`。如果 macOS 弹出 Developer Tools 权限提示，请允许当前终端应用；如果没有弹窗但报 `Not allowed to attach to process`，到 System Settings -> Privacy & Security -> Developer Tools 里启用当前终端应用，退出并重新打开终端后再重试。如果你的 Telegram 不在 `/Applications/Telegram.app`，把上面的 App 路径换成实际路径。
+   启动 `lldb-login` 后，在等待时间内从 Telegram **退出账号并重新登录**。tg 会在公开系统函数 `CCKeyDerivationPBKDF` 上捕获一次账号级 key material，再按每个数据库自己的 salt 并行派生并验证独立 key。它需要 Apple Command Line Tools；如果本机没有 `lldb`，先运行 `xcode-select --install`。如果 macOS 弹出 Developer Tools 权限提示，请允许当前终端应用；如果没有弹窗但报 `Not allowed to attach to process`，到 System Settings -> Privacy & Security -> Developer Tools 里启用当前终端应用，退出并重新打开终端后再重试。旧命令名 `lldb-cold` 仍作为兼容 alias 保留。
 
-   Linux 或已经完成 macOS 重签并打开客户端时，也可以用默认内存扫描：
+   后续直接运行默认 `auto` 路径即可。它优先复用 `~/.tg/key_material.bin`，已有 key 会先做第一页 HMAC 验证，只有新 salt 才执行 PBKDF2；旧版客户端或 Linux 没有缓存材料时再回退到内存扫描：
 
    ```bash
    sudo tg keys
    ```
 
-   成功后密钥会保存到 `~/.tg/all_keys.json`。
+   成功后派生的数据库密钥会保存到 `~/.tg/all_keys.json`。账号级材料单独保存在权限为 `0600` 的 `~/.tg/key_material.bin`，不会写入日志或命令输出。
 
 3. 刷新本地缓存和近期消息索引：
 
@@ -271,12 +272,13 @@ sudo DevToolsSecurity -enable
 osascript -e 'quit app "Telegram"'
 while pgrep -x Telegram >/dev/null; do sleep 1; done
 sudo codesign --force --deep --sign - /Applications/Telegram.app
-sudo tg keys --method lldb-cold --timeout 90
+open -a Telegram
+sudo tg keys --method lldb-login --timeout 180
 ```
 
-如果输出里有 `Not allowed to attach to process`，打开 System Settings -> Privacy & Security -> Developer Tools，启用当前终端应用，退出并重新打开终端后再运行上面的命令。
+命令开始等待后，需要在 Telegram 中退出账号并重新登录以触发派生。如果输出里有 `Not allowed to attach to process`，打开 System Settings -> Privacy & Security -> Developer Tools，启用当前终端应用，退出并重新打开终端后再运行上面的命令。
 
-如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径。`lldb-cold` 会自己重新打开 Telegram；如果仍要用默认内存扫描，则在重签后手动打开 Telegram，再运行 `sudo tg keys` 或 `tg refresh --keys`。
+如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径。要强制使用旧版内存模式，可运行 `sudo tg keys --method memory`。
 
 Linux 上需要保持桌面客户端打开；如果普通用户无法读取进程内存，直接运行 `sudo tg keys`。
 
@@ -464,6 +466,7 @@ tg voice "张三" --id 123 --format wav
 默认会生成这些文件或目录：
 
 - `~/.tg/all_keys.json`：数据库密钥。
+- `~/.tg/key_material.bin`：新版客户端的账号级 key material，版本化二进制格式，权限 `0600`；新数据库出现时用于离线派生对应 key。
 - `~/.tg/decrypted/`：解密后的 SQLite 数据库。
 - `~/.tg/decrypted/.tg_index.db`：`refresh` 维护的本地热索引，默认查询和导出会优先使用；可删除后重新 `refresh` 构建。
 - `exported/`：导出的聊天和媒体，默认位于当前目录。
@@ -490,7 +493,8 @@ sudo DevToolsSecurity -enable
 osascript -e 'quit app "Telegram"'
 while pgrep -x Telegram >/dev/null; do sleep 1; done
 sudo codesign --force --deep --sign - /Applications/Telegram.app
-sudo tg keys --method lldb-cold --timeout 90
+open -a Telegram
+sudo tg keys --method lldb-login --timeout 180
 ```
 
 如果本机没有 Apple `lldb`，先安装 Command Line Tools：
@@ -501,7 +505,7 @@ xcode-select --install
 
 如果 `lldb` 输出 `Not allowed to attach to process`，打开 System Settings -> Privacy & Security -> Developer Tools，启用当前终端应用，退出并重新打开终端后再重试。
 
-如果继续用默认内存扫描，重签后要先重新打开 Telegram，再运行 `sudo tg keys`。
+捕获命令开始等待后，在 Telegram 中退出账号并重新登录。捕获成功并通过数据库第一页 HMAC 验证后，日常 `tg keys` / `tg refresh --keys` 会复用本地 key material，不再 attach。要诊断旧版内存路径时显式加 `--method memory`。
 
 ### `No sessions found`
 
@@ -589,7 +593,10 @@ scripts/perf_regression.sh --baseline v1.4.2 --candidate WORKTREE --session "张
 
 项目入口是 `src/main.rs`。主要模块：
 
-- `src/scanner.rs`：运行内嵌的 macOS/Linux 密钥扫描器。
+- `src/scanner.rs`：选择缓存派生、旧版内存扫描或平台捕获策略。
+- `src/scanner/lldb.rs`：macOS 上按公开 PBKDF2 系统符号捕获账号级 key material。
+- `src/database_keys.rs`：唯一 salt 去重、并行 PBKDF2、第一页 HMAC 验证和 key 映射。
+- `src/key_material.rs`：账号级 key material 的版本化私有存储与内存清理。
 - `src/decrypt.rs`：数据库解密。
 - `src/db.rs`：会话、联系人和消息查询。
 - `src/message.rs`：消息类型解析。

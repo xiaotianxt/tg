@@ -40,6 +40,7 @@ chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
 zstd = "0.13"
 log = "0.4"
+zeroize = "1"
 
 [build-dependencies]
 cc = "1"

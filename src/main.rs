@@ -2,12 +2,14 @@ mod cache;
 mod completion;
 mod completion_values;
 mod contact;
+mod database_keys;
 mod db;
 mod decrypt;
 mod dictionary;
 mod doctor;
 mod export;
 mod index_policy;
+mod key_material;
 mod logger;
 mod media;
 mod media_decrypt;
@@ -126,14 +128,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Extract DB encryption keys from Telegram process memory (requires sudo)
+    /// Refresh DB encryption keys from cached or captured account material
     Keys {
         /// Timeout in seconds
-        #[arg(long, default_value = "30")]
+        #[arg(
+            long,
+            default_value = "30",
+            default_value_if("method", "lldb-login", "180"),
+            default_value_if("method", "lldb-cold", "180")
+        )]
         timeout: u64,
         /// Key extraction method
-        #[arg(long, value_enum, default_value_t = KeyExtractionMethod::Memory)]
-        method: KeyExtractionMethod,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = scanner::KeyExtractionMethod::Auto
+        )]
+        method: scanner::KeyExtractionMethod,
+        /// Number of parallel key-derivation jobs (0 = auto)
+        #[arg(long, default_value_t = 0)]
+        jobs: usize,
     },
     /// Decrypt all encrypted databases using extracted keys
     Decrypt {
@@ -669,25 +683,17 @@ enum CompleteKind {
     Words,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum KeyExtractionMethod {
-    Memory,
-    LldbCold,
-}
-
 fn main() {
     logger::init();
     scanner::maybe_run_internal_scanner();
     let cli = Cli::parse_from(normalize_args_for_default_messages(std::env::args_os()));
 
     match cli.command {
-        Commands::Keys { timeout, method } => match scanner::extract_keys_with_method(
+        Commands::Keys {
             timeout,
-            match method {
-                KeyExtractionMethod::Memory => scanner::KeyExtractionMethod::Memory,
-                KeyExtractionMethod::LldbCold => scanner::KeyExtractionMethod::LldbCold,
-            },
-        ) {
+            method,
+            jobs,
+        } => match scanner::extract_keys_with_method_and_jobs(timeout, method, jobs) {
             Ok(path) => print_output(format_args!("Keys saved to: {}", path)),
             Err(e) => {
                 log::error!("Error: {}", e);
@@ -1417,6 +1423,35 @@ mod tests {
             normalize_args_for_default_messages(args(&["tg", "help", "messages"])),
             args(&["tg", "help", "messages"])
         );
+    }
+
+    #[test]
+    fn keys_defaults_to_auto_material_reuse_and_accepts_job_count() {
+        let cli = Cli::parse_from(args(&["tg", "keys", "--jobs", "3"]));
+        match cli.command {
+            Commands::Keys {
+                timeout,
+                method,
+                jobs,
+            } => {
+                assert_eq!(timeout, 30);
+                assert!(matches!(method, scanner::KeyExtractionMethod::Auto));
+                assert_eq!(jobs, 3);
+            }
+            _ => panic!("expected keys command"),
+        }
+
+        let cli = Cli::parse_from(args(&["tg", "keys", "--method", "lldb-login"]));
+        match cli.command {
+            Commands::Keys { timeout, .. } => assert_eq!(timeout, 180),
+            _ => panic!("expected keys command"),
+        }
+
+        let cli = Cli::parse_from(args(&["tg", "keys", "--method", "lldb-cold"]));
+        match cli.command {
+            Commands::Keys { timeout, .. } => assert_eq!(timeout, 180),
+            _ => panic!("expected keys command"),
+        }
     }
 
     #[test]
