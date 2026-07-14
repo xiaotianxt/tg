@@ -848,6 +848,7 @@ fn scanner_failure_message(code: Option<i32>, stdout: &str, stderr: &str) -> Str
     message
 }
 
+#[cfg(target_os = "macos")]
 fn append_scanner_recovery_hint(message: &mut String) {
     message.push_str("\n\nIf key extraction failed with `task_for_pid failed` or another macOS process permission error, quit Telegram, re-sign it, reopen it, then retry:\n\n");
     message.push_str("  sudo codesign --force --deep --sign - /Applications/Telegram.app\n");
