@@ -145,32 +145,26 @@ pub(super) fn runtime_address(
     let maps_path = PathBuf::from(format!("/proc/{}/maps", identity.pid));
     let maps = std::fs::read_to_string(&maps_path)
         .map_err(|error| format!("Cannot read {}: {error}", maps_path.display()))?;
-    let expected_major = u64::from(libc::major(identity.executable_device));
-    let expected_minor = u64::from(libc::minor(identity.executable_device));
+    let expected_inode = identity.executable_inode;
+    let expected_path = identity.executable_path.to_string_lossy();
 
     for line in maps.lines() {
         let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() < 5 || !fields[1].contains('x') {
+        if fields.len() < 6 || !fields[1].contains('x') {
             continue;
         }
         let Some((start_text, end_text)) = fields[0].split_once('-') else {
             continue;
         };
-        let Some((major_text, minor_text)) = fields[3].split_once(':') else {
-            continue;
-        };
-        let (Ok(start), Ok(end), Ok(mapping_offset), Ok(major), Ok(minor), Ok(inode)) = (
+        let (Ok(start), Ok(end), Ok(mapping_offset), Ok(inode)) = (
             u64::from_str_radix(start_text, 16),
             u64::from_str_radix(end_text, 16),
             u64::from_str_radix(fields[2], 16),
-            u64::from_str_radix(major_text, 16),
-            u64::from_str_radix(minor_text, 16),
             fields[4].parse::<u64>(),
         ) else {
             continue;
         };
-        if major != expected_major || minor != expected_minor || inode != identity.executable_inode
-        {
+        if inode != expected_inode || fields[5] != expected_path {
             continue;
         }
         let mapping_size = end.saturating_sub(start);
