@@ -15,6 +15,12 @@ use crate::{
     dictionary, key_material, paths,
 };
 
+#[cfg(target_os = "linux")]
+mod elf_locator;
+#[cfg(target_os = "linux")]
+mod gdb;
+#[cfg(target_os = "linux")]
+mod linux_process;
 #[cfg(target_os = "macos")]
 mod lldb;
 
@@ -24,8 +30,13 @@ const INTERNAL_SCAN_ARG: &str = "__tg-scan-keys";
 pub(crate) enum KeyExtractionMethod {
     Auto,
     Memory,
-    #[value(name = "lldb-login", alias = "lldb-cold")]
-    LldbLogin,
+    #[value(
+        name = "login",
+        alias = "lldb-login",
+        alias = "lldb-cold",
+        alias = "gdb-login"
+    )]
+    Login,
 }
 
 #[cfg(target_os = "macos")]
@@ -209,10 +220,13 @@ pub(crate) fn extract_keys_with_method_and_jobs(
     method: KeyExtractionMethod,
     jobs: usize,
 ) -> Result<String, String> {
+    if method == KeyExtractionMethod::Login && timeout_secs == 0 {
+        return Err("Login key capture requires a timeout greater than zero.".to_string());
+    }
     match method {
         KeyExtractionMethod::Auto => extract_keys_auto(timeout_secs, jobs),
         KeyExtractionMethod::Memory => extract_keys_from_memory(timeout_secs),
-        KeyExtractionMethod::LldbLogin => extract_keys_with_lldb_login(timeout_secs, jobs),
+        KeyExtractionMethod::Login => extract_keys_with_login_capture(timeout_secs, jobs),
     }
 }
 
@@ -224,7 +238,7 @@ fn extract_keys_auto(timeout_secs: u64, jobs: usize) -> Result<String, String> {
     extract_keys_from_memory(timeout_secs).map_err(|error| {
         format!(
             "{error}\n\nFor newer desktop clients, capture account key material once with:\n\n  \
-             sudo tg keys --method lldb-login --timeout 180"
+             sudo tg keys --method login --timeout 180"
         )
     })
 }
@@ -379,7 +393,7 @@ fn extract_keys_from_memory(timeout_secs: u64) -> Result<String, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn extract_keys_with_lldb_login(timeout_secs: u64, jobs: usize) -> Result<String, String> {
+fn extract_keys_with_login_capture(timeout_secs: u64, jobs: usize) -> Result<String, String> {
     let db_storage = find_db_storage_dir()
         .ok_or_else(|| "Cannot find local db_storage directory.".to_string())?;
     validate_sudo_credentials(timeout_secs)?;
@@ -399,12 +413,57 @@ fn extract_keys_with_lldb_login(timeout_secs: u64, jobs: usize) -> Result<String
         timeout_secs,
     })?;
 
+    finish_login_capture(material, &db_storage, jobs)
+}
+
+#[cfg(target_os = "linux")]
+fn extract_keys_with_login_capture(timeout_secs: u64, jobs: usize) -> Result<String, String> {
+    let db_storage = find_db_storage_dir()
+        .ok_or_else(|| "Cannot find local db_storage directory.".to_string())?;
+    let identity =
+        linux_process::find_invoking_user_main_process(dictionary::desktop_app_process())?;
+    let binary_path = identity.proc_exe_path();
+    let hook = elf_locator::find_hook(&binary_path)?;
+    identity.verify()?;
+    let runtime_address = elf_locator::runtime_address(&identity, hook.file_offset)?;
+    let gdb_path = find_gdb_command()?;
+    let work_dir = tempfile::Builder::new()
+        .prefix("tg-gdb-material-")
+        .tempdir_in("/tmp")
+        .map_err(|error| format!("Cannot create gdb capture directory: {error}"))?;
+
+    log::info!("Waiting for account key derivation in the desktop client.");
+    log::info!("Log out of the account, then log back in within {timeout_secs} seconds.");
+    let material = gdb::capture_account_material(gdb::CaptureRequest {
+        identity: &identity,
+        gdb_path: &gdb_path,
+        work_dir: work_dir.path(),
+        runtime_address,
+        code_fingerprint: &hook.code_fingerprint,
+        architecture: hook.architecture,
+        timeout_secs,
+    })?;
+
+    finish_login_capture(material, &db_storage, jobs)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn extract_keys_with_login_capture(_timeout_secs: u64, _jobs: usize) -> Result<String, String> {
+    Err("Login key extraction is only supported on macOS and Linux.".to_string())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn finish_login_capture(
+    material: key_material::AccountKeyMaterial,
+    db_storage: &Path,
+    jobs: usize,
+) -> Result<String, String> {
     let keys_path = paths::default_keys_path();
     let existing = load_existing_keys(&keys_path)?;
     let outcome =
-        database_keys::derive_from_storage(material.as_bytes(), &db_storage, &existing, jobs)?;
+        database_keys::derive_from_storage(material.as_bytes(), db_storage, &existing, jobs)?;
     if outcome.derived_databases == 0
-        && !database_keys::validates_against_storage(material.as_bytes(), &db_storage)?
+        && !database_keys::validates_against_storage(material.as_bytes(), db_storage)?
     {
         return Err(
             "Captured account key material did not validate against any local database."
@@ -416,11 +475,6 @@ fn extract_keys_with_lldb_login(timeout_secs: u64, jobs: usize) -> Result<String
     log_derivation_outcome("captured account material", &outcome);
     write_derivation_outcome(&keys_path, outcome)?;
     Ok(keys_path.to_string_lossy().to_string())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn extract_keys_with_lldb_login(_timeout_secs: u64, _jobs: usize) -> Result<String, String> {
-    Err("lldb login key extraction is only supported on macOS.".to_string())
 }
 
 fn load_existing_keys(path: &Path) -> Result<DatabaseKeys, String> {
@@ -601,8 +655,50 @@ fn find_lldb_command() -> Result<PathBuf, String> {
         format!(" xcrun said: {detail}")
     };
     Err(format!(
-        "lldb is required for `keys --method lldb-login`; install Apple Command Line Tools with `xcode-select --install`.{detail}"
+        "lldb is required for `keys --method login`; install Apple Command Line Tools with `xcode-select --install`.{detail}"
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn find_gdb_command() -> Result<PathBuf, String> {
+    for candidate in ["/usr/bin/gdb", "/bin/gdb", "/usr/local/bin/gdb"] {
+        let candidate = PathBuf::from(candidate);
+        let Ok(canonical) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
+        if trusted_root_executable(&canonical) {
+            return Ok(canonical);
+        }
+    }
+    Err(
+        "gdb is required for `keys --method login`; install it with `sudo apt install gdb`."
+            .to_string(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_root_executable(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let mode = metadata.permissions().mode();
+    if !metadata.is_file() || metadata.uid() != 0 || mode & 0o111 == 0 || mode & 0o022 != 0 {
+        return false;
+    }
+
+    let mut parent = path.parent();
+    while let Some(directory) = parent {
+        let Ok(metadata) = std::fs::metadata(directory) else {
+            return false;
+        };
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
+            return false;
+        }
+        parent = directory.parent();
+    }
+    true
 }
 
 #[cfg(target_os = "macos")]

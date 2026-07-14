@@ -142,7 +142,7 @@ fn with_attach_recovery_hint(mut message: String, error_output: &str) -> String 
         "\n\nmacOS denied the lldb/debugserver attach. Enable Developer Tools access for \
          this terminal, restart the terminal, and retry. You can initialize the system setting \
          with:\n\n  sudo DevToolsSecurity -enable\n\nThen rerun:\n\n  \
-         sudo tg keys --method lldb-login --timeout 180",
+         sudo tg keys --method login --timeout 180",
     );
     message
 }
@@ -287,7 +287,7 @@ mod tests {
 
         assert!(message.contains("sudo DevToolsSecurity -enable"));
         assert!(message.contains("Developer Tools"));
-        assert!(message.contains("sudo tg keys --method lldb-login --timeout 180"));
+        assert!(message.contains("sudo tg keys --method login --timeout 180"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "tg"
-version = "1.4.26"
+version = "1.5.0"
 edition = "2021"
 description = "本地 Telegram 桌面聊天记录读取 CLI 工具"
 authors = ["xiaotianxt"]
@@ -41,6 +41,13 @@ flate2 = "1"
 zstd = "0.13"
 log = "0.4"
 zeroize = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gimli = { version = "0.34", default-features = false, features = ["read"] }
+libc = "0.2"
+object = { version = "0.39", default-features = false, features = ["elf", "read", "std"] }
+yaxpeax-arch = { version = "0.3", default-features = false }
+yaxpeax-arm = { version = "0.4", default-features = false }
 
 [build-dependencies]
 cc = "1"

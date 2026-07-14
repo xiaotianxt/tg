@@ -219,12 +219,19 @@ xcode-select --install
    while pgrep -x Telegram >/dev/null; do sleep 1; done
    sudo codesign --force --deep --sign - /Applications/Telegram.app
    open -a Telegram
-   sudo tg keys --method lldb-login --timeout 180
+   sudo tg keys --method login --timeout 180
    ```
 
-   启动 `lldb-login` 后，在等待时间内从 Telegram **退出账号并重新登录**。tg 会在公开系统函数 `CCKeyDerivationPBKDF` 上捕获一次账号级 key material，再按每个数据库自己的 salt 并行派生并验证独立 key。它需要 Apple Command Line Tools；如果本机没有 `lldb`，先运行 `xcode-select --install`。如果 macOS 弹出 Developer Tools 权限提示，请允许当前终端应用；如果没有弹窗但报 `Not allowed to attach to process`，到 System Settings -> Privacy & Security -> Developer Tools 里启用当前终端应用，退出并重新打开终端后再重试。旧命令名 `lldb-cold` 仍作为兼容 alias 保留。
+   启动 `login` 后，在等待时间内从 Telegram **退出账号并重新登录**。tg 会在公开系统函数 `CCKeyDerivationPBKDF` 上捕获一次账号级 key material，再按每个数据库自己的 salt 并行派生并验证独立 key。它需要 Apple Command Line Tools；如果本机没有 `lldb`，先运行 `xcode-select --install`。如果 macOS 弹出 Developer Tools 权限提示，请允许当前终端应用；如果没有弹窗但报 `Not allowed to attach to process`，到 System Settings -> Privacy & Security -> Developer Tools 里启用当前终端应用，退出并重新打开终端后再重试。旧命令名 `lldb-login` / `lldb-cold` 仍作为兼容 alias 保留。
 
-   后续直接运行默认 `auto` 路径即可。它优先复用 `~/.tg/key_material.bin`，已有 key 会先做第一页 HMAC 验证，只有新 salt 才执行 PBKDF2；旧版客户端或 Linux 没有缓存材料时再回退到内存扫描：
+   Linux 新版客户端使用同一个 `login` 接口，内部通过 ELF anchor、unwind FDE 和指令语义定位稳定入口，再由 GDB 捕获。先安装 GDB，然后运行命令并在等待期间退出账号、重新登录：
+
+   ```bash
+   sudo apt install gdb
+   sudo tg keys --method login --timeout 180
+   ```
+
+   后续直接运行默认 `auto` 路径即可。它优先复用 `~/.tg/key_material.bin`，已有 key 会先做第一页 HMAC 验证，只有新 salt 才执行 PBKDF2；旧版客户端或没有缓存材料时再回退到内存扫描：
 
    ```bash
    sudo tg keys
@@ -273,14 +280,14 @@ osascript -e 'quit app "Telegram"'
 while pgrep -x Telegram >/dev/null; do sleep 1; done
 sudo codesign --force --deep --sign - /Applications/Telegram.app
 open -a Telegram
-sudo tg keys --method lldb-login --timeout 180
+sudo tg keys --method login --timeout 180
 ```
 
 命令开始等待后，需要在 Telegram 中退出账号并重新登录以触发派生。如果输出里有 `Not allowed to attach to process`，打开 System Settings -> Privacy & Security -> Developer Tools，启用当前终端应用，退出并重新打开终端后再运行上面的命令。
 
 如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径。要强制使用旧版内存模式，可运行 `sudo tg keys --method memory`。
 
-Linux 上需要保持桌面客户端打开；如果普通用户无法读取进程内存，直接运行 `sudo tg keys`。
+Linux 上需要保持桌面客户端打开。旧版可直接运行 `sudo tg keys` 做内存扫描；新版首次运行 `sudo tg keys --method login --timeout 180`，以后默认 `sudo tg keys` 会复用已验证的本地材料。
 
 ## 常用命令
 
@@ -494,7 +501,7 @@ osascript -e 'quit app "Telegram"'
 while pgrep -x Telegram >/dev/null; do sleep 1; done
 sudo codesign --force --deep --sign - /Applications/Telegram.app
 open -a Telegram
-sudo tg keys --method lldb-login --timeout 180
+sudo tg keys --method login --timeout 180
 ```
 
 如果本机没有 Apple `lldb`，先安装 Command Line Tools：

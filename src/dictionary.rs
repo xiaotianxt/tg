@@ -79,6 +79,18 @@ pub(crate) fn target_module_suffix() -> &'static str {
     )
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn cipher_config_anchor() -> &'static [u8] {
+    static VALUE: OnceLock<Vec<u8>> = OnceLock::new();
+    cached_bytes(
+        &VALUE,
+        &[
+            57, 53, 55, 116, 14, 63, 52, 57, 63, 52, 46, 116, 13, 25, 30, 24, 116, 25, 53, 52, 60,
+            51, 61, 116, 25, 51, 42, 50, 63, 40,
+        ],
+    )
+}
+
 pub(crate) fn msg_body_column() -> &'static str {
     static VALUE: OnceLock<String> = OnceLock::new();
     cached_text(

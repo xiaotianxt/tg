@@ -134,8 +134,10 @@ enum Commands {
         #[arg(
             long,
             default_value = "30",
+            default_value_if("method", "login", "180"),
             default_value_if("method", "lldb-login", "180"),
-            default_value_if("method", "lldb-cold", "180")
+            default_value_if("method", "lldb-cold", "180"),
+            default_value_if("method", "gdb-login", "180")
         )]
         timeout: u64,
         /// Key extraction method
@@ -1448,6 +1450,23 @@ mod tests {
         }
 
         let cli = Cli::parse_from(args(&["tg", "keys", "--method", "lldb-cold"]));
+        match cli.command {
+            Commands::Keys { timeout, .. } => assert_eq!(timeout, 180),
+            _ => panic!("expected keys command"),
+        }
+
+        let cli = Cli::parse_from(args(&["tg", "keys", "--method", "login"]));
+        match cli.command {
+            Commands::Keys {
+                timeout, method, ..
+            } => {
+                assert_eq!(timeout, 180);
+                assert!(matches!(method, scanner::KeyExtractionMethod::Login));
+            }
+            _ => panic!("expected keys command"),
+        }
+
+        let cli = Cli::parse_from(args(&["tg", "keys", "--method", "gdb-login"]));
         match cli.command {
             Commands::Keys { timeout, .. } => assert_eq!(timeout, 180),
             _ => panic!("expected keys command"),
