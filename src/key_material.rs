@@ -1,6 +1,11 @@
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::fs;
+#[cfg(any(target_os = "macos", test))]
+use std::fs::OpenOptions;
+#[cfg(any(target_os = "macos", test))]
+use std::io::Write;
+use std::io::{ErrorKind, Read};
 use std::path::Path;
+#[cfg(any(target_os = "macos", test))]
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
@@ -51,6 +56,7 @@ pub(crate) fn load(path: &Path) -> Result<Option<AccountKeyMaterial>, String> {
     Ok(Some(AccountKeyMaterial::from_bytes(bytes)))
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn store(path: &Path, material: &AccountKeyMaterial) -> Result<(), String> {
     let parent = path.parent().ok_or_else(|| {
         format!(
@@ -126,14 +132,14 @@ pub(crate) fn store(path: &Path, material: &AccountKeyMaterial) -> Result<(), St
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(any(target_os = "macos", test), unix))]
 fn restrict_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(any(target_os = "macos", test), not(unix)))]
 fn restrict_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }

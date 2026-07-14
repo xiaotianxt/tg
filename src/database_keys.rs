@@ -144,6 +144,7 @@ pub(crate) fn derive_from_storage(
     ))
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn validates_against_storage(
     account_material: &[u8; 32],
     db_storage: &std::path::Path,
