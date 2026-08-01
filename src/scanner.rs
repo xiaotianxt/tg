@@ -1,6 +1,9 @@
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::{Output, Stdio};
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
 use crate::{database_keys, decrypt::DatabaseKeys, dictionary, key_material, paths};
@@ -331,6 +334,7 @@ fn write_derivation_outcome(
     write_keys_file(path, &content)
 }
 
+#[cfg(target_os = "macos")]
 fn validate_sudo_credentials(timeout_secs: u64) -> Result<(), String> {
     let mut cmd = Command::new("sudo");
     cmd.arg("-v");
@@ -366,6 +370,7 @@ fn validate_sudo_credentials(timeout_secs: u64) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn attach_sudo_tty(cmd: &mut Command) {
     match std::fs::File::open("/dev/tty") {
         Ok(tty) => {
