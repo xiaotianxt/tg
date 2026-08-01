@@ -858,9 +858,7 @@ version = "1.5.0"
 dependencies = [
  "aes",
  "cbc",
- "cc",
  "chrono",
- "cipher",
  "clap",
  "flate2",
  "gimli",

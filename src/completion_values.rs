@@ -14,39 +14,11 @@ pub(crate) fn time_buckets() -> PossibleValuesParser {
     ])
 }
 
-pub(crate) fn query_formats() -> PossibleValuesParser {
-    parser(&[("table", "Table output"), ("json", "JSON output")])
-}
-
 pub(crate) fn voice_formats() -> PossibleValuesParser {
     parser(&[
         ("native", "Native voice output"),
         ("wav", "WAV output"),
         ("pcm", "Raw PCM output"),
-    ])
-}
-
-pub(crate) fn orders() -> PossibleValuesParser {
-    parser(&[
-        ("newest", "Newest messages first"),
-        ("oldest", "Oldest messages first"),
-    ])
-}
-
-pub(crate) fn match_modes() -> PossibleValuesParser {
-    parser(&[
-        ("all", "Require every keyword"),
-        ("any", "Match any keyword"),
-    ])
-}
-
-pub(crate) fn media_types() -> PossibleValuesParser {
-    parser(&[
-        ("voice", "Voice messages"),
-        ("image", "Image messages"),
-        ("sticker", "Sticker messages"),
-        ("file", "File attachments"),
-        ("video", "Video messages"),
     ])
 }
 

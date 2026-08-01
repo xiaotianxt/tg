@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::{contact, db, dictionary, media, message, message_index, output, parallel};
+use crate::{contact, db, dictionary, media, message, message_index, output, parallel, paths};
 
 const MESSAGE_TARGETS: &[&str] = &["messages", "message", "all-messages"];
 const MAX_QUERY_KEYWORDS: usize = 16;
@@ -14,37 +14,23 @@ const MAX_QUERY_KEYWORD_CHARS: usize = 256;
 const MAX_QUERY_RESULT_WINDOW: usize = 10_000;
 const MAX_TABLE_CELL_CHARS: usize = 10_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueryOutputFormat {
+    #[value(help = "Table output")]
     Table,
+    #[value(help = "JSON output")]
     Json,
 }
 
-impl QueryOutputFormat {
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "table" | "tsv" => Ok(Self::Table),
-            "json" | "jsonl" => Ok(Self::Json),
-            _ => Err("expected table or json".to_string()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuerySort {
+    #[value(help = "Newest messages first")]
     Newest,
+    #[value(help = "Oldest messages first")]
     Oldest,
 }
 
 impl QuerySort {
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "newest" | "desc" => Ok(Self::Newest),
-            "oldest" | "asc" => Ok(Self::Oldest),
-            _ => Err("expected newest or oldest".to_string()),
-        }
-    }
-
     fn order_dir(self) -> &'static str {
         match self {
             Self::Newest => "DESC",
@@ -53,21 +39,15 @@ impl QuerySort {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueryMatchMode {
+    #[value(help = "Require every keyword")]
     All,
+    #[value(help = "Match any keyword")]
     Any,
 }
 
 impl QueryMatchMode {
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "all" => Ok(Self::All),
-            "any" => Ok(Self::Any),
-            _ => Err("expected all or any".to_string()),
-        }
-    }
-
     fn joiner(self) -> &'static str {
         match self {
             Self::All => " AND ",
@@ -76,27 +56,21 @@ impl QueryMatchMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueryMediaType {
+    #[value(help = "Voice messages")]
     Voice,
+    #[value(help = "Image messages")]
     Image,
+    #[value(help = "Sticker messages")]
     Sticker,
+    #[value(help = "File attachments")]
     File,
+    #[value(help = "Video messages")]
     Video,
 }
 
 impl QueryMediaType {
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "voice" => Ok(Self::Voice),
-            "image" | "img" => Ok(Self::Image),
-            "sticker" => Ok(Self::Sticker),
-            "file" => Ok(Self::File),
-            "video" => Ok(Self::Video),
-            _ => Err("expected voice, image, sticker, file, or video".to_string()),
-        }
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Voice => "voice",
@@ -562,7 +536,7 @@ fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryConte
     let targets = message_dbs
         .into_iter()
         .map(|path| QueryTarget {
-            label: relative_label(options.decrypted_dir, &path),
+            label: paths::relative_label(options.decrypted_dir, &path),
             path,
         })
         .collect();
@@ -584,13 +558,13 @@ fn query_message_target(
     let conn = open_readonly(&target.path)?;
     let tables = match &context.selected_table {
         Some(table) => vec![table.clone()],
-        None => list_message_tables(&conn)?,
+        None => db::list_message_tables(&conn)?,
     };
 
-    let name2id = load_name2id(&conn);
+    let name2id = db::load_name2id(&conn);
     let mut rows = Vec::new();
     for table in tables {
-        if !table_exists(&conn, &table) {
+        if !db::message_table_exists(&conn, &table) {
             continue;
         }
         let mut table_rows =
@@ -640,7 +614,7 @@ fn query_message_table(
             .raw_contains
             .iter()
             .map(|query| {
-                params.push(Value::Text(like_contains_pattern(query)));
+                params.push(Value::Text(db::like_contains_pattern(query)));
                 format!("{body_col} LIKE ? ESCAPE '\\'")
             })
             .collect::<Vec<_>>()
@@ -685,7 +659,7 @@ fn query_message_table(
     let mapped = stmt
         .query_map(params_from_iter(params.iter()), |row| {
             let marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
-            let raw_body = read_message_body(row, 2, marker);
+            let raw_body = db::read_message_body(row, 2, marker);
             let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
             let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
             let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
@@ -794,7 +768,7 @@ fn query_indexed_messages(
             .contains
             .iter()
             .map(|query| {
-                params.push(Value::Text(like_contains_pattern(query)));
+                params.push(Value::Text(db::like_contains_pattern(query)));
                 format!("{decoded_body_col} LIKE ? ESCAPE '\\'")
             })
             .collect::<Vec<_>>()
@@ -803,7 +777,7 @@ fn query_indexed_messages(
     }
 
     for query in options.not_contains {
-        params.push(Value::Text(like_contains_pattern(query)));
+        params.push(Value::Text(db::like_contains_pattern(query)));
         clauses.push(format!("{decoded_body_col} NOT LIKE ? ESCAPE '\\'"));
     }
     if !options.raw_contains.is_empty() {
@@ -811,7 +785,7 @@ fn query_indexed_messages(
             .raw_contains
             .iter()
             .map(|query| {
-                params.push(Value::Text(like_contains_pattern(query)));
+                params.push(Value::Text(db::like_contains_pattern(query)));
                 format!("{raw_body_col} LIKE ? ESCAPE '\\'")
             })
             .collect::<Vec<_>>()
@@ -907,22 +881,6 @@ fn query_indexed_messages(
         .collect())
 }
 
-fn read_message_body(row: &rusqlite::Row<'_>, index: usize, marker: Option<i64>) -> String {
-    if marker == Some(4) {
-        if let Ok(bytes) = row.get::<_, Vec<u8>>(index) {
-            return message::try_decompress(&bytes).unwrap_or_default();
-        }
-    }
-
-    match row.get::<_, Option<String>>(index) {
-        Ok(Some(value)) => value,
-        _ => match row.get::<_, Option<Vec<u8>>>(index) {
-            Ok(Some(bytes)) => String::from_utf8(bytes).unwrap_or_default(),
-            _ => String::new(),
-        },
-    }
-}
-
 fn display_sender(sender_account: &str, context: &MessageQueryContext) -> String {
     if sender_account.is_empty() {
         return String::new();
@@ -1014,37 +972,6 @@ fn legacy_indexed_media_clause(media_type: QueryMediaType, raw_body_col: &str) -
 
 fn message_has_media(local_type: i64, raw_body: &str, media_type: QueryMediaType) -> bool {
     media::message_media_type(local_type, raw_body) == Some(media_type.as_str())
-}
-
-fn list_message_tables(conn: &Connection) -> Result<Vec<String>, String> {
-    let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
-        .map_err(|e| format!("Cannot list message tables: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| format!("Cannot read message tables: {}", e))?;
-    Ok(rows.filter_map(|row| row.ok()).collect())
-}
-
-fn table_exists(conn: &Connection, table: &str) -> bool {
-    conn.prepare(&format!(
-        "SELECT 1 FROM {} LIMIT 1",
-        db::quote_identifier(table)
-    ))
-    .is_ok()
-}
-
-fn load_name2id(conn: &Connection) -> HashMap<i64, String> {
-    match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
-        Ok(mut stmt) => stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|row| row.ok()).collect())
-            .unwrap_or_default(),
-        Err(_) => HashMap::new(),
-    }
 }
 
 fn sort_message_rows(rows: &mut [MessageRow], sort: QuerySort) {
@@ -1208,12 +1135,7 @@ fn public_schema_rows(db_target: &str, target_count: usize) -> Vec<SchemaRow> {
         SchemaRow {
             section: "filter",
             name: "has",
-            value: "voice,image,sticker,file,video"
-                .split(',')
-                .filter_map(|value| QueryMediaType::parse(value).ok())
-                .map(QueryMediaType::as_str)
-                .collect::<Vec<_>>()
-                .join(","),
+            value: "voice,image,sticker,file,video".to_string(),
             description: "require a decoded media category",
         },
         SchemaRow {
@@ -1321,7 +1243,7 @@ fn resolve_targets(decrypted_dir: &Path, target: &str) -> Result<Vec<QueryTarget
         return Ok(message_dbs
             .into_iter()
             .map(|path| QueryTarget {
-                label: relative_label(decrypted_dir, &path),
+                label: paths::relative_label(decrypted_dir, &path),
                 path,
             })
             .collect());
@@ -1342,7 +1264,7 @@ fn resolve_targets(decrypted_dir: &Path, target: &str) -> Result<Vec<QueryTarget
 
     if let Some(path) = resolve_numbered_message_db(decrypted_dir, target) {
         return Ok(vec![QueryTarget {
-            label: relative_label(decrypted_dir, &path),
+            label: paths::relative_label(decrypted_dir, &path),
             path,
         }]);
     }
@@ -1384,26 +1306,6 @@ fn open_readonly(path: &Path) -> Result<Connection, String> {
         return Err(format!("{} did not open read-only", path.display()));
     }
     Ok(conn)
-}
-
-fn relative_label(base: &Path, path: &Path) -> String {
-    path.strip_prefix(base)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string()
-}
-
-fn like_contains_pattern(query: &str) -> String {
-    let mut pattern = String::with_capacity(query.len() + 2);
-    pattern.push('%');
-    for ch in query.chars() {
-        if matches!(ch, '%' | '_' | '\\') {
-            pattern.push('\\');
-        }
-        pattern.push(ch);
-    }
-    pattern.push('%');
-    pattern
 }
 
 fn escape_table_cell(value: &str, max_chars: usize) -> String {

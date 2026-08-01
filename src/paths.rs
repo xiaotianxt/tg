@@ -31,6 +31,13 @@ pub(crate) fn default_decrypted_dir() -> PathBuf {
     default_state_dir().join("decrypted")
 }
 
+pub(crate) fn relative_label(base: &Path, path: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     restrict_dir_permissions(path)?;

@@ -18,14 +18,7 @@ tg 是一个 macOS/Linux 本地 Telegram 聊天记录读取 CLI。它把本机 T
 
 ## Agent Skill
 
-安装随 `tg` 打包的本地 Codex/agent skill：
-
-```bash
-tg skill install
-```
-
-这个命令会从 `tg` 的公开 skill 模板生成本机安装版本，并按本机 dictionary
-渲染应用显示名。只想安装公开的 central skill 模板时，也可以用：
+安装公开的 central skill 模板：
 
 ```bash
 npx -y github:xiaotianxt/skills tg
@@ -231,7 +224,7 @@ xcode-select --install
    sudo tg keys --method login --timeout 180
    ```
 
-   后续直接运行默认 `auto` 路径即可。它优先复用 `~/.tg/key_material.bin`，已有 key 会先做第一页 HMAC 验证，只有新 salt 才执行 PBKDF2；旧版客户端或没有缓存材料时再回退到内存扫描：
+   后续直接运行默认 `auto` 路径即可。它复用 `~/.tg/key_material.bin`，已有 key 会先做第一页 HMAC 验证，只有新 salt 才执行 PBKDF2；没有可用材料时会提示重新执行一次 `login` 捕获：
 
    ```bash
    sudo tg keys
@@ -285,9 +278,9 @@ sudo tg keys --method login --timeout 180
 
 命令开始等待后，需要在 Telegram 中退出账号并重新登录以触发派生。如果输出里有 `Not allowed to attach to process`，打开 System Settings -> Privacy & Security -> Developer Tools，启用当前终端应用，退出并重新打开终端后再运行上面的命令。
 
-如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径。要强制使用旧版内存模式，可运行 `sudo tg keys --method memory`。
+如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径。
 
-Linux 上需要保持桌面客户端打开。旧版可直接运行 `sudo tg keys` 做内存扫描；新版首次运行 `sudo tg keys --method login --timeout 180`，以后默认 `sudo tg keys` 会复用已验证的本地材料。
+Linux 上需要保持桌面客户端打开。首次运行 `sudo tg keys --method login --timeout 180`，以后默认 `sudo tg keys` 会复用已验证的本地材料。
 
 ## 常用命令
 
@@ -512,7 +505,7 @@ xcode-select --install
 
 如果 `lldb` 输出 `Not allowed to attach to process`，打开 System Settings -> Privacy & Security -> Developer Tools，启用当前终端应用，退出并重新打开终端后再重试。
 
-捕获命令开始等待后，在 Telegram 中退出账号并重新登录。捕获成功并通过数据库第一页 HMAC 验证后，日常 `tg keys` / `tg refresh --keys` 会复用本地 key material，不再 attach。要诊断旧版内存路径时显式加 `--method memory`。
+捕获命令开始等待后，在 Telegram 中退出账号并重新登录。捕获成功并通过数据库第一页 HMAC 验证后，日常 `tg keys` / `tg refresh --keys` 会复用本地 key material，不再 attach。
 
 ### `No sessions found`
 
@@ -582,25 +575,9 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-性能回归可以用本地解密库跑一组固定命令。脚本会构建 baseline 和当前工作区两个 release binary，命令输出会丢弃，只保存耗时：
-
-```bash
-scripts/perf_regression.sh --session "张三" --runs 5
-TG_PERF_SESSION="张三" make perf
-```
-
-默认 baseline 是 `v1.4.1`。也可以显式指定：
-
-```bash
-scripts/perf_regression.sh --baseline v1.4.2 --candidate WORKTREE --session "张三"
-```
-
-需要把性能门禁接进 release checklist 时，加 `--fail-threshold 1.20`，候选中位数超过 baseline 20% 会非零退出。默认用例包括 `sessions`、`messages`、`query`、`image-list`、`file-list`、`voice-list`、`sticker-list`。
-报告写到 `target/perf/<timestamp>/summary.csv`。
-
 项目入口是 `src/main.rs`。主要模块：
 
-- `src/scanner.rs`：选择缓存派生、旧版内存扫描或平台捕获策略。
+- `src/scanner.rs`：选择缓存派生或平台登录捕获策略。
 - `src/scanner/lldb.rs`：macOS 上按公开 PBKDF2 系统符号捕获账号级 key material。
 - `src/database_keys.rs`：唯一 salt 去重、并行 PBKDF2、第一页 HMAC 验证和 key 映射。
 - `src/key_material.rs`：账号级 key material 的版本化私有存储与内存清理。
@@ -609,15 +586,8 @@ scripts/perf_regression.sh --baseline v1.4.2 --candidate WORKTREE --session "张
 - `src/message.rs`：消息类型解析。
 - `src/media*.rs`：媒体元信息、缓存查找和解密。
 - `src/export.rs`：导出。
-- `vendor/find_all_keys_macos.c`：链接进 `tg` 的 macOS Telegram 进程扫描器；Linux 扫描器在 Rust 窄适配层里实现。
 
 面向 AI/自动化助手的能力说明见 [SKILL.md](SKILL.md)。
-
-也可以把随版本打包的 skill 安装到本机 Codex skill 目录：
-
-```bash
-tg skill install
-```
 
 ## License
 

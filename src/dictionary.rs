@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -34,15 +32,6 @@ pub(crate) fn desktop_app_process() -> &'static str {
     }
 }
 
-pub(crate) fn desktop_app_name() -> &'static str {
-    desktop_app_process()
-}
-
-pub(crate) fn desktop_app_localized_name() -> &'static str {
-    static VALUE: OnceLock<String> = OnceLock::new();
-    cached_text(&VALUE, &[191, 228, 244, 190, 229, 251])
-}
-
 pub(crate) fn container_id() -> &'static str {
     static VALUE: OnceLock<String> = OnceLock::new();
     cached_text(
@@ -66,17 +55,6 @@ pub(crate) fn account_id_prefix() -> &'static str {
 pub(crate) fn sticker_magic() -> &'static [u8] {
     static VALUE: OnceLock<Vec<u8>> = OnceLock::new();
     cached_bytes(&VALUE, &[45, 34, 61, 60])
-}
-
-pub(crate) fn target_module_suffix() -> &'static str {
-    static VALUE: OnceLock<String> = OnceLock::new();
-    cached_text(
-        &VALUE,
-        &[
-            117, 8, 63, 41, 53, 47, 40, 57, 63, 41, 117, 45, 63, 57, 50, 59, 46, 116, 62, 35, 54,
-            51, 56,
-        ],
-    )
 }
 
 #[cfg(target_os = "linux")]

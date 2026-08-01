@@ -660,8 +660,8 @@ fn collect_source_messages(
     let source = &refresh.source;
     let conn = Connection::open(&source.path)
         .map_err(|e| format!("Cannot open {}: {}", source.path.display(), e))?;
-    let tables = list_message_tables(&conn)?;
-    let name2id = load_name2id(&conn);
+    let tables = db::list_message_tables(&conn)?;
+    let name2id = db::load_name2id(&conn);
     let body_col = db::quote_identifier(dictionary::msg_body_column());
     let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
     let sender_col = db::quote_identifier(dictionary::msg_sender_column());
@@ -714,7 +714,7 @@ fn collect_source_messages(
 
         let map_row = |row: &rusqlite::Row<'_>| {
             let marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
-            let raw_body = read_message_body(row, 3, marker);
+            let raw_body = db::read_message_body(row, 3, marker);
             let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
             let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
             let sender_display = table_context
@@ -812,11 +812,11 @@ fn collect_session_table_messages(
 ) -> Result<Option<CollectedSource>, String> {
     let conn = Connection::open(&source.path)
         .map_err(|e| format!("Cannot open {}: {}", source.path.display(), e))?;
-    if !message_table_exists(&conn, table_name) {
+    if !db::message_table_exists(&conn, table_name) {
         return Ok(None);
     }
 
-    let name2id = load_name2id(&conn);
+    let name2id = db::load_name2id(&conn);
     let body_col = db::quote_identifier(dictionary::msg_body_column());
     let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
     let sender_col = db::quote_identifier(dictionary::msg_sender_column());
@@ -851,7 +851,7 @@ fn collect_session_table_messages(
     let rows = stmt
         .query_map(params![since], |row| {
             let marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
-            let raw_body = read_message_body(row, 3, marker);
+            let raw_body = db::read_message_body(row, 3, marker);
             let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
             let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
             let sender_display = table_context
@@ -977,58 +977,11 @@ fn table_context(contacts: &HashMap<String, contact::Contact>) -> TableContext {
     }
 }
 
-fn list_message_tables(conn: &Connection) -> Result<Vec<String>, String> {
-    let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
-        .map_err(|e| format!("Cannot list message tables: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| format!("Cannot read message table names: {}", e))?;
-    Ok(rows.filter_map(|row| row.ok()).collect())
-}
-
-fn message_table_exists(conn: &Connection, table_name: &str) -> bool {
-    conn.prepare(&format!(
-        "SELECT 1 FROM {} LIMIT 1",
-        db::quote_identifier(table_name)
-    ))
-    .is_ok()
-}
-
-fn load_name2id(conn: &Connection) -> HashMap<i64, String> {
-    match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
-        Ok(mut stmt) => stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|row| row.ok()).collect())
-            .unwrap_or_default(),
-        Err(_) => HashMap::new(),
-    }
-}
-
-fn read_message_body(row: &rusqlite::Row<'_>, index: usize, marker: Option<i64>) -> String {
-    if marker == Some(4) {
-        if let Ok(bytes) = row.get::<_, Vec<u8>>(index) {
-            return message::try_decompress(&bytes).unwrap_or_default();
-        }
-    }
-
-    match row.get::<_, Option<String>>(index) {
-        Ok(Some(value)) => value,
-        _ => match row.get::<_, Option<Vec<u8>>>(index) {
-            Ok(Some(bytes)) => String::from_utf8(bytes).unwrap_or_default(),
-            _ => String::new(),
-        },
-    }
-}
-
 fn source_files(decrypted_dir: &Path, message_dbs: Vec<PathBuf>) -> Vec<SourceFile> {
     message_dbs
         .into_iter()
         .filter_map(|path| {
-            let key = relative_label(decrypted_dir, &path);
+            let key = paths::relative_label(decrypted_dir, &path);
             let fingerprint = row_identity::SourceFingerprint::from_path(&path)?;
             Some(SourceFile {
                 key,
@@ -1197,13 +1150,6 @@ fn contact_signature(contacts: &HashMap<String, contact::Contact>) -> String {
         })
         .collect::<Vec<_>>();
     row_identity::contact_fingerprint(&mut entries).to_string()
-}
-
-fn relative_label(base: &Path, path: &Path) -> String {
-    path.strip_prefix(base)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string()
 }
 
 fn meta_string(conn: &Connection, key: &str) -> Result<Option<String>, String> {

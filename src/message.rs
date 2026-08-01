@@ -731,7 +731,7 @@ fn decode_chat_history_content(content: &str, time_bucket: time::MessageTimeBuck
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "聊天记录".to_string());
     let record_item = crate::media::extract_xml_tag(content, "recorditem")
-        .map(|s| strip_cdata(&s).to_string())
+        .map(|s| media::strip_cdata(&s).to_string())
         .unwrap_or_default();
 
     let items = parse_chat_history_items(&record_item);
@@ -746,14 +746,6 @@ fn decode_chat_history_content(content: &str, time_bucket: time::MessageTimeBuck
     let mut out = format!("[聊天记录] {} ({}条)", title, items.len());
     render_chat_history_items(&mut out, &items, time_bucket);
     out
-}
-
-fn strip_cdata(value: &str) -> &str {
-    let trimmed = value.trim();
-    trimmed
-        .strip_prefix("<![CDATA[")
-        .and_then(|s| s.strip_suffix("]]>"))
-        .unwrap_or(trimmed)
 }
 
 fn parse_chat_history_items(record_info: &str) -> Vec<ChatHistoryItem> {

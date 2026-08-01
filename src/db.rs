@@ -209,6 +209,57 @@ pub(crate) fn table_has_column(conn: &Connection, table_name: &str, column_name:
     false
 }
 
+pub(crate) fn list_message_tables(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
+        .map_err(|e| format!("Cannot list message tables: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("Cannot read message table names: {}", e))?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+pub(crate) fn message_table_exists(conn: &Connection, table_name: &str) -> bool {
+    conn.prepare(&format!(
+        "SELECT 1 FROM {} LIMIT 1",
+        quote_identifier(table_name)
+    ))
+    .is_ok()
+}
+
+pub(crate) fn load_name2id(conn: &Connection) -> HashMap<i64, String> {
+    match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
+        Ok(mut stmt) => stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|row| row.ok()).collect())
+            .unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+pub(crate) fn read_message_body(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    marker: Option<i64>,
+) -> String {
+    if marker == Some(4) {
+        if let Ok(bytes) = row.get::<_, Vec<u8>>(index) {
+            return message::try_decompress(&bytes).unwrap_or_default();
+        }
+    }
+
+    match row.get::<_, Option<String>>(index) {
+        Ok(Some(value)) => value,
+        _ => match row.get::<_, Option<Vec<u8>>>(index) {
+            Ok(Some(bytes)) => String::from_utf8(bytes).unwrap_or_default(),
+            _ => String::new(),
+        },
+    }
+}
+
 fn session_stats_for_table(conn: &Connection, table_name: &str) -> Option<SessionInfo> {
     let table = quote_identifier(table_name);
     let fast_sql = format!(
@@ -1517,7 +1568,7 @@ fn fts_content_like_clause() -> &'static str {
     "c0 LIKE ? ESCAPE '\\'"
 }
 
-fn like_contains_pattern(query: &str) -> String {
+pub(crate) fn like_contains_pattern(query: &str) -> String {
     let mut pattern = String::with_capacity(query.len() + 2);
     pattern.push('%');
     for ch in query.chars() {
@@ -1556,11 +1607,6 @@ pub(crate) fn resolve_username_for_messages_with_contacts(
     jobs: usize,
 ) -> String {
     resolve_username_from_contacts(query, contacts, Some(message_dbs), jobs)
-}
-
-#[allow(dead_code)]
-pub(crate) fn resolve_username(query: &str, contact_db: Option<&Path>) -> Result<String, String> {
-    resolve_username_with_context(query, contact_db, None, 1)
 }
 
 fn resolve_username_with_context(
@@ -2856,7 +2902,8 @@ mod tests {
             ("tgid_bob", "Bob Lee", "", ""),
         ]);
 
-        let username = resolve_username("Alic Zhang", Some(&contact_db)).unwrap();
+        let username =
+            resolve_username_with_context("Alic Zhang", Some(&contact_db), None, 1).unwrap();
 
         assert_eq!(username, "tgid_alice");
     }

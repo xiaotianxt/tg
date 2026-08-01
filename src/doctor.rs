@@ -22,7 +22,7 @@ pub(crate) fn run(options: DoctorOptions<'_>) -> Result<(), String> {
     out.blank_line()?;
 
     write_process_status(&mut out)?;
-    out.line(format_args!("scanner: OK (embedded in tg)"))?;
+    out.line(format_args!("key capture: login or cached material"))?;
     let keys = write_keys_status(&mut out)?;
     write_cache_status(&mut out, options.decrypted_dir, keys.as_ref())?;
 

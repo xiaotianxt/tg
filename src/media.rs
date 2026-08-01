@@ -23,27 +23,6 @@ impl ImageInfo {
     pub fn display(&self) -> String {
         image_tag(self.identifier())
     }
-
-    #[allow(dead_code)]
-    pub fn display_verbose(&self) -> String {
-        let dims = if self.thumb_width > 0 && self.thumb_height > 0 {
-            format!(" {}x{}", self.thumb_width, self.thumb_height)
-        } else {
-            String::new()
-        };
-        let size = if self.raw_length > 0 {
-            if self.raw_length > 1024 * 1024 {
-                format!(" {:.1}MB", self.raw_length as f64 / (1024.0 * 1024.0))
-            } else if self.raw_length > 1024 {
-                format!(" {}KB", self.raw_length / 1024)
-            } else {
-                format!(" {}B", self.raw_length)
-            }
-        } else {
-            String::new()
-        };
-        format!("[图片{}{}]", dims, size)
-    }
 }
 
 pub(crate) fn image_tag(identifier: Option<&str>) -> String {
@@ -285,7 +264,7 @@ fn is_file_app_message(local_type: i64, raw_body: &str) -> bool {
             || matches!(extract_xml_tag_int(raw_body, "type"), Some(6 | 62)))
 }
 
-fn app_message_subtype(local_type: i64) -> Option<i64> {
+pub(crate) fn app_message_subtype(local_type: i64) -> Option<i64> {
     let encoded = local_type as u64;
     if encoded & 0xffff_ffff != 49 {
         return None;
@@ -575,8 +554,8 @@ fn find_file_named(dir: &Path, target: &str) -> Option<PathBuf> {
 
 pub fn decrypt_sticker_aes_cbc(data: &[u8], aes_key_hex: &str) -> Option<Vec<u8>> {
     use aes::Aes128;
+    use cbc::cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
     use cbc::Decryptor;
-    use cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
 
     let key = hex::decode(aes_key_hex).ok()?;
     if key.len() != 16 || data.is_empty() || !data.len().is_multiple_of(16) {
@@ -714,7 +693,7 @@ fn is_upgrade_title(value: &str) -> bool {
     value.contains("不支持展示该内容") || value.contains("升级至最新版本")
 }
 
-fn strip_cdata(value: &str) -> &str {
+pub(crate) fn strip_cdata(value: &str) -> &str {
     let trimmed = value.trim();
     trimmed
         .strip_prefix("<![CDATA[")
@@ -799,12 +778,11 @@ mod tests {
     }
 
     #[test]
-    fn test_image_display_compact_identifier_and_verbose_details() {
+    fn test_image_display_compact_identifier() {
         let xml = r#"<msg><img aeskey="abc123" cdnthumbwidth="180" cdnthumbheight="153" rawlength="38186" /></msg>"#;
         let info = parse_image_info(xml);
         assert_eq!(info.identifier(), Some("abc123"));
         assert_eq!(info.display(), "[img:abc123]");
-        assert_eq!(info.display_verbose(), "[图片 180x153 37KB]");
     }
 
     #[test]

@@ -2,7 +2,6 @@ use std::{path::Path, time::Duration};
 
 use crate::{db, decrypt, paths, scanner};
 
-const KEY_REFRESH_TIMEOUT_SECS: u64 = 30;
 const MESSAGE_AUTO_REFRESH_GRACE: Duration = Duration::from_secs(60);
 
 pub(crate) fn refresh_decrypted(
@@ -54,7 +53,7 @@ pub(crate) fn refresh_keys_and_decrypted(
     decrypted_dir: &Path,
     jobs: usize,
 ) -> Result<decrypt::DecryptStats, String> {
-    scanner::extract_keys(KEY_REFRESH_TIMEOUT_SECS)?;
+    scanner::extract_keys()?;
     refresh_decrypted(decrypted_dir, jobs)
 }
 
@@ -62,7 +61,7 @@ pub(crate) fn refresh_keys_and_message_decrypted(
     decrypted_dir: &Path,
     jobs: usize,
 ) -> Result<decrypt::DecryptStats, String> {
-    scanner::extract_keys(KEY_REFRESH_TIMEOUT_SECS)?;
+    scanner::extract_keys()?;
     refresh_message_decrypted(decrypted_dir, jobs)
 }
 

@@ -24,7 +24,6 @@ mod paths;
 mod query;
 mod row_identity;
 mod scanner;
-mod skill;
 mod time;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -345,8 +344,8 @@ enum Commands {
         #[arg(long = "raw-contains")]
         raw_contains: Vec<String>,
         /// Require a structured media type: voice, image, sticker, file, or video
-        #[arg(long = "has", value_parser = completion_values::media_types())]
-        has: Vec<String>,
+        #[arg(long = "has", value_enum)]
+        has: Vec<query::QueryMediaType>,
         /// Show messages after this time (ISO 8601 or relative: 5min, 1h, today)
         #[arg(long, conflicts_with = "all_time")]
         since: Option<String>,
@@ -363,29 +362,17 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         offset: usize,
         /// Sort order: newest or oldest
-        #[arg(
-            long,
-            default_value = "newest",
-            value_parser = completion_values::orders()
-        )]
-        order: String,
+        #[arg(long, value_enum, default_value = "newest")]
+        order: query::QuerySort,
         /// Keyword matching mode when --contains is repeated: all or any
-        #[arg(
-            long,
-            default_value = "all",
-            value_parser = completion_values::match_modes()
-        )]
-        match_mode: String,
+        #[arg(long, value_enum, default_value = "all")]
+        match_mode: query::QueryMatchMode,
         /// Output fields: time,session,sender,type,body,timestamp
         #[arg(long, default_value = "time,session,sender,body")]
         fields: String,
         /// Output format: table or json
-        #[arg(
-            long,
-            default_value = "table",
-            value_parser = completion_values::query_formats()
-        )]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: query::QueryOutputFormat,
         /// Maximum displayed characters per text cell
         #[arg(long, default_value_t = 500)]
         max_cell_chars: usize,
@@ -413,12 +400,8 @@ enum Commands {
         )]
         decrypted_dir: PathBuf,
         /// Output format: table or json
-        #[arg(
-            long,
-            default_value = "table",
-            value_parser = completion_values::query_formats()
-        )]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: query::QueryOutputFormat,
         /// Maximum displayed characters per text cell
         #[arg(long, default_value_t = 500)]
         max_cell_chars: usize,
@@ -622,11 +605,6 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         jobs: usize,
     },
-    /// Install or manage the local agent skill
-    Skill {
-        #[command(subcommand)]
-        command: SkillCommands,
-    },
     /// Generate shell completion scripts
     Completions {
         /// Shell to generate completions for
@@ -662,16 +640,6 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand)]
-enum SkillCommands {
-    /// Install the local SKILL.md generated from tg's bundled template
-    Install {
-        /// Skill directory to write; defaults to $CODEX_HOME/skills/tg or ~/.codex/skills/tg
-        #[arg(long, value_hint = clap::ValueHint::DirPath)]
-        dir: Option<PathBuf>,
-    },
-}
-
 #[derive(Clone, Copy, ValueEnum)]
 enum CompletionShell {
     Fish,
@@ -687,7 +655,6 @@ enum CompleteKind {
 
 fn main() {
     logger::init();
-    scanner::maybe_run_internal_scanner();
     let cli = Cli::parse_from(normalize_args_for_default_messages(std::env::args_os()));
 
     match cli.command {
@@ -1016,42 +983,10 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let sort = match query::QuerySort::parse(&order) {
-                Ok(sort) => sort,
-                Err(e) => {
-                    log::error!("Error parsing --order: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let match_mode = match query::QueryMatchMode::parse(&match_mode) {
-                Ok(mode) => mode,
-                Err(e) => {
-                    log::error!("Error parsing --match-mode: {}", e);
-                    std::process::exit(1);
-                }
-            };
             let fields = match query::QueryFields::parse(&fields) {
                 Ok(fields) => fields,
                 Err(e) => {
                     log::error!("Error parsing --fields: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let format = match query::QueryOutputFormat::parse(&format) {
-                Ok(format) => format,
-                Err(e) => {
-                    log::error!("Error parsing --format: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let has = match has
-                .iter()
-                .map(|value| query::QueryMediaType::parse(value))
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(has) => has,
-                Err(e) => {
-                    log::error!("Error parsing --has: {}", e);
                     std::process::exit(1);
                 }
             };
@@ -1066,7 +1001,7 @@ fn main() {
                 until: until_ts,
                 limit,
                 offset,
-                sort,
+                sort: order,
                 match_mode,
                 fields,
                 format,
@@ -1103,13 +1038,6 @@ fn main() {
             max_cell_chars,
             jobs,
         } => {
-            let format = match query::QueryOutputFormat::parse(&format) {
-                Ok(format) => format,
-                Err(e) => {
-                    log::error!("Error parsing --format: {}", e);
-                    std::process::exit(1);
-                }
-            };
             let refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
             if cache::needs_search_refresh_warning(&refresh) {
                 log::warn!(
@@ -1323,19 +1251,6 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Skill { command } => match command {
-            SkillCommands::Install { dir } => {
-                match skill::install(skill::InstallOptions { target_dir: dir }) {
-                    Ok(path) => {
-                        print_output(format_args!("Skill installed to: {}", path.display()))
-                    }
-                    Err(e) => {
-                        log::error!("Error: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-        },
         Commands::Completions { shell } => {
             if let Err(e) = completion::print_script(shell) {
                 log::error!("Error: {}", e);
@@ -1404,7 +1319,6 @@ mod tests {
             "voice",
             "doctor",
             "refresh",
-            "skill",
             "completions",
             "__complete",
         ] {
@@ -1684,7 +1598,7 @@ mod tests {
             } => {
                 assert_eq!(contains, vec!["needle"]);
                 assert_eq!(raw_contains, vec!["<appmsg"]);
-                assert_eq!(has, vec!["voice"]);
+                assert_eq!(has, vec![query::QueryMediaType::Voice]);
                 assert_eq!(fields, "time,body");
             }
             _ => panic!("expected query command"),

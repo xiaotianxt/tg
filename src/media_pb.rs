@@ -210,21 +210,6 @@ pub fn display_image(meta: &ImageMeta) -> String {
     crate::media::image_tag(image_identifier(meta))
 }
 
-#[allow(dead_code)]
-pub fn display_image_verbose(meta: &ImageMeta) -> String {
-    let dims = if meta.width > 0 && meta.height > 0 {
-        format!(" {}x{}", meta.width, meta.height)
-    } else {
-        String::new()
-    };
-    let name = if !meta.filename.is_empty() {
-        format!(" {}", meta.filename)
-    } else {
-        String::new()
-    };
-    format!("[图片{}{}]", dims, name)
-}
-
 pub fn image_identifier(meta: &ImageMeta) -> Option<&str> {
     if meta.filename.trim().is_empty() {
         None
@@ -383,7 +368,6 @@ mod tests {
         assert_eq!(m.width, 1920);
         assert_eq!(m.filename, "test.jpg");
         assert_eq!(display_image(&m), "[img:test.jpg]");
-        assert_eq!(display_image_verbose(&m), "[图片 1920x1080 test.jpg]");
     }
 
     #[test]

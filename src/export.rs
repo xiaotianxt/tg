@@ -424,8 +424,8 @@ pub fn export_messages(
                 }
                 // Try protobuf filename first, then fall back to XML aeskey
                 let identifier = try_protobuf_identifier(&m.packed_info)
-                    .or_else(|| extract_xml_attr_str(&m.raw_content, "aeskey"))
-                    .or_else(|| extract_xml_attr_str(&m.raw_content, "cdnthumburl"));
+                    .or_else(|| media::extract_xml_attr(&m.raw_content, "aeskey"))
+                    .or_else(|| media::extract_xml_attr(&m.raw_content, "cdnthumburl"));
                 let identifier = match identifier {
                     Some(ref s) if !s.is_empty() => s.clone(),
                     _ => continue,
@@ -1127,8 +1127,8 @@ fn load_sticker_messages(
 
 fn image_identifier(message: &ImageMessage) -> Option<String> {
     try_protobuf_identifier(&message.packed_info)
-        .or_else(|| extract_xml_attr_str(&message.raw_content, "aeskey"))
-        .or_else(|| extract_xml_attr_str(&message.raw_content, "cdnthumburl"))
+        .or_else(|| media::extract_xml_attr(&message.raw_content, "aeskey"))
+        .or_else(|| media::extract_xml_attr(&message.raw_content, "cdnthumburl"))
 }
 
 /// Try to extract media cache identifier from packed_info protobuf.
@@ -1203,21 +1203,8 @@ fn is_file_message_parts(msg_type: i64, raw_content: &str) -> bool {
     media::message_media_type(msg_type, raw_content) == Some("file")
 }
 
-fn app_message_subtype(local_type: i64) -> Option<i64> {
-    let encoded = local_type as u64;
-    if encoded & 0xffff_ffff != 49 {
-        return None;
-    }
-    let subtype = encoded >> 32;
-    if subtype == 0 {
-        None
-    } else {
-        Some(subtype as i64)
-    }
-}
-
 fn file_export_type(local_type: i64) -> i64 {
-    if local_type == 62 || app_message_subtype(local_type) == Some(62) {
+    if local_type == 62 || media::app_message_subtype(local_type) == Some(62) {
         62
     } else {
         49
@@ -2579,11 +2566,6 @@ fn sqlite_uri_path(path: &Path) -> String {
     encoded
 }
 
-/// Extract attribute value from XML-like string within content.
-fn extract_xml_attr_str(content: &str, attr: &str) -> Option<String> {
-    media::extract_xml_attr(content, attr)
-}
-
 fn export_txt(
     path: &Path,
     username: &str,
@@ -2663,7 +2645,7 @@ fn export_media_with_decrypt(
             // based on the decrypted payload magic.
             let filename = format!(
                 "{}_{}_{}_{:04}.dat",
-                sanitize_filename(session_name),
+                media::sanitize_filename(session_name),
                 cat_name,
                 msg_type,
                 index
@@ -2795,7 +2777,7 @@ fn write_sticker_bytes(
 
     let filename = format!(
         "{}_Sticker_47_{:04}.{}",
-        sanitize_filename(session_name),
+        media::sanitize_filename(session_name),
         index,
         ext
     );
@@ -2837,18 +2819,6 @@ fn download_url(url: &str) -> Result<Vec<u8>, String> {
     }
 
     Ok(output.stdout)
-}
-
-fn sanitize_filename(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn escape_csv(s: &str) -> String {

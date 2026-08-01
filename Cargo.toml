@@ -13,15 +13,6 @@ categories = ["command-line-utilities", "database"]
 name = "tg"
 path = "src/main.rs"
 
-[[bin]]
-name = "try_decrypt"
-path = "src/bin/try_decrypt.rs"
-required-features = ["debug-tools"]
-
-[features]
-default = []
-debug-tools = []
-
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rusqlite = "0.31"
@@ -34,7 +25,6 @@ sha2 = "0.11"
 pbkdf2 = "0.13"
 md-5 = "0.11"
 hex = "0.4"
-cipher = "0.5"
 tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
@@ -48,6 +38,3 @@ libc = "0.2"
 object = { version = "0.39", default-features = false, features = ["elf", "read", "std"] }
 yaxpeax-arch = { version = "0.3", default-features = false }
 yaxpeax-arm = { version = "0.4", default-features = false }
-
-[build-dependencies]
-cc = "1"
