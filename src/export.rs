@@ -3,7 +3,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,7 +43,8 @@ enum MediaExportJob {
     },
     Sticker {
         index: usize,
-        message: ExportMessage,
+        info: Box<media::StickerInfo>,
+        cached_source: Option<PathBuf>,
     },
 }
 
@@ -442,18 +443,27 @@ pub fn export_messages(
             }
         }
 
+        let mut seen_stickers = HashSet::new();
         for m in &all_messages {
             if m.msg_type != 47 {
                 continue;
             }
 
-            if !has_sticker_export_source(m) {
+            let info = media::parse_sticker_info(&m.raw_content);
+            if info.md5.is_empty() || !record_new_sticker(&mut seen_stickers, &info) {
                 continue;
             }
 
+            let Some(cached_source) =
+                media::find_cached_sticker_in_layout(&telegram_base, &info.md5)
+            else {
+                continue;
+            };
+
             media_jobs.push(MediaExportJob::Sticker {
                 index: next_index,
-                message: m.clone(),
+                info: Box::new(info),
+                cached_source: Some(cached_source),
             });
             next_index += 1;
         }
@@ -478,7 +488,7 @@ pub fn export_messages(
             }
         }
 
-        let media_job_count = parallel::job_count(jobs, 4);
+        let media_job_count = parallel::job_count(jobs, 8);
         let media_results = parallel::map_ordered(media_jobs, media_job_count, |job| match job {
             MediaExportJob::Cached {
                 index,
@@ -498,13 +508,26 @@ pub fn export_messages(
                     media_keys.as_ref(),
                 ),
             },
-            MediaExportJob::Sticker { index, message } => MediaExportResult {
+            MediaExportJob::Sticker {
+                index,
+                info,
+                cached_source,
+            } => MediaExportResult {
                 index,
                 is_sticker: true,
-                result: export_sticker_message(&message, &telegram_base, &mdir, &username, index),
+                result: export_sticker_info(
+                    &info,
+                    cached_source.as_deref(),
+                    false,
+                    &mdir,
+                    &username,
+                    index,
+                ),
             },
         });
 
+        let mut skipped_stickers = 0usize;
+        let mut first_sticker_error = None;
         for media_result in media_results {
             match media_result.result {
                 Ok(path) => {
@@ -517,12 +540,16 @@ pub fn export_messages(
                 }
                 Err(e) => {
                     if media_result.is_sticker {
-                        log::warn!("  Sticker #{} export failed: {}", media_result.index, e);
+                        skipped_stickers += 1;
+                        first_sticker_error.get_or_insert(e);
                     } else {
                         log::warn!("  Media #{} export failed: {}", media_result.index, e);
                     }
                 }
             }
+        }
+        if let Some(error) = first_sticker_error {
+            log::warn!("Skipped {} cached stickers: {}", skipped_stickers, error);
         }
     } else {
         log::warn!("Telegram data directory not found, cached image/video/file export skipped");
@@ -756,7 +783,7 @@ fn export_cached_images(
             msg_type: 3,
         })
         .collect::<Vec<_>>();
-    let image_job_count = parallel::job_count(jobs, 4);
+    let image_job_count = parallel::job_count(jobs, 8);
     let image_results = parallel::map_ordered(image_jobs, image_job_count, |job| match job {
         MediaExportJob::Cached {
             index,
@@ -1413,7 +1440,7 @@ fn export_cached_files(
 ) -> Result<Vec<PathBuf>, String> {
     std::fs::create_dir_all(output_dir).map_err(|e| format!("Cannot create file dir: {}", e))?;
 
-    let file_job_count = parallel::job_count(jobs, 4);
+    let file_job_count = parallel::job_count(jobs, 8);
     let file_results = parallel::map_ordered(files, file_job_count, |file| {
         let index = file.index;
         MediaExportResult {
@@ -1592,13 +1619,7 @@ pub fn export_stickers(
         ));
     }
 
-    export_sticker_candidates(
-        &telegram_base,
-        &username,
-        config.output_dir,
-        config.jobs,
-        selected,
-    )
+    export_sticker_candidates(&username, config.output_dir, config.jobs, selected)
 }
 
 fn export_sticker_by_identifier(
@@ -1630,7 +1651,6 @@ fn export_sticker_by_identifier(
             ));
         }
         return export_sticker_candidates(
-            &telegram_base,
             &username,
             config.output_dir,
             config.jobs,
@@ -1654,7 +1674,6 @@ fn export_sticker_by_identifier(
                 cached_source,
             };
             return export_sticker_candidates(
-                &telegram_base,
                 &username,
                 config.output_dir,
                 config.jobs,
@@ -1692,20 +1711,20 @@ fn build_sticker_candidates(
 }
 
 fn export_sticker_candidates(
-    telegram_base: &Path,
     username: &str,
     output_dir: &Path,
     jobs: usize,
     stickers: Vec<StickerCandidate>,
 ) -> Result<Vec<PathBuf>, String> {
-    let sticker_job_count = parallel::job_count(jobs, 4);
+    let sticker_job_count = parallel::job_count(jobs, 8);
     let sticker_results =
         parallel::map_ordered(stickers, sticker_job_count, |sticker| MediaExportResult {
             index: sticker.index,
             is_sticker: true,
             result: export_sticker_info(
                 &sticker.info,
-                telegram_base,
+                sticker.cached_source.as_deref(),
+                true,
                 output_dir,
                 username,
                 sticker.index,
@@ -1774,6 +1793,10 @@ fn sticker_id_label(candidate: &StickerCandidate) -> String {
 
 fn sticker_identifier(info: &media::StickerInfo) -> Option<String> {
     info.identifier().map(ToString::to_string)
+}
+
+fn record_new_sticker(seen: &mut HashSet<String>, info: &media::StickerInfo) -> bool {
+    sticker_identifier(info).is_none_or(|identifier| seen.insert(identifier))
 }
 
 fn sticker_info_label(info: &media::StickerInfo) -> String {
@@ -2567,8 +2590,9 @@ fn export_txt(
     display_name: &str,
     messages: &[ExportMessage],
 ) -> Result<(), String> {
-    let mut f = std::fs::File::create(path)
+    let file = std::fs::File::create(path)
         .map_err(|e| format!("Cannot create {}: {}", path.display(), e))?;
+    let mut f = BufWriter::new(file);
 
     writeln!(f, "Telegram 聊天记录: {} ({})", display_name, username).ok();
     writeln!(f, "总消息数: {}", messages.len()).ok();
@@ -2590,8 +2614,9 @@ fn export_txt(
 }
 
 fn export_csv(path: &Path, messages: &[ExportMessage]) -> Result<(), String> {
-    let mut f = std::fs::File::create(path)
+    let file = std::fs::File::create(path)
         .map_err(|e| format!("Cannot create {}: {}", path.display(), e))?;
+    let mut f = BufWriter::new(file);
 
     // Write BOM for Excel compatibility
     f.write_all(&[0xEF, 0xBB, 0xBF]).ok();
@@ -2610,10 +2635,14 @@ fn export_csv(path: &Path, messages: &[ExportMessage]) -> Result<(), String> {
 }
 
 fn export_json(path: &Path, messages: &[ExportMessage]) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(messages)
+    let file = std::fs::File::create(path)
+        .map_err(|e| format!("Cannot create {}: {}", path.display(), e))?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, messages)
         .map_err(|e| format!("JSON serialization error: {}", e))?;
-    std::fs::write(path, json).map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
-    Ok(())
+    writer
+        .flush()
+        .map_err(|e| format!("Cannot write {}: {}", path.display(), e))
 }
 
 /// Export a media file, decrypting V2 files on the fly.
@@ -2660,20 +2689,10 @@ fn export_media_with_decrypt(
     )
 }
 
-fn export_sticker_message(
-    message: &ExportMessage,
-    telegram_base: &Path,
-    output_dir: &Path,
-    session_name: &str,
-    index: usize,
-) -> Result<PathBuf, String> {
-    let info = media::parse_sticker_info(&message.raw_content);
-    export_sticker_info(&info, telegram_base, output_dir, session_name, index)
-}
-
 fn export_sticker_info(
     info: &media::StickerInfo,
-    telegram_base: &Path,
+    cached_source: Option<&Path>,
+    download_remote: bool,
     output_dir: &Path,
     session_name: &str,
     index: usize,
@@ -2688,16 +2707,16 @@ fn export_sticker_info(
         return Err("no sticker md5 or URL in message XML".to_string());
     }
 
-    if !info.md5.is_empty() {
-        if let Some(src) = media::find_cached_sticker(telegram_base, &info.md5) {
-            let data = std::fs::read(&src)
-                .map_err(|e| format!("Read cached sticker {}: {}", src.display(), e))?;
-            if let Some(path) =
-                write_sticker_candidate(&data, info, output_dir, session_name, index)?
-            {
-                return Ok(path);
-            }
+    if let Some(src) = cached_source {
+        let data = std::fs::read(src)
+            .map_err(|e| format!("Read cached sticker {}: {}", src.display(), e))?;
+        if let Some(path) = write_sticker_candidate(&data, info, output_dir, session_name, index)? {
+            return Ok(path);
         }
+    }
+
+    if !download_remote {
+        return Err("cached sticker could not be decoded".to_string());
     }
 
     let mut tried_urls = HashSet::new();
@@ -2730,16 +2749,6 @@ fn export_sticker_info(
         &info.md5
     };
     Err(format!("cannot decode sticker {}", id))
-}
-
-fn has_sticker_export_source(message: &ExportMessage) -> bool {
-    let info = media::parse_sticker_info(&message.raw_content);
-    !info.md5.is_empty()
-        || !info.url.is_empty()
-        || !info.cdn_url.is_empty()
-        || !info.encrypt_url.is_empty()
-        || !info.extern_url.is_empty()
-        || !info.thumb_url.is_empty()
 }
 
 fn write_sticker_candidate(
@@ -3478,6 +3487,17 @@ mod tests {
             &candidate,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         ));
+    }
+
+    #[test]
+    fn full_export_deduplicates_repeated_stickers() {
+        let info = media::parse_sticker_info(
+            r#"<emoji md5="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" cdnurl="https://x.test/b.webp"></emoji>"#,
+        );
+        let mut seen = HashSet::new();
+
+        assert!(record_new_sticker(&mut seen, &info));
+        assert!(!record_new_sticker(&mut seen, &info));
     }
 
     #[test]

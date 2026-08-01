@@ -517,6 +517,13 @@ pub fn find_telegram_base_path() -> Option<PathBuf> {
 // ===== Sticker cache search =====
 
 pub fn find_cached_sticker(base_path: &Path, md5: &str) -> Option<PathBuf> {
+    find_cached_sticker_in_layout(base_path, md5).or_else(|| {
+        let cache_dir = base_path.join("cache");
+        find_file_named(&cache_dir, &md5.trim().to_lowercase())
+    })
+}
+
+pub(crate) fn find_cached_sticker_in_layout(base_path: &Path, md5: &str) -> Option<PathBuf> {
     let md5 = md5.trim().to_lowercase();
     if md5.len() < 2 {
         return None;
@@ -537,7 +544,7 @@ pub fn find_cached_sticker(base_path: &Path, md5: &str) -> Option<PathBuf> {
         }
     }
 
-    find_file_named(&cache_dir, &md5)
+    None
 }
 
 fn find_file_named(dir: &Path, target: &str) -> Option<PathBuf> {
@@ -762,6 +769,20 @@ mod tests {
         assert_eq!(info.height, 47);
         assert_eq!(info.identifier(), Some("abc123"));
         assert_eq!(info.display(), "[sticker:abc123]");
+    }
+
+    #[test]
+    fn test_find_cached_sticker_in_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let md5 = "abcdef0123456789abcdef0123456789";
+        let sticker = temp.path().join("cache/2026-08/Emoticon/ab").join(md5);
+        fs::create_dir_all(sticker.parent().unwrap()).unwrap();
+        fs::write(&sticker, b"sticker").unwrap();
+
+        assert_eq!(
+            find_cached_sticker_in_layout(temp.path(), md5).unwrap(),
+            sticker
+        );
     }
 
     #[test]
