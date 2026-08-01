@@ -1,12 +1,12 @@
 use rusqlite::types::Value;
-use rusqlite::{params_from_iter, Connection, OpenFlags, MAIN_DB};
+use rusqlite::{params_from_iter, Connection};
 use serde_json::{Map, Number, Value as JsonValue};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::{contact, db, dictionary, media, message, message_index, output, parallel, paths};
+use crate::{contact, db, dictionary, media, message, output, parallel, paths};
 
 const MESSAGE_TARGETS: &[&str] = &["messages", "message", "all-messages"];
 const MAX_QUERY_KEYWORDS: usize = 16;
@@ -211,10 +211,6 @@ pub(crate) fn run(options: QueryOptions<'_>) -> Result<usize, String> {
     run_messages_with_output(options, &mut out)
 }
 
-pub(crate) fn can_answer_from_existing_index(options: &QueryOptions<'_>) -> bool {
-    source_validated_answerable_index(options).is_some()
-}
-
 pub(crate) fn run_schema(options: SchemaOptions<'_>) -> Result<usize, String> {
     let stdout = std::io::stdout();
     let mut out = output::Output::new(stdout.lock());
@@ -226,12 +222,6 @@ fn run_messages_with_output<W: Write>(
     out: &mut output::Output<W>,
 ) -> Result<usize, String> {
     validate_message_options(&options)?;
-    match try_run_indexed_messages_with_output(&options, out) {
-        Ok(Some(displayed)) => return Ok(displayed),
-        Ok(None) => {}
-        Err(e) => log::warn!("Message index query failed; falling back: {}", e),
-    }
-
     let context = build_message_context(&options)?;
     if context.targets.is_empty() {
         return Err("No message databases found. Try 'tg refresh' first.".to_string());
@@ -265,111 +255,6 @@ fn run_messages_with_output<W: Write>(
     )?;
     out.flush()?;
     Ok(displayed)
-}
-
-fn try_run_indexed_messages_with_output<W: Write>(
-    options: &QueryOptions<'_>,
-    out: &mut output::Output<W>,
-) -> Result<Option<usize>, String> {
-    if !query_may_use_index(options) {
-        return Ok(None);
-    }
-
-    let Some(index) = existing_answerable_index(options) else {
-        return Ok(None);
-    };
-    let has_current_derived_semantics =
-        message_index::has_current_derived_semantics(&index).unwrap_or(false);
-
-    if !has_current_derived_semantics {
-        let Some(index) = source_validated_answerable_index(options) else {
-            return Ok(None);
-        };
-        let rows = query_indexed_messages(&index, options)?;
-        let displayed = rows.len();
-        write_message_rows(
-            out,
-            &rows,
-            &options.fields,
-            options.format,
-            options.max_cell_chars,
-        )?;
-        out.flush()?;
-        return Ok(Some(displayed));
-    }
-
-    if has_current_derived_semantics {
-        if let Err(e) = message_index::ensure_recent_sessions(options.decrypted_dir, options.jobs) {
-            log::warn!(
-                "Message index session catch-up failed; falling back if needed: {}",
-                e
-            );
-        }
-    }
-
-    let index = existing_answerable_index(options).unwrap_or(index);
-
-    let rows = query_indexed_messages(&index, options)?;
-    let displayed = rows.len();
-    write_message_rows(
-        out,
-        &rows,
-        &options.fields,
-        options.format,
-        options.max_cell_chars,
-    )?;
-    out.flush()?;
-    Ok(Some(displayed))
-}
-
-fn query_may_use_index(options: &QueryOptions<'_>) -> bool {
-    options.name_mode != contact::DisplayNameMode::Anonymous && options.since.is_some()
-}
-
-fn existing_answerable_index(options: &QueryOptions<'_>) -> Option<message_index::HotIndex> {
-    answerable_index(options, true)
-}
-
-fn source_validated_answerable_index(
-    options: &QueryOptions<'_>,
-) -> Option<message_index::HotIndex> {
-    answerable_index(options, false)
-}
-
-fn answerable_index(
-    options: &QueryOptions<'_>,
-    allow_session_catch_up: bool,
-) -> Option<message_index::HotIndex> {
-    if options.name_mode == contact::DisplayNameMode::Anonymous {
-        return None;
-    }
-
-    let since = options.since?;
-    let index = match if allow_session_catch_up {
-        message_index::open_existing_query_index(options.decrypted_dir)
-    } else {
-        message_index::open_existing_recent(options.decrypted_dir)
-    } {
-        Ok(Some(index)) if index.covers(since) => index,
-        Ok(_) => return None,
-        Err(e) => {
-            log::warn!("Message index read failed; falling back: {}", e);
-            return None;
-        }
-    };
-
-    let has_current_derived_semantics =
-        message_index::has_current_derived_semantics(&index).unwrap_or(false);
-    if !has_current_derived_semantics && !index_has_raw_body(&index).unwrap_or(false) {
-        return None;
-    }
-    if (!options.contains.is_empty() || !options.not_contains.is_empty())
-        && (!has_current_derived_semantics || !index_has_decoded_body(&index).unwrap_or(false))
-    {
-        return None;
-    }
-
-    Some(index)
 }
 
 fn run_schema_with_output<W: Write>(
@@ -459,32 +344,11 @@ fn query_needs_post_filtering(options: &QueryOptions<'_>) -> bool {
         || media_filters_need_post_filtering(options)
 }
 
-fn indexed_query_needs_post_filtering(
-    options: &QueryOptions<'_>,
-    has_indexed_media_type: bool,
-) -> bool {
-    !has_indexed_media_type && media_filters_need_post_filtering(options)
-}
-
 fn media_filters_need_post_filtering(options: &QueryOptions<'_>) -> bool {
     options
         .has
         .iter()
         .any(|media_type| matches!(media_type, QueryMediaType::File | QueryMediaType::Video))
-}
-
-fn index_has_decoded_body(index: &message_index::HotIndex) -> Result<bool, String> {
-    index_has_message_column(index, "decoded_body")
-}
-
-fn index_has_raw_body(index: &message_index::HotIndex) -> Result<bool, String> {
-    index_has_message_column(index, "raw_body")
-}
-
-fn index_has_message_column(index: &message_index::HotIndex, column: &str) -> Result<bool, String> {
-    let conn = Connection::open(&index.path)
-        .map_err(|e| format!("Cannot open message index {}: {}", index.path.display(), e))?;
-    Ok(db::table_has_column(&conn, "messages", column))
 }
 
 fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryContext, String> {
@@ -555,7 +419,7 @@ fn query_message_target(
     context: &MessageQueryContext,
     options: &QueryOptions<'_>,
 ) -> Result<Vec<MessageRow>, String> {
-    let conn = open_readonly(&target.path)?;
+    let conn = crate::sqlite::open_immutable(&target.path)?;
     let tables = match &context.selected_table {
         Some(table) => vec![table.clone()],
         None => db::list_message_tables(&conn)?,
@@ -594,6 +458,11 @@ fn query_message_table(
         db::quote_identifier("local_id")
     } else {
         "rowid".to_string()
+    };
+    let order_col = if db::table_has_column(conn, table, "sort_seq") {
+        "sort_seq"
+    } else {
+        "create_time"
     };
     let quoted_table = db::quote_identifier(table);
     let result_window = message_query_window(options)?;
@@ -641,13 +510,14 @@ fn query_message_table(
         "SELECT local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}, {local_id_col} \
          FROM {quoted_table} \
          WHERE {where_clause} \
-         ORDER BY create_time {order_dir}{limit_clause}",
+         ORDER BY {order_col} {order_dir}{limit_clause}",
         body_col = body_col,
         marker_col = marker_col,
         sender_col = sender_col,
         packed_col = packed_col,
         local_id_col = local_id_col,
         quoted_table = quoted_table,
+        order_col = order_col,
         where_clause = clauses.join(" AND "),
         order_dir = options.sort.order_dir(),
         limit_clause = limit_clause,
@@ -695,189 +565,6 @@ fn query_message_table(
         .filter_map(|row| row.ok())
         .filter(|row| message_row_matches_filters(row, options))
         .take(result_window)
-        .collect())
-}
-
-fn query_indexed_messages(
-    index: &message_index::HotIndex,
-    options: &QueryOptions<'_>,
-) -> Result<Vec<MessageRow>, String> {
-    let (contact_db, message_dbs) = db::find_decrypted_dbs(options.decrypted_dir);
-    let contacts = contact_db
-        .as_ref()
-        .and_then(|path| contact::load_contacts(path).ok())
-        .unwrap_or_default();
-    let selected_session = match options.session {
-        Some(session) if contacts.is_empty() => db::resolve_username_for_messages(
-            session,
-            contact_db.as_deref(),
-            &message_dbs,
-            options.jobs,
-        )
-        .map(Some)?,
-        Some(session) => Some(db::resolve_username_for_messages_with_contacts(
-            session,
-            &contacts,
-            &message_dbs,
-            options.jobs,
-        )),
-        None => None,
-    };
-    let result_window = message_query_window(options)?;
-    let conn = Connection::open(&index.path)
-        .map_err(|e| format!("Cannot open message index {}: {}", index.path.display(), e))?;
-    let raw_body_col = if db::table_has_column(&conn, "messages", "raw_body") {
-        "raw_body"
-    } else {
-        "body"
-    };
-    let has_current_derived_semantics =
-        message_index::has_current_derived_semantics(index).unwrap_or(false);
-    let has_decoded_body =
-        has_current_derived_semantics && db::table_has_column(&conn, "messages", "decoded_body");
-    let decoded_body_col = if has_decoded_body {
-        "decoded_body"
-    } else {
-        raw_body_col
-    };
-    let has_media_type =
-        has_current_derived_semantics && db::table_has_column(&conn, "messages", "media_type");
-    let local_id_col = if db::table_has_column(&conn, "messages", "local_id") {
-        "local_id"
-    } else {
-        "NULL"
-    };
-    let mut clauses = vec!["create_time > 0".to_string()];
-    let mut params = Vec::new();
-
-    if let Some(session) = selected_session {
-        clauses.push("session_id = ?".to_string());
-        params.push(Value::Text(session));
-    }
-    if let Some(since) = options.since {
-        clauses.push("create_time >= ?".to_string());
-        params.push(Value::Integer(since));
-    }
-    if let Some(until) = options.until {
-        clauses.push("create_time <= ?".to_string());
-        params.push(Value::Integer(until));
-    }
-
-    if !options.contains.is_empty() {
-        let contains_clause = options
-            .contains
-            .iter()
-            .map(|query| {
-                params.push(Value::Text(db::like_contains_pattern(query)));
-                format!("{decoded_body_col} LIKE ? ESCAPE '\\'")
-            })
-            .collect::<Vec<_>>()
-            .join(options.match_mode.joiner());
-        clauses.push(format!("({})", contains_clause));
-    }
-
-    for query in options.not_contains {
-        params.push(Value::Text(db::like_contains_pattern(query)));
-        clauses.push(format!("{decoded_body_col} NOT LIKE ? ESCAPE '\\'"));
-    }
-    if !options.raw_contains.is_empty() {
-        let contains_clause = options
-            .raw_contains
-            .iter()
-            .map(|query| {
-                params.push(Value::Text(db::like_contains_pattern(query)));
-                format!("{raw_body_col} LIKE ? ESCAPE '\\'")
-            })
-            .collect::<Vec<_>>()
-            .join(options.match_mode.joiner());
-        clauses.push(format!("({})", contains_clause));
-    }
-    if !options.has.is_empty() {
-        if has_media_type {
-            let placeholders = options
-                .has
-                .iter()
-                .map(|media_type| {
-                    params.push(Value::Text(media_type.as_str().to_string()));
-                    "?"
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            clauses.push(format!("media_type IN ({})", placeholders));
-        } else {
-            let media_clause = options
-                .has
-                .iter()
-                .map(|media_type| legacy_indexed_media_clause(*media_type, raw_body_col))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            clauses.push(format!("({})", media_clause));
-        }
-    }
-
-    let limit_clause = if indexed_query_needs_post_filtering(options, has_media_type) {
-        String::new()
-    } else {
-        format!(" LIMIT {}", result_window)
-    };
-    let sql = format!(
-        "SELECT session_display, sender_display, local_type, create_time, {raw_body_col}, {decoded_body_col}, marker, packed_info, {local_id_col}
-         FROM messages
-         WHERE {where_clause}
-         ORDER BY create_time {order_dir}{limit_clause}",
-        raw_body_col = raw_body_col,
-        decoded_body_col = decoded_body_col,
-        local_id_col = local_id_col,
-        where_clause = clauses.join(" AND "),
-        order_dir = options.sort.order_dir(),
-        limit_clause = limit_clause,
-    );
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| format!("Prepare indexed query: {}", e))?;
-    let mapped = stmt
-        .query_map(params_from_iter(params.iter()), |row| {
-            let session = row.get::<_, Option<String>>(0)?.unwrap_or_default();
-            let local_type = row.get::<_, Option<i64>>(2)?.unwrap_or(-1);
-            let raw_body = row.get::<_, Option<String>>(4)?.unwrap_or_default();
-            let body = if has_decoded_body {
-                row.get::<_, Option<String>>(5)?.unwrap_or_default()
-            } else {
-                let marker = row.get::<_, Option<i64>>(6)?;
-                let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(7)?.unwrap_or_default();
-                let local_id = row.get::<_, Option<i64>>(8)?.unwrap_or(0);
-                decode_query_body(
-                    local_type,
-                    &raw_body,
-                    marker,
-                    &packed_info,
-                    Some(local_id),
-                    &session,
-                    &HashMap::new(),
-                )
-            };
-            Ok(MessageRow {
-                session,
-                sender: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                local_type,
-                create_time: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                body,
-                raw_body,
-            })
-        })
-        .map_err(|e| format!("Run indexed query: {}", e))?;
-
-    Ok(mapped
-        .filter_map(|row| row.ok())
-        .filter(|row| {
-            if has_decoded_body {
-                message_row_matches_media_filters(row, options)
-            } else {
-                message_row_matches_filters(row, options)
-            }
-        })
-        .skip(options.offset)
-        .take(options.limit)
         .collect())
 }
 
@@ -1295,19 +982,6 @@ fn resolve_numbered_message_db(decrypted_dir: &Path, target: &str) -> Option<Pat
     path.exists().then_some(path)
 }
 
-fn open_readonly(path: &Path) -> Result<Connection, String> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(path, flags)
-        .map_err(|e| format!("Cannot open {} read-only: {}", path.display(), e))?;
-    if !conn
-        .is_readonly(MAIN_DB)
-        .map_err(|e| format!("Cannot verify read-only mode: {}", e))?
-    {
-        return Err(format!("{} did not open read-only", path.display()));
-    }
-    Ok(conn)
-}
-
 fn escape_table_cell(value: &str, max_chars: usize) -> String {
     let mut escaped = String::new();
     let mut chars = value.chars();
@@ -1332,7 +1006,7 @@ fn escape_table_cell(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::{params, OptionalExtension};
+    use rusqlite::params;
     use tempfile::{tempdir, TempDir};
 
     fn create_query_test_dir() -> TempDir {
@@ -1664,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    fn message_query_decodes_indexed_xml_body() {
+    fn message_query_decodes_xml_body() {
         let dir = create_query_test_dir();
         let conn = Connection::open(dir.path().join("message/message_0.db")).unwrap();
         let marker_col = dictionary::msg_compression_marker_column();
@@ -1680,8 +1354,6 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        crate::message_index::ensure_recent(dir.path(), 1).unwrap();
-
         let contains = vec!["索引回复".to_string()];
         let mut bytes = Vec::new();
         let mut out = output::Output::new(&mut bytes);
@@ -1698,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn message_query_uses_indexed_decoded_body_for_contains() {
+    fn message_query_uses_decoded_body_for_contains() {
         let dir = create_query_test_dir();
         let conn = Connection::open(dir.path().join("message/message_0.db")).unwrap();
         let marker_col = dictionary::msg_compression_marker_column();
@@ -1714,8 +1386,6 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        crate::message_index::ensure_recent(dir.path(), 1).unwrap();
-
         let contains = vec!["indexed-raw-only".to_string()];
         let mut bytes = Vec::new();
         let mut out = output::Output::new(&mut bytes);
@@ -1743,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn message_query_uses_indexed_voice_media_and_local_id() {
+    fn message_query_uses_voice_media_and_local_id() {
         let dir = create_query_test_dir();
         let conn = Connection::open(dir.path().join("message/message_0.db")).unwrap();
         let marker_col = dictionary::msg_compression_marker_column();
@@ -1759,8 +1429,6 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        crate::message_index::ensure_recent(dir.path(), 1).unwrap();
-
         let has = vec![QueryMediaType::Voice];
         let mut bytes = Vec::new();
         let mut out = output::Output::new(&mut bytes);
@@ -1774,256 +1442,6 @@ mod tests {
 
         assert_eq!(count, 1);
         assert!(output.contains("[voice:5151]"));
-    }
-
-    #[test]
-    fn message_query_uses_indexed_media_type_column_for_has() {
-        let dir = tempdir().unwrap();
-        let index_path = dir.path().join(".tg_index.db");
-        let conn = Connection::open(&index_path).unwrap();
-        conn.execute_batch(
-            "PRAGMA user_version = 8;
-             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE messages (
-                 id INTEGER PRIMARY KEY,
-                 source_db TEXT NOT NULL,
-                 table_name TEXT NOT NULL,
-                 session_id TEXT NOT NULL,
-                 session_display TEXT NOT NULL,
-                 sender_account TEXT NOT NULL,
-                 sender_display TEXT NOT NULL,
-                 local_id INTEGER,
-                 local_type INTEGER NOT NULL,
-                 media_type TEXT NOT NULL,
-                 create_time INTEGER NOT NULL,
-                 raw_body TEXT NOT NULL,
-                 decoded_body TEXT NOT NULL,
-                 body TEXT NOT NULL,
-                 marker INTEGER,
-                 packed_info BLOB NOT NULL
-             );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('derived_semantics_version', ?1)",
-            params![message_index::DERIVED_SEMANTICS_VERSION.to_string()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (
-                source_db, table_name, session_id, session_display,
-                sender_account, sender_display, local_id, local_type,
-                media_type, create_time, raw_body, decoded_body, body, marker, packed_info
-             ) VALUES (
-                'message/message_0.db', 'Msg_test', 'tgid_test', 'Test',
-                '', '', 1, 49, 'file', ?1, '<msg><appmsg><title>report.pdf</title><type>6</type></appmsg></msg>',
-                '[文件] report.pdf', '<msg><appmsg><title>report.pdf</title><type>6</type></appmsg></msg>', NULL, x''
-             )",
-            params![crate::time::default_recent_since() + 1],
-        )
-        .unwrap();
-        drop(conn);
-
-        let index = message_index::HotIndex {
-            path: index_path,
-            since: crate::time::default_recent_since(),
-        };
-        let has = vec![QueryMediaType::File];
-        let mut options = default_query_options(dir.path(), &[], &[]);
-        options.has = &has;
-        options.since = Some(crate::time::default_recent_since());
-
-        let rows = query_indexed_messages(&index, &options).unwrap();
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].body, "[文件] report.pdf");
-    }
-
-    #[test]
-    fn message_query_ignores_stale_indexed_media_type_without_semantics_meta() {
-        let dir = tempdir().unwrap();
-        let index_path = dir.path().join(".tg_index.db");
-        let conn = Connection::open(&index_path).unwrap();
-        conn.execute_batch(
-            "PRAGMA user_version = 8;
-             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE messages (
-                 id INTEGER PRIMARY KEY,
-                 source_db TEXT NOT NULL,
-                 table_name TEXT NOT NULL,
-                 session_id TEXT NOT NULL,
-                 session_display TEXT NOT NULL,
-                 sender_account TEXT NOT NULL,
-                 sender_display TEXT NOT NULL,
-                 local_id INTEGER,
-                 local_type INTEGER NOT NULL,
-                 media_type TEXT NOT NULL,
-                 create_time INTEGER NOT NULL,
-                 raw_body TEXT NOT NULL,
-                 decoded_body TEXT NOT NULL,
-                 marker INTEGER,
-                 packed_info BLOB NOT NULL
-             );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (
-                source_db, table_name, session_id, session_display,
-                sender_account, sender_display, local_id, local_type,
-                media_type, create_time, raw_body, decoded_body, marker, packed_info
-             ) VALUES (
-                'message/message_0.db', 'Msg_test', 'tgid_test', 'Test',
-                '', '', 1, ?1, 'file', ?2,
-                '<msg><appmsg><title>我拍了拍 \"Bob\"</title><type>62</type><patinfo><template>我拍了拍 \"${tgid_bob}\"</template></patinfo></appmsg></msg>',
-                '[文件] 我拍了拍 \"Bob\"', NULL, x''
-             )",
-            params![(62_i64 << 32) | 49, crate::time::default_recent_since() + 1],
-        )
-        .unwrap();
-        drop(conn);
-
-        let index = message_index::HotIndex {
-            path: index_path,
-            since: crate::time::default_recent_since(),
-        };
-        let has = vec![QueryMediaType::File];
-        let mut options = default_query_options(dir.path(), &[], &[]);
-        options.has = &has;
-        options.since = Some(crate::time::default_recent_since());
-
-        let rows = query_indexed_messages(&index, &options).unwrap();
-
-        assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn message_query_does_not_upgrade_stale_semantics_index() {
-        let dir = tempdir().unwrap();
-        let message_dir = dir.path().join("message");
-        std::fs::create_dir_all(&message_dir).unwrap();
-        drop(Connection::open(message_dir.join("message_0.db")).unwrap());
-        let index_path = dir.path().join(".tg_index.db");
-        let conn = Connection::open(&index_path).unwrap();
-        conn.execute_batch(
-            "PRAGMA user_version = 8;
-             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta (key, value) VALUES ('index_since', '1');
-             CREATE TABLE messages (
-                 id INTEGER PRIMARY KEY,
-                 source_db TEXT NOT NULL,
-                 table_name TEXT NOT NULL,
-                 session_id TEXT NOT NULL,
-                 session_display TEXT NOT NULL,
-                 sender_account TEXT NOT NULL,
-                 sender_display TEXT NOT NULL,
-                 local_id INTEGER,
-                 local_type INTEGER NOT NULL,
-                 media_type TEXT NOT NULL,
-                 create_time INTEGER NOT NULL,
-                 raw_body TEXT NOT NULL,
-                 decoded_body TEXT NOT NULL,
-                 marker INTEGER,
-                 packed_info BLOB NOT NULL
-             );
-             INSERT INTO messages (
-                 source_db, table_name, session_id, session_display,
-                 sender_account, sender_display, local_id, local_type,
-                 media_type, create_time, raw_body, decoded_body, marker, packed_info
-             ) VALUES (
-                 'message/message_0.db', 'Msg_test', 'tgid_test', 'Test',
-                 '', '', 1, 49, 'file', 2,
-                 '<msg><appmsg><title>report.pdf</title><type>6</type></appmsg></msg>',
-                 '[文件] report.pdf', NULL, x''
-             );",
-        )
-        .unwrap();
-        drop(conn);
-
-        let has = vec![QueryMediaType::File];
-        let mut bytes = Vec::new();
-        let mut out = output::Output::new(&mut bytes);
-        let mut options = default_query_options(dir.path(), &[], &[]);
-        options.has = &has;
-        options.since = Some(1);
-        let count = run_messages_with_output(options, &mut out).unwrap();
-        out.flush().unwrap();
-        drop(out);
-
-        let conn = Connection::open(&index_path).unwrap();
-        let version: i64 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        let derived_version: Option<String> = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'derived_semantics_version'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .unwrap();
-
-        assert_eq!(count, 0);
-        assert_eq!(version, 8);
-        assert!(derived_version.is_none());
-    }
-
-    #[test]
-    fn message_query_rejects_stale_index_without_raw_body() {
-        let dir = tempdir().unwrap();
-        let message_dir = dir.path().join("message");
-        std::fs::create_dir_all(&message_dir).unwrap();
-        drop(Connection::open(message_dir.join("message_0.db")).unwrap());
-        let index_path = dir.path().join(".tg_index.db");
-        let conn = Connection::open(&index_path).unwrap();
-        conn.execute_batch(
-            "PRAGMA user_version = 5;
-             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta (key, value) VALUES ('index_since', '1');
-             CREATE TABLE messages (
-                 id INTEGER PRIMARY KEY,
-                 source_db TEXT NOT NULL,
-                 table_name TEXT NOT NULL,
-                 session_id TEXT NOT NULL,
-                 session_display TEXT NOT NULL,
-                 sender_account TEXT NOT NULL,
-                 sender_display TEXT NOT NULL,
-                 local_type INTEGER NOT NULL,
-                 media_type TEXT NOT NULL,
-                 create_time INTEGER NOT NULL,
-                 body TEXT NOT NULL,
-                 marker INTEGER,
-                 packed_info BLOB NOT NULL
-             );
-             INSERT INTO messages (
-                 source_db, table_name, session_id, session_display,
-                 sender_account, sender_display, local_type,
-                 media_type, create_time, body, marker, packed_info
-             ) VALUES (
-                 'message/message_0.db', 'Msg_test', 'tgid_test', 'Test',
-                 '', '', 266287972401, 'file', 2,
-                 '[文件] 我拍了拍 \"Bob\"', NULL, x''
-             );",
-        )
-        .unwrap();
-        drop(conn);
-
-        let has = vec![QueryMediaType::File];
-        let mut bytes = Vec::new();
-        let mut out = output::Output::new(&mut bytes);
-        let mut options = default_query_options(dir.path(), &[], &[]);
-        options.has = &has;
-        options.since = Some(1);
-        let count = run_messages_with_output(options, &mut out).unwrap();
-        out.flush().unwrap();
-        drop(out);
-
-        let conn = Connection::open(&index_path).unwrap();
-        let version: i64 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-
-        assert_eq!(count, 0);
-        assert_eq!(version, 5);
     }
 
     #[test]
@@ -2137,7 +1555,7 @@ mod tests {
         let dir = create_query_test_dir();
         let path = dir.path().join("message/message_0.db");
 
-        let conn = open_readonly(&path).unwrap();
+        let conn = crate::sqlite::open_immutable(&path).unwrap();
 
         assert!(conn.is_readonly(rusqlite::MAIN_DB).unwrap());
         assert!(conn

@@ -59,8 +59,7 @@ pub(crate) fn resolve_sender_name_with_mode(
 }
 
 pub(crate) fn load_contacts(contact_db: &Path) -> Result<HashMap<String, Contact>, String> {
-    let conn =
-        Connection::open(contact_db).map_err(|e| format!("Cannot open contact DB: {}", e))?;
+    let conn = crate::sqlite::open_immutable(contact_db)?;
 
     let mut contacts = load_contact_table(&conn, ContactTable::Contact)
         .map_err(|e| format!("Contact read error: {}", e))?;
@@ -138,8 +137,7 @@ pub(crate) fn load_chat_room_member_names(
     contact_db: &Path,
     room_username: &str,
 ) -> Result<HashMap<String, String>, String> {
-    let conn =
-        Connection::open(contact_db).map_err(|e| format!("Cannot open contact DB: {}", e))?;
+    let conn = crate::sqlite::open_immutable(contact_db)?;
     let ext_buffer: Option<Vec<u8>> = conn
         .query_row(
             "SELECT ext_buffer FROM chat_room WHERE username = ?1",

@@ -588,6 +588,8 @@ fn decode_link_content(
         62 => decode_file_content(content, packed_info),
         19 => decode_chat_history_content(content, time_bucket),
         57 => decode_quote_content(content, time_bucket, resolve_display_name),
+        87 => decode_group_notice_content(content)
+            .unwrap_or_else(|| decode_app_card_fallback(sub_type, "卡片", content)),
         2000 => decode_app_card_fallback(sub_type, "转账", content),
         2001 => decode_app_card_fallback(sub_type, "红包", content),
         51 => decode_short_video_or_legacy_reference_content(content),
@@ -611,6 +613,12 @@ fn decode_app_link_content(content: &str) -> String {
         .as_ref()
         .map(display_link_info)
         .unwrap_or_else(|| "[链接]".to_string())
+}
+
+fn decode_group_notice_content(content: &str) -> Option<String> {
+    let announcement = crate::media::extract_xml_tag(content, "textannouncement")?;
+    let announcement = media::strip_cdata(&announcement).trim();
+    (!announcement.is_empty()).then(|| format!("[群公告] {}", announcement))
 }
 
 fn display_link_info(info: &media::LinkInfo) -> String {
@@ -1585,6 +1593,14 @@ mod tests {
         let xml = r#"<msg><appmsg><title>Special Card</title><des>Details</des><type>87</type></appmsg></msg>"#;
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
         assert_eq!(d.content, "[卡片:87] Special Card - Details");
+    }
+
+    #[test]
+    fn test_decode_group_notice_card() {
+        let xml = r#"<msg><appmsg><type>87</type><group_notice_item><announcement><textannouncement><![CDATA[课程资料、课程视频和练习均会开源]]></textannouncement></announcement></group_notice_item></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Group", None, &[], |id| id.to_string());
+
+        assert_eq!(d.content, "[群公告] 课程资料、课程视频和练习均会开源");
     }
 
     #[test]

@@ -24,7 +24,8 @@ Do not wait for the user to name tg. tg is the tool; the user goal is local macO
 
 Chat data is private. Keep work local by default, avoid printing more message content than the user asked for, and treat exports as sensitive.
 For summary requests, choose display names by the target. If the user clearly names a 1-on-1 person, omit `--anonymous` so the summary uses the user's intended name for that person. If the target is a group chat, a room, a global search, or the target type is unclear, use `--anonymous` whenever the command supports it to avoid exposing personal contact remarks in assistant-visible output and exported sender names.
-`~/.tg/all_keys.json` and `~/.tg/decrypted/` are sensitive local state. `~/.tg/decrypted/.tg_index.db` is a local derived hot index maintained by `tg refresh`; treat it as sensitive and safe to delete if it needs to be rebuilt.
+`~/.tg/all_keys.json` and `~/.tg/decrypted/` are sensitive local state. `tg refresh` maintains only the decrypted cache; search reuses the upstream FTS and message reads use the source databases' indexes.
+For exhaustive keyword lookup over locally cached messages, prefer `tg query --contains "..." --all-time`; `tg search` is the faster upstream-FTS path and does not cover every message type or nested card body.
 
 ## First Setup
 
@@ -100,7 +101,7 @@ tg query --session "产品讨论群" --contains "关键词" --fields time,sender
 tg query --contains "项目" --contains "上线" --match-mode all --since today --anonymous
 tg query --contains "项目" --not "已取消" --format json --fields timestamp,session,body --anonymous
 tg query --contains "项目" --all-time --anonymous
-tg schema --db message_0
+tg schema --db messages
 ```
 
 Use `tg schema` when the user asks what `query` can return or filter on. It

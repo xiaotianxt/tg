@@ -2,7 +2,7 @@
 
 tg 是一个 macOS/Linux 本地 Telegram 聊天记录读取 CLI。它把本机 Telegram 桌面版的聊天数据整理成几个直接的命令：读一个会话、全局搜索、结构化检索、导出聊天和导出本地缓存媒体。
 
-底层的密钥提取、数据库解密和索引维护仍然可控，但日常使用不需要反复关心这些步骤。`tg refresh` 负责刷新本地解密缓存和近期消息索引；`messages`、`search`、`query`、`export` 会在读取前尽量静默刷新，失败时继续使用已有缓存并给出诊断线索。
+底层的密钥提取和数据库解密仍然可控，但日常使用不需要反复关心这些步骤。`tg refresh` 负责刷新本地解密缓存；`messages`、`search`、`query`、`export` 会在读取前尽量静默刷新，失败时继续使用已有缓存并给出诊断线索。
 
 适合这些场景：
 
@@ -124,7 +124,7 @@ tg doctor "联系人或群名"
 tg refresh
 ```
 
-`refresh` 会刷新解密缓存并维护 `~/.tg/decrypted/.tg_index.db`。如果发现消息或联系人数据库缺 key，它会自动刷新 keys 并重试一次；也可以用 `tg refresh --keys` 强制先重新提取 keys。
+`refresh` 只维护 `~/.tg/decrypted/` 下的解密缓存；搜索直接复用上游 FTS，其他读取直接使用消息库已有索引，不再生成一份消息副本。如果发现消息或联系人数据库缺 key，它会自动刷新 keys 并重试一次；也可以用 `tg refresh --keys` 强制先重新提取 keys。
 
 ## 支持与限制
 
@@ -190,7 +190,7 @@ tg completions bash > ~/.local/share/bash-completion/completions/tg
 ```
 
 补全脚本支持命令、常用 flags、会话名和 `query --session`。动态会话候选只读取本地
-`~/.tg/decrypted/.tg_index.db` 或 contact cache，不会触发解密、刷新或读取在线服务。
+contact/session cache，不会触发解密、刷新或读取在线服务。
 release formula 会为 Homebrew 用户自动安装这些 completions。
 
 如果 macOS 没有 C 编译器：
@@ -232,13 +232,13 @@ xcode-select --install
 
    成功后派生的数据库密钥会保存到 `~/.tg/all_keys.json`。账号级材料单独保存在权限为 `0600` 的 `~/.tg/key_material.bin`，不会写入日志或命令输出。
 
-3. 刷新本地缓存和近期消息索引：
+3. 刷新本地解密缓存：
 
    ```bash
    tg refresh
    ```
 
-   成功后解密缓存会保存到 `~/.tg/decrypted/`，近期消息索引会保存到 `~/.tg/decrypted/.tg_index.db`。
+   成功后解密缓存会保存到 `~/.tg/decrypted/`。
 
 4. 看有哪些会话：
 
@@ -346,6 +346,8 @@ tg search "关键词" --since today --anonymous
 tg search "关键词" --all-time --anonymous
 ```
 
+`search` 直接复用上游 FTS，速度最快，但只覆盖上游已收录的正文；邮件、部分群公告和聊天记录卡片的深层内容可能不在其中。需要完整扫描本地消息分片和解码后正文时，使用 `tg query --contains "关键词" --all-time`。
+
 结构化检索：
 
 ```bash
@@ -357,10 +359,10 @@ tg query --contains "项目" --not "已取消" --format json --fields timestamp,
 tg query --has voice --session "张三" --limit 20
 tg query --raw-contains "<appmsg" --fields time,session,raw_body --limit 20
 tg query --contains "项目" --all-time --anonymous
-tg schema --db message_0
+tg schema --db messages
 ```
 
-`query` 适合在本机做精确检索：限定某个会话、同时要求多个关键词、排除某些词、筛选媒体类型、按时间收窄结果，或者只输出后续脚本需要的字段。`--contains` 匹配解码后的展示文本，图片、语音、表情等会按 tg 的可读标记参与匹配；需要查原始 XML/缓存正文时用 `--raw-contains`。`--has` 支持 `voice,image,sticker,file,video`，命中的是 hot index 里的结构化 `media_type`，不是展示文本。`--fields` 支持 `time,session,sender,type,body,raw_body,timestamp`，`--format json` 会按 JSON lines 输出，便于继续处理。升级后运行一次 `tg refresh` 可重建包含 `decoded_body` / `media_type` 的新版 hot index；旧索引缺列时会回退到只读原始缓存扫描。
+`query` 适合在本机做精确检索：限定某个会话、同时要求多个关键词、排除某些词、筛选媒体类型、按时间收窄结果，或者只输出后续脚本需要的字段。`--contains` 匹配解码后的展示文本，图片、语音、表情等会按 tg 的可读标记参与匹配；需要查原始 XML/缓存正文时用 `--raw-contains`。`--has` 支持 `voice,image,sticker,file,video`，根据消息类型和原始正文判断，不依赖额外索引。`--fields` 支持 `time,session,sender,type,body,raw_body,timestamp`，`--format json` 会按 JSON lines 输出，便于继续处理。
 
 `query` 不接受原始 SQL。用户只传会话、关键词、排除词、媒体类型、时间、排序和输出字段，tg 内部生成固定的参数化数据库查询，并以只读方式打开消息数据库。默认查询最近 365 天；加 `--all-time` 后，为了避免误扫全库，必须至少传 `--contains`、`--raw-contains`、`--has` 或 `--since` 之一。空关键词会被拒绝；单次 `--limit + --offset` 最多 10000。table 输出会转义终端控制字符，避免聊天正文影响终端显示。`schema` 展示的是公开查询字段和过滤器，不输出原始表名、列名或建表语句。
 
@@ -468,7 +470,6 @@ tg voice "张三" --id 123 --format wav
 - `~/.tg/all_keys.json`：数据库密钥。
 - `~/.tg/key_material.bin`：新版客户端的账号级 key material，版本化二进制格式，权限 `0600`；新数据库出现时用于离线派生对应 key。
 - `~/.tg/decrypted/`：解密后的 SQLite 数据库。
-- `~/.tg/decrypted/.tg_index.db`：`refresh` 维护的本地热索引，默认查询和导出会优先使用；可删除后重新 `refresh` 构建。
 - `exported/`：导出的聊天和媒体，默认位于当前目录。
 
 这些文件都应视为敏感数据。使用后如需清理：

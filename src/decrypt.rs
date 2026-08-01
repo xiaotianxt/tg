@@ -74,6 +74,7 @@ pub enum DecryptScope {
     All,
     Sessions,
     Messages,
+    Search,
 }
 
 struct DecryptTask {
@@ -128,6 +129,7 @@ struct TempPathGuard {
 
 impl TempPathGuard {
     fn disarm(&mut self) {
+        remove_sqlite_sidecars(&self.path);
         self.remove_on_drop = false;
     }
 }
@@ -136,8 +138,58 @@ impl Drop for TempPathGuard {
     fn drop(&mut self) {
         if self.remove_on_drop {
             let _ = fs::remove_file(&self.path);
+            remove_sqlite_sidecars(&self.path);
         }
     }
+}
+
+fn remove_sqlite_sidecars(path: &Path) {
+    for suffix in ["-wal", "-shm"] {
+        let _ = fs::remove_file(sqlite_sidecar_path(path, suffix));
+    }
+}
+
+fn cleanup_decrypted_cache(output_dir: &Path) {
+    for name in [".tg_index.db", ".tg_index.db-wal", ".tg_index.db-shm"] {
+        match fs::remove_file(output_dir.join(name)) {
+            Ok(()) => log::info!("Removed retired local message index {}", name),
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => log::warn!("Cannot remove retired cache file {}: {}", name, e),
+        }
+    }
+
+    fn remove_stale_sidecars(dir: &Path) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                remove_stale_sidecars(&path);
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if name.starts_with('.') && (name.ends_with(".tmp-wal") || name.ends_with(".tmp-shm")) {
+                if let Err(e) = fs::remove_file(&path) {
+                    log::warn!(
+                        "Cannot remove orphan temp sidecar {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
+            } else if let Some(base_name) = name.strip_suffix(".db-wal") {
+                if fs::metadata(&path).is_ok_and(|meta| meta.len() == 0) {
+                    let _ = fs::remove_file(&path);
+                    let _ = fs::remove_file(path.with_file_name(format!("{}.db-shm", base_name)));
+                }
+            }
+        }
+    }
+
+    remove_stale_sidecars(output_dir);
 }
 
 fn acquire_refresh_lock(output_dir: &Path) -> Result<RefreshLock, String> {
@@ -893,6 +945,11 @@ fn path_in_decrypt_scope(scope: DecryptScope, rel_path: &str) -> bool {
         DecryptScope::Messages => {
             rel_path == "contact/contact.db" || is_numbered_message_rel_path(rel_path)
         }
+        DecryptScope::Search => {
+            rel_path == "contact/contact.db"
+                || rel_path == "message/message_fts.db"
+                || is_numbered_message_rel_path(rel_path)
+        }
     }
 }
 
@@ -989,6 +1046,7 @@ pub fn decrypt_all(
     }
 
     let _refresh_lock = acquire_refresh_lock(output_dir)?;
+    cleanup_decrypted_cache(output_dir);
 
     // Collect all .db files
     let db_files = collect_db_files(&db_storage);
@@ -1171,7 +1229,7 @@ pub fn decrypt_all(
 }
 
 fn verify_sqlite(db_path: &Path) -> Result<Vec<String>, String> {
-    let conn = rusqlite::Connection::open(db_path).map_err(|e| format!("Cannot open: {}", e))?;
+    let conn = crate::sqlite::open_immutable(db_path)?;
 
     let mut stmt = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -1201,6 +1259,49 @@ mod tests {
 
         drop(lock);
         assert!(acquire_refresh_lock(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn cleanup_removes_retired_and_stale_sidecars_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("message");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(dir.path().join(".tg_index.db"), b"old").unwrap();
+        fs::write(nested.join(".message_0.db.1.2.0.tmp-wal"), b"old").unwrap();
+        fs::write(nested.join(".message_0.db.1.2.0.tmp-shm"), b"old").unwrap();
+        fs::write(nested.join("message_0.db-wal"), b"").unwrap();
+        fs::write(nested.join("message_0.db-shm"), b"old").unwrap();
+        fs::write(nested.join("keep.db-wal"), b"live").unwrap();
+        fs::write(nested.join("keep.db-shm"), b"live").unwrap();
+        fs::write(nested.join("message_0.db"), b"keep").unwrap();
+
+        cleanup_decrypted_cache(dir.path());
+
+        assert!(!dir.path().join(".tg_index.db").exists());
+        assert!(!nested.join(".message_0.db.1.2.0.tmp-wal").exists());
+        assert!(!nested.join(".message_0.db.1.2.0.tmp-shm").exists());
+        assert!(!nested.join("message_0.db-wal").exists());
+        assert!(!nested.join("message_0.db-shm").exists());
+        assert!(nested.join("keep.db-wal").exists());
+        assert!(nested.join("keep.db-shm").exists());
+        assert!(nested.join("message_0.db").exists());
+    }
+
+    #[test]
+    fn sqlite_verification_does_not_create_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE test (value INTEGER)", [])
+            .unwrap();
+        conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+            .unwrap();
+        drop(conn);
+        remove_sqlite_sidecars(&path);
+
+        assert_eq!(verify_sqlite(&path).unwrap(), vec!["test"]);
+        assert!(!sqlite_sidecar_path(&path, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&path, "-shm").exists());
     }
 
     #[test]
@@ -1294,6 +1395,30 @@ mod tests {
         assert!(!path_in_decrypt_scope(
             DecryptScope::Messages,
             "session/session.db"
+        ));
+    }
+
+    #[test]
+    fn search_decrypt_scope_includes_fts_and_fallback_message_dbs() {
+        assert!(path_in_decrypt_scope(
+            DecryptScope::Search,
+            "contact/contact.db"
+        ));
+        assert!(path_in_decrypt_scope(
+            DecryptScope::Search,
+            "message/message_fts.db"
+        ));
+        assert!(path_in_decrypt_scope(
+            DecryptScope::Search,
+            "message/message_0.db"
+        ));
+        assert!(!path_in_decrypt_scope(
+            DecryptScope::Search,
+            "message/media_0.db"
+        ));
+        assert!(!path_in_decrypt_scope(
+            DecryptScope::Search,
+            "favorite/favorite.db"
         ));
     }
 

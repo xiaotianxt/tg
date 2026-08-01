@@ -8,7 +8,7 @@ mod decrypt;
 mod dictionary;
 mod doctor;
 mod export;
-mod index_policy;
+mod fts;
 mod key_material;
 mod logger;
 mod media;
@@ -17,13 +17,12 @@ mod media_index;
 mod media_key;
 mod media_pb;
 mod message;
-mod message_index;
 mod output;
 mod parallel;
 mod paths;
 mod query;
-mod row_identity;
 mod scanner;
+mod sqlite;
 mod time;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -803,10 +802,6 @@ fn main() {
 
             match refresh {
                 Ok(stats) => {
-                    log::info!("Refreshing local message index");
-                    if let Err(e) = message_index::ensure_recent(&decrypted_dir, jobs) {
-                        log::warn!("Message index refresh failed: {}", e);
-                    }
                     print_refresh_stats("Refresh complete", &stats);
                 }
                 Err(e) => {
@@ -907,7 +902,7 @@ fn main() {
             } else {
                 Some(since_ts.unwrap_or_else(time::default_recent_since))
             };
-            let refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
+            let refresh = cache::refresh_search_decrypted(&decrypted_dir, jobs);
             if cache::needs_search_refresh_warning(&refresh) {
                 log::warn!(
                     "Decrypted cache refresh had issues ({}). Search results may be stale.",
@@ -1013,14 +1008,12 @@ fn main() {
                 },
                 jobs,
             };
-            if !query::can_answer_from_existing_index(&query_options) {
-                let refresh = cache::refresh_message_decrypted(&decrypted_dir, jobs);
-                if cache::needs_message_key_retry(&refresh) {
-                    log::warn!(
-                        "Decrypted message cache refresh had issues ({}). Query results may be stale.",
-                        cache::retry_reason(&refresh)
-                    );
-                }
+            let refresh = cache::refresh_message_decrypted(&decrypted_dir, jobs);
+            if cache::needs_message_key_retry(&refresh) {
+                log::warn!(
+                    "Decrypted message cache refresh had issues ({}). Query results may be stale.",
+                    cache::retry_reason(&refresh)
+                );
             }
             match query::run(query_options) {
                 Ok(0) => print_output(format_args!("No rows returned.")),

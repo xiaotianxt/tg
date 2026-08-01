@@ -1,10 +1,9 @@
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::io::{BufWriter, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -293,7 +292,7 @@ pub fn export_messages(
     let db_jobs = parallel::job_count(jobs, 8);
     let per_db_messages = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
         let mut messages = Vec::new();
-        let conn = match Connection::open(&db_path) {
+        let conn = match crate::sqlite::open_immutable(&db_path) {
             Ok(c) => c,
             Err(_) => return messages,
         };
@@ -867,7 +866,7 @@ fn load_image_messages(
     let db_jobs = parallel::job_count(jobs, 8);
     let per_db_messages = parallel::map_ordered(message_dbs, db_jobs, |db_path| {
         let mut messages = Vec::new();
-        let conn = match Connection::open(&db_path) {
+        let conn = match crate::sqlite::open_immutable(&db_path) {
             Ok(c) => c,
             Err(_) => return messages,
         };
@@ -950,7 +949,7 @@ fn load_file_messages(
     let db_jobs = parallel::job_count(jobs, 8);
     let per_db_messages = parallel::map_ordered(message_dbs, db_jobs, |db_path| {
         let mut messages = Vec::new();
-        let conn = match Connection::open(&db_path) {
+        let conn = match crate::sqlite::open_immutable(&db_path) {
             Ok(c) => c,
             Err(_) => return messages,
         };
@@ -1053,7 +1052,7 @@ fn load_sticker_messages(
     let db_jobs = parallel::job_count(jobs, 8);
     let per_db_messages = parallel::map_ordered(message_dbs, db_jobs, |db_path| {
         let mut messages = Vec::new();
-        let conn = match Connection::open(&db_path) {
+        let conn = match crate::sqlite::open_immutable(&db_path) {
             Ok(c) => c,
             Err(_) => return messages,
         };
@@ -2483,7 +2482,7 @@ fn open_voice_db_for_session(
         return Err(format!("Media database not found: {}", media_db.display()));
     }
 
-    let conn = open_immutable_connection(&media_db)?;
+    let conn = crate::sqlite::open_immutable(&media_db)?;
     let chat_name_id: Option<i64> = conn
         .query_row(
             "SELECT rowid FROM Name2Id WHERE user_name = ?1",
@@ -2542,28 +2541,6 @@ fn voice_payload(data: &[u8]) -> Option<VoicePayload<'_>> {
 
 fn native_voice_header() -> Vec<u8> {
     [b"#!SI".as_slice(), b"LK_V3".as_slice()].concat()
-}
-
-fn open_immutable_connection(path: &Path) -> Result<Connection, String> {
-    let uri = format!("file:{}?immutable=1", sqlite_uri_path(path));
-    Connection::open_with_flags(
-        &uri,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(|e| format!("Open media database {}: {}", path.display(), e))
-}
-
-fn sqlite_uri_path(path: &Path) -> String {
-    let mut encoded = String::new();
-    for byte in path.as_os_str().as_bytes() {
-        match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
-                encoded.push(*byte as char)
-            }
-            _ => encoded.push_str(&format!("%{:02X}", byte)),
-        }
-    }
-    encoded
 }
 
 fn export_txt(

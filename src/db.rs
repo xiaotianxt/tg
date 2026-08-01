@@ -1,6 +1,5 @@
 use md5::{Digest, Md5};
-use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection};
+use rusqlite::{params, Connection};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
@@ -8,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use crate::contact::{self, Contact, DisplayNameMode};
 use crate::dictionary;
+use crate::fts;
 use crate::message;
-use crate::message_index;
 use crate::parallel;
 use crate::time;
 
@@ -111,7 +110,6 @@ type SessionListRow = (String, i64, String, String);
 type SessionListRows = Vec<SessionListRow>;
 const SESSION_TIME_BOUNDARY_ROWS: usize = 128;
 const SEARCH_PREVIEW_CHARS: usize = 100;
-const INDEXED_UNBOUNDED_MESSAGE_WINDOW_SECS: i64 = 31 * 86400;
 const TELEGRAM_FTS_CONTENT_TABLE_PREFIX: &str = "message_fts_v4_";
 const TELEGRAM_FTS_CONTENT_TABLE_SUFFIX: &str = "_content";
 
@@ -357,7 +355,7 @@ pub fn list_sessions(
     let db_jobs = parallel::job_count(jobs, 8);
     let per_db_sessions = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
         let mut sessions: HashMap<String, SessionInfo> = HashMap::new();
-        let conn = match Connection::open(&db_path) {
+        let conn = match crate::sqlite::open_immutable(&db_path) {
             Ok(c) => c,
             Err(_) => return sessions,
         };
@@ -568,8 +566,7 @@ fn list_sessions_from_session_db(
     query: Option<&str>,
     mode: SessionDbListMode,
 ) -> Result<Option<SessionListRows>, String> {
-    let conn = Connection::open(session_db)
-        .map_err(|e| format!("Cannot open session DB {}: {}", session_db.display(), e))?;
+    let conn = crate::sqlite::open_immutable(session_db)?;
     let sql = format!(
         "SELECT username,
                 COALESCE(unread_count, 0),
@@ -804,69 +801,64 @@ pub fn read_messages(
         .map(|ts| format!(" AND create_time >= {}", ts))
         .unwrap_or_default();
 
-    let indexed_messages = match read_messages_with_hot_index(decrypted_dir, &options, &username) {
-        Ok(rows) => rows,
-        Err(e) => {
-            log::warn!("Message index read failed; falling back: {}", e);
-            None
-        }
-    };
-
     let query_limit = query_window_limit(options.limit, options.offset, options.tail);
     let db_jobs = parallel::job_count(options.jobs, 8);
-    let per_db_messages = if indexed_messages.is_some() {
-        Vec::new()
-    } else {
-        parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
-            let mut rows: Vec<MessageRow> = Vec::new();
-            let conn = match Connection::open(&db_path) {
-                Ok(c) => c,
-                Err(_) => return rows,
+    let per_db_messages = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
+        let mut rows: Vec<MessageRow> = Vec::new();
+        let conn = match crate::sqlite::open_immutable(&db_path) {
+            Ok(c) => c,
+            Err(_) => return rows,
+        };
+
+        // Check if table exists quickly
+        let table = quote_identifier(&table_name);
+        let table_exists = conn
+            .prepare(&format!("SELECT 1 FROM {} LIMIT 1", table))
+            .is_ok();
+        if !table_exists {
+            return rows;
+        }
+
+        // Load Name2Id mapping (sender_id to account id)
+        let name2id: HashMap<i64, String> =
+            match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
+                Ok(mut stmt) => stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .ok()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default(),
+                Err(_) => HashMap::new(),
             };
 
-            // Check if table exists quickly
-            let table = quote_identifier(&table_name);
-            let table_exists = conn
-                .prepare(&format!("SELECT 1 FROM {} LIMIT 1", table))
-                .is_ok();
-            if !table_exists {
-                return rows;
-            }
+        let order_dir = if options.tail { "DESC" } else { "ASC" };
 
-            // Load Name2Id mapping (sender_id to account id)
-            let name2id: HashMap<i64, String> =
-                match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
-                    Ok(mut stmt) => stmt
-                        .query_map([], |row| {
-                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                        })
-                        .ok()
-                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                        .unwrap_or_default(),
-                    Err(_) => HashMap::new(),
-                };
-
-            let order_dir = if options.tail { "DESC" } else { "ASC" };
-
-            // Query messages - collect eagerly to avoid borrow issues
-            let body_col = quote_identifier(dictionary::msg_body_column());
-            let marker_col = quote_identifier(dictionary::msg_compression_marker_column());
-            let sender_col = quote_identifier(dictionary::msg_sender_column());
-            let packed_col = quote_identifier(dictionary::msg_packed_meta_column());
-            let local_id_col = if table_has_column(&conn, &table_name, "local_id") {
-                quote_identifier("local_id")
-            } else {
-                "NULL".to_string()
-            };
-            let sql = format!(
+        // Query messages - collect eagerly to avoid borrow issues
+        let body_col = quote_identifier(dictionary::msg_body_column());
+        let marker_col = quote_identifier(dictionary::msg_compression_marker_column());
+        let sender_col = quote_identifier(dictionary::msg_sender_column());
+        let packed_col = quote_identifier(dictionary::msg_packed_meta_column());
+        let local_id_col = if table_has_column(&conn, &table_name, "local_id") {
+            quote_identifier("local_id")
+        } else {
+            "NULL".to_string()
+        };
+        let order_col = if table_has_column(&conn, &table_name, "sort_seq") {
+            "sort_seq"
+        } else {
+            "create_time"
+        };
+        let sql = format!(
             "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col} \
-             FROM {table_name} WHERE create_time > 0{search_clause}{since_clause} ORDER BY create_time {order_dir}{limit_clause}",
+             FROM {table_name} WHERE create_time > 0{search_clause}{since_clause} ORDER BY {order_col} {order_dir}{limit_clause}",
             local_id_col = local_id_col,
             body_col = body_col,
             marker_col = marker_col,
             sender_col = sender_col,
             packed_col = packed_col,
             table_name = table,
+            order_col = order_col,
             search_clause = search_clause,
             since_clause = since_clause,
             order_dir = order_dir,
@@ -874,56 +866,54 @@ pub fn read_messages(
                 .map(|n| format!(" LIMIT {}", n))
                 .unwrap_or_default()
         );
-            rows = match conn.prepare(&sql) {
-                Ok(mut stmt) => {
-                    let map_row = |row: &rusqlite::Row<'_>| {
-                        let compression_marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
-                        let content: String = if compression_marker == Some(4) {
-                            if let Ok(b) = row.get::<_, Vec<u8>>(3) {
-                                message::try_decompress(&b).unwrap_or_default()
-                            } else {
-                                String::new()
-                            }
+        rows = match conn.prepare(&sql) {
+            Ok(mut stmt) => {
+                let map_row = |row: &rusqlite::Row<'_>| {
+                    let compression_marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
+                    let content: String = if compression_marker == Some(4) {
+                        if let Ok(b) = row.get::<_, Vec<u8>>(3) {
+                            message::try_decompress(&b).unwrap_or_default()
                         } else {
-                            match row.get::<_, Option<String>>(3) {
-                                Ok(Some(s)) => s,
-                                _ => match row.get::<_, Option<Vec<u8>>>(3) {
-                                    Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                                    _ => String::new(),
-                                },
-                            }
-                        };
-                        let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
-                        let sender_account_id =
-                            name2id.get(&sender_id).cloned().unwrap_or_default();
-                        let packed_info: Vec<u8> =
-                            row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
-                        Ok(MessageRow {
-                            local_id: row.get::<_, Option<i64>>(0)?,
-                            local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
-                            create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                            content,
-                            compression_marker,
-                            sender_account_id,
-                            packed_info,
-                        })
+                            String::new()
+                        }
+                    } else {
+                        match row.get::<_, Option<String>>(3) {
+                            Ok(Some(s)) => s,
+                            _ => match row.get::<_, Option<Vec<u8>>>(3) {
+                                Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
+                                _ => String::new(),
+                            },
+                        }
                     };
-                    let rows = match &search_pattern {
-                        Some(pattern) => stmt.query_map(params![pattern], map_row),
-                        None => stmt.query_map([], map_row),
-                    };
-                    match rows {
-                        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                        Err(_) => vec![],
-                    }
+                    let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
+                    let sender_account_id = name2id.get(&sender_id).cloned().unwrap_or_default();
+                    let packed_info: Vec<u8> =
+                        row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
+                    Ok(MessageRow {
+                        local_id: row.get::<_, Option<i64>>(0)?,
+                        local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
+                        create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        content,
+                        compression_marker,
+                        sender_account_id,
+                        packed_info,
+                    })
+                };
+                let rows = match &search_pattern {
+                    Some(pattern) => stmt.query_map(params![pattern], map_row),
+                    None => stmt.query_map([], map_row),
+                };
+                match rows {
+                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                    Err(_) => vec![],
                 }
-                Err(_) => vec![],
-            };
-            rows
-        })
-    };
+            }
+            Err(_) => vec![],
+        };
+        rows
+    });
 
-    let mut all_messages = indexed_messages.unwrap_or_default();
+    let mut all_messages = Vec::new();
     for rows in per_db_messages {
         all_messages.extend(rows);
     }
@@ -1059,98 +1049,6 @@ fn query_window_limit(limit: Option<usize>, offset: usize, tail: bool) -> Option
     }
 }
 
-fn read_messages_with_hot_index(
-    decrypted_dir: &Path,
-    options: &ReadMessagesOptions<'_>,
-    username: &str,
-) -> Result<Option<Vec<MessageRow>>, String> {
-    let index = match message_index::open_existing_recent(decrypted_dir) {
-        Ok(Some(index)) => index,
-        Ok(None) => return Ok(None),
-        Err(e) => {
-            log::warn!("Message index read failed; falling back: {}", e);
-            return Ok(None);
-        }
-    };
-
-    let since = if let Some(since) = options.since {
-        if !index.covers(since) {
-            return Ok(None);
-        }
-        if options.limit.is_none()
-            && time::now_timestamp().saturating_sub(since) > INDEXED_UNBOUNDED_MESSAGE_WINDOW_SECS
-        {
-            return Ok(None);
-        }
-        since
-    } else if options.tail
-        && options.search_query.is_none()
-        && options.offset == 0
-        && options.limit.is_some()
-    {
-        index.since
-    } else {
-        return Ok(None);
-    };
-
-    let conn = Connection::open(&index.path)
-        .map_err(|e| format!("Cannot open message index {}: {}", index.path.display(), e))?;
-    let body_col = if table_has_column(&conn, "messages", "raw_body") {
-        "raw_body"
-    } else {
-        "body"
-    };
-    let mut clauses = vec!["session_id = ?".to_string(), "create_time >= ?".to_string()];
-    let mut params = vec![Value::Text(username.to_string()), Value::Integer(since)];
-    if let Some(query) = options.search_query {
-        clauses.push(format!("{body_col} LIKE ? ESCAPE '\\'"));
-        params.push(Value::Text(like_contains_pattern(query)));
-    }
-    let order_dir = if options.tail { "DESC" } else { "ASC" };
-    let limit_clause = query_window_limit(options.limit, options.offset, options.tail)
-        .map(|limit| format!(" LIMIT {}", limit))
-        .unwrap_or_default();
-    let sql = format!(
-        "SELECT local_id, local_type, create_time, {body_col}, marker, sender_account, packed_info
-         FROM messages
-         WHERE {where_clause}
-         ORDER BY create_time {order_dir}{limit_clause}",
-        body_col = body_col,
-        where_clause = clauses.join(" AND "),
-        order_dir = order_dir,
-        limit_clause = limit_clause,
-    );
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| format!("Prepare indexed message read: {}", e))?;
-    let rows = stmt
-        .query_map(params_from_iter(params.iter()), |row| {
-            Ok(MessageRow {
-                local_id: row.get::<_, Option<i64>>(0)?,
-                local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
-                create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                content: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                compression_marker: row.get::<_, Option<i64>>(4)?,
-                sender_account_id: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                packed_info: row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default(),
-            })
-        })
-        .map_err(|e| format!("Read indexed messages: {}", e))?
-        .filter_map(|row| row.ok())
-        .collect::<Vec<_>>();
-
-    if options.since.is_none() {
-        if let Some(limit) = options.limit {
-            if rows.len() < limit {
-                return Ok(None);
-            }
-        }
-    }
-
-    Ok(Some(rows))
-}
-
 pub(crate) fn probe_session(
     decrypted_dir: &Path,
     session_query: &str,
@@ -1171,7 +1069,7 @@ pub(crate) fn probe_session(
 
     let db_jobs = parallel::job_count(jobs, 8);
     let per_db_counts = parallel::map_ordered(message_dbs, db_jobs, |db_path| {
-        let conn = match Connection::open(&db_path) {
+        let conn = match crate::sqlite::open_immutable(&db_path) {
             Ok(conn) => conn,
             Err(_) => return None,
         };
@@ -1211,34 +1109,22 @@ pub fn search_messages(
         .and_then(|p| contact::load_contacts(p).ok())
         .unwrap_or_default();
 
-    if let Some(since) = options.since {
-        match message_index::open_existing_recent(decrypted_dir) {
-            Ok(Some(index)) if index.covers(since) => {
-                match search_messages_with_hot_index(&index, &options) {
-                    Ok((displayed, has_more, results)) => {
-                        return print_search_results(
-                            options.query,
-                            displayed,
-                            has_more,
-                            results,
-                            &contacts,
-                            options.name_mode,
-                        );
-                    }
-                    Err(e) => log::warn!("Message index search failed; falling back: {}", e),
-                }
-            }
-            Ok(_) => {}
-            Err(e) => log::warn!("Message index read failed; falling back: {}", e),
+    if options.use_telegram_fts {
+        if let Some((displayed, has_more, results)) =
+            search_messages_with_telegram_fts(decrypted_dir, &options)
+        {
+            return print_search_results(
+                options.query,
+                displayed,
+                has_more,
+                results,
+                &contacts,
+                options.name_mode,
+            );
         }
     }
 
-    let (displayed, has_more, results) = if options.use_telegram_fts {
-        search_messages_with_telegram_fts(decrypted_dir, &options)
-            .unwrap_or_else(|| search_messages_by_scanning(message_dbs, &options))
-    } else {
-        search_messages_by_scanning(message_dbs, &options)
-    };
+    let (displayed, has_more, results) = search_messages_by_scanning(message_dbs, &options);
 
     print_search_results(
         options.query,
@@ -1248,51 +1134,6 @@ pub fn search_messages(
         &contacts,
         options.name_mode,
     )
-}
-
-fn search_messages_with_hot_index(
-    index: &message_index::HotIndex,
-    options: &SearchMessagesOptions<'_>,
-) -> Result<(usize, bool, Vec<SearchRow>), String> {
-    let since = options
-        .since
-        .ok_or_else(|| "indexed search requires a since bound".to_string())?;
-    let conn = Connection::open(&index.path)
-        .map_err(|e| format!("Cannot open message index {}: {}", index.path.display(), e))?;
-    let body_col = if table_has_column(&conn, "messages", "raw_body") {
-        "raw_body"
-    } else {
-        "body"
-    };
-    let search_pattern = like_contains_pattern(options.query);
-    let result_limit = options.limit.saturating_add(1);
-    let sql = format!(
-        "SELECT local_type, create_time, {body_col}, session_id
-               FROM messages
-               WHERE create_time >= ?1 AND {body_col} LIKE ?2 ESCAPE '\\'
-               ORDER BY create_time DESC
-               LIMIT ?3",
-        body_col = body_col
-    );
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| format!("Prepare indexed search: {}", e))?;
-    let rows = stmt
-        .query_map(params![since, search_pattern, result_limit as i64], |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
-                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-            ))
-        })
-        .map_err(|e| format!("Run indexed search: {}", e))?;
-    let mut results: Vec<SearchRow> = rows.filter_map(|row| row.ok()).collect();
-    let has_more = results.len() > options.limit;
-    results.truncate(options.limit);
-    let displayed = results.len();
-    results.sort_by_key(|row| row.1);
-    Ok((displayed, has_more, results))
 }
 
 fn search_messages_by_scanning(
@@ -1309,7 +1150,7 @@ fn search_messages_by_scanning(
     let db_jobs = parallel::job_count(options.jobs, 8);
     let per_db_results = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
         let mut results: Vec<SearchRow> = Vec::new();
-        let conn = match Connection::open(&db_path) {
+        let conn = match crate::sqlite::open_immutable(&db_path) {
             Ok(c) => c,
             Err(_) => return results,
         };
@@ -1327,14 +1168,20 @@ fn search_messages_by_scanning(
 
         for table_name in &tables {
             let table = quote_identifier(table_name);
+            let order_col = if table_has_column(&conn, table_name, "sort_seq") {
+                "sort_seq"
+            } else {
+                "create_time"
+            };
             let sql = format!(
                 "SELECT local_type, create_time, {} \
                  FROM {} WHERE {}{} \
-                 ORDER BY create_time DESC LIMIT {}",
+                 ORDER BY {} DESC LIMIT {}",
                 quote_identifier(dictionary::msg_body_column()),
                 table,
                 search_clause,
                 since_clause,
+                order_col,
                 result_limit
             );
             let rows: Vec<SearchRow> = match conn.prepare(&sql) {
@@ -1382,53 +1229,34 @@ fn search_messages_with_telegram_fts(
     options: &SearchMessagesOptions<'_>,
 ) -> Option<(usize, bool, Vec<SearchRow>)> {
     let fts_db = find_message_fts_db(decrypted_dir)?;
-    let conn = Connection::open(fts_db).ok()?;
+    let conn = crate::sqlite::open_immutable(&fts_db).ok()?;
     let content_tables = telegram_fts_content_tables(&conn)?;
     if content_tables.is_empty() {
         return None;
     }
 
     let name2id = load_fts_name2id(&conn);
-    let search_clause = fts_content_like_clause();
-    let search_pattern = like_contains_pattern(options.query);
-    let since_clause = options
-        .since
-        .map(|ts| format!(" AND c6 >= {}", ts))
-        .unwrap_or_default();
-
-    let mut results: Vec<SearchRow> = Vec::new();
     let result_limit = options.limit.saturating_add(1);
-
-    for table_name in content_tables {
-        let table = quote_identifier(&table_name);
-        let sql = format!(
-            "SELECT c1, c6, c0, c4 \
-             FROM {} WHERE {}{} \
-             ORDER BY c6 DESC LIMIT {}",
-            table, search_clause, since_clause, result_limit
-        );
-        let rows: Vec<SearchRow> = match conn.prepare(&sql) {
-            Ok(mut stmt) => stmt
-                .query_map(params![&search_pattern], |row| {
-                    let session_id = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
-                    let session = name2id
-                        .get(&session_id)
-                        .cloned()
-                        .unwrap_or_else(|| session_id.to_string());
-                    Ok((
-                        row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
-                        row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                        row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                        session,
-                    ))
-                })
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
-        results.extend(rows);
-    }
+    let match_query = fts::ideograph_match_query(options.query)
+        .filter(|_| fts::register_compatible_tokenizer(&conn).is_ok());
+    let mut results = collect_telegram_fts_rows(
+        &conn,
+        &content_tables,
+        &name2id,
+        options,
+        result_limit,
+        match_query,
+    )
+    .or_else(|| {
+        collect_telegram_fts_rows(
+            &conn,
+            &content_tables,
+            &name2id,
+            options,
+            result_limit,
+            None,
+        )
+    })?;
 
     results.sort_by_key(|row| Reverse(row.1));
     let has_more = results.len() > options.limit;
@@ -1437,6 +1265,72 @@ fn search_messages_with_telegram_fts(
     results.sort_by_key(|row| row.1);
 
     Some((displayed, has_more, results))
+}
+
+fn collect_telegram_fts_rows(
+    conn: &Connection,
+    content_tables: &[String],
+    name2id: &HashMap<i64, String>,
+    options: &SearchMessagesOptions<'_>,
+    result_limit: usize,
+    match_query: Option<&str>,
+) -> Option<Vec<SearchRow>> {
+    let search_pattern = like_contains_pattern(options.query);
+    let mut results = Vec::new();
+
+    for content_table in content_tables {
+        let (table, columns, search_clause, time_column, search_value) =
+            if let Some(query) = match_query {
+                let table = content_table.strip_suffix("_content")?;
+                let quoted = quote_identifier(table);
+                (
+                    quoted.clone(),
+                    "local_type, create_time, acontent, session_id",
+                    format!("{} MATCH ?1", quoted),
+                    "create_time",
+                    query,
+                )
+            } else {
+                (
+                    quote_identifier(content_table),
+                    "c3, c6, c0, c4",
+                    fts_content_like_clause().to_string(),
+                    "c6",
+                    search_pattern.as_str(),
+                )
+            };
+        let since_clause = options
+            .since
+            .map(|ts| format!(" AND {time_column} >= {ts}"))
+            .unwrap_or_default();
+        let sql = format!(
+            "SELECT {columns} FROM {table} \
+             WHERE {search_clause}{since_clause} \
+             ORDER BY {time_column} DESC LIMIT {result_limit}"
+        );
+        let mut stmt = conn.prepare(&sql).ok()?;
+        let rows = stmt
+            .query_map(params![search_value], |row| {
+                let session_id = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+                let session = name2id
+                    .get(&session_id)
+                    .cloned()
+                    .unwrap_or_else(|| session_id.to_string());
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
+                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    session,
+                ))
+            })
+            .ok()?;
+        results.extend(rows.filter_map(|row| row.ok()));
+    }
+
+    if match_query.is_some() {
+        results.retain(|row| row.2.contains(options.query));
+    }
+    Some(results)
 }
 
 fn print_search_results(
@@ -1994,7 +1888,7 @@ fn latest_message_times_for_candidates(
     let db_jobs = parallel::job_count(jobs, 8);
     let per_db_latest = parallel::map_ordered(message_dbs.to_vec(), db_jobs, |db_path| {
         let mut latest_by_username: HashMap<String, i64> = HashMap::new();
-        let conn = match Connection::open(&db_path) {
+        let conn = match crate::sqlite::open_immutable(&db_path) {
             Ok(c) => c,
             Err(_) => return latest_by_username,
         };
@@ -2315,6 +2209,7 @@ mod tests {
         std::fs::create_dir_all(&message_dir).unwrap();
         let path = message_dir.join("message_fts.db");
         let conn = Connection::open(&path).unwrap();
+        crate::fts::register_compatible_tokenizer(&conn).unwrap();
         conn.execute("CREATE TABLE name2id(username TEXT PRIMARY KEY)", [])
             .unwrap();
         conn.execute(
@@ -2322,26 +2217,26 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute(
-            "CREATE TABLE message_fts_v4_0_content (
-                id INTEGER PRIMARY KEY,
-                c0,
-                c1,
-                c2,
-                c3,
-                c4,
-                c5,
-                c6
-            )",
-            [],
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE message_fts_v4_0 USING fts5(
+                 tokenize = 'MMFtsTokenizer disable_pinyin',
+                 acontent,
+                 message_local_id UNINDEXED,
+                 sort_seq UNINDEXED,
+                 local_type UNINDEXED,
+                 session_id UNINDEXED,
+                 sender_id UNINDEXED,
+                 create_time UNINDEXED
+             )",
         )
         .unwrap();
 
         for (i, content) in contents.iter().enumerate() {
             conn.execute(
-                "INSERT INTO message_fts_v4_0_content
-                 (id, c0, c1, c2, c3, c4, c5, c6)
-                 VALUES (?1, ?2, 1, 0, ?1, 7, 0, ?3)",
+                "INSERT INTO message_fts_v4_0 (
+                     rowid, acontent, message_local_id, sort_seq,
+                     local_type, session_id, sender_id, create_time
+                 ) VALUES (?1, ?2, ?1, 0, 1, 7, 0, ?3)",
                 params![i as i64 + 1, content, 1000 + i as i64],
             )
             .unwrap();
@@ -2723,6 +2618,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn search_messages_uses_internal_match_for_ideographs() {
+        let dir = create_decrypted_dir_with_fts(&["开源计划", "开放源码", "普通消息"]);
+
+        let count = search_messages(
+            dir.path(),
+            SearchMessagesOptions {
+                query: "开源",
+                limit: 20,
+                since: None,
+                use_telegram_fts: true,
+                name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
     }
 
     #[test]
