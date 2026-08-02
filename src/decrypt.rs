@@ -946,9 +946,7 @@ fn path_in_decrypt_scope(scope: DecryptScope, rel_path: &str) -> bool {
             rel_path == "contact/contact.db" || is_numbered_message_rel_path(rel_path)
         }
         DecryptScope::Search => {
-            rel_path == "contact/contact.db"
-                || rel_path == "message/message_fts.db"
-                || is_numbered_message_rel_path(rel_path)
+            rel_path == "contact/contact.db" || rel_path == "message/message_fts.db"
         }
     }
 }
@@ -1399,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn search_decrypt_scope_includes_fts_and_fallback_message_dbs() {
+    fn search_decrypt_scope_includes_only_contacts_and_fts() {
         assert!(path_in_decrypt_scope(
             DecryptScope::Search,
             "contact/contact.db"
@@ -1408,7 +1406,7 @@ mod tests {
             DecryptScope::Search,
             "message/message_fts.db"
         ));
-        assert!(path_in_decrypt_scope(
+        assert!(!path_in_decrypt_scope(
             DecryptScope::Search,
             "message/message_0.db"
         ));

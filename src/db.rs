@@ -75,7 +75,6 @@ pub(crate) fn is_message_db_name(name: &str) -> bool {
 #[derive(Default)]
 struct SessionInfo {
     count: i64,
-    earliest: Option<i64>,
     latest: Option<i64>,
 }
 
@@ -108,7 +107,6 @@ struct MessageRow {
 type SearchRow = (i64, i64, String, String);
 type SessionListRow = (String, i64, String, String);
 type SessionListRows = Vec<SessionListRow>;
-const SESSION_TIME_BOUNDARY_ROWS: usize = 128;
 const SEARCH_PREVIEW_CHARS: usize = 100;
 const TELEGRAM_FTS_CONTENT_TABLE_PREFIX: &str = "message_fts_v4_";
 const TELEGRAM_FTS_CONTENT_TABLE_SUFFIX: &str = "_content";
@@ -166,9 +164,7 @@ pub(crate) struct SearchMessagesOptions<'a> {
     pub query: &'a str,
     pub limit: usize,
     pub since: Option<i64>,
-    pub use_telegram_fts: bool,
     pub name_mode: DisplayNameMode,
-    pub jobs: usize,
 }
 
 pub(crate) fn msg_table_name(username: &str) -> String {
@@ -258,277 +254,20 @@ pub(crate) fn read_message_body(
     }
 }
 
-fn session_stats_for_table(conn: &Connection, table_name: &str) -> Option<SessionInfo> {
-    let table = quote_identifier(table_name);
-    let fast_sql = format!(
-        "SELECT \
-            (SELECT COUNT(*) FROM {table}), \
-            (SELECT MIN(create_time) FROM (SELECT create_time FROM {table} WHERE create_time > 0 ORDER BY sort_seq ASC LIMIT {SESSION_TIME_BOUNDARY_ROWS})), \
-            (SELECT MAX(create_time) FROM (SELECT create_time FROM {table} WHERE create_time > 0 ORDER BY sort_seq DESC LIMIT {SESSION_TIME_BOUNDARY_ROWS}))"
-    );
-
-    // Telegram message tables have a SORTSEQ index. These boundary lookups avoid
-    // full-table MIN/MAX(create_time) scans on large chats while tolerating
-    // small same-second ordering differences near each edge.
-    if let Ok((count, earliest, latest)) = conn.query_row(&fast_sql, [], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, Option<i64>>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-        ))
-    }) {
-        if count > 0 && (earliest.is_some() || latest.is_some()) {
-            return Some(SessionInfo {
-                count,
-                earliest,
-                latest,
-            });
-        }
-        return None;
-    }
-
-    let exact_sql = format!(
-        "SELECT COUNT(*), MIN(create_time), MAX(create_time) FROM {} WHERE create_time > 0",
-        table
-    );
-    let (count, earliest, latest) = conn
-        .query_row(&exact_sql, [], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-            ))
-        })
-        .ok()?;
-    (count > 0).then_some(SessionInfo {
-        count,
-        earliest,
-        latest,
-    })
-}
-
 /// List chat sessions.
 pub fn list_sessions(
     decrypted_dir: &Path,
     top_n: usize,
     query: Option<&str>,
-    jobs: usize,
 ) -> Result<SessionListRows, String> {
-    let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
-
-    // Load contacts
-    let contacts = match &contact_db {
-        Some(path) => contact::load_contacts(path).unwrap_or_default(),
+    let contact_db = find_decrypted_contact_db(decrypted_dir);
+    let contacts = match contact_db {
+        Some(path) => contact::load_contacts(&path).unwrap_or_default(),
         None => HashMap::new(),
     };
-
-    if let Some(session_db) = find_decrypted_session_db(decrypted_dir) {
-        match list_sessions_from_session_db(
-            &session_db,
-            &contacts,
-            top_n,
-            query,
-            SessionDbListMode::All,
-        ) {
-            Ok(Some(sessions)) => return Ok(sessions),
-            Ok(None) => {}
-            Err(e) => log::warn!(
-                "Session database read failed; falling back to message scan: {}",
-                e
-            ),
-        }
-    }
-
-    // Map: table_name -> SessionInfo
-    // Also track: table_name -> contact username
-    let mut table_to_username: HashMap<String, String> = HashMap::new();
-    for (username, contact) in &contacts {
-        let table = msg_table_name(username);
-        table_to_username.insert(table, username.clone());
-        // Also store by display name
-        let display_table = msg_table_name(contact.personal_display_name());
-        table_to_username
-            .entry(display_table)
-            .or_insert_with(|| username.clone());
-    }
-
-    let db_jobs = parallel::job_count(jobs, 8);
-    let per_db_sessions = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
-        let mut sessions: HashMap<String, SessionInfo> = HashMap::new();
-        let conn = match crate::sqlite::open_immutable(&db_path) {
-            Ok(c) => c,
-            Err(_) => return sessions,
-        };
-
-        // Find all Msg_ tables
-        let tables: Vec<String> = match conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
-        {
-            Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                Err(_) => vec![],
-            },
-            Err(_) => vec![],
-        };
-
-        for table_name in &tables {
-            if let Some(table_info) = session_stats_for_table(&conn, table_name) {
-                let info = sessions.entry(table_name.clone()).or_default();
-                info.count += table_info.count;
-                if table_info
-                    .earliest
-                    .is_none_or(|e| info.earliest.is_none_or(|ie| e < ie))
-                {
-                    info.earliest = table_info.earliest;
-                }
-                if table_info
-                    .latest
-                    .is_none_or(|l| info.latest.is_none_or(|il| l > il))
-                {
-                    info.latest = table_info.latest;
-                }
-            }
-        }
-        sessions
-    });
-
-    let mut sessions: HashMap<String, SessionInfo> = HashMap::new();
-    for db_sessions in per_db_sessions {
-        for (table_name, db_info) in db_sessions {
-            let info = sessions.entry(table_name).or_default();
-            info.count += db_info.count;
-            if db_info
-                .earliest
-                .is_none_or(|e| info.earliest.is_none_or(|ie| e < ie))
-            {
-                info.earliest = db_info.earliest;
-            }
-            if db_info
-                .latest
-                .is_none_or(|l| info.latest.is_none_or(|il| l > il))
-            {
-                info.latest = db_info.latest;
-            }
-        }
-    }
-
-    // Sort by message count
-    let mut sorted: Vec<_> = sessions.into_iter().collect();
-    sorted.sort_by_key(|entry| Reverse(entry.1.count));
-
-    if sorted.is_empty() {
-        return Ok(Vec::new());
-    }
-    let total_sessions = sorted.len();
-
-    let mut entries: Vec<_> = sorted
-        .into_iter()
-        .map(|(table, info)| {
-            let username = table_to_username
-                .get(&table)
-                .cloned()
-                .unwrap_or_else(|| table.clone());
-            let display = contacts
-                .get(&username)
-                .map(|c| c.personal_display_name().to_string())
-                .unwrap_or_else(|| "(?)".to_string());
-
-            SessionListEntry {
-                username,
-                info,
-                display,
-                match_info: None,
-            }
-        })
-        .collect();
-
-    let query = query.map(str::trim).filter(|value| !value.is_empty());
-    if let Some(query) = query {
-        entries = entries
-            .into_iter()
-            .filter_map(|mut entry| {
-                let match_info =
-                    session_match_info(&contacts, &entry.username, &entry.display, query)?;
-                entry.match_info = Some(match_info);
-                Some(entry)
-            })
-            .collect();
-
-        entries.sort_by(|a, b| {
-            let a_match = a.match_info.expect("filtered session entry has match info");
-            let b_match = b.match_info.expect("filtered session entry has match info");
-            a_match
-                .field_priority
-                .cmp(&b_match.field_priority)
-                .then_with(|| b_match.score.cmp(&a_match.score))
-                .then_with(|| {
-                    b.info
-                        .latest
-                        .unwrap_or_default()
-                        .cmp(&a.info.latest.unwrap_or_default())
-                })
-                .then_with(|| a_match.distance.cmp(&b_match.distance))
-                .then_with(|| a_match.field_len.cmp(&b_match.field_len))
-                .then_with(|| b.info.count.cmp(&a.info.count))
-                .then_with(|| a.display.cmp(&b.display))
-                .then_with(|| a.username.cmp(&b.username))
-        });
-    }
-
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-    let matched_sessions = entries.len();
-
-    let stdout = std::io::stdout();
-    let mut out = crate::output::Output::new(stdout.lock());
-
-    out.line(format_args!(
-        "{:<4} {:<8} {:<46} {:<22} Username",
-        "Rank", "Count", "Time Range", "Display Name"
-    ))?;
-    out.line(format_args!("{}", "-".repeat(120)))?;
-
-    let mut result = Vec::new();
-
-    for (i, entry) in entries.iter().enumerate().take(top_n) {
-        let time_range = match (entry.info.earliest, entry.info.latest) {
-            (Some(e), Some(l)) => {
-                let e_ts = time::format_local_timestamp_minutes(e);
-                let l_ts = time::format_local_timestamp_minutes(l);
-                format!("{} ~ {}", e_ts, l_ts)
-            }
-            _ => String::new(),
-        };
-
-        out.line(format_args!(
-            "{:<4} {:<8} {:<46} {:<22} {}",
-            i + 1,
-            entry.info.count,
-            time_range,
-            entry.display,
-            entry.username
-        ))?;
-
-        result.push((
-            entry.username.clone(),
-            entry.info.count,
-            time_range,
-            entry.display.clone(),
-        ));
-    }
-
-    out.blank_line()?;
-    if query.is_some() {
-        out.line(format_args!(
-            "Matched: {} of {} sessions",
-            matched_sessions, total_sessions
-        ))?;
-    } else {
-        out.line(format_args!("Total: {} sessions", total_sessions))?;
-    }
-    out.flush()?;
-    Ok(result)
+    let session_db = find_decrypted_session_db(decrypted_dir)
+        .ok_or_else(|| "Session database not found. Try 'tg refresh' first.".to_string())?;
+    list_sessions_from_session_db(&session_db, &contacts, top_n, query, SessionDbListMode::All)
 }
 
 /// List unread chat sessions from the session database.
@@ -543,20 +282,15 @@ pub fn list_unread_sessions(
         None => HashMap::new(),
     };
 
-    let Some(session_db) = find_decrypted_session_db(decrypted_dir) else {
-        return Ok(Vec::new());
-    };
-
-    match list_sessions_from_session_db(
+    let session_db = find_decrypted_session_db(decrypted_dir)
+        .ok_or_else(|| "Session database not found. Try 'tg refresh' first.".to_string())?;
+    list_sessions_from_session_db(
         &session_db,
         &contacts,
         top_n,
         query,
         SessionDbListMode::Unread,
-    )? {
-        Some(sessions) => Ok(sessions),
-        None => Ok(Vec::new()),
-    }
+    )
 }
 
 fn list_sessions_from_session_db(
@@ -565,7 +299,7 @@ fn list_sessions_from_session_db(
     top_n: usize,
     query: Option<&str>,
     mode: SessionDbListMode,
-) -> Result<Option<SessionListRows>, String> {
+) -> Result<SessionListRows, String> {
     let conn = crate::sqlite::open_immutable(session_db)?;
     let sql = format!(
         "SELECT username,
@@ -607,7 +341,6 @@ fn list_sessions_from_session_db(
                 username,
                 info: SessionInfo {
                     count: unread_count,
-                    earliest: None,
                     latest: Some(activity),
                 },
                 display,
@@ -615,10 +348,6 @@ fn list_sessions_from_session_db(
             }
         })
         .collect::<Vec<_>>();
-
-    if entries.is_empty() && matches!(mode, SessionDbListMode::All) {
-        return Ok(None);
-    }
 
     let total_sessions = entries.len();
     let query = query.map(str::trim).filter(|value| !value.is_empty());
@@ -656,7 +385,7 @@ fn list_sessions_from_session_db(
     }
 
     if entries.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     }
     let matched_sessions = entries.len();
 
@@ -710,7 +439,7 @@ fn list_sessions_from_session_db(
         ))?;
     }
     out.flush()?;
-    Ok(Some(result))
+    Ok(result)
 }
 
 fn session_match_info(
@@ -810,27 +539,12 @@ pub fn read_messages(
             Err(_) => return rows,
         };
 
-        // Check if table exists quickly
         let table = quote_identifier(&table_name);
-        let table_exists = conn
-            .prepare(&format!("SELECT 1 FROM {} LIMIT 1", table))
-            .is_ok();
-        if !table_exists {
+        if !message_table_exists(&conn, &table_name) {
             return rows;
         }
 
-        // Load Name2Id mapping (sender_id to account id)
-        let name2id: HashMap<i64, String> =
-            match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
-                Ok(mut stmt) => stmt
-                    .query_map([], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .ok()
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default(),
-                Err(_) => HashMap::new(),
-            };
+        let name2id = load_name2id(&conn);
 
         let order_dir = if options.tail { "DESC" } else { "ASC" };
 
@@ -870,21 +584,7 @@ pub fn read_messages(
             Ok(mut stmt) => {
                 let map_row = |row: &rusqlite::Row<'_>| {
                     let compression_marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
-                    let content: String = if compression_marker == Some(4) {
-                        if let Ok(b) = row.get::<_, Vec<u8>>(3) {
-                            message::try_decompress(&b).unwrap_or_default()
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        match row.get::<_, Option<String>>(3) {
-                            Ok(Some(s)) => s,
-                            _ => match row.get::<_, Option<Vec<u8>>>(3) {
-                                Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                                _ => String::new(),
-                            },
-                        }
-                    };
+                    let content = read_message_body(row, 3, compression_marker);
                     let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
                     let sender_account_id = name2id.get(&sender_id).cloned().unwrap_or_default();
                     let packed_info: Vec<u8> =
@@ -1103,28 +803,13 @@ pub fn search_messages(
     decrypted_dir: &Path,
     options: SearchMessagesOptions<'_>,
 ) -> Result<usize, String> {
-    let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
+    let contact_db = find_decrypted_contact_db(decrypted_dir);
     let contacts = contact_db
         .as_ref()
         .and_then(|p| contact::load_contacts(p).ok())
         .unwrap_or_default();
-
-    if options.use_telegram_fts {
-        if let Some((displayed, has_more, results)) =
-            search_messages_with_telegram_fts(decrypted_dir, &options)
-        {
-            return print_search_results(
-                options.query,
-                displayed,
-                has_more,
-                results,
-                &contacts,
-                options.name_mode,
-            );
-        }
-    }
-
-    let (displayed, has_more, results) = search_messages_by_scanning(message_dbs, &options);
+    let (displayed, has_more, results) =
+        search_messages_with_telegram_fts(decrypted_dir, &options)?;
 
     print_search_results(
         options.query,
@@ -1136,127 +821,61 @@ pub fn search_messages(
     )
 }
 
-fn search_messages_by_scanning(
-    message_dbs: Vec<PathBuf>,
-    options: &SearchMessagesOptions<'_>,
-) -> (usize, bool, Vec<SearchRow>) {
-    let search_clause = msg_body_like_clause();
-    let search_pattern = like_contains_pattern(options.query);
-    let since_clause = options
-        .since
-        .map(|ts| format!(" AND create_time >= {}", ts))
-        .unwrap_or_default();
-    let result_limit = options.limit.saturating_add(1);
-    let db_jobs = parallel::job_count(options.jobs, 8);
-    let per_db_results = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
-        let mut results: Vec<SearchRow> = Vec::new();
-        let conn = match crate::sqlite::open_immutable(&db_path) {
-            Ok(c) => c,
-            Err(_) => return results,
-        };
-
-        // Find Msg_ tables - collect eagerly
-        let tables: Vec<String> = match conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
-        {
-            Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                Err(_) => vec![],
-            },
-            Err(_) => vec![],
-        };
-
-        for table_name in &tables {
-            let table = quote_identifier(table_name);
-            let order_col = if table_has_column(&conn, table_name, "sort_seq") {
-                "sort_seq"
-            } else {
-                "create_time"
-            };
-            let sql = format!(
-                "SELECT local_type, create_time, {} \
-                 FROM {} WHERE {}{} \
-                 ORDER BY {} DESC LIMIT {}",
-                quote_identifier(dictionary::msg_body_column()),
-                table,
-                search_clause,
-                since_clause,
-                order_col,
-                result_limit
-            );
-            let rows: Vec<SearchRow> = match conn.prepare(&sql) {
-                Ok(mut q) => match q.query_map(params![&search_pattern], |row| {
-                    let content: String = match row.get::<_, Option<String>>(2) {
-                        Ok(Some(s)) => s,
-                        _ => match row.get::<_, Option<Vec<u8>>>(2) {
-                            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                            _ => String::new(),
-                        },
-                    };
-                    Ok((
-                        row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
-                        row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                        content,
-                        table_name.clone(),
-                    ))
-                }) {
-                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                    Err(_) => vec![],
-                },
-                Err(_) => vec![],
-            };
-            results.extend(rows);
-        }
-        results
-    });
-
-    let mut results = Vec::new();
-    for rows in per_db_results {
-        results.extend(rows);
-    }
-
-    results.sort_by_key(|row| Reverse(row.1));
-    let has_more = results.len() > options.limit;
-    results.truncate(options.limit);
-    let displayed = results.len();
-    results.sort_by_key(|row| row.1);
-
-    (displayed, has_more, results)
-}
-
 fn search_messages_with_telegram_fts(
     decrypted_dir: &Path,
     options: &SearchMessagesOptions<'_>,
-) -> Option<(usize, bool, Vec<SearchRow>)> {
-    let fts_db = find_message_fts_db(decrypted_dir)?;
-    let conn = crate::sqlite::open_immutable(&fts_db).ok()?;
+) -> Result<(usize, bool, Vec<SearchRow>), String> {
+    let fts_db = find_message_fts_db(decrypted_dir).ok_or_else(|| {
+        "Message search index is unavailable. Run 'tg refresh'; use 'tg query' for exhaustive lookup."
+            .to_string()
+    })?;
+    let conn = crate::sqlite::open_immutable(&fts_db)
+        .map_err(|error| format!("Open message search index {}: {}", fts_db.display(), error))?;
     let content_tables = telegram_fts_content_tables(&conn)?;
     if content_tables.is_empty() {
-        return None;
+        return Err(format!(
+            "Message search index {} has no supported FTS tables. Run 'tg refresh'.",
+            fts_db.display()
+        ));
     }
 
-    let name2id = load_fts_name2id(&conn);
+    let name2id = load_fts_name2id(&conn)?;
     let result_limit = options.limit.saturating_add(1);
     let match_query = fts::ideograph_match_query(options.query)
         .filter(|_| fts::register_compatible_tokenizer(&conn).is_ok());
-    let mut results = collect_telegram_fts_rows(
-        &conn,
-        &content_tables,
-        &name2id,
-        options,
-        result_limit,
-        match_query,
-    )
-    .or_else(|| {
-        collect_telegram_fts_rows(
+    let mut results = match match_query {
+        Some(query) => collect_telegram_fts_rows(
+            &conn,
+            &content_tables,
+            &name2id,
+            options,
+            result_limit,
+            Some(query),
+        )
+        .or_else(|match_error| {
+            collect_telegram_fts_rows(
+                &conn,
+                &content_tables,
+                &name2id,
+                options,
+                result_limit,
+                None,
+            )
+            .map_err(|fallback_error| {
+                format!(
+                    "Search message index failed ({match_error}); content fallback failed: {fallback_error}"
+                )
+            })
+        })?,
+        None => collect_telegram_fts_rows(
             &conn,
             &content_tables,
             &name2id,
             options,
             result_limit,
             None,
-        )
-    })?;
+        )?,
+    };
 
     results.sort_by_key(|row| Reverse(row.1));
     let has_more = results.len() > options.limit;
@@ -1264,7 +883,7 @@ fn search_messages_with_telegram_fts(
     let displayed = results.len();
     results.sort_by_key(|row| row.1);
 
-    Some((displayed, has_more, results))
+    Ok((displayed, has_more, results))
 }
 
 fn collect_telegram_fts_rows(
@@ -1274,14 +893,16 @@ fn collect_telegram_fts_rows(
     options: &SearchMessagesOptions<'_>,
     result_limit: usize,
     match_query: Option<&str>,
-) -> Option<Vec<SearchRow>> {
+) -> Result<Vec<SearchRow>, String> {
     let search_pattern = like_contains_pattern(options.query);
     let mut results = Vec::new();
 
     for content_table in content_tables {
         let (table, columns, search_clause, time_column, search_value) =
             if let Some(query) = match_query {
-                let table = content_table.strip_suffix("_content")?;
+                let table = content_table
+                    .strip_suffix("_content")
+                    .ok_or_else(|| format!("Invalid FTS content table name: {content_table}"))?;
                 let quoted = quote_identifier(table);
                 (
                     quoted.clone(),
@@ -1308,7 +929,9 @@ fn collect_telegram_fts_rows(
              WHERE {search_clause}{since_clause} \
              ORDER BY {time_column} DESC LIMIT {result_limit}"
         );
-        let mut stmt = conn.prepare(&sql).ok()?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|error| format!("Prepare search of {content_table}: {error}"))?;
         let rows = stmt
             .query_map(params![search_value], |row| {
                 let session_id = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
@@ -1323,14 +946,17 @@ fn collect_telegram_fts_rows(
                     session,
                 ))
             })
-            .ok()?;
-        results.extend(rows.filter_map(|row| row.ok()));
+            .map_err(|error| format!("Query search index table {content_table}: {error}"))?;
+        let rows = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| format!("Read search index table {content_table}: {error}"))?;
+        results.extend(rows);
     }
 
     if match_query.is_some() {
         results.retain(|row| row.2.contains(options.query));
     }
-    Some(results)
+    Ok(results)
 }
 
 fn print_search_results(
@@ -1387,7 +1013,7 @@ fn print_search_results(
     Ok(displayed)
 }
 
-fn find_message_fts_db(decrypted_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_message_fts_db(decrypted_dir: &Path) -> Option<PathBuf> {
     let path = decrypted_dir.join("message/message_fts.db");
     if path.exists() {
         return Some(path);
@@ -1399,18 +1025,20 @@ fn find_message_fts_db(decrypted_dir: &Path) -> Option<PathBuf> {
         .filter(|p| p.exists())
 }
 
-fn telegram_fts_content_tables(conn: &Connection) -> Option<Vec<String>> {
+fn telegram_fts_content_tables(conn: &Connection) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT name FROM sqlite_master \
              WHERE type='table' AND name LIKE 'message_fts_v4_%_content' \
              ORDER BY name",
         )
-        .ok()?;
+        .map_err(|error| format!("Inspect message search index tables: {error}"))?;
     let tables: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(0))
-        .ok()?
-        .filter_map(|row| row.ok())
+        .map_err(|error| format!("Query message search index tables: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Read message search index tables: {error}"))?
+        .into_iter()
         .filter(|name| {
             name.starts_with(TELEGRAM_FTS_CONTENT_TABLE_PREFIX)
                 && name.ends_with(TELEGRAM_FTS_CONTENT_TABLE_SUFFIX)
@@ -1420,20 +1048,20 @@ fn telegram_fts_content_tables(conn: &Connection) -> Option<Vec<String>> {
                     .all(|c| c.is_ascii_digit())
         })
         .collect();
-    Some(tables)
+    Ok(tables)
 }
 
-fn load_fts_name2id(conn: &Connection) -> HashMap<i64, String> {
-    match conn.prepare("SELECT rowid, username FROM name2id") {
-        Ok(mut stmt) => stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default(),
-        Err(_) => HashMap::new(),
-    }
+fn load_fts_name2id(conn: &Connection) -> Result<HashMap<i64, String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT rowid, username FROM name2id")
+        .map_err(|error| format!("Prepare message search session map: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("Query message search session map: {error}"))?;
+    rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+        .map_err(|error| format!("Read message search session map: {error}"))
 }
 
 fn search_session_display(
@@ -1893,15 +1521,7 @@ fn latest_message_times_for_candidates(
             Err(_) => return latest_by_username,
         };
 
-        let tables: Vec<String> = match conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
-        {
-            Ok(mut stmt) => match stmt.query_map([], |row| row.get::<_, String>(0)) {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                Err(_) => vec![],
-            },
-            Err(_) => vec![],
-        };
+        let tables = list_message_tables(&conn).unwrap_or_default();
 
         for table_name in tables {
             let username = match table_to_username.get(&table_name) {
@@ -2022,76 +1642,6 @@ mod tests {
 
         drop(conn);
         (dir, path)
-    }
-
-    fn create_decrypted_dir_with_session_counts(
-        contacts: &[(&str, &str, &str, &str)],
-        rows: &[(&str, usize, i64)],
-    ) -> TempDir {
-        let dir = tempdir().unwrap();
-        let contact_dir = dir.path().join("contact");
-        let message_dir = dir.path().join("message");
-        std::fs::create_dir_all(&contact_dir).unwrap();
-        std::fs::create_dir_all(&message_dir).unwrap();
-
-        let contact_conn = Connection::open(contact_dir.join("contact.db")).unwrap();
-        contact_conn
-            .execute(
-                "CREATE TABLE contact (
-                    username TEXT,
-                    nick_name TEXT,
-                    remark TEXT,
-                    alias TEXT
-                )",
-                [],
-            )
-            .unwrap();
-        for (username, nick_name, remark, alias) in contacts {
-            contact_conn
-                .execute(
-                    "INSERT INTO contact (username, nick_name, remark, alias)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![username, nick_name, remark, alias],
-                )
-                .unwrap();
-        }
-        drop(contact_conn);
-
-        let message_conn = Connection::open(message_dir.join("message_0.db")).unwrap();
-        let body_col = quote_identifier(dictionary::msg_body_column());
-        for (username, count, latest_time) in rows {
-            let table_name = msg_table_name(username);
-            message_conn
-                .execute(
-                    &format!(
-                        "CREATE TABLE {} (
-                            local_type INTEGER,
-                            create_time INTEGER,
-                            {} TEXT
-                        )",
-                        table_name, body_col
-                    ),
-                    [],
-                )
-                .unwrap();
-
-            for i in 0..*count {
-                let create_time = latest_time - (*count - i - 1) as i64;
-                message_conn
-                    .execute(
-                        &format!(
-                            "INSERT INTO {} (local_type, create_time, {})
-                             VALUES (1, ?1, 'hello')",
-                            table_name, body_col
-                        ),
-                        params![create_time],
-                    )
-                    .unwrap();
-            }
-        }
-        drop(message_conn);
-
-        dir
     }
 
     fn create_decrypted_dir_with_session_table(
@@ -2256,107 +1806,7 @@ mod tests {
     }
 
     #[test]
-    fn session_stats_uses_sort_seq_boundaries() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute(
-            "CREATE TABLE Msg_test (
-                local_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sort_seq INTEGER,
-                create_time INTEGER
-            )",
-            [],
-        )
-        .unwrap();
-        conn.execute("CREATE INDEX Msg_test_SORTSEQ ON Msg_test(sort_seq)", [])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO Msg_test (sort_seq, create_time) VALUES
-             (10, 1001), (11, 1000), (20, 2000), (21, 1999)",
-            [],
-        )
-        .unwrap();
-
-        let stats = session_stats_for_table(&conn, "Msg_test").unwrap();
-
-        assert_eq!(stats.count, 4);
-        assert_eq!(stats.earliest, Some(1000));
-        assert_eq!(stats.latest, Some(2000));
-    }
-
-    #[test]
-    fn session_stats_falls_back_without_sort_seq() {
-        let conn = Connection::open_in_memory().unwrap();
-        let body_col = quote_identifier(dictionary::msg_body_column());
-        conn.execute(
-            &format!(
-                "CREATE TABLE Msg_test (
-                local_type INTEGER,
-                create_time INTEGER,
-                {} TEXT
-            )",
-                body_col
-            ),
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            &format!(
-                "INSERT INTO Msg_test (local_type, create_time, {}) VALUES
-             (1, 2000, 'newer'), (1, 1000, 'older')",
-                body_col
-            ),
-            [],
-        )
-        .unwrap();
-
-        let stats = session_stats_for_table(&conn, "Msg_test").unwrap();
-
-        assert_eq!(stats.count, 2);
-        assert_eq!(stats.earliest, Some(1000));
-        assert_eq!(stats.latest, Some(2000));
-    }
-
-    #[test]
-    fn list_sessions_returns_sorted_contact_display_names() {
-        let dir = create_decrypted_dir_with_session_counts(
-            &[
-                ("tgid_low", "Low Nick", "Low Remark", ""),
-                ("tgid_high", "High Nick", "", ""),
-            ],
-            &[("tgid_low", 1, 1000), ("tgid_high", 3, 2000)],
-        );
-
-        let sessions = list_sessions(dir.path(), 10, None, 1).unwrap();
-
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].0, "tgid_high");
-        assert_eq!(sessions[0].1, 3);
-        assert_eq!(sessions[0].3, "High Nick");
-        assert_eq!(sessions[1].0, "tgid_low");
-        assert_eq!(sessions[1].1, 1);
-        assert_eq!(sessions[1].3, "Low Remark");
-    }
-
-    #[test]
-    fn list_sessions_filters_by_fuzzy_contact_query() {
-        let dir = create_decrypted_dir_with_session_counts(
-            &[
-                ("tgid_alice", "Alice Zhang", "", ""),
-                ("tgid_bob", "Bob Lee", "", ""),
-                ("tgid_inactive", "Alice Archive", "", ""),
-            ],
-            &[("tgid_alice", 2, 1000), ("tgid_bob", 5, 2000)],
-        );
-
-        let sessions = list_sessions(dir.path(), 10, Some("Alic Zhang"), 1).unwrap();
-
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].0, "tgid_alice");
-        assert_eq!(sessions[0].3, "Alice Zhang");
-    }
-
-    #[test]
-    fn list_sessions_prefers_session_db_without_message_dbs() {
+    fn list_sessions_reads_session_db_without_message_dbs() {
         let dir = create_decrypted_dir_with_session_table(
             &[
                 ("tgid_old", "Old Nick", "Old Remark", ""),
@@ -2365,7 +1815,7 @@ mod tests {
             &[("tgid_old", 0, 1000, 1000), ("tgid_recent", 3, 2000, 2100)],
         );
 
-        let sessions = list_sessions(dir.path(), 10, None, 1).unwrap();
+        let sessions = list_sessions(dir.path(), 10, None).unwrap();
 
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].0, "tgid_recent");
@@ -2374,6 +1824,15 @@ mod tests {
         assert_eq!(sessions[1].0, "tgid_old");
         assert_eq!(sessions[1].1, 0);
         assert_eq!(sessions[1].3, "Old Remark");
+    }
+
+    #[test]
+    fn list_sessions_requires_session_db() {
+        let dir = tempdir().unwrap();
+
+        let error = list_sessions(dir.path(), 10, None).unwrap_err();
+
+        assert!(error.contains("Session database not found"));
     }
 
     #[test]
@@ -2386,7 +1845,7 @@ mod tests {
             &[("tgid_alice", 0, 1000, 1000), ("tgid_bob", 0, 2000, 2000)],
         );
 
-        let sessions = list_sessions(dir.path(), 10, Some("Alic Zhang"), 1).unwrap();
+        let sessions = list_sessions(dir.path(), 10, Some("Alic Zhang")).unwrap();
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].0, "tgid_alice");
@@ -2427,98 +1886,6 @@ mod tests {
         assert_eq!(sessions[0].0, "tgid_alice");
         assert_eq!(sessions[0].1, 4);
         assert_eq!(sessions[0].3, "Alice Zhang");
-    }
-
-    #[test]
-    fn search_messages_matches_query_inside_content() {
-        let dir = create_decrypted_dir_with_messages(
-            "tgid_search",
-            &["before needle after", "before needle", "no match"],
-        );
-
-        let count = search_messages(
-            dir.path(),
-            SearchMessagesOptions {
-                query: "needle",
-                limit: 20,
-                since: None,
-                use_telegram_fts: true,
-                name_mode: DisplayNameMode::PersonalRemark,
-                jobs: 1,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn search_messages_treats_query_as_bound_text() {
-        let dir = create_decrypted_dir_with_messages(
-            "tgid_search",
-            &["before needle after", "before needle", "no match"],
-        );
-
-        let count = search_messages(
-            dir.path(),
-            SearchMessagesOptions {
-                query: "' OR 1=1 --",
-                limit: 20,
-                since: None,
-                use_telegram_fts: false,
-                name_mode: DisplayNameMode::PersonalRemark,
-                jobs: 1,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn search_messages_treats_wildcards_as_text() {
-        let dir = create_decrypted_dir_with_messages(
-            "tgid_search",
-            &["literal 100%_match", "ordinary update"],
-        );
-
-        let count = search_messages(
-            dir.path(),
-            SearchMessagesOptions {
-                query: "%",
-                limit: 20,
-                since: None,
-                use_telegram_fts: false,
-                name_mode: DisplayNameMode::PersonalRemark,
-                jobs: 1,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn search_messages_respects_since_filter() {
-        let dir = create_decrypted_dir_with_messages(
-            "tgid_search",
-            &["old needle", "new needle", "no match"],
-        );
-
-        let count = search_messages(
-            dir.path(),
-            SearchMessagesOptions {
-                query: "needle",
-                limit: 20,
-                since: Some(1001),
-                use_telegram_fts: false,
-                name_mode: DisplayNameMode::PersonalRemark,
-                jobs: 1,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(count, 1);
     }
 
     #[test]
@@ -2610,14 +1977,57 @@ mod tests {
                 query: "needle",
                 limit: 20,
                 since: None,
-                use_telegram_fts: true,
                 name_mode: DisplayNameMode::PersonalRemark,
-                jobs: 1,
             },
         )
         .unwrap();
 
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn search_messages_requires_fts() {
+        let dir = tempdir().unwrap();
+
+        let error = search_messages(
+            dir.path(),
+            SearchMessagesOptions {
+                query: "needle",
+                limit: 20,
+                since: None,
+                name_mode: DisplayNameMode::PersonalRemark,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("search index is unavailable"));
+    }
+
+    #[test]
+    fn search_messages_reports_malformed_fts_schema() {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let conn = Connection::open(message_dir.join("message_fts.db")).unwrap();
+        conn.execute("CREATE TABLE name2id(username TEXT PRIMARY KEY)", [])
+            .unwrap();
+        conn.execute("CREATE TABLE message_fts_v4_0_content (c0 TEXT)", [])
+            .unwrap();
+        drop(conn);
+
+        let error = search_messages(
+            dir.path(),
+            SearchMessagesOptions {
+                query: "needle",
+                limit: 20,
+                since: None,
+                name_mode: DisplayNameMode::PersonalRemark,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Prepare search of message_fts_v4_0_content"));
+        assert!(!error.contains("search index is unavailable"));
     }
 
     #[test]
@@ -2630,9 +2040,7 @@ mod tests {
                 query: "开源",
                 limit: 20,
                 since: None,
-                use_telegram_fts: true,
                 name_mode: DisplayNameMode::PersonalRemark,
-                jobs: 1,
             },
         )
         .unwrap();
@@ -2651,9 +2059,7 @@ mod tests {
                 query: "' OR 1=1 --",
                 limit: 20,
                 since: None,
-                use_telegram_fts: true,
                 name_mode: DisplayNameMode::PersonalRemark,
-                jobs: 1,
             },
         )
         .unwrap();
@@ -2671,9 +2077,7 @@ mod tests {
                 query: "%",
                 limit: 20,
                 since: None,
-                use_telegram_fts: true,
                 name_mode: DisplayNameMode::PersonalRemark,
-                jobs: 1,
             },
         )
         .unwrap();
@@ -2691,9 +2095,7 @@ mod tests {
                 query: "needle",
                 limit: 20,
                 since: Some(1001),
-                use_telegram_fts: true,
                 name_mode: DisplayNameMode::PersonalRemark,
-                jobs: 1,
             },
         )
         .unwrap();

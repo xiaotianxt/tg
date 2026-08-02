@@ -25,7 +25,7 @@ mod scanner;
 mod sqlite;
 mod time;
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -124,6 +124,20 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Args)]
+struct DecryptedArgs {
+    /// Path to decrypted databases
+    #[arg(
+        long,
+        default_value_os_t = paths::default_decrypted_dir(),
+        value_hint = clap::ValueHint::DirPath
+    )]
+    decrypted_dir: PathBuf,
+    /// Number of parallel jobs (0 = auto)
+    #[arg(long, default_value_t = 0)]
+    jobs: usize,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Refresh DB encryption keys from cached or captured account material
@@ -185,80 +199,41 @@ enum Commands {
     Sessions {
         /// Optional display name or username query to filter sessions
         query: Option<String>,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
         /// Number of top sessions to show
         #[arg(long, default_value_t = 30)]
         top: usize,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
+        #[command(flatten)]
+        cache: DecryptedArgs,
     },
     /// List sessions with unread messages
     Unread {
         /// Optional display name or username query to filter unread sessions
         query: Option<String>,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
         /// Number of top unread sessions to show
         #[arg(long, default_value_t = 30)]
         top: usize,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
+        #[command(flatten)]
+        cache: DecryptedArgs,
     },
     /// Diagnose tg setup and optionally a specific chat
     Doctor {
         /// Optional session username (tgid_xxx) or display name to inspect
         session: Option<String>,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
+        #[command(flatten)]
+        cache: DecryptedArgs,
     },
     /// Refresh decrypted cache, refreshing keys if needed
     Refresh {
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
         /// Extract keys before decrypting
         #[arg(long)]
         keys: bool,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
+        #[command(flatten)]
+        cache: DecryptedArgs,
     },
     /// Read messages from a specific session
     Messages {
         /// Session username (tgid_xxx) or display name to search
         session: String,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
         /// Number of messages to show (defaults to 50 unless --since or --all-time is used)
         #[arg(long)]
         limit: Option<usize>,
@@ -290,21 +265,13 @@ enum Commands {
         /// Use group/member public names instead of your contact remarks
         #[arg(long)]
         anonymous: bool,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
+        #[command(flatten)]
+        cache: DecryptedArgs,
     },
     /// Search across all sessions
     Search {
         /// Search query
         query: String,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
         /// Number of results
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -317,22 +284,14 @@ enum Commands {
         /// Use public names instead of your contact remarks in output
         #[arg(long)]
         anonymous: bool,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
+        #[command(flatten)]
+        cache: DecryptedArgs,
     },
     /// Search message tables with fixed, parameterized query templates
     Query {
         /// Optional session username (tgid_xxx) or display name to search within
         #[arg(long)]
         session: Option<String>,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
         /// Keyword that must appear in message text; repeat for multiple keywords
         #[arg(long = "contains")]
         contains: Vec<String>,
@@ -366,7 +325,7 @@ enum Commands {
         /// Keyword matching mode when --contains is repeated: all or any
         #[arg(long, value_enum, default_value = "all")]
         match_mode: query::QueryMatchMode,
-        /// Output fields: time,session,sender,type,body,timestamp
+        /// Output fields: time,session,sender,type,body,raw_body,timestamp
         #[arg(long, default_value = "time,session,sender,body")]
         fields: String,
         /// Output format: table or json
@@ -378,47 +337,13 @@ enum Commands {
         /// Use public names instead of your contact remarks in output
         #[arg(long)]
         anonymous: bool,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
-    },
-    /// Show public query fields and filters without dumping raw database schema
-    Schema {
-        /// Cache target to check: messages, contact, fts, or message_N
-        #[arg(
-            long,
-            default_value = "messages",
-            value_parser = completion_values::db_targets()
-        )]
-        db: String,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
-        /// Output format: table or json
-        #[arg(long, value_enum, default_value = "table")]
-        format: query::QueryOutputFormat,
-        /// Maximum displayed characters per text cell
-        #[arg(long, default_value_t = 500)]
-        max_cell_chars: usize,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
+        #[command(flatten)]
+        cache: DecryptedArgs,
     },
     /// Export a complete chat archive
     Export {
         /// Session username (tgid_xxx) or display name to search
         session: String,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
         /// Output directory
         #[arg(
             long,
@@ -426,21 +351,13 @@ enum Commands {
             value_hint = clap::ValueHint::DirPath
         )]
         output: PathBuf,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
+        #[command(flatten)]
+        cache: DecryptedArgs,
     },
     /// Export local cached images from a specific session
     Image {
         /// Session username (tgid_xxx) or display name to search
         session: String,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
         /// Output directory for readable image files
         #[arg(
             long,
@@ -466,21 +383,13 @@ enum Commands {
         /// Only consider images after this time (ISO 8601 or relative: 5min, 1h, today)
         #[arg(long)]
         since: Option<String>,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
+        #[command(flatten)]
+        cache: DecryptedArgs,
     },
     /// Export local cached file attachments from a specific session
     File {
         /// Session username (tgid_xxx) or display name to search
         session: String,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
         /// Output directory for cached file attachments
         #[arg(
             long,
@@ -506,22 +415,14 @@ enum Commands {
         /// Only consider files after this time (ISO 8601 or relative: 5min, 1h, today)
         #[arg(long)]
         since: Option<String>,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
+        #[command(flatten)]
+        cache: DecryptedArgs,
     },
     /// Export local cached stickers from a specific session
     #[command(visible_alias = "emoji")]
     Sticker {
         /// Session username (tgid_xxx) or display name to search
         session: String,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
         /// Output directory for sticker files
         #[arg(
             long,
@@ -547,21 +448,13 @@ enum Commands {
         /// Only consider stickers after this time (ISO 8601 or relative: 5min, 1h, today)
         #[arg(long)]
         since: Option<String>,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
+        #[command(flatten)]
+        cache: DecryptedArgs,
     },
     /// Export local cached voice messages from a specific session
     Voice {
         /// Session username (tgid_xxx) or display name to search
         session: String,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
         /// Output directory for normalized voice files
         #[arg(
             long,
@@ -600,9 +493,8 @@ enum Commands {
         /// Output sample rate for decoded pcm/wav
         #[arg(long, default_value_t = 24000)]
         sample_rate: u32,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
+        #[command(flatten)]
+        cache: DecryptedArgs,
     },
     /// Generate shell completion scripts
     Completions {
@@ -714,14 +606,19 @@ fn main() {
                 }
             }
         }
-        Commands::Sessions {
-            query,
-            decrypted_dir,
-            top,
-            jobs,
-        } => {
-            let _ = cache::refresh_session_decrypted(&decrypted_dir, jobs);
-            match db::list_sessions(&decrypted_dir, top, query.as_deref(), jobs) {
+        Commands::Sessions { query, top, cache } => {
+            let DecryptedArgs {
+                decrypted_dir,
+                jobs,
+            } = cache;
+            let refresh = cache::refresh_session_decrypted(&decrypted_dir, jobs);
+            if let Some(error) = cache::session_refresh_error(&refresh) {
+                log::warn!(
+                    "Session cache refresh had issues ({}). Using existing session cache.",
+                    error
+                );
+            }
+            match db::list_sessions(&decrypted_dir, top, query.as_deref()) {
                 Ok(sessions) => {
                     if sessions.is_empty() {
                         if let Some(query) =
@@ -741,13 +638,18 @@ fn main() {
                 }
             }
         }
-        Commands::Unread {
-            query,
-            decrypted_dir,
-            top,
-            jobs,
-        } => {
-            let _ = cache::refresh_session_decrypted(&decrypted_dir, jobs);
+        Commands::Unread { query, top, cache } => {
+            let DecryptedArgs {
+                decrypted_dir,
+                jobs,
+            } = cache;
+            let refresh = cache::refresh_session_decrypted(&decrypted_dir, jobs);
+            if let Some(error) = cache::session_refresh_error(&refresh) {
+                log::warn!(
+                    "Session cache refresh had issues ({}). Using existing session cache.",
+                    error
+                );
+            }
             match db::list_unread_sessions(&decrypted_dir, top, query.as_deref()) {
                 Ok(sessions) => {
                     if sessions.is_empty() {
@@ -766,11 +668,11 @@ fn main() {
                 }
             }
         }
-        Commands::Doctor {
-            session,
-            decrypted_dir,
-            jobs,
-        } => {
+        Commands::Doctor { session, cache } => {
+            let DecryptedArgs {
+                decrypted_dir,
+                jobs,
+            } = cache;
             if let Err(e) = doctor::run(doctor::DoctorOptions {
                 session: session.as_deref(),
                 decrypted_dir: &decrypted_dir,
@@ -780,11 +682,11 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Refresh {
-            decrypted_dir,
-            keys,
-            jobs,
-        } => {
+        Commands::Refresh { keys, cache } => {
+            let DecryptedArgs {
+                decrypted_dir,
+                jobs,
+            } = cache;
             let refresh = if keys {
                 cache::refresh_keys_and_decrypted(&decrypted_dir, jobs)
             } else {
@@ -812,7 +714,6 @@ fn main() {
         }
         Commands::Messages {
             session,
-            decrypted_dir,
             limit,
             offset,
             search,
@@ -822,8 +723,12 @@ fn main() {
             head,
             time_bucket,
             anonymous,
-            jobs,
+            cache,
         } => {
+            let DecryptedArgs {
+                decrypted_dir,
+                jobs,
+            } = cache;
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -879,13 +784,16 @@ fn main() {
         }
         Commands::Search {
             query,
-            decrypted_dir,
             limit,
             since,
             all_time,
             anonymous,
-            jobs,
+            cache,
         } => {
+            let DecryptedArgs {
+                decrypted_dir,
+                jobs,
+            } = cache;
             if limit == 0 {
                 log::error!("Error: --limit must be greater than 0");
                 std::process::exit(1);
@@ -909,23 +817,17 @@ fn main() {
                     cache::search_refresh_reason(&refresh)
                 );
             }
-            let use_telegram_fts = match &refresh {
-                Ok(stats) => !cache::failures_can_affect_telegram_fts(stats),
-                Err(_) => true,
-            };
             match db::search_messages(
                 &decrypted_dir,
                 db::SearchMessagesOptions {
                     query: &query,
                     limit,
                     since: since_ts,
-                    use_telegram_fts,
                     name_mode: if anonymous {
                         contact::DisplayNameMode::Anonymous
                     } else {
                         contact::DisplayNameMode::PersonalRemark
                     },
-                    jobs,
                 },
             ) {
                 Ok(count) => {
@@ -941,7 +843,6 @@ fn main() {
         }
         Commands::Query {
             session,
-            decrypted_dir,
             contains,
             not_contains,
             raw_contains,
@@ -957,8 +858,12 @@ fn main() {
             format,
             max_cell_chars,
             anonymous,
-            jobs,
+            cache,
         } => {
+            let DecryptedArgs {
+                decrypted_dir,
+                jobs,
+            } = cache;
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -1024,40 +929,15 @@ fn main() {
                 }
             }
         }
-        Commands::Schema {
-            db,
-            decrypted_dir,
-            format,
-            max_cell_chars,
-            jobs,
-        } => {
-            let refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
-            if cache::needs_search_refresh_warning(&refresh) {
-                log::warn!(
-                    "Decrypted cache refresh had issues ({}). Schema may be stale.",
-                    cache::search_refresh_reason(&refresh)
-                );
-            }
-            match query::run_schema(query::SchemaOptions {
-                decrypted_dir: &decrypted_dir,
-                db_target: &db,
-                format,
-                max_cell_chars,
-            }) {
-                Ok(0) => print_output(format_args!("No rows returned.")),
-                Ok(_) => {}
-                Err(e) => {
-                    log::error!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
         Commands::Export {
             session,
-            decrypted_dir,
             output,
-            jobs,
+            cache,
         } => {
+            let DecryptedArgs {
+                decrypted_dir,
+                jobs,
+            } = cache;
             let mut refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
             if cache::needs_export_key_retry(&refresh) {
                 log::warn!(
@@ -1093,7 +973,6 @@ fn main() {
         }
         Commands::Image {
             session,
-            decrypted_dir,
             output,
             list,
             all,
@@ -1101,8 +980,12 @@ fn main() {
             id,
             limit,
             since,
-            jobs,
+            cache,
         } => {
+            let DecryptedArgs {
+                decrypted_dir,
+                jobs,
+            } = cache;
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -1128,7 +1011,6 @@ fn main() {
         }
         Commands::File {
             session,
-            decrypted_dir,
             output,
             list,
             all,
@@ -1136,8 +1018,12 @@ fn main() {
             id,
             limit,
             since,
-            jobs,
+            cache,
         } => {
+            let DecryptedArgs {
+                decrypted_dir,
+                jobs,
+            } = cache;
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -1163,7 +1049,6 @@ fn main() {
         }
         Commands::Sticker {
             session,
-            decrypted_dir,
             output,
             list,
             all,
@@ -1171,8 +1056,12 @@ fn main() {
             id,
             limit,
             since,
-            jobs,
+            cache,
         } => {
+            let DecryptedArgs {
+                decrypted_dir,
+                jobs,
+            } = cache;
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -1198,19 +1087,22 @@ fn main() {
         }
         Commands::Voice {
             session,
-            decrypted_dir,
             output,
             format,
             decoder,
+            sample_rate,
             list,
             all,
             index,
             id,
             limit,
             since,
-            sample_rate,
-            jobs,
+            cache,
         } => {
+            let DecryptedArgs {
+                decrypted_dir,
+                jobs,
+            } = cache;
             let since_ts = match time::parse_since_opt(since.as_deref()) {
                 Ok(ts) => ts,
                 Err(e) => {
@@ -1302,7 +1194,6 @@ mod tests {
             "messages",
             "search",
             "query",
-            "schema",
             "sql",
             "export",
             "image",
@@ -1495,36 +1386,69 @@ mod tests {
     }
 
     #[test]
-    fn voice_accepts_index_selection() {
-        let cli = Cli::parse_from(args(&[
-            "tg", "voice", "alice", "--index", "2", "--format", "wav",
-        ]));
-        match cli.command {
-            Commands::Voice {
-                session,
-                index,
-                format,
-                ..
-            } => {
-                assert_eq!(session, "alice");
-                assert_eq!(index, Some(2));
-                assert_eq!(format, "wav");
-            }
-            _ => panic!("expected voice command"),
+    fn media_commands_share_selection_and_cache_options() {
+        for command in ["image", "file", "sticker", "voice"] {
+            let cli = Cli::parse_from(args(&[
+                "tg",
+                command,
+                "alice",
+                "--index",
+                "2",
+                "--limit",
+                "7",
+                "--since",
+                "today",
+                "--decrypted-dir",
+                "/tmp/tg-test",
+                "--jobs",
+                "3",
+            ]));
+            let (session, index, limit, since, cache) = match cli.command {
+                Commands::Image {
+                    session,
+                    index,
+                    limit,
+                    since,
+                    cache,
+                    ..
+                }
+                | Commands::File {
+                    session,
+                    index,
+                    limit,
+                    since,
+                    cache,
+                    ..
+                }
+                | Commands::Sticker {
+                    session,
+                    index,
+                    limit,
+                    since,
+                    cache,
+                    ..
+                } => (session, index, limit, since, cache),
+                Commands::Voice {
+                    session,
+                    index,
+                    limit,
+                    since,
+                    cache,
+                    ..
+                } => (session, index, limit, since, cache),
+                _ => panic!("expected media command"),
+            };
+            assert_eq!(session, "alice");
+            assert_eq!(index, Some(2));
+            assert_eq!(limit, 7);
+            assert_eq!(since.as_deref(), Some("today"));
+            assert_eq!(cache.decrypted_dir, PathBuf::from("/tmp/tg-test"));
+            assert_eq!(cache.jobs, 3);
         }
     }
 
     #[test]
-    fn sticker_accepts_index_selection_and_emoji_alias() {
-        let cli = Cli::parse_from(args(&["tg", "sticker", "alice", "--index", "2"]));
-        match cli.command {
-            Commands::Sticker { session, index, .. } => {
-                assert_eq!(session, "alice");
-                assert_eq!(index, Some(2));
-            }
-            _ => panic!("expected sticker command"),
-        }
-
+    fn sticker_accepts_emoji_alias() {
         let cli = Cli::parse_from(normalize_args_for_default_messages(args(&[
             "tg", "emoji", "alice", "--list",
         ])));
@@ -1538,32 +1462,23 @@ mod tests {
     }
 
     #[test]
-    fn voice_accepts_id_selection() {
-        let cli = Cli::parse_from(args(&["tg", "voice", "alice", "--id", "42"]));
-        match cli.command {
-            Commands::Voice { id, .. } => assert_eq!(id, Some(42)),
-            _ => panic!("expected voice command"),
-        }
-    }
-
-    #[test]
-    fn file_accepts_index_selection() {
-        let cli = Cli::parse_from(args(&["tg", "file", "alice", "--index", "2"]));
-        match cli.command {
-            Commands::File { session, index, .. } => {
-                assert_eq!(session, "alice");
-                assert_eq!(index, Some(2));
+    fn media_commands_share_typed_id_selection_and_conflicts() {
+        for command in ["image", "file", "sticker", "voice"] {
+            let cli = Cli::parse_from(args(&["tg", command, "alice", "--id", "42"]));
+            match cli.command {
+                Commands::Image { id, .. }
+                | Commands::File { id, .. }
+                | Commands::Sticker { id, .. } => {
+                    assert_eq!(id.as_deref(), Some("42"));
+                }
+                Commands::Voice { id, .. } => assert_eq!(id, Some(42)),
+                _ => panic!("expected media command"),
             }
-            _ => panic!("expected file command"),
-        }
-    }
 
-    #[test]
-    fn file_accepts_id_selection() {
-        let cli = Cli::parse_from(args(&["tg", "file", "alice", "--id", "report.pdf"]));
-        match cli.command {
-            Commands::File { id, .. } => assert_eq!(id.as_deref(), Some("report.pdf")),
-            _ => panic!("expected file command"),
+            assert!(
+                Cli::try_parse_from(args(&["tg", command, "alice", "--id", "42", "--list",]))
+                    .is_err()
+            );
         }
     }
 

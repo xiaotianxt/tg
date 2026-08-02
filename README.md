@@ -263,7 +263,7 @@ tg export "联系人或群名"
 
 `search`、`query` 默认只看最近 365 天，这是大多数查询的热路径。需要全量历史时加 `--all-time`；需要更窄窗口时加 `--since today`、`--since 30d` 或具体日期。`export` 默认就是全量归档。
 
-`sessions` 和 `unread` 会优先用轻量会话缓存列出最近活跃会话和未读数，不需要扫描 numbered message 数据库。`search`、`query`、`schema`、`export` 在读取前会尝试静默增量刷新 `~/.tg/decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"` 看具体状态。
+`sessions` 和 `unread` 只使用轻量 `session.db` 列出最近活跃会话和未读数，不扫描 numbered message 数据库。`search`、`query`、`export` 在读取前会尝试静默增量刷新 `~/.tg/decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"`；诊断会明确报告 `session.db` 和 `message_fts.db` 是否就绪。
 
 macOS 上如果 `sudo tg keys` 遇到 `task_for_pid failed` 或权限问题，不要在 Telegram 正在运行时直接重签后继续扫同一个进程。按这个顺序重来：
 
@@ -359,12 +359,11 @@ tg query --contains "项目" --not "已取消" --format json --fields timestamp,
 tg query --has voice --session "张三" --limit 20
 tg query --raw-contains "<appmsg" --fields time,session,raw_body --limit 20
 tg query --contains "项目" --all-time --anonymous
-tg schema --db messages
 ```
 
 `query` 适合在本机做精确检索：限定某个会话、同时要求多个关键词、排除某些词、筛选媒体类型、按时间收窄结果，或者只输出后续脚本需要的字段。`--contains` 匹配解码后的展示文本，图片、语音、表情等会按 tg 的可读标记参与匹配；需要查原始 XML/缓存正文时用 `--raw-contains`。`--has` 支持 `voice,image,sticker,file,video`，根据消息类型和原始正文判断，不依赖额外索引。`--fields` 支持 `time,session,sender,type,body,raw_body,timestamp`，`--format json` 会按 JSON lines 输出，便于继续处理。
 
-`query` 不接受原始 SQL。用户只传会话、关键词、排除词、媒体类型、时间、排序和输出字段，tg 内部生成固定的参数化数据库查询，并以只读方式打开消息数据库。默认查询最近 365 天；加 `--all-time` 后，为了避免误扫全库，必须至少传 `--contains`、`--raw-contains`、`--has` 或 `--since` 之一。空关键词会被拒绝；单次 `--limit + --offset` 最多 10000。table 输出会转义终端控制字符，避免聊天正文影响终端显示。`schema` 展示的是公开查询字段和过滤器，不输出原始表名、列名或建表语句。
+`query` 不接受原始 SQL。用户只传会话、关键词、排除词、媒体类型、时间、排序和输出字段，tg 内部生成固定的参数化数据库查询，并以只读方式打开消息数据库。默认查询最近 365 天；加 `--all-time` 后，为了避免误扫全库，必须至少传 `--contains`、`--raw-contains`、`--has` 或 `--since` 之一。空关键词会被拒绝；单次 `--limit + --offset` 最多 10000。table 输出会转义终端控制字符，避免聊天正文影响终端显示。
 
 诊断：
 

@@ -101,16 +101,14 @@ tg query --session "产品讨论群" --contains "关键词" --fields time,sender
 tg query --contains "项目" --contains "上线" --match-mode all --since today --anonymous
 tg query --contains "项目" --not "已取消" --format json --fields timestamp,session,body --anonymous
 tg query --contains "项目" --all-time --anonymous
-tg schema --db messages
 ```
 
-Use `tg schema` when the user asks what `query` can return or filter on. It
-shows the public query contract, not raw database table or column names.
+Use `tg query --help` when the user asks what `query` can return or filter on.
 
 Query safety rules:
 
-- `search`, `query`, and `export` default to the recent 365-day window; use `--all-time` only when the user asks for full history.
-- With `--all-time`, `query` requires at least `--contains` or `--since`.
+- `search` and `query` default to the recent 365-day window; `export` always writes the complete chat archive.
+- With `--all-time`, `query` requires at least `--contains`, `--raw-contains`, `--has`, or `--since`.
 - Empty `--contains` / `--not` values are rejected.
 - Use `--session`, `--since`, and a reasonable `--limit` when results could be large.
 - Table output escapes terminal control characters; use `--format json` for machine parsing.
@@ -127,12 +125,12 @@ tg doctor "张三"
 Export:
 
 ```bash
-tg export "张三" --format txt
-tg export "张三" --format csv --since 30d --output exported/zhangsan
-tg export "张三" --format json --limit 1000 --output exported/zhangsan
-tg export "张三" --format json --all-time --output exported/zhangsan
-tg export "产品讨论群" --format json --output exported/group --media-dir exported/group/media --anonymous
+tg export "张三"
+tg export "张三" --output exported/zhangsan
+tg export "产品讨论群" --output exported/group
 ```
+
+Each export writes `chat.txt`, `chat.csv`, `chat.json`, and locally available media under `media/`.
 
 Export cached images:
 
@@ -172,6 +170,6 @@ Date, datetime, and displayed message times use the current system time zone.
 - `task_for_pid failed`: quit Telegram, run `sudo codesign --force --deep --sign - /Applications/Telegram.app`, reopen Telegram, then run `sudo tg keys --method lldb-login --timeout 180` and log out/in once while it waits.
 - No chats or messages found: run `tg refresh --keys`, then `tg sessions --top 50`.
 - Wrong chat matched: use `tg sessions --top 100` and rerun with the exact `tgid_...` or `...@chatroom`.
-- Missing media: open or download the media in Telegram first, then retry `tg image` or `tg export --media-dir ...`.
+- Missing media: open or download it in Telegram first, then retry `tg export CHAT` or the matching `tg image`, `tg file`, `tg sticker`, or `tg voice` command.
 - Voice output defaults to normalized `.voice`; use `tg voice ... --format wav` after installing a compatible native voice decoder.
 - Unknown issue: run `tg doctor` or `tg doctor "联系人或群名"` and follow the result.

@@ -22,14 +22,6 @@ pub(crate) fn voice_formats() -> PossibleValuesParser {
     ])
 }
 
-pub(crate) fn db_targets() -> PossibleValuesParser {
-    parser(&[
-        ("messages", "Message cache"),
-        ("contact", "Contact cache"),
-        ("fts", "Message index"),
-    ])
-}
-
 fn parser(values: &[(&'static str, &'static str)]) -> PossibleValuesParser {
     PossibleValuesParser::new(
         values

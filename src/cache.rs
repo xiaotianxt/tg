@@ -130,6 +130,23 @@ pub(crate) fn search_refresh_reason(refresh: &Result<decrypt::DecryptStats, Stri
     }
 }
 
+pub(crate) fn session_refresh_error(
+    refresh: &Result<decrypt::DecryptStats, String>,
+) -> Option<String> {
+    match refresh {
+        Ok(stats)
+            if stats
+                .failed_paths
+                .iter()
+                .any(|path| path == "session/session.db") =>
+        {
+            Some("session/session.db failed to decrypt".to_string())
+        }
+        Err(error) => Some(error.clone()),
+        _ => None,
+    }
+}
+
 pub(crate) fn failures_can_affect_messages(stats: &decrypt::DecryptStats) -> bool {
     stats
         .failed_paths
@@ -160,7 +177,7 @@ pub(crate) fn failures_can_affect_search(stats: &decrypt::DecryptStats) -> bool 
     stats
         .failed_paths
         .iter()
-        .any(|path| failure_can_affect_messages(path) || failure_can_affect_telegram_fts(path))
+        .any(|path| path == "contact/contact.db" || failure_can_affect_telegram_fts(path))
 }
 
 pub(crate) fn failures_can_affect_export(stats: &decrypt::DecryptStats) -> bool {
@@ -187,13 +204,6 @@ pub(crate) fn export_failure_summary(stats: &decrypt::DecryptStats) -> String {
         summary.push_str(&format!(" ... {} total", paths.len()));
     }
     summary
-}
-
-pub(crate) fn failures_can_affect_telegram_fts(stats: &decrypt::DecryptStats) -> bool {
-    stats
-        .failed_paths
-        .iter()
-        .any(|path| failure_can_affect_telegram_fts(path))
 }
 
 fn failure_can_affect_messages(path: &str) -> bool {
@@ -246,6 +256,18 @@ mod tests {
     }
 
     #[test]
+    fn session_refresh_error_reports_only_session_failures() {
+        assert_eq!(
+            session_refresh_error(&Ok(stats_with_failed_paths(&["session/session.db"]))),
+            Some("session/session.db failed to decrypt".to_string())
+        );
+        assert_eq!(
+            session_refresh_error(&Ok(stats_with_failed_paths(&["contact/contact.db"]))),
+            None
+        );
+    }
+
+    #[test]
     fn message_retry_ignores_refresh_lock_contention() {
         let refresh = Err("Decrypted cache refresh is already running for decrypted".to_string());
         assert!(!needs_message_key_retry(&refresh));
@@ -292,8 +314,5 @@ mod tests {
         assert!(failures_can_affect_search(&stats_with_failed_paths(&[
             "message/message_fts.db"
         ])));
-        assert!(failures_can_affect_telegram_fts(&stats_with_failed_paths(
-            &["message/message_fts.db"]
-        )));
     }
 }

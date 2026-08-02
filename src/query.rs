@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use crate::{contact, db, dictionary, media, message, output, parallel, paths};
 
-const MESSAGE_TARGETS: &[&str] = &["messages", "message", "all-messages"];
 const MAX_QUERY_KEYWORDS: usize = 16;
 const MAX_QUERY_KEYWORD_CHARS: usize = 256;
 const MAX_QUERY_RESULT_WINDOW: usize = 10_000;
@@ -166,13 +165,6 @@ pub(crate) struct QueryOptions<'a> {
     pub jobs: usize,
 }
 
-pub(crate) struct SchemaOptions<'a> {
-    pub decrypted_dir: &'a Path,
-    pub db_target: &'a str,
-    pub format: QueryOutputFormat,
-    pub max_cell_chars: usize,
-}
-
 #[derive(Debug, Clone)]
 struct QueryTarget {
     label: String,
@@ -198,23 +190,10 @@ struct MessageRow {
     raw_body: String,
 }
 
-struct SchemaRow {
-    section: &'static str,
-    name: &'static str,
-    value: String,
-    description: &'static str,
-}
-
 pub(crate) fn run(options: QueryOptions<'_>) -> Result<usize, String> {
     let stdout = std::io::stdout();
     let mut out = output::Output::new(stdout.lock());
     run_messages_with_output(options, &mut out)
-}
-
-pub(crate) fn run_schema(options: SchemaOptions<'_>) -> Result<usize, String> {
-    let stdout = std::io::stdout();
-    let mut out = output::Output::new(stdout.lock());
-    run_schema_with_output(options, &mut out)
 }
 
 fn run_messages_with_output<W: Write>(
@@ -255,24 +234,6 @@ fn run_messages_with_output<W: Write>(
     )?;
     out.flush()?;
     Ok(displayed)
-}
-
-fn run_schema_with_output<W: Write>(
-    options: SchemaOptions<'_>,
-    out: &mut output::Output<W>,
-) -> Result<usize, String> {
-    let targets = resolve_targets(options.decrypted_dir, options.db_target)?;
-    if targets.is_empty() {
-        return Err(format!(
-            "No databases matched --db '{}'. Try 'tg refresh' first.",
-            options.db_target
-        ));
-    }
-
-    let rows = public_schema_rows(options.db_target, targets.len());
-    write_schema_rows(out, &rows, options.format, options.max_cell_chars)?;
-    out.flush()?;
-    Ok(rows.len())
 }
 
 fn validate_message_options(options: &QueryOptions<'_>) -> Result<(), String> {
@@ -730,256 +691,12 @@ fn message_field_text(row: &MessageRow, field: MessageField) -> String {
     }
 }
 
-fn public_schema_rows(db_target: &str, target_count: usize) -> Vec<SchemaRow> {
-    let mut rows = vec![
-        SchemaRow {
-            section: "target",
-            name: "selected",
-            value: db_target.to_string(),
-            description: "cache target checked for availability",
-        },
-        SchemaRow {
-            section: "target",
-            name: "databases",
-            value: target_count.to_string(),
-            description: "matching decrypted cache files",
-        },
-        SchemaRow {
-            section: "target",
-            name: "mode",
-            value: "read-only".to_string(),
-            description: "tg opens cache files without write access",
-        },
-        SchemaRow {
-            section: "command",
-            name: "query",
-            value: "tg query".to_string(),
-            description: "structured message lookup; raw database SQL is not accepted",
-        },
-    ];
-
-    rows.extend([
-        SchemaRow {
-            section: "field",
-            name: "time",
-            value: "string".to_string(),
-            description: "local display time",
-        },
-        SchemaRow {
-            section: "field",
-            name: "timestamp",
-            value: "integer".to_string(),
-            description: "message create time from the local cache",
-        },
-        SchemaRow {
-            section: "field",
-            name: "session",
-            value: "string".to_string(),
-            description: "resolved session display name when known",
-        },
-        SchemaRow {
-            section: "field",
-            name: "sender",
-            value: "string".to_string(),
-            description: "resolved sender display name when known",
-        },
-        SchemaRow {
-            section: "field",
-            name: "type",
-            value: "integer".to_string(),
-            description: "message type code from the local cache",
-        },
-        SchemaRow {
-            section: "field",
-            name: "body",
-            value: "string".to_string(),
-            description: "message text or decoded text payload",
-        },
-        SchemaRow {
-            section: "field",
-            name: "raw_body",
-            value: "string".to_string(),
-            description: "raw message body from the local cache",
-        },
-        SchemaRow {
-            section: "filter",
-            name: "session",
-            value: "--session".to_string(),
-            description: "limit query to one resolved session",
-        },
-        SchemaRow {
-            section: "filter",
-            name: "contains",
-            value: "--contains".to_string(),
-            description: "required decoded/display text match; repeatable",
-        },
-        SchemaRow {
-            section: "filter",
-            name: "raw_contains",
-            value: "--raw-contains".to_string(),
-            description: "required raw database body match; repeatable",
-        },
-        SchemaRow {
-            section: "filter",
-            name: "has",
-            value: "voice,image,sticker,file,video".to_string(),
-            description: "require a decoded media category",
-        },
-        SchemaRow {
-            section: "filter",
-            name: "not",
-            value: "--not".to_string(),
-            description: "excluded text match; repeatable",
-        },
-        SchemaRow {
-            section: "filter",
-            name: "since",
-            value: "--since".to_string(),
-            description: "lower time bound",
-        },
-        SchemaRow {
-            section: "filter",
-            name: "until",
-            value: "--until".to_string(),
-            description: "upper time bound",
-        },
-        SchemaRow {
-            section: "option",
-            name: "format",
-            value: "table,json".to_string(),
-            description: "supported output formats",
-        },
-        SchemaRow {
-            section: "option",
-            name: "order",
-            value: "newest,oldest".to_string(),
-            description: "global result ordering",
-        },
-    ]);
-
-    rows
-}
-
-fn write_schema_rows<W: Write>(
-    out: &mut output::Output<W>,
-    rows: &[SchemaRow],
-    format: QueryOutputFormat,
-    max_cell_chars: usize,
-) -> Result<(), String> {
-    match format {
-        QueryOutputFormat::Table => {
-            out.line(format_args!("section\tname\tvalue\tdescription"))?;
-            for row in rows {
-                out.line(format_args!(
-                    "{}\t{}\t{}\t{}",
-                    escape_table_cell(row.section, max_cell_chars),
-                    escape_table_cell(row.name, max_cell_chars),
-                    escape_table_cell(&row.value, max_cell_chars),
-                    escape_table_cell(row.description, max_cell_chars)
-                ))?;
-            }
-        }
-        QueryOutputFormat::Json => {
-            for row in rows {
-                let mut object = Map::new();
-                object.insert(
-                    "section".to_string(),
-                    JsonValue::String(row.section.to_string()),
-                );
-                object.insert("name".to_string(), JsonValue::String(row.name.to_string()));
-                object.insert("value".to_string(), JsonValue::String(row.value.clone()));
-                object.insert(
-                    "description".to_string(),
-                    JsonValue::String(row.description.to_string()),
-                );
-                out.line(format_args!("{}", JsonValue::Object(object)))?;
-            }
-        }
-    }
-    Ok(())
-}
-
 fn message_field_json(row: &MessageRow, field: MessageField) -> JsonValue {
     match field {
         MessageField::Type => JsonValue::Number(Number::from(row.local_type)),
         MessageField::Timestamp => JsonValue::Number(Number::from(row.create_time)),
         _ => JsonValue::String(message_field_text(row, field)),
     }
-}
-
-fn resolve_targets(decrypted_dir: &Path, target: &str) -> Result<Vec<QueryTarget>, String> {
-    let target = target.trim();
-    if target.is_empty() {
-        return Err("--db cannot be empty".to_string());
-    }
-
-    let (contact_db, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
-    let lower = target.to_ascii_lowercase();
-    if lower == "contact" {
-        return contact_db
-            .map(|path| {
-                vec![QueryTarget {
-                    label: "contact/contact.db".to_string(),
-                    path,
-                }]
-            })
-            .ok_or_else(|| "contact/contact.db was not found".to_string());
-    }
-
-    if MESSAGE_TARGETS.contains(&lower.as_str()) {
-        return Ok(message_dbs
-            .into_iter()
-            .map(|path| QueryTarget {
-                label: paths::relative_label(decrypted_dir, &path),
-                path,
-            })
-            .collect());
-    }
-
-    if matches!(lower.as_str(), "fts" | "message_fts" | "message_fts.db") {
-        let path = decrypted_dir.join("message/message_fts.db");
-        return path
-            .exists()
-            .then(|| {
-                vec![QueryTarget {
-                    label: "message/message_fts.db".to_string(),
-                    path,
-                }]
-            })
-            .ok_or_else(|| "message/message_fts.db was not found".to_string());
-    }
-
-    if let Some(path) = resolve_numbered_message_db(decrypted_dir, target) {
-        return Ok(vec![QueryTarget {
-            label: paths::relative_label(decrypted_dir, &path),
-            path,
-        }]);
-    }
-
-    Err(format!(
-        "unsupported --db '{}'; use messages, contact, fts, or message_N",
-        target
-    ))
-}
-
-fn resolve_numbered_message_db(decrypted_dir: &Path, target: &str) -> Option<PathBuf> {
-    let target = target.trim().trim_start_matches("./");
-    let file_name = target
-        .strip_prefix("message/")
-        .or_else(|| target.strip_prefix("message\\"))
-        .unwrap_or(target);
-    let file_name = if file_name.ends_with(".db") {
-        file_name.to_string()
-    } else {
-        format!("{}.db", file_name)
-    };
-
-    if !db::is_message_db_name(&file_name) {
-        return None;
-    }
-
-    let path = decrypted_dir.join("message").join(file_name);
-    path.exists().then_some(path)
 }
 
 fn escape_table_cell(value: &str, max_chars: usize) -> String {
@@ -1522,32 +1239,6 @@ mod tests {
         let err = run_messages_for_test(dir.path(), &[], &[]).unwrap_err();
 
         assert!(err.contains("unbounded"));
-    }
-
-    #[test]
-    fn schema_lists_public_query_contract() {
-        let dir = create_query_test_dir();
-        let mut bytes = Vec::new();
-        let mut out = output::Output::new(&mut bytes);
-
-        let count = run_schema_with_output(
-            SchemaOptions {
-                decrypted_dir: dir.path(),
-                db_target: "message_0",
-                format: QueryOutputFormat::Table,
-                max_cell_chars: 500,
-            },
-            &mut out,
-        )
-        .unwrap();
-
-        assert!(count >= 1);
-        drop(out);
-        let output = String::from_utf8(bytes).unwrap();
-        assert!(output.contains("section\tname\tvalue\tdescription"));
-        assert!(output.contains("field\tbody\tstring"));
-        assert!(!output.contains("CREATE TABLE"));
-        assert!(!output.contains("Msg_test"));
     }
 
     #[test]

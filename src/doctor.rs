@@ -145,6 +145,17 @@ fn write_cache_status<W: std::io::Write>(
         Some(path) => out.line(format_args!("contact db: OK ({})", path.display()))?,
         None => out.line(format_args!("contact db: MISSING"))?,
     }
+    match db::find_decrypted_session_db(decrypted_dir) {
+        Some(path) => out.line(format_args!("session db: OK ({})", path.display()))?,
+        None => out.line(format_args!("session db: MISSING"))?,
+    }
+    match db::find_message_fts_db(decrypted_dir) {
+        Some(path) => out.line(format_args!(
+            "message search index: OK ({})",
+            path.display()
+        ))?,
+        None => out.line(format_args!("message search index: MISSING"))?,
+    }
     out.line(format_args!(
         "decrypted numbered message dbs: {}",
         message_dbs.len()
@@ -412,6 +423,24 @@ mod tests {
             vec!["message/message_0.db".to_string()]
         );
         assert_eq!(usable_key_count(&keys), 0);
+    }
+
+    #[test]
+    fn cache_status_reports_required_session_and_search_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("session");
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&message_dir).unwrap();
+        std::fs::write(session_dir.join("session.db"), []).unwrap();
+        std::fs::write(message_dir.join("message_fts.db"), []).unwrap();
+
+        let mut output = Vec::new();
+        write_cache_status(&mut Output::new(&mut output), dir.path(), None).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("session db: OK"));
+        assert!(output.contains("message search index: OK"));
     }
 
     #[test]

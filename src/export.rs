@@ -309,21 +309,7 @@ pub fn export_messages(
         let rows: Vec<ExportMessageRow> = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
                 let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
-                let content: String = if compression_marker == Some(4) {
-                    if let Ok(b) = row.get::<_, Vec<u8>>(2) {
-                        message::try_decompress(&b).unwrap_or_default()
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    match row.get::<_, Option<String>>(2) {
-                        Ok(Some(s)) => s,
-                        _ => match row.get::<_, Option<Vec<u8>>>(2) {
-                            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                            _ => String::new(),
-                        },
-                    }
-                };
+                let content = db::read_message_body(row, 2, compression_marker);
                 let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
                 Ok((
                     row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
@@ -883,21 +869,7 @@ fn load_image_messages(
         let rows: Vec<(i64, String, Vec<u8>)> = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
                 let compression_marker: Option<i64> = row.get::<_, Option<i64>>(2)?;
-                let content: String = if compression_marker == Some(4) {
-                    if let Ok(b) = row.get::<_, Vec<u8>>(1) {
-                        message::try_decompress(&b).unwrap_or_default()
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    match row.get::<_, Option<String>>(1) {
-                        Ok(Some(s)) => s,
-                        _ => match row.get::<_, Option<Vec<u8>>>(1) {
-                            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                            _ => String::new(),
-                        },
-                    }
-                };
+                let content = db::read_message_body(row, 1, compression_marker);
                 let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default();
                 Ok((
                     row.get::<_, Option<i64>>(0)?.unwrap_or(0),
@@ -978,21 +950,7 @@ fn load_file_messages(
         };
         let Ok(rows) = stmt.query_map([], |row| {
             let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
-            let content: String = if compression_marker == Some(4) {
-                if let Ok(b) = row.get::<_, Vec<u8>>(2) {
-                    message::try_decompress(&b).unwrap_or_default()
-                } else {
-                    String::new()
-                }
-            } else {
-                match row.get::<_, Option<String>>(2) {
-                    Ok(Some(s)) => s,
-                    _ => match row.get::<_, Option<Vec<u8>>>(2) {
-                        Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                        _ => String::new(),
-                    },
-                }
-            };
+            let content = db::read_message_body(row, 2, compression_marker);
             let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
             Ok((
                 row.get::<_, Option<i64>>(0)?.unwrap_or(0),
@@ -1073,21 +1031,7 @@ fn load_sticker_messages(
         let rows: Vec<(i64, i64, String)> = match conn.prepare(&sql) {
             Ok(mut stmt) => match stmt.query_map([], |row| {
                 let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
-                let content: String = if compression_marker == Some(4) {
-                    if let Ok(b) = row.get::<_, Vec<u8>>(2) {
-                        message::try_decompress(&b).unwrap_or_default()
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    match row.get::<_, Option<String>>(2) {
-                        Ok(Some(s)) => s,
-                        _ => match row.get::<_, Option<Vec<u8>>>(2) {
-                            Ok(Some(b)) => String::from_utf8(b).unwrap_or_default(),
-                            _ => String::new(),
-                        },
-                    }
-                };
+                let content = db::read_message_body(row, 2, compression_marker);
                 Ok((
                     row.get::<_, Option<i64>>(0)?.unwrap_or(0),
                     row.get::<_, Option<i64>>(1)?.unwrap_or(0),
