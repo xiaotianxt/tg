@@ -132,23 +132,7 @@ tg export "产品讨论群" --output exported/group
 
 Each export writes `chat.txt`, `chat.csv`, `chat.json`, and locally available media under `media/`.
 
-Export cached images:
-
-```bash
-tg image "张三" --list --limit 20
-tg image "张三" --index 3
-tg image "张三" --all --limit 10 --output exported/images
-```
-
-Export cached voice messages:
-
-```bash
-tg voice "张三" --list --limit 20
-tg voice "张三" --id 123
-tg voice "张三" --index 3
-tg voice "张三" --all --limit 10 --output exported/voices
-tg voice "张三" --id 123 --format wav
-```
+Media is exported only as part of the complete chat archive. Locally cached images, videos, stickers, files, and voices go under `media/`; voices prefer WAV and fall back to native `.voice` when decoding is unavailable.
 
 Time filters support dates, datetimes, and relative values:
 
@@ -170,6 +154,6 @@ Date, datetime, and displayed message times use the current system time zone.
 - `task_for_pid failed`: quit Telegram, run `sudo codesign --force --deep --sign - /Applications/Telegram.app`, reopen Telegram, then run `sudo tg keys --method lldb-login --timeout 180` and log out/in once while it waits.
 - No chats or messages found: run `tg refresh --keys`, then `tg sessions --top 50`.
 - Wrong chat matched: use `tg sessions --top 100` and rerun with the exact `tgid_...` or `...@chatroom`.
-- Missing media: open or download it in Telegram first, then retry `tg export CHAT` or the matching `tg image`, `tg file`, `tg sticker`, or `tg voice` command.
-- Voice output defaults to normalized `.voice`; use `tg voice ... --format wav` after installing a compatible native voice decoder.
+- Missing media: open or download it in Telegram first, then retry `tg export CHAT`.
+- Voice export prefers WAV and falls back to native `.voice`; install the Homebrew decoder for playable WAV output.
 - Unknown issue: run `tg doctor` or `tg doctor "联系人或群名"` and follow the result.

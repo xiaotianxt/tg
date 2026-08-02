@@ -495,13 +495,6 @@ pub fn find_telegram_base_path() -> Option<PathBuf> {
 
 // ===== Sticker cache search =====
 
-pub fn find_cached_sticker(base_path: &Path, md5: &str) -> Option<PathBuf> {
-    find_cached_sticker_in_layout(base_path, md5).or_else(|| {
-        let cache_dir = base_path.join("cache");
-        find_file_named(&cache_dir, &md5.trim().to_lowercase())
-    })
-}
-
 pub(crate) fn find_cached_sticker_in_layout(base_path: &Path, md5: &str) -> Option<PathBuf> {
     let md5 = md5.trim().to_lowercase();
     if md5.len() < 2 {
@@ -524,32 +517,6 @@ pub(crate) fn find_cached_sticker_in_layout(base_path: &Path, md5: &str) -> Opti
     }
 
     None
-}
-
-fn find_file_named(dir: &Path, target: &str) -> Option<PathBuf> {
-    fn walk(dir: &Path, target: &str) -> Option<PathBuf> {
-        let entries = fs::read_dir(dir).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(found) = walk(&path, target) {
-                    return Some(found);
-                }
-            } else {
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                if name == target {
-                    return Some(path);
-                }
-            }
-        }
-        None
-    }
-
-    walk(dir, target)
 }
 
 pub fn decrypt_sticker_aes_cbc(data: &[u8], aes_key_hex: &str) -> Option<Vec<u8>> {

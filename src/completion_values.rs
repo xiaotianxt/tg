@@ -14,14 +14,6 @@ pub(crate) fn time_buckets() -> PossibleValuesParser {
     ])
 }
 
-pub(crate) fn voice_formats() -> PossibleValuesParser {
-    parser(&[
-        ("native", "Native voice output"),
-        ("wav", "WAV output"),
-        ("pcm", "Raw PCM output"),
-    ])
-}
-
 fn parser(values: &[(&'static str, &'static str)]) -> PossibleValuesParser {
     PossibleValuesParser::new(
         values

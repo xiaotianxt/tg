@@ -10,8 +10,7 @@ tg 是一个 macOS/Linux 本地 Telegram 聊天记录读取 CLI。它把本机 T
 - 快速找某个人、某个群、某个关键词的历史消息。
 - 用包含词、排除词、时间范围和输出字段做更精确的本地检索。
 - 把聊天导出成 `txt`、`csv`、`json`，用于归档、整理或本地分析。
-- 从本地缓存里导出图片、视频、表情和普通文件附件。
-- 从本地媒体数据库里导出语音消息为 `.voice` 文件。
+- 随完整聊天归档导出本地缓存的图片、视频、表情、文件和语音。
 - 给本地 AI/自动化助手一个稳定的聊天记录读取工具和 skill 描述。
 
 默认数据只留在本机。`~/.tg/all_keys.json`、`~/.tg/decrypted/`、`exported/` 都是敏感文件，请当作聊天原文保存和处理。
@@ -69,33 +68,7 @@ Exported to:
   [json] exported/zhangsan/chat.json
 ```
 
-导出最近一张本地缓存图片：
-
-```bash
-$ tg image "产品讨论群"
-exported/images/123456789_chatroom_Image_3_0001.jpg
-```
-
-导出最近一个本地缓存文件附件：
-
-```bash
-$ tg file "产品讨论群"
-exported/files/123456789_chatroom_File_49_0001.pdf
-```
-
-导出最近一个表情：
-
-```bash
-$ tg sticker "产品讨论群"
-exported/stickers/123456789_chatroom_Sticker_47_0001.webp
-```
-
-导出最近一条本地语音：
-
-```bash
-$ tg voice "产品讨论群"
-exported/voices/123456789_chatroom_Voice_34_0001_123.voice
-```
+可用的本地缓存媒体会一起写入 `exported/zhangsan/media/`。语音优先转成 WAV；解码器不可用或单条解码失败时保留原始 `.voice`，避免归档遗漏本地音频。
 
 ## 日常工作流
 
@@ -108,10 +81,6 @@ tg unread
 tg search "关键词"
 tg query --session "产品讨论群" --contains "项目" --not "取消" --fields time,sender,body
 tg export "张三" --output exported/zhangsan
-tg image "产品讨论群" --list
-tg file "产品讨论群" --list
-tg sticker "产品讨论群" --list
-tg voice "产品讨论群" --list
 ```
 
 `search`、`query` 默认只处理最近 365 天，这是当前版本为速度和常见需求做的默认路径。需要全量历史时加 `--all-time`；需要更窄范围时用 `--since today`、`--since 30d` 或具体日期。`export` 是完整归档入口，默认导出整个会话。
@@ -138,7 +107,7 @@ tg refresh
 | 消息读取 | 文本、群聊发送者、系统提示、撤回提示、引用、链接、小程序、聊天记录卡片展开、位置、文件卡片、图片/视频/语音/表情的可读摘要 |
 | 搜索 | 全局关键词搜索，单个会话内关键词搜索，结构化检索；支持包含词、排除词、时间范围、字段选择和 JSON 行输出 |
 | 导出 | 完整会话归档；同时写出 `txt`、`csv`、`json` |
-| 媒体 | `export` 会尝试导出本地缓存图片、视频、表情、普通文件附件和可解码语音；`.dat` 图片/视频会尝试解密；语音默认导出为可播放 WAV |
+| 媒体 | `export` 会尝试导出本地缓存图片、视频、表情、普通文件附件和语音；`.dat` 图片/视频会尝试解密；语音优先导出 WAV，失败时保留原始 `.voice` |
 | 增量更新 | 默认只解密变化过的数据库 |
 
 暂不支持或不保证：
@@ -146,8 +115,8 @@ tg refresh
 - 不支持 Windows、iOS、Android、网页版 Telegram。
 - 不恢复 Telegram 本地数据库里已经没有的消息。
 - 不保证导出所有媒体。Telegram 没有缓存、缓存被清理、文件未下载时，只能显示消息摘要。
-- `export` 会把可导出的媒体放到输出目录的 `media/` 子目录；Telegram 没有缓存、缓存被清理或解码器不可用时，对应媒体只能保留消息摘要。
-- `sticker` 命令可能根据消息里的 URL 用 `curl` 下载；全量 `export` 只导出本地缓存媒体。
+- `export` 会把可导出的媒体放到输出目录的 `media/` 子目录；Telegram 没有缓存或缓存被清理时，对应媒体只能保留消息摘要。
+- 媒体导出只读取本地缓存，不根据消息 URL 下载远端文件。
 - `tggf` 表情转换需要本机可用的 `ffmpeg`。
 - 不做 OCR、语义搜索、拼音搜索。
 - 多账号或 Telegram 路径异常时，可能需要手动指定 `--db-dir`。
@@ -189,8 +158,7 @@ tg completions zsh > ~/.zsh/completions/_tg
 tg completions bash > ~/.local/share/bash-completion/completions/tg
 ```
 
-补全脚本支持命令、常用 flags、会话名和 `query --session`。动态会话候选只读取本地
-contact/session cache，不会触发解密、刷新或读取在线服务。
+补全脚本由 Clap 元数据静态生成，支持命令、flags、枚举值和路径提示；它不会运行 tg 或读取本地聊天数据库。
 release formula 会为 Homebrew 用户自动安装这些 completions。
 
 如果 macOS 没有 C 编译器：
@@ -385,71 +353,15 @@ tg export "张三" --output exported/zhangsan
 tg export "产品讨论群" --output exported/group
 ```
 
-导出图片：
+### 媒体归档
+
+`messages` 会继续用 `[img:<id>]`、`[sticker:<id>]`、`[voice:<id>:<时长>s]` 和 `[文件:标题 (大小)]` 展示媒体摘要。真正的文件统一由完整归档导出：
 
 ```bash
-tg image "张三"
-tg image "张三" --list --limit 20
-tg image "张三" --index 3
-tg image "张三" --id abc123
-tg image "张三" --all --limit 10 --output exported/images
+tg export "张三" --output exported/zhangsan
 ```
 
-`messages` 默认把图片显示成紧凑标签：有可用标识时是 `[img:<id>]`，没有时是 `[img]`。这里的 `id` 是本地媒体定位标识，不保证是哈希；它可能来自 protobuf 文件名、XML `aeskey` 或 `cdnthumburl`。可以把这个值传给 `image --id`，直接从本地缓存导出对应图片。
-
-`image --list` 会先列出最近图片是否还在本地缓存里：
-
-```text
-Index Time                Status   Source
-----------------------------------------------------------------------------------------------------
-1     2026-04-28 09:38:44 cached   .../msg/attach/...
-2     2026-04-27 22:10:01 missing  cdnthumburl...
-```
-
-导出文件附件：
-
-```bash
-tg file "张三"
-tg file "张三" --list --limit 20
-tg file "张三" --index 3
-tg file "张三" --id report.pdf
-tg file "张三" --all --limit 10 --output exported/files
-```
-
-`messages` 会把文件卡片显示成 `[文件:标题 (大小)]`。`file --list` 会列出最近文件附件是否仍在本地缓存中；`file --id` 可以用列表里的文件名或消息里的文件标识直接导出本地缓存文件。文件缓存索引只扫描当前会话对应的附件目录，避免为了单个会话遍历全量附件缓存。
-
-导出表情：
-
-```bash
-tg sticker "张三"
-tg sticker "张三" --list --limit 20
-tg sticker "张三" --index 3
-tg sticker "张三" --id bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-tg sticker "张三" --all --limit 10 --output exported/stickers
-```
-
-`messages` 里有可定位信息的表情会显示成 `[sticker:<id>]`；这个 `<id>` 可以直接传给 `sticker --id`。`sticker --list` 也会列出最近表情的 `ID`、缓存状态和来源；状态是 `remote` 的表情会在导出时按消息里的 URL 尝试下载。`emoji` 是 `sticker` 的别名。
-
-导出语音：
-
-```bash
-tg voice "张三"
-tg voice "张三" --list --limit 20
-tg voice "张三" --id 123
-tg voice "张三" --index 3
-tg voice "张三" --all --limit 10 --output exported/voices
-tg voice "张三" --id 123 --format wav
-```
-
-`messages` 会把可定位的语音显示成 `[voice:<id>:<时长>s]`，例如 `[voice:123:7s]`；没有时长时显示 `[voice:<id>]`。这里的 `id` 可以直接传给 `voice --id` 精确导出某条语音。`voice --list` 也会显示同一个可复用的 `ID`。`voice` 从本地媒体数据库读取语音 BLOB。当前 macOS 数据里常见格式是在原始音频头前多一个前置字节，导出时会自动去掉这个字节并保存为 `.voice`。
-
-`.voice` 不是系统播放器通用格式。Homebrew 安装的 `tg` 会一并安装默认解码器；需要直接导出可播放 WAV 时：
-
-```bash
-tg voice "张三" --id 123 --format wav
-```
-
-源码安装时也可以用 `--decoder /path/to/decoder` 或 `TG_VOICE_DECODER=/path/to/decoder` 指定解码器。当前会尝试从 `PATH` 寻找常见兼容解码器命令。
+本地可用的图片、视频、表情、文件和语音写入 `exported/zhangsan/media/`。媒体缓存缺失时保留消息摘要；语音优先通过 Homebrew 安装的默认解码器写成 WAV，无法解码时保留去掉前置字节后的 `.voice` 原始文件。源码安装可用 `TG_VOICE_DECODER=/path/to/decoder` 指定同一 Rust decoder 协议。
 
 ## 时间过滤
 
@@ -529,11 +441,11 @@ tg messages "tgid_abcd1234" --limit 50
 
 ### 图片、视频或文件导不出来
 
-媒体导出依赖 Telegram 本地缓存。可以先在 Telegram 里打开对应图片、视频、表情或文件，让 Telegram 把文件下载到本机，再重新运行 `tg export "联系人或群名"`，或用 `tg image`、`tg sticker`、`tg file` 单独定位。
+媒体导出依赖 Telegram 本地缓存。可以先在 Telegram 里打开对应图片、视频、表情或文件，让 Telegram 把文件下载到本机，再重新运行 `tg export "联系人或群名"`。
 
 ### 语音导出后不能直接播放
 
-`tg export` 会把可解码语音导出为 WAV，放在输出目录的 `media/` 子目录。`tg voice` 仍可用于单独定位某条语音；它默认导出 `.voice` 原始编码，也可以用 `tg voice "张三" --id <ID> --format wav` 导出 WAV。Homebrew 安装的 `tg` 会一并安装默认解码器；需要 `mp3` 时再让 `ffmpeg` 处理 WAV。
+`tg export` 会把语音放在输出目录的 `media/` 子目录。Homebrew 安装的默认解码器可用时写成 WAV；解码器不可用或单条解码失败时保留 `.voice`，不会丢弃本地语音。需要 `mp3` 时再让 `ffmpeg` 处理 WAV。
 
 ### `tggf` 表情转换失败
 

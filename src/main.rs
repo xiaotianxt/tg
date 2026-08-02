@@ -29,11 +29,8 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-fn print_output(args: std::fmt::Arguments<'_>) {
-    if let Err(e) = output::stdout_line(args) {
-        log::error!("Error: {}", e);
-        std::process::exit(1);
-    }
+fn print_output(args: std::fmt::Arguments<'_>) -> Result<(), String> {
+    output::stdout_line(args).map_err(|e| format!("Error: {e}"))
 }
 
 fn normalize_args_for_default_messages<I>(args: I) -> Vec<OsString>
@@ -64,7 +61,10 @@ fn messages_limit_or_default(
 }
 
 fn is_known_subcommand(value: &str) -> bool {
-    if matches!(value, "help" | "sql" | "emoji") {
+    if matches!(
+        value,
+        "help" | "sql" | "image" | "file" | "sticker" | "emoji" | "voice" | "__complete"
+    ) {
         return true;
     }
     Cli::command()
@@ -72,14 +72,14 @@ fn is_known_subcommand(value: &str) -> bool {
         .any(|command| command.get_name() == value)
 }
 
-fn print_refresh_stats(label: &str, stats: &decrypt::DecryptStats) {
+fn print_refresh_stats(label: &str, stats: &decrypt::DecryptStats) -> Result<(), String> {
     print_output(format_args!(
         "{}: {} succeeded, {} failed, {} skipped, {} total",
         label, stats.success, stats.failed, stats.skipped, stats.total
-    ));
+    ))
 }
 
-fn ensure_message_cache_ready(decrypted_dir: &Path, jobs: usize) {
+fn ensure_message_cache_ready(decrypted_dir: &Path, jobs: usize) -> Result<(), String> {
     log::info!("Refreshing local message cache");
     let refresh = cache::refresh_message_decrypted(decrypted_dir, jobs);
     let refresh = if cache::needs_message_key_retry(&refresh) {
@@ -94,11 +94,10 @@ fn ensure_message_cache_ready(decrypted_dir: &Path, jobs: usize) {
 
     match refresh {
         Ok(stats) if cache::failures_can_affect_messages(&stats) => {
-            log::error!(
+            return Err(format!(
                 "Cannot read messages because the decrypted cache is still incomplete after refreshing keys. Failed: {}",
                 cache::message_failure_summary(&stats)
-            );
-            std::process::exit(1);
+            ));
         }
         Ok(_) => {}
         Err(e) if decrypt::is_refresh_lock_busy_error(&e) => {
@@ -107,10 +106,11 @@ fn ensure_message_cache_ready(decrypted_dir: &Path, jobs: usize) {
             );
         }
         Err(e) => {
-            log::error!("Cannot refresh decrypted message cache: {}", e);
-            std::process::exit(1);
+            return Err(format!("Cannot refresh decrypted message cache: {e}"));
         }
     }
+
+    Ok(())
 }
 
 #[derive(Parser)]
@@ -354,180 +354,10 @@ enum Commands {
         #[command(flatten)]
         cache: DecryptedArgs,
     },
-    /// Export local cached images from a specific session
-    Image {
-        /// Session username (tgid_xxx) or display name to search
-        session: String,
-        /// Output directory for readable image files
-        #[arg(
-            long,
-            default_value = "exported/images",
-            value_hint = clap::ValueHint::DirPath
-        )]
-        output: PathBuf,
-        /// List recent image messages without exporting
-        #[arg(long, conflicts_with_all = ["all", "index"])]
-        list: bool,
-        /// Export every locally cached image in the selected window
-        #[arg(long, conflicts_with = "index")]
-        all: bool,
-        /// Export the Nth image shown by --list (newest first)
-        #[arg(long)]
-        index: Option<usize>,
-        /// Export an image by compact message identifier
-        #[arg(long, conflicts_with_all = ["list", "all", "index"])]
-        id: Option<String>,
-        /// Number of recent image messages to scan
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Only consider images after this time (ISO 8601 or relative: 5min, 1h, today)
-        #[arg(long)]
-        since: Option<String>,
-        #[command(flatten)]
-        cache: DecryptedArgs,
-    },
-    /// Export local cached file attachments from a specific session
-    File {
-        /// Session username (tgid_xxx) or display name to search
-        session: String,
-        /// Output directory for cached file attachments
-        #[arg(
-            long,
-            default_value = "exported/files",
-            value_hint = clap::ValueHint::DirPath
-        )]
-        output: PathBuf,
-        /// List recent file messages without exporting
-        #[arg(long, conflicts_with_all = ["all", "index"])]
-        list: bool,
-        /// Export every locally cached file in the selected window
-        #[arg(long, conflicts_with = "index")]
-        all: bool,
-        /// Export the Nth file shown by --list (newest first)
-        #[arg(long)]
-        index: Option<usize>,
-        /// Export a file by compact message identifier or filename
-        #[arg(long, conflicts_with_all = ["list", "all", "index"])]
-        id: Option<String>,
-        /// Number of recent file messages to scan
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Only consider files after this time (ISO 8601 or relative: 5min, 1h, today)
-        #[arg(long)]
-        since: Option<String>,
-        #[command(flatten)]
-        cache: DecryptedArgs,
-    },
-    /// Export local cached stickers from a specific session
-    #[command(visible_alias = "emoji")]
-    Sticker {
-        /// Session username (tgid_xxx) or display name to search
-        session: String,
-        /// Output directory for sticker files
-        #[arg(
-            long,
-            default_value = "exported/stickers",
-            value_hint = clap::ValueHint::DirPath
-        )]
-        output: PathBuf,
-        /// List recent sticker messages without exporting
-        #[arg(long, conflicts_with_all = ["all", "index", "id"])]
-        list: bool,
-        /// Export every exportable sticker in the selected window
-        #[arg(long, conflicts_with_all = ["index", "id"])]
-        all: bool,
-        /// Export the Nth sticker shown by --list (newest first)
-        #[arg(long, conflicts_with = "id")]
-        index: Option<usize>,
-        /// Export a sticker by the md5 or URL shown by --list
-        #[arg(long, conflicts_with_all = ["list", "all", "index"])]
-        id: Option<String>,
-        /// Number of recent sticker messages to scan
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Only consider stickers after this time (ISO 8601 or relative: 5min, 1h, today)
-        #[arg(long)]
-        since: Option<String>,
-        #[command(flatten)]
-        cache: DecryptedArgs,
-    },
-    /// Export local cached voice messages from a specific session
-    Voice {
-        /// Session username (tgid_xxx) or display name to search
-        session: String,
-        /// Output directory for normalized voice files
-        #[arg(
-            long,
-            default_value = "exported/voices",
-            value_hint = clap::ValueHint::DirPath
-        )]
-        output: PathBuf,
-        /// Output format: native, wav, or pcm
-        #[arg(
-            long,
-            default_value = "native",
-            value_parser = completion_values::voice_formats()
-        )]
-        format: String,
-        /// Path to native voice decoder command (defaults to TG_VOICE_DECODER or PATH lookup)
-        #[arg(long, value_hint = clap::ValueHint::FilePath)]
-        decoder: Option<PathBuf>,
-        /// List recent voice messages without exporting
-        #[arg(long, conflicts_with_all = ["all", "index", "id"])]
-        list: bool,
-        /// Export every local voice message in the selected window
-        #[arg(long, conflicts_with_all = ["index", "id"])]
-        all: bool,
-        /// Export the Nth voice shown by --list (newest first)
-        #[arg(long, conflicts_with = "id")]
-        index: Option<usize>,
-        /// Export a voice by the ID shown in --list
-        #[arg(long, conflicts_with_all = ["list", "all", "index"])]
-        id: Option<i64>,
-        /// Number of recent voice messages to scan
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Only consider voices after this time (ISO 8601 or relative: 5min, 1h, today)
-        #[arg(long)]
-        since: Option<String>,
-        /// Output sample rate for decoded pcm/wav
-        #[arg(long, default_value_t = 24000)]
-        sample_rate: u32,
-        #[command(flatten)]
-        cache: DecryptedArgs,
-    },
     /// Generate shell completion scripts
     Completions {
         /// Shell to generate completions for
         shell: CompletionShell,
-    },
-    /// Internal dynamic completion helper
-    #[command(name = "__complete", hide = true)]
-    Complete {
-        /// Dynamic candidate kind
-        kind: CompleteKind,
-        /// Path to decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
-        decrypted_dir: PathBuf,
-        /// Maximum candidates to return
-        #[arg(long, default_value_t = 200)]
-        limit: usize,
-        /// Shell requesting word completion
-        #[arg(long, value_enum)]
-        shell: Option<CompletionShell>,
-        /// Active word index reported by the shell
-        #[arg(long)]
-        cursor: Option<usize>,
-        /// Active token prefix reported by the shell
-        #[arg(long, allow_hyphen_values = true)]
-        current: Option<String>,
-        /// Shell words for runtime completion
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        words: Vec<String>,
     },
 }
 
@@ -538,28 +368,27 @@ enum CompletionShell {
     Bash,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum CompleteKind {
-    Sessions,
-    Words,
-}
-
 fn main() {
     logger::init();
     let cli = Cli::parse_from(normalize_args_for_default_messages(std::env::args_os()));
 
-    match cli.command {
+    if let Err(error) = run(cli.command) {
+        log::error!("{error}");
+        std::process::exit(1);
+    }
+}
+
+fn run(command: Commands) -> Result<(), String> {
+    match command {
         Commands::Keys {
             timeout,
             method,
             jobs,
-        } => match scanner::extract_keys_with_method_and_jobs(timeout, method, jobs) {
-            Ok(path) => print_output(format_args!("Keys saved to: {}", path)),
-            Err(e) => {
-                log::error!("Error: {}", e);
-                std::process::exit(1);
-            }
-        },
+        } => {
+            let path = scanner::extract_keys_with_method_and_jobs(timeout, method, jobs)
+                .map_err(|e| format!("Error: {e}"))?;
+            print_output(format_args!("Keys saved to: {path}"))
+        }
         Commands::Decrypt {
             keys,
             output,
@@ -569,13 +398,8 @@ fn main() {
             verbose,
             jobs,
         } => {
-            let since_ts = match time::parse_since_opt(since.as_deref()) {
-                Ok(ts) => ts,
-                Err(e) => {
-                    log::error!("Error parsing --since: {}", e);
-                    std::process::exit(1);
-                }
-            };
+            let since_ts = time::parse_since_opt(since.as_deref())
+                .map_err(|e| format!("Error parsing --since: {e}"))?;
             let config = decrypt::DecryptConfig {
                 incremental: !full,
                 since: since_ts,
@@ -584,27 +408,27 @@ fn main() {
                 quiet: !verbose,
                 jobs,
             };
-            match decrypt::decrypt_all(&keys, &output, db_dir.as_deref(), &config) {
-                Ok(stats) => {
-                    if verbose {
-                        if stats.skipped > 0 {
-                            log::info!("Decryption complete: {} succeeded, {} failed, {} skipped, {} total",
-                                stats.success, stats.failed, stats.skipped, stats.total);
-                        } else {
-                            log::info!(
-                                "Decryption complete: {} succeeded, {} failed, {} total",
-                                stats.success,
-                                stats.failed,
-                                stats.total
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("Error: {}", e);
-                    std::process::exit(1);
+            let stats = decrypt::decrypt_all(&keys, &output, db_dir.as_deref(), &config)
+                .map_err(|e| format!("Error: {e}"))?;
+            if verbose {
+                if stats.skipped > 0 {
+                    log::info!(
+                        "Decryption complete: {} succeeded, {} failed, {} skipped, {} total",
+                        stats.success,
+                        stats.failed,
+                        stats.skipped,
+                        stats.total
+                    );
+                } else {
+                    log::info!(
+                        "Decryption complete: {} succeeded, {} failed, {} total",
+                        stats.success,
+                        stats.failed,
+                        stats.total
+                    );
                 }
             }
+            Ok(())
         }
         Commands::Sessions { query, top, cache } => {
             let DecryptedArgs {
@@ -618,25 +442,18 @@ fn main() {
                     error
                 );
             }
-            match db::list_sessions(&decrypted_dir, top, query.as_deref()) {
-                Ok(sessions) => {
-                    if sessions.is_empty() {
-                        if let Some(query) =
-                            query.as_deref().filter(|value| !value.trim().is_empty())
-                        {
-                            print_output(format_args!("No sessions matched '{}'.", query));
-                        } else {
-                            print_output(format_args!(
-                                "No sessions found. Try running 'decrypt' first."
-                            ));
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("Error: {}", e);
-                    std::process::exit(1);
+            let sessions = db::list_sessions(&decrypted_dir, top, query.as_deref())
+                .map_err(|e| format!("Error: {e}"))?;
+            if sessions.is_empty() {
+                if let Some(query) = query.as_deref().filter(|value| !value.trim().is_empty()) {
+                    print_output(format_args!("No sessions matched '{}'.", query))?;
+                } else {
+                    print_output(format_args!(
+                        "No sessions found. Try running 'decrypt' first."
+                    ))?;
                 }
             }
+            Ok(())
         }
         Commands::Unread { query, top, cache } => {
             let DecryptedArgs {
@@ -650,37 +467,28 @@ fn main() {
                     error
                 );
             }
-            match db::list_unread_sessions(&decrypted_dir, top, query.as_deref()) {
-                Ok(sessions) => {
-                    if sessions.is_empty() {
-                        if let Some(query) =
-                            query.as_deref().filter(|value| !value.trim().is_empty())
-                        {
-                            print_output(format_args!("No unread sessions matched '{}'.", query));
-                        } else {
-                            print_output(format_args!("No unread sessions."));
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("Error: {}", e);
-                    std::process::exit(1);
+            let sessions = db::list_unread_sessions(&decrypted_dir, top, query.as_deref())
+                .map_err(|e| format!("Error: {e}"))?;
+            if sessions.is_empty() {
+                if let Some(query) = query.as_deref().filter(|value| !value.trim().is_empty()) {
+                    print_output(format_args!("No unread sessions matched '{}'.", query))?;
+                } else {
+                    print_output(format_args!("No unread sessions."))?;
                 }
             }
+            Ok(())
         }
         Commands::Doctor { session, cache } => {
             let DecryptedArgs {
                 decrypted_dir,
                 jobs,
             } = cache;
-            if let Err(e) = doctor::run(doctor::DoctorOptions {
+            doctor::run(doctor::DoctorOptions {
                 session: session.as_deref(),
                 decrypted_dir: &decrypted_dir,
                 jobs,
-            }) {
-                log::error!("Error: {}", e);
-                std::process::exit(1);
-            }
+            })
+            .map_err(|e| format!("Error: {e}"))
         }
         Commands::Refresh { keys, cache } => {
             let DecryptedArgs {
@@ -701,16 +509,8 @@ fn main() {
                     refresh
                 }
             };
-
-            match refresh {
-                Ok(stats) => {
-                    print_refresh_stats("Refresh complete", &stats);
-                }
-                Err(e) => {
-                    log::error!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            }
+            let stats = refresh.map_err(|e| format!("Error: {e}"))?;
+            print_refresh_stats("Refresh complete", &stats)
         }
         Commands::Messages {
             session,
@@ -729,58 +529,39 @@ fn main() {
                 decrypted_dir,
                 jobs,
             } = cache;
-            let since_ts = match time::parse_since_opt(since.as_deref()) {
-                Ok(ts) => ts,
-                Err(e) => {
-                    log::error!("Error parsing --since: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let time_bucket = match time::parse_message_time_bucket(&time_bucket) {
-                Ok(bucket) => bucket,
-                Err(e) => {
-                    log::error!("Error parsing --time-bucket: {}", e);
-                    std::process::exit(1);
-                }
-            };
+            let since_ts = time::parse_since_opt(since.as_deref())
+                .map_err(|e| format!("Error parsing --since: {e}"))?;
+            let time_bucket = time::parse_message_time_bucket(&time_bucket)
+                .map_err(|e| format!("Error parsing --time-bucket: {e}"))?;
             let limit = messages_limit_or_default(limit, since_ts, all_time);
             let use_tail = tail || (!head && offset == 0);
-            ensure_message_cache_ready(&decrypted_dir, jobs);
-            let read_messages = || {
-                db::read_messages(
-                    &decrypted_dir,
-                    db::ReadMessagesOptions {
-                        session_query: &session,
-                        limit,
-                        offset,
-                        search_query: search.as_deref(),
-                        since: since_ts,
-                        tail: use_tail,
-                        time_bucket,
-                        name_mode: if anonymous {
-                            contact::DisplayNameMode::Anonymous
-                        } else {
-                            contact::DisplayNameMode::PersonalRemark
-                        },
-                        jobs,
+            ensure_message_cache_ready(&decrypted_dir, jobs)?;
+            let msg_count = db::read_messages(
+                &decrypted_dir,
+                db::ReadMessagesOptions {
+                    session_query: &session,
+                    limit,
+                    offset,
+                    search_query: search.as_deref(),
+                    since: since_ts,
+                    tail: use_tail,
+                    time_bucket,
+                    name_mode: if anonymous {
+                        contact::DisplayNameMode::Anonymous
+                    } else {
+                        contact::DisplayNameMode::PersonalRemark
                     },
-                )
-            };
-
-            let msg_count = match read_messages() {
-                Ok(count) => count,
-                Err(e) => {
-                    log::error!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            };
-
+                    jobs,
+                },
+            )
+            .map_err(|e| format!("Error: {e}"))?;
             if msg_count == 0 {
                 print_output(format_args!(
                     "No messages found for '{}'. Use 'sessions' to list available sessions.",
                     session
-                ));
+                ))?;
             }
+            Ok(())
         }
         Commands::Search {
             query,
@@ -795,16 +576,10 @@ fn main() {
                 jobs,
             } = cache;
             if limit == 0 {
-                log::error!("Error: --limit must be greater than 0");
-                std::process::exit(1);
+                return Err("Error: --limit must be greater than 0".to_string());
             }
-            let since_ts = match time::parse_since_opt(since.as_deref()) {
-                Ok(ts) => ts,
-                Err(e) => {
-                    log::error!("Error parsing --since: {}", e);
-                    std::process::exit(1);
-                }
-            };
+            let since_ts = time::parse_since_opt(since.as_deref())
+                .map_err(|e| format!("Error parsing --since: {e}"))?;
             let since_ts = if all_time {
                 since_ts
             } else {
@@ -817,7 +592,7 @@ fn main() {
                     cache::search_refresh_reason(&refresh)
                 );
             }
-            match db::search_messages(
+            let count = db::search_messages(
                 &decrypted_dir,
                 db::SearchMessagesOptions {
                     query: &query,
@@ -829,17 +604,12 @@ fn main() {
                         contact::DisplayNameMode::PersonalRemark
                     },
                 },
-            ) {
-                Ok(count) => {
-                    if count == 0 {
-                        print_output(format_args!("No messages found for '{}'.", query));
-                    }
-                }
-                Err(e) => {
-                    log::error!("Error: {}", e);
-                    std::process::exit(1);
-                }
+            )
+            .map_err(|e| format!("Error: {e}"))?;
+            if count == 0 {
+                print_output(format_args!("No messages found for '{}'.", query))?;
             }
+            Ok(())
         }
         Commands::Query {
             session,
@@ -864,32 +634,17 @@ fn main() {
                 decrypted_dir,
                 jobs,
             } = cache;
-            let since_ts = match time::parse_since_opt(since.as_deref()) {
-                Ok(ts) => ts,
-                Err(e) => {
-                    log::error!("Error parsing --since: {}", e);
-                    std::process::exit(1);
-                }
-            };
+            let since_ts = time::parse_since_opt(since.as_deref())
+                .map_err(|e| format!("Error parsing --since: {e}"))?;
             let since_ts = if all_time {
                 since_ts
             } else {
                 Some(since_ts.unwrap_or_else(time::default_recent_since))
             };
-            let until_ts = match time::parse_since_opt(until.as_deref()) {
-                Ok(ts) => ts,
-                Err(e) => {
-                    log::error!("Error parsing --until: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let fields = match query::QueryFields::parse(&fields) {
-                Ok(fields) => fields,
-                Err(e) => {
-                    log::error!("Error parsing --fields: {}", e);
-                    std::process::exit(1);
-                }
-            };
+            let until_ts = time::parse_since_opt(until.as_deref())
+                .map_err(|e| format!("Error parsing --until: {e}"))?;
+            let fields = query::QueryFields::parse(&fields)
+                .map_err(|e| format!("Error parsing --fields: {e}"))?;
             let query_options = query::QueryOptions {
                 decrypted_dir: &decrypted_dir,
                 session: session.as_deref(),
@@ -920,14 +675,10 @@ fn main() {
                     cache::retry_reason(&refresh)
                 );
             }
-            match query::run(query_options) {
-                Ok(0) => print_output(format_args!("No rows returned.")),
-                Ok(_) => {}
-                Err(e) => {
-                    log::error!("Error: {}", e);
-                    std::process::exit(1);
-                }
+            if query::run(query_options).map_err(|e| format!("Error: {e}"))? == 0 {
+                print_output(format_args!("No rows returned."))?;
             }
+            Ok(())
         }
         Commands::Export {
             session,
@@ -946,224 +697,26 @@ fn main() {
                 );
                 refresh = cache::refresh_keys_and_decrypted(&decrypted_dir, jobs);
             }
-            if let Some(e) = cache::export_refresh_error(&refresh) {
-                log::error!(
-                    "Error: export needs a complete decrypted cache, but refresh is incomplete: {}",
-                    e
-                );
-                std::process::exit(1);
+            if let Some(error) = cache::export_refresh_error(&refresh) {
+                return Err(format!(
+                    "Error: export needs a complete decrypted cache, but refresh is incomplete: {error}"
+                ));
             }
-            match export::export_messages(export::MessageExportConfig {
+            let paths = export::export_messages(export::MessageExportConfig {
                 decrypted_dir: &decrypted_dir,
                 session_query: &session,
                 output_dir: &output,
                 jobs,
-            }) {
-                Ok(paths) => {
-                    print_output(format_args!("Exported to:"));
-                    for (fmt, path) in paths {
-                        print_output(format_args!("  [{}] {}", fmt, path.display()));
-                    }
-                }
-                Err(e) => {
-                    log::error!("Error: {}", e);
-                    std::process::exit(1);
-                }
+            })
+            .map_err(|e| format!("Error: {e}"))?;
+            print_output(format_args!("Exported to:"))?;
+            for (format, path) in paths {
+                print_output(format_args!("  [{}] {}", format, path.display()))?;
             }
-        }
-        Commands::Image {
-            session,
-            output,
-            list,
-            all,
-            index,
-            id,
-            limit,
-            since,
-            cache,
-        } => {
-            let DecryptedArgs {
-                decrypted_dir,
-                jobs,
-            } = cache;
-            let since_ts = match time::parse_since_opt(since.as_deref()) {
-                Ok(ts) => ts,
-                Err(e) => {
-                    log::error!("Error parsing --since: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let _ = cache::refresh_decrypted(&decrypted_dir, jobs);
-            let config = export::ImageExportConfig {
-                output_dir: &output,
-                list,
-                all,
-                index,
-                id: id.as_deref(),
-                limit,
-                since: since_ts,
-                jobs,
-            };
-            if let Err(e) = export::export_images(&decrypted_dir, &session, config) {
-                log::error!("Error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Commands::File {
-            session,
-            output,
-            list,
-            all,
-            index,
-            id,
-            limit,
-            since,
-            cache,
-        } => {
-            let DecryptedArgs {
-                decrypted_dir,
-                jobs,
-            } = cache;
-            let since_ts = match time::parse_since_opt(since.as_deref()) {
-                Ok(ts) => ts,
-                Err(e) => {
-                    log::error!("Error parsing --since: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let _ = cache::refresh_decrypted(&decrypted_dir, jobs);
-            let config = export::FileExportConfig {
-                output_dir: &output,
-                list,
-                all,
-                index,
-                id: id.as_deref(),
-                limit,
-                since: since_ts,
-                jobs,
-            };
-            if let Err(e) = export::export_files(&decrypted_dir, &session, config) {
-                log::error!("Error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Commands::Sticker {
-            session,
-            output,
-            list,
-            all,
-            index,
-            id,
-            limit,
-            since,
-            cache,
-        } => {
-            let DecryptedArgs {
-                decrypted_dir,
-                jobs,
-            } = cache;
-            let since_ts = match time::parse_since_opt(since.as_deref()) {
-                Ok(ts) => ts,
-                Err(e) => {
-                    log::error!("Error parsing --since: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let _ = cache::refresh_decrypted(&decrypted_dir, jobs);
-            let config = export::StickerExportConfig {
-                output_dir: &output,
-                list,
-                all,
-                index,
-                id: id.as_deref(),
-                limit,
-                since: since_ts,
-                jobs,
-            };
-            if let Err(e) = export::export_stickers(&decrypted_dir, &session, config) {
-                log::error!("Error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Commands::Voice {
-            session,
-            output,
-            format,
-            decoder,
-            sample_rate,
-            list,
-            all,
-            index,
-            id,
-            limit,
-            since,
-            cache,
-        } => {
-            let DecryptedArgs {
-                decrypted_dir,
-                jobs,
-            } = cache;
-            let since_ts = match time::parse_since_opt(since.as_deref()) {
-                Ok(ts) => ts,
-                Err(e) => {
-                    log::error!("Error parsing --since: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let output_format = match export::VoiceOutputFormat::parse(&format) {
-                Ok(format) => format,
-                Err(e) => {
-                    log::error!("Error parsing --format: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let _ = cache::refresh_decrypted(&decrypted_dir, jobs);
-            let config = export::VoiceExportConfig {
-                output_dir: &output,
-                format: output_format,
-                decoder: decoder.as_deref(),
-                list,
-                all,
-                index,
-                id,
-                limit,
-                since: since_ts,
-                jobs,
-                sample_rate,
-            };
-            if let Err(e) = export::export_voices(&decrypted_dir, &session, config) {
-                log::error!("Error: {}", e);
-                std::process::exit(1);
-            }
+            Ok(())
         }
         Commands::Completions { shell } => {
-            if let Err(e) = completion::print_script(shell) {
-                log::error!("Error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Commands::Complete {
-            kind,
-            decrypted_dir,
-            limit,
-            shell,
-            cursor,
-            current,
-            words,
-        } => {
-            let request = completion::CompletionRequest {
-                kind,
-                decrypted_dir: &decrypted_dir,
-                limit,
-                shell,
-                cursor,
-                current: current.as_deref(),
-                words: &words,
-            };
-            if let Err(e) = completion::print_candidates(request) {
-                log::error!("Error: {}", e);
-                std::process::exit(1);
-            }
+            completion::print_script(shell).map_err(|e| format!("Error: {e}"))
         }
     }
 }
@@ -1196,21 +749,37 @@ mod tests {
             "query",
             "sql",
             "export",
-            "image",
-            "file",
-            "sticker",
-            "emoji",
-            "voice",
             "doctor",
             "refresh",
             "completions",
-            "__complete",
         ] {
             assert_eq!(
                 normalize_args_for_default_messages(args(&["tg", command])),
                 args(&["tg", command])
             );
         }
+    }
+
+    #[test]
+    fn retired_media_commands_are_not_rewritten_as_session_names() {
+        for command in ["image", "file", "sticker", "emoji", "voice"] {
+            let argv = args(&["tg", command]);
+            assert_eq!(normalize_args_for_default_messages(argv.clone()), argv);
+            assert_eq!(
+                Cli::try_parse_from(argv).err().unwrap().kind(),
+                clap::error::ErrorKind::InvalidSubcommand
+            );
+        }
+    }
+
+    #[test]
+    fn removed_dynamic_completion_command_is_unknown() {
+        let argv = args(&["tg", "__complete"]);
+        assert_eq!(normalize_args_for_default_messages(argv.clone()), argv);
+        assert_eq!(
+            Cli::try_parse_from(argv).err().unwrap().kind(),
+            clap::error::ErrorKind::InvalidSubcommand
+        );
     }
 
     #[test]
@@ -1382,103 +951,6 @@ mod tests {
         match cli.command {
             Commands::Unread { query, .. } => assert_eq!(query.as_deref(), Some("alice")),
             _ => panic!("expected unread command"),
-        }
-    }
-
-    #[test]
-    fn media_commands_share_selection_and_cache_options() {
-        for command in ["image", "file", "sticker", "voice"] {
-            let cli = Cli::parse_from(args(&[
-                "tg",
-                command,
-                "alice",
-                "--index",
-                "2",
-                "--limit",
-                "7",
-                "--since",
-                "today",
-                "--decrypted-dir",
-                "/tmp/tg-test",
-                "--jobs",
-                "3",
-            ]));
-            let (session, index, limit, since, cache) = match cli.command {
-                Commands::Image {
-                    session,
-                    index,
-                    limit,
-                    since,
-                    cache,
-                    ..
-                }
-                | Commands::File {
-                    session,
-                    index,
-                    limit,
-                    since,
-                    cache,
-                    ..
-                }
-                | Commands::Sticker {
-                    session,
-                    index,
-                    limit,
-                    since,
-                    cache,
-                    ..
-                } => (session, index, limit, since, cache),
-                Commands::Voice {
-                    session,
-                    index,
-                    limit,
-                    since,
-                    cache,
-                    ..
-                } => (session, index, limit, since, cache),
-                _ => panic!("expected media command"),
-            };
-            assert_eq!(session, "alice");
-            assert_eq!(index, Some(2));
-            assert_eq!(limit, 7);
-            assert_eq!(since.as_deref(), Some("today"));
-            assert_eq!(cache.decrypted_dir, PathBuf::from("/tmp/tg-test"));
-            assert_eq!(cache.jobs, 3);
-        }
-    }
-
-    #[test]
-    fn sticker_accepts_emoji_alias() {
-        let cli = Cli::parse_from(normalize_args_for_default_messages(args(&[
-            "tg", "emoji", "alice", "--list",
-        ])));
-        match cli.command {
-            Commands::Sticker { session, list, .. } => {
-                assert_eq!(session, "alice");
-                assert!(list);
-            }
-            _ => panic!("expected sticker command"),
-        }
-    }
-
-    #[test]
-    fn media_commands_share_typed_id_selection_and_conflicts() {
-        for command in ["image", "file", "sticker", "voice"] {
-            let cli = Cli::parse_from(args(&["tg", command, "alice", "--id", "42"]));
-            match cli.command {
-                Commands::Image { id, .. }
-                | Commands::File { id, .. }
-                | Commands::Sticker { id, .. } => {
-                    assert_eq!(id.as_deref(), Some("42"));
-                }
-                Commands::Voice { id, .. } => assert_eq!(id, Some(42)),
-                _ => panic!("expected media command"),
-            }
-
-            assert!(
-                Cli::try_parse_from(args(&["tg", command, "alice", "--id", "42", "--list",]))
-                    .is_err()
-            );
         }
     }
 
