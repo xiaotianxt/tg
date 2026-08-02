@@ -347,9 +347,8 @@ license_line = keep_line(r'^  license .*$')
 native_decoder_dep = '  depends_on "rust-" + "si" + "lk"\n'
 caveats = '''  def caveats
     <<~EOS
-      `tg keys --method lldb-login` uses Apple's lldb/debugserver while you log out and back in once.
-      Install Apple Command Line Tools when that mode is needed:
-        xcode-select --install
+      `tg keys --method login` uses LLDB on macOS or GDB on Linux while you log out and back in once.
+      Install Apple Command Line Tools on macOS, or GDB on Linux, when that mode is needed.
     EOS
   end
 '''
@@ -385,6 +384,7 @@ path.write_text(f'''class Tg < Formula
 {caveats}
   def install
     bin.install "tg"
+    doc.install "LICENSE", "THIRD_PARTY_LICENSES"
     generate_completions_from_executable(bin/"tg", "completions")
   end
 

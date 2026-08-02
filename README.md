@@ -1,153 +1,30 @@
 # tg
 
-tg 是一个 macOS/Linux 本地 Telegram 聊天记录读取 CLI。它把本机 Telegram 桌面版的聊天数据整理成几个直接的命令：读一个会话、全局搜索、结构化检索、导出聊天和导出本地缓存媒体。
+tg 是一个 macOS/Linux 本地 Telegram 聊天记录读取 CLI。它直接只读打开 Telegram 的 SQLCipher 数据库，复用原生 SQLite 索引、FTS 和当前 WAL；不复制消息库，也不需要 `refresh`。
 
-底层的密钥提取和数据库解密仍然可控，但日常使用不需要反复关心这些步骤。`tg refresh` 负责刷新本地解密缓存；`messages`、`search`、`query`、`export` 会在读取前尽量静默刷新，失败时继续使用已有缓存并给出诊断线索。
+主要用途：
 
-适合这些场景：
+- 查看会话、未读消息和单个会话历史。
+- 全局快速搜索或结构化完整检索。
+- 把完整会话导出成 `txt`、`csv`、`json`，并归档本地缓存媒体。
 
-- 备份自己的 Telegram 聊天记录，不依赖手机备份。
-- 快速找某个人、某个群、某个关键词的历史消息。
-- 用包含词、排除词、时间范围和输出字段做更精确的本地检索。
-- 把聊天导出成 `txt`、`csv`、`json`，用于归档、整理或本地分析。
-- 随完整聊天归档导出本地缓存的图片、视频、表情、文件和语音。
-- 给本地 AI/自动化助手一个稳定的聊天记录读取工具和 skill 描述。
-
-默认数据只留在本机。`~/.tg/all_keys.json`、`~/.tg/decrypted/`、`exported/` 都是敏感文件，请当作聊天原文保存和处理。
-
-## Agent Skill
-
-安装公开的 central skill 模板：
-
-```bash
-npx -y github:xiaotianxt/skills tg
-```
-
-## 先看效果
-
-列出会话：
-
-```bash
-$ tg sessions --top 5
-Rank Unread   Last Activity        Display Name           Username
-------------------------------------------------------------------------------------------------------------------------
-1    4        2026-04-28 09:41     产品讨论群              123456789@chatroom
-2    0        2026-04-27 23:10     张三                    tgid_abcd1234
-3    0        2026-04-20 18:05     文件传输助手            filehelper
-
-Total: 37 sessions
-```
-
-读取最近消息：
-
-```bash
-$ tg messages "产品讨论群" --limit 4
-Chat with: 产品讨论群 (123456789@chatroom)
-Showing latest 4 messages
-
-[2026-04-28 09:37]
-我: 今天先把导出格式定下来
-[2026-04-28 09:38]
-李四: [img:abc123]
- 这张是最新版
-[2026-04-28 09:41]
-王五: > 李四: [img:abc123]
-        这张可以放到 README 里
-
---- End of messages ---
-```
-
-导出聊天：
-
-```bash
-$ tg export "张三" --output exported/zhangsan
-Exported 2381 messages for 张三 (tgid_abcd1234)
-Exported to:
-  [txt] exported/zhangsan/chat.txt
-  [csv] exported/zhangsan/chat.csv
-  [json] exported/zhangsan/chat.json
-```
-
-可用的本地缓存媒体会一起写入 `exported/zhangsan/media/`。语音优先转成 WAV；解码器不可用或单条解码失败时保留原始 `.voice`，避免归档遗漏本地音频。
-
-## 日常工作流
-
-第一次初始化后，最常用的是这些命令：
-
-```bash
-tg "张三" --limit 50
-tg "产品讨论群" --since today
-tg unread
-tg search "关键词"
-tg query --session "产品讨论群" --contains "项目" --not "取消" --fields time,sender,body
-tg export "张三" --output exported/zhangsan
-```
-
-`search`、`query` 默认只处理最近 365 天，这是当前版本为速度和常见需求做的默认路径。需要全量历史时加 `--all-time`；需要更窄范围时用 `--since today`、`--since 30d` 或具体日期。`export` 是完整归档入口，默认导出整个会话。
-
-如果结果看起来不完整，先跑：
-
-```bash
-tg doctor
-tg doctor "联系人或群名"
-tg refresh
-```
-
-`refresh` 只维护 `~/.tg/decrypted/` 下的解密缓存；搜索直接复用上游 FTS，其他读取直接使用消息库已有索引，不再生成一份消息副本。如果发现消息或联系人数据库缺 key，它会自动刷新 keys 并重试一次；也可以用 `tg refresh --keys` 强制先重新提取 keys。
-
-## 支持与限制
-
-| 类别 | 当前支持 |
-| --- | --- |
-| 系统 | macOS arm64、Linux x86_64、Linux arm64，本机 Telegram 桌面版的本地数据 |
-| Telegram 版本 | 主要面向 Telegram 4.x 桌面版；Telegram 升级后如果数据库结构变化，可能需要跟进适配 |
-| Telegram 数据 | 本机 `db_storage` 中的聊天数据库；无需手机备份 |
-| 会话匹配 | 联系人显示名、备注、别名、`tgid_...`、群 ID |
-| 未读 | `sessions` 显示未读数；`unread` 只列有未读消息的会话 |
-| 消息读取 | 文本、群聊发送者、系统提示、撤回提示、引用、链接、小程序、聊天记录卡片展开、位置、文件卡片、图片/视频/语音/表情的可读摘要 |
-| 搜索 | 全局关键词搜索，单个会话内关键词搜索，结构化检索；支持包含词、排除词、时间范围、字段选择和 JSON 行输出 |
-| 导出 | 完整会话归档；同时写出 `txt`、`csv`、`json` |
-| 媒体 | `export` 会尝试导出本地缓存图片、视频、表情、普通文件附件和语音；`.dat` 图片/视频会尝试解密；语音优先导出 WAV，失败时保留原始 `.voice` |
-| 增量更新 | 默认只解密变化过的数据库 |
-
-暂不支持或不保证：
-
-- 不支持 Windows、iOS、Android、网页版 Telegram。
-- 不恢复 Telegram 本地数据库里已经没有的消息。
-- 不保证导出所有媒体。Telegram 没有缓存、缓存被清理、文件未下载时，只能显示消息摘要。
-- `export` 会把可导出的媒体放到输出目录的 `media/` 子目录；Telegram 没有缓存或缓存被清理时，对应媒体只能保留消息摘要。
-- 媒体导出只读取本地缓存，不根据消息 URL 下载远端文件。
-- `tggf` 表情转换需要本机可用的 `ffmpeg`。
-- 不做 OCR、语义搜索、拼音搜索。
-- 多账号或 Telegram 路径异常时，可能需要手动指定 `--db-dir`。
+聊天数据默认只留在本机。`~/.tg/all_keys.json`、`~/.tg/key_material.bin` 和导出目录都包含敏感数据。
 
 ## 安装
-
-### Homebrew
 
 ```bash
 brew install xiaotianxt/tap/tg
 tg --version
 ```
 
-Homebrew formula 会按当前系统选择 release asset：macOS Apple Silicon 使用 `darwin-arm64`，Linux 使用 `linux-x86_64` 或 `linux-arm64`。
+Homebrew 支持 macOS Apple Silicon、Linux x86_64 和 Linux arm64。
 
-### 源码安装
-
-需要 Rust 工具链。macOS 还需要 Xcode Command Line Tools；Linux 需要 C 编译器、`pkg-config` 和 SQLite 开发包。
+源码安装需要 Rust、C 编译器、make、Perl 和 pkg-config；SQLCipher 与 OpenSSL 会静态编入二进制，不需要系统 SQLite/SQLCipher/OpenSSL 动态库。
 
 ```bash
 git clone https://github.com/xiaotianxt/tg.git
 cd tg
 make install-local
-```
-
-`make install-local` 会把 `tg` 安装到 `~/.local/bin`。请确认 `~/.local/bin` 已经在 `PATH` 中。
-
-如果要安装到 `/usr/local/bin`：
-
-```bash
-make install
 ```
 
 安装 shell completion：
@@ -158,82 +35,11 @@ tg completions zsh > ~/.zsh/completions/_tg
 tg completions bash > ~/.local/share/bash-completion/completions/tg
 ```
 
-补全脚本由 Clap 元数据静态生成，支持命令、flags、枚举值和路径提示；它不会运行 tg 或读取本地聊天数据库。
-release formula 会为 Homebrew 用户自动安装这些 completions。
-
-如果 macOS 没有 C 编译器：
-
-```bash
-xcode-select --install
-```
-
 ## 第一次使用
 
-1. 打开并登录本机 Telegram 桌面版。
-2. 提取数据库密钥：
+先打开并登录本机 Telegram 桌面版，然后提取数据库密钥。
 
-   macOS 新版客户端只在登录时使用账号级 key material 派生每个数据库的独立 key。注意：`codesign` 只影响下一次启动的进程；如果 Telegram 已经在运行，对正在运行的 PID 重签没有用。
-
-   ```bash
-   sudo DevToolsSecurity -enable
-   osascript -e 'quit app "Telegram"'
-   while pgrep -x Telegram >/dev/null; do sleep 1; done
-   sudo codesign --force --deep --sign - /Applications/Telegram.app
-   open -a Telegram
-   sudo tg keys --method login --timeout 180
-   ```
-
-   启动 `login` 后，在等待时间内从 Telegram **退出账号并重新登录**。tg 会在公开系统函数 `CCKeyDerivationPBKDF` 上捕获一次账号级 key material，再按每个数据库自己的 salt 并行派生并验证独立 key。它需要 Apple Command Line Tools；如果本机没有 `lldb`，先运行 `xcode-select --install`。如果 macOS 弹出 Developer Tools 权限提示，请允许当前终端应用；如果没有弹窗但报 `Not allowed to attach to process`，到 System Settings -> Privacy & Security -> Developer Tools 里启用当前终端应用，退出并重新打开终端后再重试。旧命令名 `lldb-login` / `lldb-cold` 仍作为兼容 alias 保留。
-
-   Linux 新版客户端使用同一个 `login` 接口，内部通过 ELF anchor、unwind FDE 和指令语义定位稳定入口，再由 GDB 捕获。先安装 GDB，然后运行命令并在等待期间退出账号、重新登录：
-
-   ```bash
-   sudo apt install gdb
-   sudo tg keys --method login --timeout 180
-   ```
-
-   后续直接运行默认 `auto` 路径即可。它复用 `~/.tg/key_material.bin`，已有 key 会先做第一页 HMAC 验证，只有新 salt 才执行 PBKDF2；没有可用材料时会提示重新执行一次 `login` 捕获：
-
-   ```bash
-   sudo tg keys
-   ```
-
-   成功后派生的数据库密钥会保存到 `~/.tg/all_keys.json`。账号级材料单独保存在权限为 `0600` 的 `~/.tg/key_material.bin`，不会写入日志或命令输出。
-
-3. 刷新本地解密缓存：
-
-   ```bash
-   tg refresh
-   ```
-
-   成功后解密缓存会保存到 `~/.tg/decrypted/`。
-
-4. 看有哪些会话：
-
-   ```bash
-   tg sessions --top 30
-   ```
-
-5. 读取一个会话：
-
-   ```bash
-   tg "联系人或群名" --limit 50
-   ```
-
-后续使用时通常只需要：
-
-```bash
-tg "联系人或群名" --limit 50
-tg search "关键词"
-tg query --session "联系人或群名" --contains "关键词" --fields time,sender,body --limit 20
-tg export "联系人或群名"
-```
-
-`search`、`query` 默认只看最近 365 天，这是大多数查询的热路径。需要全量历史时加 `--all-time`；需要更窄窗口时加 `--since today`、`--since 30d` 或具体日期。`export` 默认就是全量归档。
-
-`sessions` 和 `unread` 只使用轻量 `session.db` 列出最近活跃会话和未读数，不扫描 numbered message 数据库。`search`、`query`、`export` 在读取前会尝试静默增量刷新 `~/.tg/decrypted/`。如果当前无法访问 Telegram 数据库或没有可用密钥，它们会继续读取已有的解密缓存。`messages` 会先确认 contact 和 numbered message 数据库都已解密；如果发现缺 key 或解密失败，会自动重新提取 keys、刷新解密缓存并重试一次，仍不完整时会报错退出，避免输出不完整的聊天记录。读不到时先跑 `tg doctor` 或 `tg doctor "联系人或群名"`；诊断会明确报告 `session.db` 和 `message_fts.db` 是否就绪。
-
-macOS 上如果 `sudo tg keys` 遇到 `task_for_pid failed` 或权限问题，不要在 Telegram 正在运行时直接重签后继续扫同一个进程。按这个顺序重来：
+macOS 新版客户端需要在登录时捕获一次账号级 key material。`codesign` 只影响重签后启动的新进程：
 
 ```bash
 sudo DevToolsSecurity -enable
@@ -244,41 +50,34 @@ open -a Telegram
 sudo tg keys --method login --timeout 180
 ```
 
-命令开始等待后，需要在 Telegram 中退出账号并重新登录以触发派生。如果输出里有 `Not allowed to attach to process`，打开 System Settings -> Privacy & Security -> Developer Tools，启用当前终端应用，退出并重新打开终端后再运行上面的命令。
+命令等待期间，在 Telegram 中退出账号并重新登录。需要 Apple Command Line Tools；若缺少 `lldb`，运行 `xcode-select --install`。若系统提示 Developer Tools 权限，请允许当前终端应用。
 
-如果你的 Telegram 路径不是 `/Applications/Telegram.app`，把路径改成实际的 App 路径。
+Linux 使用同一个接口，内部通过 GDB 捕获：
 
-Linux 上需要保持桌面客户端打开。首次运行 `sudo tg keys --method login --timeout 180`，以后默认 `sudo tg keys` 会复用已验证的本地材料。
+```bash
+sudo apt install gdb
+sudo tg keys --method login --timeout 180
+```
 
-## 常用命令
-
-提取密钥：
+以后直接运行下面的快速路径。它会复用权限为 `0600` 的 `~/.tg/key_material.bin`，验证已有 key，只为新 salt 派生密钥：
 
 ```bash
 sudo tg keys
+tg doctor
+tg sessions --top 30
 ```
 
-解密数据库：
+密钥保存在 `~/.tg/all_keys.json`。所有读取命令随后直接打开加密源库，不创建解密副本。
 
-```bash
-tg refresh
-tg refresh --keys
-tg decrypt
-tg decrypt --full
-tg decrypt --since 1h --verbose
-tg decrypt --db-dir "/path/to/your/db_storage"
-```
+## 常用命令
 
-常见 `db_storage` 位置在 Telegram 容器目录下，例如 `Documents/xtelegram_files/.../db_storage` 或 `Library/Application Support/telegram-container/.../db_storage`。
-
-查看会话：
+查找会话和未读：
 
 ```bash
 tg sessions
 tg sessions "张三"
 tg sessions --top 50
 tg unread
-tg unread "张三"
 tg unread --top 50
 ```
 
@@ -286,52 +85,41 @@ tg unread --top 50
 
 ```bash
 tg "张三"
-tg "张三" --limit 100
-tg messages "张三"
 tg messages "张三" --limit 100
 tg messages "张三" --since today
-tg messages "张三" --since yesterday
 tg messages "张三" --all-time
 tg messages "张三" --search "项目"
 tg messages "张三" --head --limit 20
-tg messages "张三" --tail --limit 20
-tg messages "张三" --offset 100 --limit 50
-tg messages "张三" --time-bucket full
-tg messages "张三" --time-bucket 1h
 tg messages "产品讨论群" --anonymous
 ```
 
-`messages` 默认显示最新 50 条；加 `--since` 会显示指定时间之后的消息，加 `--all-time` 会显示整个会话历史。默认按 `1m` 分组显示时间，同一分钟内不重复打印时间。同一个时间分组里，如果连续消息来自同一发送者，后续消息只打印一个前导空格，不重复打印发送者名。`--time-bucket` 支持 `1m`/`1min`、`1h`、`1d`、`1mo`、`1y`、`full`、`none`。
+`messages` 默认显示最新 50 条。`--since` 支持日期、日期时间、`5min`、`1h`、`2d`、`1w`、`1y`、`today` 和 `yesterday`。群聊或全局结果建议加 `--anonymous`，避免输出个人备注名。
 
-默认显示名使用你的个人备注，引用消息里的发送者也保持一致。加 `--anonymous` 后，群消息优先使用群内展示名，找不到时回退到联系人默认名，不使用你的个人备注。面向 AI/自动化的总结场景，明确总结某个一对一联系人时可以保留默认显示名；总结群聊、全局搜索或目标类型不明确时建议加 `--anonymous`。
-
-搜索：
+快速全局搜索：
 
 ```bash
-tg search "关键词" --anonymous
 tg search "关键词" --limit 50 --anonymous
 tg search "关键词" --since today --anonymous
 tg search "关键词" --all-time --anonymous
 ```
 
-`search` 直接复用上游 FTS，速度最快，但只覆盖上游已收录的正文；邮件、部分群公告和聊天记录卡片的深层内容可能不在其中。需要完整扫描本地消息分片和解码后正文时，使用 `tg query --contains "关键词" --all-time`。
+`search` 直接复用上游 FTS，速度最快，但只覆盖上游已经收录的正文。群公告、部分卡片深层内容等可能未进入 FTS。
 
-结构化检索：
+完整结构化检索：
 
 ```bash
 tg query --contains "项目" --limit 50 --anonymous
-tg query --session "张三" --contains "项目" --fields time,sender,body --limit 20
 tg query --session "产品讨论群" --contains "项目" --fields time,sender,body --limit 20 --anonymous
 tg query --contains "项目" --contains "上线" --match-mode all --since today --anonymous
-tg query --contains "项目" --not "已取消" --format json --fields timestamp,session,body --anonymous
+tg query --contains "项目" --not "取消" --format json --fields timestamp,session,body --anonymous
 tg query --has voice --session "张三" --limit 20
 tg query --raw-contains "<appmsg" --fields time,session,raw_body --limit 20
-tg query --contains "项目" --all-time --anonymous
+tg query --contains "关键词" --all-time --anonymous
 ```
 
-`query` 适合在本机做精确检索：限定某个会话、同时要求多个关键词、排除某些词、筛选媒体类型、按时间收窄结果，或者只输出后续脚本需要的字段。`--contains` 匹配解码后的展示文本，图片、语音、表情等会按 tg 的可读标记参与匹配；需要查原始 XML/缓存正文时用 `--raw-contains`。`--has` 支持 `voice,image,sticker,file,video`，根据消息类型和原始正文判断，不依赖额外索引。`--fields` 支持 `time,session,sender,type,body,raw_body,timestamp`，`--format json` 会按 JSON lines 输出，便于继续处理。
+`query` 扫描本地消息分片中由数据库索引约束出的候选行，再匹配解码后的正文，因此比 FTS 覆盖更完整。它不是原始 SQL 接口。`--has` 支持 `voice,image,sticker,file,video`；`--fields` 支持 `time,session,sender,type,body,raw_body,timestamp`。
 
-`query` 不接受原始 SQL。用户只传会话、关键词、排除词、媒体类型、时间、排序和输出字段，tg 内部生成固定的参数化数据库查询，并以只读方式打开消息数据库。默认查询最近 365 天；加 `--all-time` 后，为了避免误扫全库，必须至少传 `--contains`、`--raw-contains`、`--has` 或 `--since` 之一。空关键词会被拒绝；单次 `--limit + --offset` 最多 10000。table 输出会转义终端控制字符，避免聊天正文影响终端显示。
+`search` 和 `query` 默认查询最近 365 天。全量历史用 `--all-time`；为避免误扫全库，`query --all-time` 仍要求至少提供 `--contains`、`--raw-contains`、`--has` 或 `--since` 之一。
 
 诊断：
 
@@ -340,135 +128,112 @@ tg doctor
 tg doctor "张三"
 ```
 
-导出聊天：
+诊断会检查源目录、密钥覆盖、SQLCipher、当前 WAL、会话库和 FTS。
 
-```bash
-tg export "张三"
-tg export "张三" --output exported/zhangsan
-```
-
-`export` 会完整导出会话，写出 `chat.txt`、`chat.csv`、`chat.json`，并把可导出的本地缓存媒体放到 `media/`：
-
-```bash
-tg export "产品讨论群" --output exported/group
-```
-
-### 媒体归档
-
-`messages` 会继续用 `[img:<id>]`、`[sticker:<id>]`、`[voice:<id>:<时长>s]` 和 `[文件:标题 (大小)]` 展示媒体摘要。真正的文件统一由完整归档导出：
+## 完整导出
 
 ```bash
 tg export "张三" --output exported/zhangsan
 ```
 
-本地可用的图片、视频、表情、文件和语音写入 `exported/zhangsan/media/`。媒体缓存缺失时保留消息摘要；语音优先通过 Homebrew 安装的默认解码器写成 WAV，无法解码时保留去掉前置字节后的 `.voice` 原始文件。源码安装可用 `TG_VOICE_DECODER=/path/to/decoder` 指定同一 Rust decoder 协议。
+每次导出都会写出：
 
-## 时间过滤
+```text
+exported/zhangsan/chat.txt
+exported/zhangsan/chat.csv
+exported/zhangsan/chat.json
+exported/zhangsan/media/
+```
 
-`--since` 支持：
+本地可用的图片、视频、表情、文件和语音会写入 `media/`。Telegram 没有缓存或缓存已清理时，只保留消息摘要；tg 不从远端 URL 下载。语音优先写成 WAV，解码器不可用或单条失败时保留 `.voice`。`tggf` 表情转换需要 `ffmpeg`。
 
-- 日期：`2026-04-28`
-- 日期时间：`2026-04-28 09:30:00`
-- 相对时间：`5min`、`1h`、`2d`、`1w`、`1y`
-- 命名时间：`today`、`yesterday`
+## 自定义路径与并行度
 
-日期、日期时间和输出中的消息时间都使用当前系统时区。
-
-## 输出文件
-
-默认会生成这些文件或目录：
-
-- `~/.tg/all_keys.json`：数据库密钥。
-- `~/.tg/key_material.bin`：新版客户端的账号级 key material，版本化二进制格式，权限 `0600`；新数据库出现时用于离线派生对应 key。
-- `~/.tg/decrypted/`：解密后的 SQLite 数据库。
-- `exported/`：导出的聊天和媒体，默认位于当前目录。
-
-这些文件都应视为敏感数据。使用后如需清理：
+读取命令共同支持：
 
 ```bash
-# 确认后再清理
-rm -rf ~/.tg exported
+tg sessions --db-dir /path/to/db_storage --keys /path/to/all_keys.json
+tg query --contains "关键词" --jobs 4
 ```
+
+密钥提取也支持自定义路径：
+
+```bash
+sudo tg keys --db-dir /path/to/db_storage --output /path/to/all_keys.json
+```
+
+`--jobs 0` 表示自动选择并行度。
+
+## 数据与磁盘行为
+
+tg 自己只长期保存：
+
+- `~/.tg/all_keys.json`：每个源数据库的密钥。
+- `~/.tg/key_material.bin`：账号级 key material，权限 `0600`。
+- 用户显式指定的导出目录。
+
+`sessions`、`unread`、`doctor`、`messages`、`search` 和 `query` 不创建消息数据库、索引或页缓存。读取期间的 SQLite 临时数据强制放在内存中。`export` 只写用户指定的归档目录。
+
+旧版本留下的 `~/.tg/decrypted/` 不再读取，也不会被 tg 自动删除。确认新版工作正常后，可自行清理：
+
+```bash
+rm -rf ~/.tg/decrypted
+```
+
+## 支持与限制
+
+| 类别 | 当前支持 |
+| --- | --- |
+| 系统 | macOS arm64；glibc 2.35+ Linux x86_64 / arm64 |
+| 数据源 | 本机 Telegram 桌面版 `db_storage`，包括当前 WAL 中已提交数据 |
+| 搜索 | 上游 FTS 快速搜索；消息分片完整结构化检索 |
+| 导出 | 完整会话 `txt`、`csv`、`json` 与本地缓存媒体 |
+| 安全 | SQLCipher 只读连接、`query_only`、每个数据库独立的一致性快照 |
+
+不支持 Windows、移动端或网页版数据；不恢复本地数据库里已经不存在的消息；不保证导出 Telegram 未缓存的媒体；不提供 OCR、语义搜索或拼音搜索。
 
 ## 常见问题
 
 ### `Telegram is not running`
 
-先打开并登录 macOS Telegram，再运行 `sudo tg keys`。
+打开并登录 Telegram，再运行 `sudo tg keys`。
 
 ### `task_for_pid failed`
 
-先确认用了 `sudo tg keys`。如果仍失败，通常是因为正在运行的 Telegram 进程没有调试权限。重签必须发生在 Telegram 完全退出之后，因为 `codesign` 只影响之后新启动的进程：
+完全退出 Telegram，按“第一次使用”中的顺序重签、重启，再运行 `sudo tg keys --method login --timeout 180`。如果仍提示 `Not allowed to attach to process`，在 System Settings -> Privacy & Security -> Developer Tools 中允许当前终端，重启终端后重试。
 
-```bash
-sudo DevToolsSecurity -enable
-osascript -e 'quit app "Telegram"'
-while pgrep -x Telegram >/dev/null; do sleep 1; done
-sudo codesign --force --deep --sign - /Applications/Telegram.app
-open -a Telegram
-sudo tg keys --method login --timeout 180
-```
-
-如果本机没有 Apple `lldb`，先安装 Command Line Tools：
-
-```bash
-xcode-select --install
-```
-
-如果 `lldb` 输出 `Not allowed to attach to process`，打开 System Settings -> Privacy & Security -> Developer Tools，启用当前终端应用，退出并重新打开终端后再重试。
-
-捕获命令开始等待后，在 Telegram 中退出账号并重新登录。捕获成功并通过数据库第一页 HMAC 验证后，日常 `tg keys` / `tg refresh --keys` 会复用本地 key material，不再 attach。
-
-### `No sessions found`
-
-通常是还没有成功解密数据库。按顺序检查：
+### 没有会话或消息
 
 ```bash
 ls ~/.tg/all_keys.json
-tg refresh --keys
+sudo tg keys
+tg doctor
 tg sessions --top 30
 ```
 
-如果 Telegram 数据目录不是默认位置，给 `decrypt` 加 `--db-dir`。
+非默认安装位置请给命令传 `--db-dir`。
 
 ### 找到了错误联系人
 
-同名联系人或群较多时，先用 `tg sessions --top 100` 找到准确的 `tgid_...` 或 `...@chatroom`，再用这个 ID 读取：
-
-```bash
-tg messages "tgid_abcd1234" --limit 50
-```
+先用 `tg sessions --top 100` 找到准确的 `tgid_...` 或 `...@chatroom`，再用 ID 查询。
 
 ### 图片、视频或文件导不出来
 
-媒体导出依赖 Telegram 本地缓存。可以先在 Telegram 里打开对应图片、视频、表情或文件，让 Telegram 把文件下载到本机，再重新运行 `tg export "联系人或群名"`。
+先在 Telegram 中打开或下载该媒体，再重新运行 `tg export`。
 
-### 语音导出后不能直接播放
-
-`tg export` 会把语音放在输出目录的 `media/` 子目录。Homebrew 安装的默认解码器可用时写成 WAV；解码器不可用或单条解码失败时保留 `.voice`，不会丢弃本地语音。需要 `mp3` 时再让 `ffmpeg` 处理 WAV。
-
-### `tggf` 表情转换失败
-
-安装 `ffmpeg`：
+### `tggf` 转换失败
 
 ```bash
 brew install ffmpeg
-```
-
-如果 `ffmpeg` 不在 `PATH`，可以指定：
-
-```bash
 TG_FFMPEG=/path/to/ffmpeg tg export "张三" --output exported/zhangsan
 ```
 
 ## 日志
 
-聊天记录、会话表格、搜索结果等命令结果写到 stdout。运行状态、警告和错误写到 stderr。
-
-默认日志等级是 `info`。可以用 `TG_LOG` 或 `RUST_LOG` 调整：
+命令结果写 stdout，状态和错误写 stderr：
 
 ```bash
-TG_LOG=warn tg decrypt
+TG_LOG=warn tg sessions
 TG_LOG=debug tg messages "张三"
 ```
 
@@ -479,28 +244,16 @@ make check
 make build
 ```
 
-`make check` 会依次运行 rustfmt、clippy 和测试：
+核心模块：
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-```
-
-项目入口是 `src/main.rs`。主要模块：
-
-- `src/scanner.rs`：选择缓存派生或平台登录捕获策略。
-- `src/scanner/lldb.rs`：macOS 上按公开 PBKDF2 系统符号捕获账号级 key material。
-- `src/database_keys.rs`：唯一 salt 去重、并行 PBKDF2、第一页 HMAC 验证和 key 映射。
-- `src/key_material.rs`：账号级 key material 的版本化私有存储与内存清理。
-- `src/decrypt.rs`：数据库解密。
-- `src/db.rs`：会话、联系人和消息查询。
-- `src/message.rs`：消息类型解析。
-- `src/media*.rs`：媒体元信息、缓存查找和解密。
-- `src/export.rs`：导出。
+- `src/source_store.rs`：发现源数据库、应用 SQLCipher key、建立只读快照。
+- `src/database_keys.rs`：key 文件、salt、第一页 HMAC 验证。
+- `src/db.rs` / `src/query.rs`：会话、消息、FTS 和结构化查询。
+- `src/scanner.rs`：缓存派生或平台登录捕获。
+- `src/export.rs` / `src/media*.rs`：聊天和媒体归档。
 
 面向 AI/自动化助手的能力说明见 [SKILL.md](SKILL.md)。
 
 ## License
 
-MIT
+MIT。发布包内含 [LICENSE](LICENSE) 与 [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES)。

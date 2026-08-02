@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::{mpsc, Mutex};
 
+// ponytail: two SQLCipher readers avoid storage contention; --jobs overrides when hardware differs.
+pub(crate) const SOURCE_DB_AUTO_CAP: usize = 2;
+
 pub(crate) fn job_count(requested: usize, auto_cap: usize) -> usize {
     if requested > 0 {
         return requested.max(1);

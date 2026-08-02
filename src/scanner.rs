@@ -6,7 +6,7 @@ use std::process::{Output, Stdio};
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
-use crate::{database_keys, decrypt::DatabaseKeys, dictionary, key_material, paths};
+use crate::{database_keys, database_keys::DatabaseKeys, dictionary, key_material, paths};
 
 #[cfg(target_os = "linux")]
 mod elf_locator;
@@ -104,73 +104,56 @@ fn passwd_home_dir(user: &str) -> Option<PathBuf> {
     })
 }
 
-fn find_db_storage_dir() -> Option<PathBuf> {
-    let home = real_home_dir()?;
-    for account_files in dictionary::account_files_candidate_dirs(&home) {
-        if !account_files.is_dir() {
-            continue;
-        }
-
-        let Ok(entries) = std::fs::read_dir(&account_files) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let direct = path.join("db_storage");
-            if direct.is_dir() {
-                return Some(direct);
-            }
-
-            if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                for sub_entry in sub_entries.flatten() {
-                    let nested = sub_entry.path().join("db_storage");
-                    if nested.is_dir() {
-                        return Some(nested);
-                    }
-                }
-            }
-        }
+fn resolve_db_storage_dir(db_dir: Option<&Path>) -> Option<PathBuf> {
+    match db_dir {
+        Some(path) if path.is_dir() => Some(path.to_path_buf()),
+        Some(_) => None,
+        None => real_home_dir().and_then(|home| paths::find_db_storage_dir(&home)),
     }
-
-    None
-}
-
-/// Refresh database keys using cached account material when possible.
-pub fn extract_keys() -> Result<String, String> {
-    extract_keys_with_method_and_jobs(0, KeyExtractionMethod::Auto, 0)
 }
 
 pub(crate) fn extract_keys_with_method_and_jobs(
     timeout_secs: u64,
     method: KeyExtractionMethod,
     jobs: usize,
+    db_dir: Option<&Path>,
+    keys_path: &Path,
 ) -> Result<String, String> {
     if method == KeyExtractionMethod::Login && timeout_secs == 0 {
         return Err("Login key capture requires a timeout greater than zero.".to_string());
     }
     match method {
-        KeyExtractionMethod::Auto => extract_keys_auto(jobs),
-        KeyExtractionMethod::Login => extract_keys_with_login_capture(timeout_secs, jobs),
+        KeyExtractionMethod::Auto => extract_keys_auto(jobs, db_dir, keys_path),
+        KeyExtractionMethod::Login => {
+            extract_keys_with_login_capture(timeout_secs, jobs, db_dir, keys_path)
+        }
     }
 }
 
-fn extract_keys_auto(jobs: usize) -> Result<String, String> {
-    if let Some(path) = extract_keys_from_cached_material(jobs)? {
+fn extract_keys_auto(
+    jobs: usize,
+    db_dir: Option<&Path>,
+    keys_path: &Path,
+) -> Result<String, String> {
+    if let Some(path) = extract_keys_from_cached_material(jobs, db_dir, keys_path)? {
         return Ok(path);
     }
 
-    Err(
+    let command = resolve_db_storage_dir(db_dir)
+        .or_else(|| db_dir.map(Path::to_path_buf))
+        .map(|db_dir| paths::key_recovery_command(&db_dir, keys_path))
+        .unwrap_or_else(|| "tg keys".to_string());
+    Err(format!(
         "No usable cached account key material. Capture it once with:\n\n  \
-         sudo tg keys --method login --timeout 180"
-            .to_string(),
-    )
+         sudo {command} --method login --timeout 180"
+    ))
 }
 
-fn extract_keys_from_cached_material(jobs: usize) -> Result<Option<String>, String> {
+fn extract_keys_from_cached_material(
+    jobs: usize,
+    db_dir: Option<&Path>,
+    keys_path: &Path,
+) -> Result<Option<String>, String> {
     let material_path = paths::default_key_material_path();
     let material = match key_material::load(&material_path) {
         Ok(Some(material)) => material,
@@ -180,16 +163,15 @@ fn extract_keys_from_cached_material(jobs: usize) -> Result<Option<String>, Stri
             return Ok(None);
         }
     };
-    let Some(db_storage) = find_db_storage_dir() else {
+    let Some(db_storage) = resolve_db_storage_dir(db_dir) else {
         return Ok(None);
     };
-    let keys_path = paths::default_keys_path();
-    let existing = load_existing_keys(&keys_path)?;
+    let existing = load_existing_keys(keys_path)?;
     let outcome =
         database_keys::derive_from_storage(material.as_bytes(), &db_storage, &existing, jobs)?;
     if outcome.is_complete() || outcome.derived_databases > 0 {
         log_derivation_outcome("cached account material", &outcome);
-        write_derivation_outcome(&keys_path, outcome)?;
+        write_derivation_outcome(keys_path, outcome)?;
         return Ok(Some(keys_path.to_string_lossy().to_string()));
     }
 
@@ -203,8 +185,13 @@ fn extract_keys_from_cached_material(jobs: usize) -> Result<Option<String>, Stri
 }
 
 #[cfg(target_os = "macos")]
-fn extract_keys_with_login_capture(timeout_secs: u64, jobs: usize) -> Result<String, String> {
-    let db_storage = find_db_storage_dir()
+fn extract_keys_with_login_capture(
+    timeout_secs: u64,
+    jobs: usize,
+    db_dir: Option<&Path>,
+    keys_path: &Path,
+) -> Result<String, String> {
+    let db_storage = resolve_db_storage_dir(db_dir)
         .ok_or_else(|| "Cannot find local db_storage directory.".to_string())?;
     validate_sudo_credentials(timeout_secs)?;
     let pid = find_telegram_pid().map_err(|e| format!("Cannot find desktop process: {e}"))?;
@@ -223,12 +210,17 @@ fn extract_keys_with_login_capture(timeout_secs: u64, jobs: usize) -> Result<Str
         timeout_secs,
     })?;
 
-    finish_login_capture(material, &db_storage, jobs)
+    finish_login_capture(material, &db_storage, jobs, keys_path)
 }
 
 #[cfg(target_os = "linux")]
-fn extract_keys_with_login_capture(timeout_secs: u64, jobs: usize) -> Result<String, String> {
-    let db_storage = find_db_storage_dir()
+fn extract_keys_with_login_capture(
+    timeout_secs: u64,
+    jobs: usize,
+    db_dir: Option<&Path>,
+    keys_path: &Path,
+) -> Result<String, String> {
+    let db_storage = resolve_db_storage_dir(db_dir)
         .ok_or_else(|| "Cannot find local db_storage directory.".to_string())?;
     let identity =
         linux_process::find_invoking_user_main_process(dictionary::desktop_app_process())?;
@@ -254,11 +246,16 @@ fn extract_keys_with_login_capture(timeout_secs: u64, jobs: usize) -> Result<Str
         timeout_secs,
     })?;
 
-    finish_login_capture(material, &db_storage, jobs)
+    finish_login_capture(material, &db_storage, jobs, keys_path)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn extract_keys_with_login_capture(_timeout_secs: u64, _jobs: usize) -> Result<String, String> {
+fn extract_keys_with_login_capture(
+    _timeout_secs: u64,
+    _jobs: usize,
+    _db_dir: Option<&Path>,
+    _keys_path: &Path,
+) -> Result<String, String> {
     Err("Login key extraction is only supported on macOS and Linux.".to_string())
 }
 
@@ -267,9 +264,9 @@ fn finish_login_capture(
     material: key_material::AccountKeyMaterial,
     db_storage: &Path,
     jobs: usize,
+    keys_path: &Path,
 ) -> Result<String, String> {
-    let keys_path = paths::default_keys_path();
-    let existing = load_existing_keys(&keys_path)?;
+    let existing = load_existing_keys(keys_path)?;
     let outcome =
         database_keys::derive_from_storage(material.as_bytes(), db_storage, &existing, jobs)?;
     if outcome.derived_databases == 0
@@ -283,25 +280,21 @@ fn finish_login_capture(
 
     key_material::store(&paths::default_key_material_path(), &material)?;
     log_derivation_outcome("captured account material", &outcome);
-    write_derivation_outcome(&keys_path, outcome)?;
+    write_derivation_outcome(keys_path, outcome)?;
     Ok(keys_path.to_string_lossy().to_string())
 }
 
 fn load_existing_keys(path: &Path) -> Result<DatabaseKeys, String> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DatabaseKeys::new())
-        }
-        Err(error) => {
-            return Err(format!(
-                "Cannot read existing database keys {}: {error}",
-                path.display()
-            ))
-        }
-    };
-    serde_json::from_str(&content)
-        .map_err(|error| format!("Invalid database keys file {}: {error}", path.display()))
+    match database_keys::load_key_file(path) {
+        Ok(keys) => Ok(keys.unwrap_or_default()),
+        Err(error) => match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                log::warn!("Replacing unusable database keys file: {error}");
+                Ok(DatabaseKeys::new())
+            }
+            _ => Err(error),
+        },
+    }
 }
 
 fn log_derivation_outcome(label: &str, outcome: &database_keys::DerivationOutcome) {
@@ -328,9 +321,11 @@ fn write_derivation_outcome(
     path: &Path,
     outcome: database_keys::DerivationOutcome,
 ) -> Result<(), String> {
-    let content = serde_json::to_string_pretty(&outcome.keys)
-        .map_err(|error| format!("Cannot encode database keys: {error}"))?
-        + "\n";
+    let mut content = zeroize::Zeroizing::new(
+        serde_json::to_string_pretty(&outcome.keys)
+            .map_err(|error| format!("Cannot encode database keys: {error}"))?,
+    );
+    content.push('\n');
     write_keys_file(path, &content)
 }
 
@@ -489,11 +484,14 @@ fn wait_child_with_output(
 }
 
 fn write_keys_file(keys_path: &std::path::Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = keys_path.parent() {
+    if let Some(parent) = keys_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         paths::ensure_private_dir(parent)
             .map_err(|e| format!("Cannot create key directory {}: {}", parent.display(), e))?;
     }
-    std::fs::write(keys_path, content)
+    write_private_key_file(keys_path, content)
         .map_err(|e| format!("Cannot write keys file {}: {}", keys_path.display(), e))?;
     restrict_key_file_permissions(keys_path).map_err(|e| {
         format!(
@@ -511,6 +509,36 @@ fn write_keys_file(keys_path: &std::path::Path, content: &str) -> Result<(), Str
 }
 
 #[cfg(unix)]
+fn write_private_key_file(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => restrict_key_file_permissions(path)?,
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "keys path is not a regular file",
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(content.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_private_key_file(path: &Path, content: &str) -> std::io::Result<()> {
+    std::fs::write(path, content)
+}
+
+#[cfg(unix)]
 fn restrict_key_file_permissions(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -520,4 +548,50 @@ fn restrict_key_file_permissions(path: &std::path::Path) -> std::io::Result<()> 
 #[cfg(not(unix))]
 fn restrict_key_file_permissions(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_key_refresh_replaces_malformed_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        std::fs::write(&path, b"not json").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        assert!(load_existing_keys(&path).unwrap().is_empty());
+
+        let directory = dir.path().join("not-a-file");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(load_existing_keys(&directory).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_key_output_preserves_parent_and_creates_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("shared");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = parent.join("keys.json");
+
+        write_keys_file(&path, "{}\n").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }

@@ -4,9 +4,11 @@ use serde_json::{Map, Number, Value as JsonValue};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
 
-use crate::{contact, db, dictionary, media, message, output, parallel, paths};
+use crate::source_store::SourceStore;
+use crate::{contact, db, dictionary, media, message, output, parallel};
 
 const MAX_QUERY_KEYWORDS: usize = 16;
 const MAX_QUERY_KEYWORD_CHARS: usize = 256;
@@ -146,7 +148,7 @@ impl MessageField {
 }
 
 pub(crate) struct QueryOptions<'a> {
-    pub decrypted_dir: &'a Path,
+    pub store: &'a SourceStore,
     pub session: Option<&'a str>,
     pub contains: &'a [String],
     pub not_contains: &'a [String],
@@ -168,7 +170,6 @@ pub(crate) struct QueryOptions<'a> {
 #[derive(Debug, Clone)]
 struct QueryTarget {
     label: String,
-    path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -203,12 +204,12 @@ fn run_messages_with_output<W: Write>(
     validate_message_options(&options)?;
     let context = build_message_context(&options)?;
     if context.targets.is_empty() {
-        return Err("No message databases found. Try 'tg refresh' first.".to_string());
+        return Err("No message databases found in the source directory.".to_string());
     }
 
-    let db_jobs = parallel::job_count(options.jobs, 8);
+    let db_jobs = parallel::job_count(options.jobs, parallel::SOURCE_DB_AUTO_CAP);
     let per_db_rows = parallel::map_ordered(context.targets.clone(), db_jobs, |target| {
-        query_message_target(&target, &context, &options)
+        query_message_target(options.store, &target, &context, &options)
     });
 
     let mut rows = Vec::new();
@@ -313,11 +314,13 @@ fn media_filters_need_post_filtering(options: &QueryOptions<'_>) -> bool {
 }
 
 fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryContext, String> {
-    let (contact_db, message_dbs) = db::find_decrypted_dbs(options.decrypted_dir);
-    let contacts = contact_db
-        .as_ref()
-        .and_then(|path| contact::load_contacts(path).ok())
-        .unwrap_or_default();
+    let message_dbs = db::message_databases(options.store);
+    let contacts = if db::has_database(options.store, "contact/contact.db") {
+        let conn = options.store.open("contact/contact.db")?;
+        contact::load_contacts(&conn)?
+    } else {
+        HashMap::new()
+    };
 
     let mut table_to_session = HashMap::new();
     let mut table_to_display = HashMap::new();
@@ -331,21 +334,13 @@ fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryConte
 
     let selected_table = match options.session {
         Some(session) => {
-            let username = if contacts.is_empty() {
-                db::resolve_username_for_messages(
-                    session,
-                    contact_db.as_deref(),
-                    &message_dbs,
-                    options.jobs,
-                )?
-            } else {
-                db::resolve_username_for_messages_with_contacts(
-                    session,
-                    &contacts,
-                    &message_dbs,
-                    options.jobs,
-                )
-            };
+            let username = db::resolve_username_for_messages(
+                session,
+                &contacts,
+                options.store,
+                &message_dbs,
+                options.jobs,
+            )?;
             let table = db::msg_table_name(&username);
             table_to_session
                 .entry(table.clone())
@@ -360,10 +355,7 @@ fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryConte
 
     let targets = message_dbs
         .into_iter()
-        .map(|path| QueryTarget {
-            label: paths::relative_label(options.decrypted_dir, &path),
-            path,
-        })
+        .map(|label| QueryTarget { label })
         .collect();
 
     Ok(MessageQueryContext {
@@ -376,20 +368,21 @@ fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryConte
 }
 
 fn query_message_target(
+    store: &SourceStore,
     target: &QueryTarget,
     context: &MessageQueryContext,
     options: &QueryOptions<'_>,
 ) -> Result<Vec<MessageRow>, String> {
-    let conn = crate::sqlite::open_immutable(&target.path)?;
+    let conn = store.open(&target.label)?;
     let tables = match &context.selected_table {
         Some(table) => vec![table.clone()],
         None => db::list_message_tables(&conn)?,
     };
 
-    let name2id = db::load_name2id(&conn);
+    let name2id = db::load_name2id(&conn)?;
     let mut rows = Vec::new();
     for table in tables {
-        if !db::message_table_exists(&conn, &table) {
+        if !db::table_exists(&conn, &table)? {
             continue;
         }
         let mut table_rows =
@@ -410,17 +403,17 @@ fn query_message_table(
     let body_col = db::quote_identifier(dictionary::msg_body_column());
     let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
     let sender_col = db::quote_identifier(dictionary::msg_sender_column());
-    let packed_col = if db::table_has_column(conn, table, dictionary::msg_packed_meta_column()) {
+    let packed_col = if db::table_has_column(conn, table, dictionary::msg_packed_meta_column())? {
         db::quote_identifier(dictionary::msg_packed_meta_column())
     } else {
         "x''".to_string()
     };
-    let local_id_col = if db::table_has_column(conn, table, "local_id") {
+    let local_id_col = if db::table_has_column(conn, table, "local_id")? {
         db::quote_identifier("local_id")
     } else {
         "rowid".to_string()
     };
-    let order_col = if db::table_has_column(conn, table, "sort_seq") {
+    let order_col = if db::table_has_column(conn, table, "sort_seq")? {
         "sort_seq"
     } else {
         "create_time"
@@ -490,7 +483,7 @@ fn query_message_table(
     let mapped = stmt
         .query_map(params_from_iter(params.iter()), |row| {
             let marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
-            let raw_body = db::read_message_body(row, 2, marker);
+            let raw_body = db::read_message_body(row, 2, marker)?;
             let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
             let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
             let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
@@ -523,7 +516,9 @@ fn query_message_table(
         .map_err(|e| format!("Message query error in {}: {}", target.label, e))?;
 
     Ok(mapped
-        .filter_map(|row| row.ok())
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Read message rows in {}: {error}", target.label))?
+        .into_iter()
         .filter(|row| message_row_matches_filters(row, options))
         .take(result_window)
         .collect())
@@ -783,12 +778,13 @@ mod tests {
     }
 
     fn default_query_options<'a>(
-        dir: &'a Path,
+        dir: &Path,
         contains: &'a [String],
         not_contains: &'a [String],
     ) -> QueryOptions<'a> {
+        let store = Box::leak(Box::new(SourceStore::from_plaintext(dir).unwrap()));
         QueryOptions {
-            decrypted_dir: dir,
+            store,
             session: None,
             contains,
             not_contains,
@@ -1244,9 +1240,8 @@ mod tests {
     #[test]
     fn message_query_opens_database_read_only() {
         let dir = create_query_test_dir();
-        let path = dir.path().join("message/message_0.db");
-
-        let conn = crate::sqlite::open_immutable(&path).unwrap();
+        let store = SourceStore::from_plaintext(dir.path()).unwrap();
+        let conn = store.open("message/message_0.db").unwrap();
 
         assert!(conn.is_readonly(rusqlite::MAIN_DB).unwrap());
         assert!(conn

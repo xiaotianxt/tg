@@ -1,6 +1,6 @@
 ---
 name: tg
-description: Use when the user wants to read, search, inspect, back up, export, or troubleshoot local macOS Telegram chat history with tg. Keep the user's chat data local and guide them through the shortest working tg command flow.
+description: Use when the user wants to read, search, inspect, back up, export, or troubleshoot local macOS or Linux Telegram chat history with tg. Keep the user's chat data local and guide them through the shortest working tg command flow.
 when_to_use: Trigger for requests mentioning Telegram聊天记录, Telegram聊天, Telegram群, Telegram里, local chat backup, message search, message export, or troubleshooting why local chat history cannot be read.
 ---
 
@@ -18,39 +18,46 @@ Use this skill for user goals like:
 - "把Telegram聊天备份成 json/csv/txt"
 - "为什么本机Telegram聊天记录读不出来"
 
-Do not wait for the user to name tg. tg is the tool; the user goal is local macOS Telegram history access.
+Do not wait for the user to name tg. tg is the tool; the user goal is local desktop Telegram history access.
 
 ## Privacy
 
 Chat data is private. Keep work local by default, avoid printing more message content than the user asked for, and treat exports as sensitive.
 For summary requests, choose display names by the target. If the user clearly names a 1-on-1 person, omit `--anonymous` so the summary uses the user's intended name for that person. If the target is a group chat, a room, a global search, or the target type is unclear, use `--anonymous` whenever the command supports it to avoid exposing personal contact remarks in assistant-visible output and exported sender names.
-`~/.tg/all_keys.json` and `~/.tg/decrypted/` are sensitive local state. `tg refresh` maintains only the decrypted cache; search reuses the upstream FTS and message reads use the source databases' indexes.
+`~/.tg/all_keys.json` and `~/.tg/key_material.bin` are sensitive local state. Read commands open Telegram's encrypted databases directly and never create a decrypted database cache.
 For exhaustive keyword lookup over locally cached messages, prefer `tg query --contains "..." --all-time`; `tg search` is the faster upstream-FTS path and does not cover every message type or nested card body.
 
 ## First Setup
 
-For a fresh setup, ask the user to open and log in to macOS Telegram first.
+For a fresh setup, ask the user to open and log in to the desktop Telegram client first.
 
-If tg needs permission to access the desktop app, have the user quit Telegram and run:
+On macOS, quit Telegram, enable developer tools, sign the app, and restart it:
 
 ```bash
+sudo DevToolsSecurity -enable
 sudo codesign --force --deep --sign - /Applications/Telegram.app
+open -a Telegram
+sudo tg keys --method login --timeout 180
 ```
 
 If Telegram is installed somewhere else, use that `.app` path instead.
 
-Then run:
+On Linux, install GDB and start the same cross-platform login capture:
 
 ```bash
-open -a Telegram
-sudo tg keys --method lldb-login --timeout 180
-tg refresh
+sudo apt install gdb
+sudo tg keys --method login --timeout 180
+```
+
+While `login` is waiting, log out of the account in Telegram and log back in once. Then verify the direct reader:
+
+```bash
 tg sessions --top 50
 tg "联系人" --limit 50
 tg "群名" --limit 50 --anonymous
 ```
 
-While `lldb-login` is waiting, log out of the account in Telegram and log back in once. After the captured account material validates against the local databases, later `tg keys` and `tg refresh --keys` derive keys for new database salts without another attach.
+After the captured account material validates against the local databases, later `tg keys` derives keys for new database salts without another attach.
 
 ## Common Commands
 
@@ -113,11 +120,9 @@ Query safety rules:
 - Use `--session`, `--since`, and a reasonable `--limit` when results could be large.
 - Table output escapes terminal control characters; use `--format json` for machine parsing.
 
-Refresh or diagnose:
+Diagnose:
 
 ```bash
-tg refresh
-tg refresh --keys
 tg doctor
 tg doctor "张三"
 ```
@@ -150,9 +155,10 @@ Date, datetime, and displayed message times use the current system time zone.
 
 ## Troubleshooting
 
-- `Telegram is not running`: open and log in to macOS Telegram, then run `sudo tg keys`.
-- `task_for_pid failed`: quit Telegram, run `sudo codesign --force --deep --sign - /Applications/Telegram.app`, reopen Telegram, then run `sudo tg keys --method lldb-login --timeout 180` and log out/in once while it waits.
-- No chats or messages found: run `tg refresh --keys`, then `tg sessions --top 50`.
+- `Telegram is not running`: open and log in to the desktop Telegram client, then run `sudo tg keys`.
+- macOS `task_for_pid failed`: quit Telegram, sign it as above, reopen it, then run `sudo tg keys --method login --timeout 180` and log out/in once while it waits.
+- Linux attach failure: install GDB, verify ptrace permissions, then run `sudo tg keys --method login --timeout 180`.
+- No chats or messages found: run `sudo tg keys`, then `tg doctor` and `tg sessions --top 50`.
 - Wrong chat matched: use `tg sessions --top 100` and rerun with the exact `tgid_...` or `...@chatroom`.
 - Missing media: open or download it in Telegram first, then retry `tg export CHAT`.
 - Voice export prefers WAV and falls back to native `.voice`; install the Homebrew decoder for playable WAV output.

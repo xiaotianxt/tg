@@ -1,10 +1,179 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::io::Read;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 
+use hmac::{Hmac, KeyInit, Mac};
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha512;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::{decrypt, decrypt::DatabaseKeys, parallel};
+use crate::parallel;
+
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+#[serde(transparent)]
+pub(crate) struct DatabaseKeys(HashMap<String, HashMap<String, String>>);
+
+impl DatabaseKeys {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Deref for DatabaseKeys {
+    type Target = HashMap<String, HashMap<String, String>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for DatabaseKeys {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for DatabaseKeys {
+    fn drop(&mut self) {
+        for fields in self.0.values_mut() {
+            for value in fields.values_mut() {
+                value.zeroize();
+            }
+        }
+    }
+}
+
+const PAGE_SIZE: usize = 4096;
+const SALT_SIZE: usize = 16;
+const IV_SIZE: usize = 16;
+const HMAC_SIZE: usize = 64;
+const RESERVE_SIZE: usize = IV_SIZE + HMAC_SIZE;
+const KEY_SIZE: usize = 32;
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+pub(crate) struct SourceDatabase {
+    pub(crate) rel_path: String,
+    pub(crate) full_path: PathBuf,
+}
+
+pub(crate) fn collect_source_databases(root: &Path) -> Result<Vec<SourceDatabase>, String> {
+    fn walk(root: &Path, dir: &Path, files: &mut Vec<SourceDatabase>) -> Result<(), String> {
+        let dir_label = dir
+            .strip_prefix(root)
+            .ok()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let entries = fs::read_dir(dir)
+            .map_err(|error| format!("Cannot read source directory {dir_label}: {error}"))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("Cannot read source directory entry: {error}"))?;
+            let path = entry.path();
+            let path_label = path
+                .strip_prefix(root)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "<source>".to_string());
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("Cannot inspect source path {path_label}: {error}"))?;
+            if file_type.is_dir() {
+                walk(root, &path, files)?;
+            } else if file_type.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("db")
+            {
+                let rel_path = path
+                    .strip_prefix(root)
+                    .map_err(|error| format!("Cannot label source database: {error}"))?
+                    .to_string_lossy()
+                    .into_owned();
+                files.push(SourceDatabase {
+                    rel_path,
+                    full_path: path,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    if !root.is_dir() {
+        return Err("Source database directory does not exist".to_string());
+    }
+    let mut files = Vec::new();
+    walk(root, root, &mut files)?;
+    files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    Ok(files)
+}
+
+pub(crate) fn read_page1(path: &Path, label: &str) -> Result<[u8; 4096], String> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("Cannot open source database {label}: {error}"))?;
+    let mut page = [0u8; 4096];
+    file.read_exact(&mut page)
+        .map_err(|error| format!("Cannot read page 1 from {label}: {error}"))?;
+    Ok(page)
+}
+
+fn key_bytes_match_page1(key: &[u8], page1: &[u8]) -> bool {
+    if key.len() != KEY_SIZE || page1.len() < PAGE_SIZE {
+        return false;
+    }
+    let salt = &page1[..SALT_SIZE];
+    let mut mac_salt = [0u8; SALT_SIZE];
+    for (output, input) in mac_salt.iter_mut().zip(salt) {
+        *output = *input ^ 0x3a;
+    }
+    let mut mac_key = [0u8; KEY_SIZE];
+    pbkdf2_hmac::<Sha512>(key, &mac_salt, 2, &mut mac_key);
+    let Ok(mut mac) = Hmac::<Sha512>::new_from_slice(&mac_key) else {
+        mac_key.zeroize();
+        return false;
+    };
+    mac_key.zeroize();
+    mac.update(&page1[SALT_SIZE..PAGE_SIZE - RESERVE_SIZE + IV_SIZE]);
+    mac.update(&1u32.to_le_bytes());
+    mac.verify_slice(&page1[PAGE_SIZE - HMAC_SIZE..PAGE_SIZE])
+        .is_ok()
+}
+
+pub(crate) fn load_key_file(path: &Path) -> Result<Option<DatabaseKeys>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect keys file {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "Keys path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "Keys file must not be accessible by group or others: {}",
+                path.display()
+            ));
+        }
+    }
+
+    let bytes = zeroize::Zeroizing::new(
+        fs::read(path)
+            .map_err(|error| format!("Cannot read keys file {}: {error}", path.display()))?,
+    );
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("Invalid keys file {}: {error}", path.display()))
+}
 
 const DATABASE_KDF_ROUNDS: u32 = 256_000;
 
@@ -87,18 +256,18 @@ fn derive_for_sources(
 
     let mut derived_salts = 0;
     for (group, mut key) in derived {
-        let key_hex = hex::encode(key);
+        let key_hex = Zeroizing::new(hex::encode(key));
         let salt_hex = hex::encode(group.salt);
         let mut matched = false;
         for source in group.sources {
-            if !decrypt::key_bytes_match_page1(&key, &source.page1) {
+            if !key_bytes_match_page1(&key, &source.page1) {
                 continue;
             }
             matched = true;
             keys.insert(
                 source.rel_path,
                 HashMap::from([
-                    ("enc_key".to_string(), key_hex.clone()),
+                    ("enc_key".to_string(), key_hex.to_string()),
                     ("salt".to_string(), salt_hex.clone()),
                 ]),
             );
@@ -123,10 +292,15 @@ fn derive_for_sources(
 }
 
 fn valid_existing_key(existing: &DatabaseKeys, source: &EncryptedDatabasePage) -> Option<[u8; 32]> {
-    let key_hex = decrypt::database_key_entry(existing, &source.rel_path)?.get("enc_key")?;
-    let decoded = hex::decode(key_hex).ok()?;
-    let key: [u8; 32] = decoded.try_into().ok()?;
-    decrypt::key_bytes_match_page1(&key, &source.page1).then_some(key)
+    let key_hex = existing.get(&source.rel_path)?.get("enc_key")?;
+    let decoded = Zeroizing::new(hex::decode(key_hex).ok()?);
+    let mut key: [u8; 32] = decoded.as_slice().try_into().ok()?;
+    if key_bytes_match_page1(&key, &source.page1) {
+        Some(key)
+    } else {
+        key.zeroize();
+        None
+    }
 }
 
 pub(crate) fn derive_from_storage(
@@ -156,7 +330,7 @@ pub(crate) fn validates_against_storage(
         let mut salt = [0u8; 16];
         salt.copy_from_slice(salt_bytes);
         let mut key = derive_encryption_key(account_material, &salt);
-        let matches = decrypt::key_bytes_match_page1(&key, &source.page1);
+        let matches = key_bytes_match_page1(&key, &source.page1);
         key.zeroize();
         if matches {
             return Ok(true);
@@ -169,13 +343,15 @@ pub(crate) fn load_encrypted_database_pages(
     db_storage: &std::path::Path,
 ) -> Result<Vec<EncryptedDatabasePage>, String> {
     let mut sources = Vec::new();
-    for source in decrypt::collect_db_files(db_storage) {
-        if let Some(page1) = decrypt::read_encrypted_page1(&source.full_path)? {
-            sources.push(EncryptedDatabasePage {
-                rel_path: source.rel_path,
-                page1,
-            });
+    for source in collect_source_databases(db_storage)? {
+        let page1 = read_page1(&source.full_path, &source.rel_path)?;
+        if &page1[..SQLITE_HEADER.len()] == SQLITE_HEADER {
+            continue;
         }
+        sources.push(EncryptedDatabasePage {
+            rel_path: source.rel_path,
+            page1: page1.to_vec(),
+        });
     }
     Ok(sources)
 }

@@ -2,7 +2,7 @@
   "skills": {
     "tg": {
       "name": "tg",
-      "prompt": "Telegram聊天记录读取工具 tg 已安装。\n\n可用命令：\n  tg keys              # 提取密钥（需 sudo）\n  tg decrypt            # 解密数据库\n  tg sessions           # 列出会话\n  tg messages <会话名>   # 读取消息（支持 --limit --offset --search）\n  tg search <关键词>     # 全文搜索\n  tg export <会话名>     # 导出（--format txt|csv|json）\n\n工作流程：\n1. 确保Telegram正在运行\n2. sudo tg keys → 提取密钥到 all_keys.json\n3. tg decrypt → 解密到 decrypted/\n4. tg sessions → 查看会话列表\n5. tg messages \"联系人\" → 读消息\n\n群聊消息会自动解析 tgid 为联系人昵称。支持 --search 参数在会话内搜索。"
+      "prompt": "Telegram聊天记录读取工具 tg 已安装。\n\n可用命令：\n  tg keys               # 提取密钥（需 sudo）\n  tg sessions           # 列出会话\n  tg unread             # 列出未读会话\n  tg messages <会话名>   # 读取消息（支持 --limit --offset --search）\n  tg search <关键词>     # 上游 FTS 快速搜索\n  tg query ...          # 完整结构化检索\n  tg export <会话名>     # 导出 txt/csv/json 和本地媒体\n  tg doctor [会话名]     # 诊断源库、密钥、WAL 和 FTS\n\n工作流程：\n1. 确保 Telegram 正在运行\n2. sudo tg keys → 提取密钥到 all_keys.json\n3. tg doctor → 验证直接读取加密源库\n4. tg sessions → 查看会话列表\n5. tg messages \"联系人\" → 读消息\n\ntg 直接只读打开 SQLCipher 源数据库，不需要 refresh/decrypt，也不创建解密缓存。群聊消息会自动解析 tgid 为联系人昵称。"
     }
   }
 }

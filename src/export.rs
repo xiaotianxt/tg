@@ -12,6 +12,7 @@ use crate::media;
 use crate::media_index::MediaIndex;
 use crate::message;
 use crate::parallel;
+use crate::source_store::SourceStore;
 use crate::time;
 
 #[derive(Clone, serde::Serialize)]
@@ -52,7 +53,7 @@ struct MediaExportResult {
 }
 
 pub struct MessageExportConfig<'a> {
-    pub decrypted_dir: &'a Path,
+    pub store: &'a SourceStore,
     pub session_query: &'a str,
     pub output_dir: &'a Path,
     pub jobs: usize,
@@ -110,23 +111,21 @@ pub fn export_messages(
     config: MessageExportConfig<'_>,
 ) -> Result<Vec<(&'static str, PathBuf)>, String> {
     let MessageExportConfig {
-        decrypted_dir,
+        store,
         session_query,
         output_dir,
         jobs,
     } = config;
 
-    let (contact_db, message_dbs) = db::find_decrypted_dbs(decrypted_dir);
-    let contact_db_path = contact_db.as_deref();
-
-    // Resolve session username
+    let message_dbs = db::message_databases(store);
+    let contacts = if db::has_database(store, "contact/contact.db") {
+        let conn = store.open("contact/contact.db")?;
+        contact::load_contacts(&conn)?
+    } else {
+        HashMap::new()
+    };
     let username =
-        db::resolve_username_for_messages(session_query, contact_db_path, &message_dbs, jobs)?;
-
-    // Load contacts for display name
-    let contacts = contact_db_path
-        .and_then(|p| contact::load_contacts(p).ok())
-        .unwrap_or_default();
+        db::resolve_username_for_messages(session_query, &contacts, store, &message_dbs, jobs)?;
     let display_name = contacts
         .get(&username)
         .map(|c| c.display_name(contact::DisplayNameMode::PersonalRemark))
@@ -143,14 +142,13 @@ pub fn export_messages(
     let table_name = db::msg_table_name(&username);
     let mut all_messages: Vec<ExportMessage> = Vec::new();
 
-    let db_jobs = parallel::job_count(jobs, 8);
+    let db_jobs = parallel::job_count(jobs, parallel::SOURCE_DB_AUTO_CAP);
     let per_db_messages = parallel::map_ordered(
         message_dbs.clone(),
         db_jobs,
         |db_path| -> Result<Vec<ExportMessage>, String> {
             let mut messages = Vec::new();
-            let conn = crate::sqlite::open_immutable(&db_path)
-                .map_err(|error| format!("Open {}: {error}", db_path.display()))?;
+            let conn = store.open(&db_path)?;
             let table_exists = conn
                 .query_row(
                     "SELECT EXISTS(
@@ -159,9 +157,7 @@ pub fn export_messages(
                     params![&table_name],
                     |row| row.get::<_, bool>(0),
                 )
-                .map_err(|error| {
-                    format!("Check message table in {}: {error}", db_path.display())
-                })?;
+                .map_err(|error| format!("Check message table in {db_path}: {error}"))?;
             if !table_exists {
                 return Ok(messages);
             }
@@ -177,11 +173,11 @@ pub fn export_messages(
 
             let mut stmt = conn
                 .prepare(&sql)
-                .map_err(|error| format!("Prepare messages from {}: {error}", db_path.display()))?;
+                .map_err(|error| format!("Prepare messages from {db_path}: {error}"))?;
             let rows = stmt
                 .query_map([], |row| {
                     let compression_marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
-                    let content = db::read_message_body(row, 2, compression_marker);
+                    let content = db::read_message_body(row, 2, compression_marker)?;
                     let packed_info: Vec<u8> =
                         row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default();
                     Ok((
@@ -192,12 +188,12 @@ pub fn export_messages(
                         packed_info,
                     ))
                 })
-                .map_err(|error| format!("Read messages from {}: {error}", db_path.display()))?;
+                .map_err(|error| format!("Read messages from {db_path}: {error}"))?;
 
             for row in rows {
                 let (local_type, create_time, content, compression_marker, packed_info):
                 ExportMessageRow = row
-                .map_err(|error| format!("Decode message from {}: {error}", db_path.display()))?;
+                .map_err(|error| format!("Decode message from {db_path}: {error}"))?;
                 let time_str = time::format_local_timestamp(create_time);
 
                 let decoded = message::decode_message(
@@ -412,7 +408,7 @@ pub fn export_messages(
         log::warn!("Telegram data directory not found, cached image/video/file export skipped");
     }
 
-    for (index, path) in export_all_voice_messages(decrypted_dir, &username, &mdir, next_index)? {
+    for (index, path) in export_all_voice_messages(store, &username, &mdir, next_index)? {
         out.line(format_args!(
             "  Media #{}: {}",
             index,
@@ -516,12 +512,12 @@ fn record_new_sticker(seen: &mut HashSet<String>, info: &media::StickerInfo) -> 
 }
 
 fn export_all_voice_messages(
-    decrypted_dir: &Path,
+    store: &SourceStore,
     username: &str,
     output_dir: &Path,
     start_index: usize,
 ) -> Result<Vec<(usize, PathBuf)>, String> {
-    if !decrypted_dir.join("message/media_0.db").is_file() {
+    if !db::has_database(store, "message/media_0.db") {
         log::warn!("Voice media database not found; cached voice export skipped");
         return Ok(Vec::new());
     }
@@ -536,7 +532,7 @@ fn export_all_voice_messages(
         }
     };
     export_all_voice_messages_with_decoder(
-        decrypted_dir,
+        store,
         username,
         output_dir,
         start_index,
@@ -545,13 +541,13 @@ fn export_all_voice_messages(
 }
 
 fn export_all_voice_messages_with_decoder(
-    decrypted_dir: &Path,
+    store: &SourceStore,
     username: &str,
     output_dir: &Path,
     start_index: usize,
     decoder: Option<&Path>,
 ) -> Result<Vec<(usize, PathBuf)>, String> {
-    let messages = load_voice_messages(decrypted_dir, username)?;
+    let messages = load_voice_messages(store, username)?;
     let mut paths = Vec::new();
     for (offset, message) in messages.iter().enumerate() {
         let index = start_index + offset;
@@ -747,8 +743,8 @@ fn truncate_for_log(value: &str, max_chars: usize) -> String {
     out
 }
 
-fn load_voice_messages(decrypted_dir: &Path, username: &str) -> Result<Vec<VoiceMessage>, String> {
-    let (conn, chat_name_id) = open_voice_db_for_session(decrypted_dir, username)?;
+fn load_voice_messages(store: &SourceStore, username: &str) -> Result<Vec<VoiceMessage>, String> {
+    let (conn, chat_name_id) = open_voice_db_for_session(store, username)?;
     let Some(chat_name_id) = chat_name_id else {
         return Ok(Vec::new());
     };
@@ -769,15 +765,14 @@ fn load_voice_messages(decrypted_dir: &Path, username: &str) -> Result<Vec<Voice
 }
 
 fn open_voice_db_for_session(
-    decrypted_dir: &Path,
+    store: &SourceStore,
     username: &str,
 ) -> Result<(Connection, Option<i64>), String> {
-    let media_db = decrypted_dir.join("message/media_0.db");
-    if !media_db.is_file() {
-        return Err(format!("Media database not found: {}", media_db.display()));
+    if !db::has_database(store, "message/media_0.db") {
+        return Err("Media database not found".to_string());
     }
 
-    let conn = crate::sqlite::open_immutable(&media_db)?;
+    let conn = store.open("message/media_0.db")?;
     let chat_name_id: Option<i64> = conn
         .query_row(
             "SELECT rowid FROM Name2Id WHERE user_name = ?1",
@@ -1022,6 +1017,23 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::{tempdir, TempDir};
 
+    fn export_all_voice_messages_with_decoder(
+        root: &Path,
+        username: &str,
+        output_dir: &Path,
+        start_index: usize,
+        decoder: Option<&Path>,
+    ) -> Result<Vec<(usize, PathBuf)>, String> {
+        let store = SourceStore::from_plaintext(root)?;
+        super::export_all_voice_messages_with_decoder(
+            &store,
+            username,
+            output_dir,
+            start_index,
+            decoder,
+        )
+    }
+
     fn packed_file(filename: &str) -> Vec<u8> {
         let mut inner = vec![8, 0, 18, filename.len() as u8];
         inner.extend_from_slice(filename.as_bytes());
@@ -1196,8 +1208,9 @@ mod tests {
     fn export_messages_writes_complete_chronological_archive() {
         let decrypted = create_export_decrypted_dir();
         let output = tempdir().unwrap();
+        let store = SourceStore::from_plaintext(decrypted.path()).unwrap();
         let results = export_messages(MessageExportConfig {
-            decrypted_dir: decrypted.path(),
+            store: &store,
             session_query: "tgid_export",
             output_dir: output.path(),
             jobs: 1,
@@ -1229,9 +1242,10 @@ mod tests {
         let decrypted = create_export_decrypted_dir();
         Connection::open(decrypted.path().join("message/message_1.db")).unwrap();
         let output = tempdir().unwrap();
+        let store = SourceStore::from_plaintext(decrypted.path()).unwrap();
 
         let results = export_messages(MessageExportConfig {
-            decrypted_dir: decrypted.path(),
+            store: &store,
             session_query: "tgid_export",
             output_dir: output.path(),
             jobs: 1,
@@ -1258,9 +1272,10 @@ mod tests {
         )
         .unwrap();
         let output = tempdir().unwrap();
+        let store = SourceStore::from_plaintext(decrypted.path()).unwrap();
 
         let error = export_messages(MessageExportConfig {
-            decrypted_dir: decrypted.path(),
+            store: &store,
             session_query: "tgid_export",
             output_dir: output.path(),
             jobs: 1,

@@ -1,64 +1,42 @@
 use md5::{Digest, Md5};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 
 use crate::contact::{self, Contact, DisplayNameMode};
 use crate::dictionary;
 use crate::fts;
 use crate::message;
 use crate::parallel;
+use crate::source_store::SourceStore;
 use crate::time;
 
-/// Find decrypted databases.
-pub(crate) fn find_decrypted_dbs(decrypted_dir: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
-    let contact_db = find_decrypted_contact_db(decrypted_dir);
+const CONTACT_DB: &str = "contact/contact.db";
+const SESSION_DB: &str = "session/session.db";
+const MESSAGE_FTS_DB: &str = "message/message_fts.db";
 
-    // Find message databases
-    let msg_dir = decrypted_dir.join("message");
-    let mut message_dbs = Vec::new();
-    if msg_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&msg_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("db") {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if is_message_db_name(name) {
-                        message_dbs.push(path);
-                    }
-                }
-            }
-        }
-    }
-    message_dbs.sort();
-
-    (contact_db, message_dbs)
+pub(crate) fn has_database(store: &SourceStore, relative_path: &str) -> bool {
+    store.databases().any(|path| path == relative_path)
 }
 
-pub(crate) fn find_decrypted_contact_db(decrypted_dir: &Path) -> Option<PathBuf> {
-    let contact_db = decrypted_dir.join("contact/contact.db");
-    if contact_db.exists() {
-        return Some(contact_db);
-    }
-
-    decrypted_dir
-        .parent()
-        .map(|p| p.join("decrypted/contact/contact.db"))
-        .filter(|p| p.exists())
+pub(crate) fn message_databases(store: &SourceStore) -> Vec<String> {
+    store
+        .databases()
+        .filter(|path| {
+            path.strip_prefix("message/")
+                .is_some_and(is_message_db_name)
+        })
+        .map(str::to_string)
+        .collect()
 }
 
-pub(crate) fn find_decrypted_session_db(decrypted_dir: &Path) -> Option<PathBuf> {
-    let session_db = decrypted_dir.join("session/session.db");
-    if session_db.exists() {
-        return Some(session_db);
-    }
-
-    decrypted_dir
-        .parent()
-        .map(|p| p.join("decrypted/session/session.db"))
-        .filter(|p| p.exists())
+fn open_optional_database(
+    store: &SourceStore,
+    relative_path: &str,
+) -> Result<Option<Connection>, String> {
+    has_database(store, relative_path)
+        .then(|| store.open(relative_path))
+        .transpose()
 }
 
 pub(crate) fn is_message_db_name(name: &str) -> bool {
@@ -187,20 +165,24 @@ pub(crate) fn quote_identifier(name: &str) -> String {
     quoted
 }
 
-pub(crate) fn table_has_column(conn: &Connection, table_name: &str, column_name: &str) -> bool {
+pub(crate) fn table_has_column(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, String> {
     let sql = format!("PRAGMA table_info({})", quote_identifier(table_name));
-    let Ok(mut stmt) = conn.prepare(&sql) else {
-        return false;
-    };
-    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else {
-        return false;
-    };
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| format!("Inspect columns of {table_name}: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("Read columns of {table_name}: {error}"))?;
     for row in rows {
-        if row.ok().is_some_and(|name| name == column_name) {
-            return true;
+        if row.map_err(|error| format!("Read column of {table_name}: {error}"))? == column_name {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 pub(crate) fn list_message_tables(conn: &Connection) -> Result<Vec<String>, String> {
@@ -210,82 +192,97 @@ pub(crate) fn list_message_tables(conn: &Connection) -> Result<Vec<String>, Stri
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| format!("Cannot read message table names: {}", e))?;
-    Ok(rows.filter_map(|row| row.ok()).collect())
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Read message table name: {error}"))
 }
 
-pub(crate) fn message_table_exists(conn: &Connection, table_name: &str) -> bool {
-    conn.prepare(&format!(
-        "SELECT 1 FROM {} LIMIT 1",
-        quote_identifier(table_name)
-    ))
-    .is_ok()
+pub(crate) fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
+        )",
+        [table_name],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("Check table {table_name}: {error}"))
 }
 
-pub(crate) fn load_name2id(conn: &Connection) -> HashMap<i64, String> {
-    match conn.prepare("SELECT rowid, user_name FROM Name2Id") {
-        Ok(mut stmt) => stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|row| row.ok()).collect())
-            .unwrap_or_default(),
-        Err(_) => HashMap::new(),
+pub(crate) fn load_name2id(conn: &Connection) -> Result<HashMap<i64, String>, String> {
+    if !table_exists(conn, "Name2Id")? {
+        return Ok(HashMap::new());
     }
+    let mut stmt = conn
+        .prepare("SELECT rowid, user_name FROM Name2Id")
+        .map_err(|error| format!("Prepare Name2Id: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("Read Name2Id: {error}"))?;
+    rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+        .map_err(|error| format!("Read Name2Id row: {error}"))
 }
 
 pub(crate) fn read_message_body(
     row: &rusqlite::Row<'_>,
     index: usize,
     marker: Option<i64>,
-) -> String {
+) -> rusqlite::Result<String> {
     if marker == Some(4) {
-        if let Ok(bytes) = row.get::<_, Vec<u8>>(index) {
-            return message::try_decompress(&bytes).unwrap_or_default();
-        }
+        let bytes = row.get::<_, Vec<u8>>(index)?;
+        return Ok(message::try_decompress(&bytes).unwrap_or_default());
     }
 
     match row.get::<_, Option<String>>(index) {
-        Ok(Some(value)) => value,
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Ok(String::new()),
         _ => match row.get::<_, Option<Vec<u8>>>(index) {
-            Ok(Some(bytes)) => String::from_utf8(bytes).unwrap_or_default(),
-            _ => String::new(),
+            Ok(Some(bytes)) => Ok(String::from_utf8(bytes).unwrap_or_default()),
+            Ok(None) => Ok(String::new()),
+            Err(error) => Err(error),
         },
     }
 }
 
 /// List chat sessions.
 pub fn list_sessions(
-    decrypted_dir: &Path,
+    store: &SourceStore,
     top_n: usize,
     query: Option<&str>,
 ) -> Result<SessionListRows, String> {
-    let contact_db = find_decrypted_contact_db(decrypted_dir);
-    let contacts = match contact_db {
-        Some(path) => contact::load_contacts(&path).unwrap_or_default(),
+    let contact_conn = open_optional_database(store, CONTACT_DB)?;
+    let contacts = match contact_conn.as_ref() {
+        Some(conn) => contact::load_contacts(conn)?,
         None => HashMap::new(),
     };
-    let session_db = find_decrypted_session_db(decrypted_dir)
-        .ok_or_else(|| "Session database not found. Try 'tg refresh' first.".to_string())?;
-    list_sessions_from_session_db(&session_db, &contacts, top_n, query, SessionDbListMode::All)
+    let session_conn = store
+        .open(SESSION_DB)
+        .map_err(|error| format!("Session database is unavailable: {error}"))?;
+    list_sessions_from_connection(
+        &session_conn,
+        &contacts,
+        top_n,
+        query,
+        SessionDbListMode::All,
+    )
 }
 
 /// List unread chat sessions from the session database.
 pub fn list_unread_sessions(
-    decrypted_dir: &Path,
+    store: &SourceStore,
     top_n: usize,
     query: Option<&str>,
 ) -> Result<SessionListRows, String> {
-    let contact_db = find_decrypted_contact_db(decrypted_dir);
-    let contacts = match &contact_db {
-        Some(path) => contact::load_contacts(path).unwrap_or_default(),
+    let contact_conn = open_optional_database(store, CONTACT_DB)?;
+    let contacts = match contact_conn.as_ref() {
+        Some(conn) => contact::load_contacts(conn)?,
         None => HashMap::new(),
     };
-
-    let session_db = find_decrypted_session_db(decrypted_dir)
-        .ok_or_else(|| "Session database not found. Try 'tg refresh' first.".to_string())?;
-    list_sessions_from_session_db(
-        &session_db,
+    let session_conn = store
+        .open(SESSION_DB)
+        .map_err(|error| format!("Session database is unavailable: {error}"))?;
+    list_sessions_from_connection(
+        &session_conn,
         &contacts,
         top_n,
         query,
@@ -293,14 +290,13 @@ pub fn list_unread_sessions(
     )
 }
 
-fn list_sessions_from_session_db(
-    session_db: &Path,
+fn list_sessions_from_connection(
+    conn: &Connection,
     contacts: &HashMap<String, Contact>,
     top_n: usize,
     query: Option<&str>,
     mode: SessionDbListMode,
 ) -> Result<SessionListRows, String> {
-    let conn = crate::sqlite::open_immutable(session_db)?;
     let sql = format!(
         "SELECT username,
                 COALESCE(unread_count, 0),
@@ -486,23 +482,23 @@ fn session_match_info(
 
 /// Read messages from a specific session.
 pub fn read_messages(
-    decrypted_dir: &Path,
+    store: &SourceStore,
     options: ReadMessagesOptions<'_>,
 ) -> Result<usize, String> {
-    let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
-
+    let message_dbs = message_databases(store);
+    let contact_conn = open_optional_database(store, CONTACT_DB)?;
+    let contacts = match contact_conn.as_ref() {
+        Some(conn) => contact::load_contacts(conn)?,
+        None => HashMap::new(),
+    };
     let username = resolve_username_for_messages(
         options.session_query,
-        contact_db.as_deref(),
+        &contacts,
+        store,
         &message_dbs,
         options.jobs,
     )?;
     let table_name = msg_table_name(&username);
-
-    let contacts = contact_db
-        .as_ref()
-        .and_then(|p| contact::load_contacts(p).ok())
-        .unwrap_or_default();
 
     let display_name = contacts
         .get(&username)
@@ -511,10 +507,10 @@ pub fn read_messages(
         .to_string();
 
     let room_member_names = if options.name_mode == DisplayNameMode::Anonymous {
-        contact_db
-            .as_ref()
-            .and_then(|p| contact::load_chat_room_member_names(p, &username).ok())
-            .unwrap_or_default()
+        match contact_conn.as_ref() {
+            Some(conn) => contact::load_chat_room_member_names(conn, &username)?,
+            None => HashMap::new(),
+        }
     } else {
         HashMap::new()
     };
@@ -531,39 +527,38 @@ pub fn read_messages(
         .unwrap_or_default();
 
     let query_limit = query_window_limit(options.limit, options.offset, options.tail);
-    let db_jobs = parallel::job_count(options.jobs, 8);
-    let per_db_messages = parallel::map_ordered(message_dbs.clone(), db_jobs, |db_path| {
-        let mut rows: Vec<MessageRow> = Vec::new();
-        let conn = match crate::sqlite::open_immutable(&db_path) {
-            Ok(c) => c,
-            Err(_) => return rows,
-        };
+    let db_jobs = parallel::job_count(options.jobs, parallel::SOURCE_DB_AUTO_CAP);
+    let per_db_messages = parallel::map_ordered(
+        message_dbs,
+        db_jobs,
+        |db_path| -> Result<Vec<MessageRow>, String> {
+            let conn = store.open(&db_path)?;
 
-        let table = quote_identifier(&table_name);
-        if !message_table_exists(&conn, &table_name) {
-            return rows;
-        }
+            let table = quote_identifier(&table_name);
+            if !table_exists(&conn, &table_name)? {
+                return Ok(Vec::new());
+            }
 
-        let name2id = load_name2id(&conn);
+            let name2id = load_name2id(&conn)?;
 
-        let order_dir = if options.tail { "DESC" } else { "ASC" };
+            let order_dir = if options.tail { "DESC" } else { "ASC" };
 
-        // Query messages - collect eagerly to avoid borrow issues
-        let body_col = quote_identifier(dictionary::msg_body_column());
-        let marker_col = quote_identifier(dictionary::msg_compression_marker_column());
-        let sender_col = quote_identifier(dictionary::msg_sender_column());
-        let packed_col = quote_identifier(dictionary::msg_packed_meta_column());
-        let local_id_col = if table_has_column(&conn, &table_name, "local_id") {
-            quote_identifier("local_id")
-        } else {
-            "NULL".to_string()
-        };
-        let order_col = if table_has_column(&conn, &table_name, "sort_seq") {
-            "sort_seq"
-        } else {
-            "create_time"
-        };
-        let sql = format!(
+            // Query messages - collect eagerly to avoid borrow issues
+            let body_col = quote_identifier(dictionary::msg_body_column());
+            let marker_col = quote_identifier(dictionary::msg_compression_marker_column());
+            let sender_col = quote_identifier(dictionary::msg_sender_column());
+            let packed_col = quote_identifier(dictionary::msg_packed_meta_column());
+            let local_id_col = if table_has_column(&conn, &table_name, "local_id")? {
+                quote_identifier("local_id")
+            } else {
+                "NULL".to_string()
+            };
+            let order_col = if table_has_column(&conn, &table_name, "sort_seq")? {
+                "sort_seq"
+            } else {
+                "create_time"
+            };
+            let sql = format!(
             "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col} \
              FROM {table_name} WHERE create_time > 0{search_clause}{since_clause} ORDER BY {order_col} {order_dir}{limit_clause}",
             local_id_col = local_id_col,
@@ -580,42 +575,38 @@ pub fn read_messages(
                 .map(|n| format!(" LIMIT {}", n))
                 .unwrap_or_default()
         );
-        rows = match conn.prepare(&sql) {
-            Ok(mut stmt) => {
-                let map_row = |row: &rusqlite::Row<'_>| {
-                    let compression_marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
-                    let content = read_message_body(row, 3, compression_marker);
-                    let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
-                    let sender_account_id = name2id.get(&sender_id).cloned().unwrap_or_default();
-                    let packed_info: Vec<u8> =
-                        row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
-                    Ok(MessageRow {
-                        local_id: row.get::<_, Option<i64>>(0)?,
-                        local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
-                        create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                        content,
-                        compression_marker,
-                        sender_account_id,
-                        packed_info,
-                    })
-                };
-                let rows = match &search_pattern {
-                    Some(pattern) => stmt.query_map(params![pattern], map_row),
-                    None => stmt.query_map([], map_row),
-                };
-                match rows {
-                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                    Err(_) => vec![],
-                }
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|error| format!("Prepare messages from {db_path}: {error}"))?;
+            let map_row = |row: &rusqlite::Row<'_>| {
+                let compression_marker: Option<i64> = row.get::<_, Option<i64>>(4)?;
+                let content = read_message_body(row, 3, compression_marker)?;
+                let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
+                let sender_account_id = name2id.get(&sender_id).cloned().unwrap_or_default();
+                let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
+                Ok(MessageRow {
+                    local_id: row.get::<_, Option<i64>>(0)?,
+                    local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
+                    create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    content,
+                    compression_marker,
+                    sender_account_id,
+                    packed_info,
+                })
+            };
+            let rows = match &search_pattern {
+                Some(pattern) => stmt.query_map(params![pattern], map_row),
+                None => stmt.query_map([], map_row),
             }
-            Err(_) => vec![],
-        };
-        rows
-    });
+            .map_err(|error| format!("Query messages from {db_path}: {error}"))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| format!("Read messages from {db_path}: {error}"))
+        },
+    );
 
     let mut all_messages = Vec::new();
     for rows in per_db_messages {
-        all_messages.extend(rows);
+        all_messages.extend(rows?);
     }
 
     if options.tail {
@@ -750,43 +741,50 @@ fn query_window_limit(limit: Option<usize>, offset: usize, tail: bool) -> Option
 }
 
 pub(crate) fn probe_session(
-    decrypted_dir: &Path,
+    store: &SourceStore,
     session_query: &str,
     jobs: usize,
 ) -> Result<SessionProbe, String> {
-    let (contact_db, message_dbs) = find_decrypted_dbs(decrypted_dir);
+    let message_dbs = message_databases(store);
+    let contact_conn = open_optional_database(store, CONTACT_DB)?;
+    let contacts = match contact_conn.as_ref() {
+        Some(conn) => contact::load_contacts(conn)?,
+        None => HashMap::new(),
+    };
     let username =
-        resolve_username_for_messages(session_query, contact_db.as_deref(), &message_dbs, jobs)?;
+        resolve_username_for_messages(session_query, &contacts, store, &message_dbs, jobs)?;
     let table_name = msg_table_name(&username);
-    let contacts = contact_db
-        .as_ref()
-        .and_then(|p| contact::load_contacts(p).ok())
-        .unwrap_or_default();
     let display_name = contacts
         .get(&username)
         .map(|contact| contact.personal_display_name().to_string())
         .unwrap_or_else(|| username.clone());
 
-    let db_jobs = parallel::job_count(jobs, 8);
-    let per_db_counts = parallel::map_ordered(message_dbs, db_jobs, |db_path| {
-        let conn = match crate::sqlite::open_immutable(&db_path) {
-            Ok(conn) => conn,
-            Err(_) => return None,
-        };
-        let sql = format!(
-            "SELECT COUNT(*) FROM {} WHERE create_time > 0",
-            quote_identifier(&table_name)
-        );
-        conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
-            .ok()
-            .map(|count| count.max(0) as usize)
-    });
+    let db_jobs = parallel::job_count(jobs, parallel::SOURCE_DB_AUTO_CAP);
+    let per_db_counts = parallel::map_ordered(
+        message_dbs,
+        db_jobs,
+        |db_path| -> Result<Option<usize>, String> {
+            let conn = store.open(&db_path)?;
+            if !table_exists(&conn, &table_name)? {
+                return Ok(None);
+            }
+            let sql = format!(
+                "SELECT COUNT(*) FROM {} WHERE create_time > 0",
+                quote_identifier(&table_name)
+            );
+            conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+                .map(|count| Some(count.max(0) as usize))
+                .map_err(|error| format!("Count messages in {db_path}: {error}"))
+        },
+    );
 
     let mut matching_dbs = 0usize;
     let mut message_count = 0usize;
-    for count in per_db_counts.into_iter().flatten() {
-        matching_dbs += 1;
-        message_count += count;
+    for count in per_db_counts {
+        if let Some(count) = count? {
+            matching_dbs += 1;
+            message_count += count;
+        }
     }
 
     Ok(SessionProbe {
@@ -800,16 +798,15 @@ pub(crate) fn probe_session(
 
 /// Search across all sessions.
 pub fn search_messages(
-    decrypted_dir: &Path,
+    store: &SourceStore,
     options: SearchMessagesOptions<'_>,
 ) -> Result<usize, String> {
-    let contact_db = find_decrypted_contact_db(decrypted_dir);
-    let contacts = contact_db
-        .as_ref()
-        .and_then(|p| contact::load_contacts(p).ok())
-        .unwrap_or_default();
-    let (displayed, has_more, results) =
-        search_messages_with_telegram_fts(decrypted_dir, &options)?;
+    let contact_conn = open_optional_database(store, CONTACT_DB)?;
+    let contacts = match contact_conn.as_ref() {
+        Some(conn) => contact::load_contacts(conn)?,
+        None => HashMap::new(),
+    };
+    let (displayed, has_more, results) = search_messages_with_fts(store, &options)?;
 
     print_search_results(
         options.query,
@@ -821,22 +818,16 @@ pub fn search_messages(
     )
 }
 
-fn search_messages_with_telegram_fts(
-    decrypted_dir: &Path,
+fn search_messages_with_fts(
+    store: &SourceStore,
     options: &SearchMessagesOptions<'_>,
 ) -> Result<(usize, bool, Vec<SearchRow>), String> {
-    let fts_db = find_message_fts_db(decrypted_dir).ok_or_else(|| {
-        "Message search index is unavailable. Run 'tg refresh'; use 'tg query' for exhaustive lookup."
-            .to_string()
-    })?;
-    let conn = crate::sqlite::open_immutable(&fts_db)
-        .map_err(|error| format!("Open message search index {}: {}", fts_db.display(), error))?;
+    let conn = store
+        .open(MESSAGE_FTS_DB)
+        .map_err(|error| format!("Message search index is unavailable: {error}"))?;
     let content_tables = telegram_fts_content_tables(&conn)?;
     if content_tables.is_empty() {
-        return Err(format!(
-            "Message search index {} has no supported FTS tables. Run 'tg refresh'.",
-            fts_db.display()
-        ));
+        return Err("Message search index has no supported FTS tables".to_string());
     }
 
     let name2id = load_fts_name2id(&conn)?;
@@ -1013,18 +1004,6 @@ fn print_search_results(
     Ok(displayed)
 }
 
-pub(crate) fn find_message_fts_db(decrypted_dir: &Path) -> Option<PathBuf> {
-    let path = decrypted_dir.join("message/message_fts.db");
-    if path.exists() {
-        return Some(path);
-    }
-
-    decrypted_dir
-        .parent()
-        .map(|p| p.join("decrypted/message/message_fts.db"))
-        .filter(|p| p.exists())
-}
-
 fn telegram_fts_content_tables(conn: &Connection) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare(
@@ -1115,26 +1094,9 @@ fn truncate_preview(content: &str, max_chars: usize) -> String {
 
 pub(crate) fn resolve_username_for_messages(
     query: &str,
-    contact_db: Option<&Path>,
-    message_dbs: &[PathBuf],
-    jobs: usize,
-) -> Result<String, String> {
-    resolve_username_with_context(query, contact_db, Some(message_dbs), jobs)
-}
-
-pub(crate) fn resolve_username_for_messages_with_contacts(
-    query: &str,
     contacts: &HashMap<String, Contact>,
-    message_dbs: &[PathBuf],
-    jobs: usize,
-) -> String {
-    resolve_username_from_contacts(query, contacts, Some(message_dbs), jobs)
-}
-
-fn resolve_username_with_context(
-    query: &str,
-    contact_db: Option<&Path>,
-    message_dbs: Option<&[PathBuf]>,
+    store: &SourceStore,
+    message_dbs: &[String],
     jobs: usize,
 ) -> Result<String, String> {
     let query = query.trim();
@@ -1150,49 +1112,38 @@ fn resolve_username_with_context(
         return Ok(query.to_string());
     }
 
-    let contact_db = match contact_db {
-        Some(p) => p,
-        None => return Ok(query.to_string()),
-    };
-
-    let contacts = contact::load_contacts(contact_db)?;
-
-    Ok(resolve_username_from_contacts(
-        query,
-        &contacts,
-        message_dbs,
-        jobs,
-    ))
+    resolve_username_from_contacts(query, contacts, store, Some(message_dbs), jobs)
 }
 
 fn resolve_username_from_contacts(
     query: &str,
     contacts: &HashMap<String, Contact>,
-    message_dbs: Option<&[PathBuf]>,
+    store: &SourceStore,
+    message_dbs: Option<&[String]>,
     jobs: usize,
-) -> String {
+) -> Result<String, String> {
     let query = query.trim();
     if query.is_empty() {
-        return query.to_string();
+        return Ok(query.to_string());
     }
 
     if query.starts_with(dictionary::account_id_prefix())
         || query.starts_with("gh_")
         || query.contains("@chatroom")
     {
-        return query.to_string();
+        return Ok(query.to_string());
     }
 
     // Try exact username match
     if let Some(c) = contacts.get(query) {
-        return c.username.clone();
+        return Ok(c.username.clone());
     }
 
     if let Some(username) = unique_exact_direct_username(contacts, query) {
-        return username;
+        return Ok(username);
     }
 
-    let candidates = contact_match_candidates(contacts, query, message_dbs, jobs);
+    let candidates = contact_match_candidates(contacts, query, store, message_dbs, jobs)?;
     if let Some(best) = candidates.first() {
         if candidates.len() > 1 || best.score < EXACT_MATCH_SCORE {
             log::info!(
@@ -1221,12 +1172,12 @@ fn resolve_username_from_contacts(
                 );
             }
         }
-        return best.contact.username.clone();
+        return Ok(best.contact.username.clone());
     }
 
     // No contact match. Treat the input as a raw username so callers can still
     // read sessions whose contact row is missing.
-    query.to_string()
+    Ok(query.to_string())
 }
 
 const EXACT_MATCH_SCORE: i64 = 400;
@@ -1257,9 +1208,10 @@ struct ContactMatch<'a> {
 fn contact_match_candidates<'a>(
     contacts: &'a HashMap<String, Contact>,
     query: &str,
-    message_dbs: Option<&[PathBuf]>,
+    store: &SourceStore,
+    message_dbs: Option<&[String]>,
     jobs: usize,
-) -> Vec<ContactMatch<'a>> {
+) -> Result<Vec<ContactMatch<'a>>, String> {
     let mut candidates: Vec<_> = contacts
         .values()
         .filter_map(|contact| {
@@ -1284,7 +1236,7 @@ fn contact_match_candidates<'a>(
 
     if let Some(message_dbs) = message_dbs {
         let latest_by_username =
-            latest_message_times_for_candidates(message_dbs, &candidates, jobs);
+            latest_message_times_for_candidates(store, message_dbs, &candidates, jobs)?;
         for candidate in &mut candidates {
             candidate.latest_message_time =
                 latest_by_username.get(&candidate.contact.username).copied();
@@ -1309,7 +1261,7 @@ fn contact_match_candidates<'a>(
             })
             .then_with(|| a.contact.username.cmp(&b.contact.username))
     });
-    candidates
+    Ok(candidates)
 }
 
 fn unique_exact_direct_username(
@@ -1498,10 +1450,35 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
 }
 
 fn latest_message_times_for_candidates(
-    message_dbs: &[PathBuf],
+    store: &SourceStore,
+    message_dbs: &[String],
     candidates: &[ContactMatch<'_>],
     jobs: usize,
-) -> HashMap<String, i64> {
+) -> Result<HashMap<String, i64>, String> {
+    if candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
+    if has_database(store, SESSION_DB) {
+        let conn = store.open(SESSION_DB)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT MAX(COALESCE(last_timestamp, 0), COALESCE(sort_timestamp, 0))
+                 FROM SessionTable WHERE username = ?1",
+            )
+            .map_err(|error| format!("Prepare session activity lookup: {error}"))?;
+        let mut latest = HashMap::new();
+        for candidate in candidates {
+            let timestamp = stmt
+                .query_row([&candidate.contact.username], |row| row.get::<_, i64>(0))
+                .optional()
+                .map_err(|error| format!("Read session activity: {error}"))?;
+            if let Some(timestamp) = timestamp.filter(|timestamp| *timestamp > 0) {
+                latest.insert(candidate.contact.username.clone(), timestamp);
+            }
+        }
+        return Ok(latest);
+    }
+
     let table_to_username: HashMap<String, String> = candidates
         .iter()
         .map(|candidate| {
@@ -1513,39 +1490,44 @@ fn latest_message_times_for_candidates(
         .collect();
     let mut latest_by_username: HashMap<String, i64> = HashMap::new();
 
-    let db_jobs = parallel::job_count(jobs, 8);
-    let per_db_latest = parallel::map_ordered(message_dbs.to_vec(), db_jobs, |db_path| {
-        let mut latest_by_username: HashMap<String, i64> = HashMap::new();
-        let conn = match crate::sqlite::open_immutable(&db_path) {
-            Ok(c) => c,
-            Err(_) => return latest_by_username,
-        };
+    let db_jobs = parallel::job_count(jobs, parallel::SOURCE_DB_AUTO_CAP);
+    let per_db_latest = parallel::map_ordered(
+        message_dbs.to_vec(),
+        db_jobs,
+        |db_path| -> Result<HashMap<String, i64>, String> {
+            let mut latest_by_username: HashMap<String, i64> = HashMap::new();
+            let conn = store.open(&db_path)?;
 
-        let tables = list_message_tables(&conn).unwrap_or_default();
+            let tables = list_message_tables(&conn)?;
 
-        for table_name in tables {
-            let username = match table_to_username.get(&table_name) {
-                Some(username) => username,
-                None => continue,
-            };
-            let sql = format!(
-                "SELECT MAX(create_time) FROM {} WHERE create_time > 0",
-                quote_identifier(&table_name)
-            );
-            if let Ok(mut stmt) = conn.prepare(&sql) {
-                if let Ok(Some(ts)) = stmt.query_row([], |row| row.get::<_, Option<i64>>(0)) {
+            for table_name in tables {
+                let username = match table_to_username.get(&table_name) {
+                    Some(username) => username,
+                    None => continue,
+                };
+                let sql = format!(
+                    "SELECT MAX(create_time) FROM {} WHERE create_time > 0",
+                    quote_identifier(&table_name)
+                );
+                let mut stmt = conn.prepare(&sql).map_err(|error| {
+                    format!("Prepare latest-message query in {db_path}: {error}")
+                })?;
+                if let Some(ts) = stmt
+                    .query_row([], |row| row.get::<_, Option<i64>>(0))
+                    .map_err(|error| format!("Read latest message in {db_path}: {error}"))?
+                {
                     let entry = latest_by_username.entry(username.clone()).or_insert(ts);
                     if ts > *entry {
                         *entry = ts;
                     }
                 }
-            };
-        }
-        latest_by_username
-    });
+            }
+            Ok(latest_by_username)
+        },
+    );
 
     for db_latest in per_db_latest {
-        for (username, ts) in db_latest {
+        for (username, ts) in db_latest? {
             let entry = latest_by_username.entry(username).or_insert(ts);
             if ts > *entry {
                 *entry = ts;
@@ -1553,7 +1535,7 @@ fn latest_message_times_for_candidates(
         }
     }
 
-    latest_by_username
+    Ok(latest_by_username)
 }
 
 fn format_match_time(timestamp: i64) -> String {
@@ -1577,7 +1559,58 @@ fn find_username_by_table(contacts: &HashMap<String, Contact>, table_name: &str)
 mod tests {
     use super::*;
     use rusqlite::params;
+    use std::path::{Path, PathBuf};
     use tempfile::{tempdir, TempDir};
+
+    fn list_sessions(
+        root: &Path,
+        top_n: usize,
+        query: Option<&str>,
+    ) -> Result<SessionListRows, String> {
+        let store = SourceStore::from_plaintext(root)?;
+        super::list_sessions(&store, top_n, query)
+    }
+
+    fn list_unread_sessions(
+        root: &Path,
+        top_n: usize,
+        query: Option<&str>,
+    ) -> Result<SessionListRows, String> {
+        let store = SourceStore::from_plaintext(root)?;
+        super::list_unread_sessions(&store, top_n, query)
+    }
+
+    fn read_messages(root: &Path, options: ReadMessagesOptions<'_>) -> Result<usize, String> {
+        let store = SourceStore::from_plaintext(root)?;
+        super::read_messages(&store, options)
+    }
+
+    fn search_messages(root: &Path, options: SearchMessagesOptions<'_>) -> Result<usize, String> {
+        let store = SourceStore::from_plaintext(root)?;
+        super::search_messages(&store, options)
+    }
+
+    fn load_contacts(path: &Path) -> HashMap<String, Contact> {
+        let conn = Connection::open(path).unwrap();
+        contact::load_contacts(&conn).unwrap()
+    }
+
+    fn resolve_username_for_test(
+        query: &str,
+        contact_db: &Path,
+        message_db: Option<&Path>,
+        jobs: usize,
+    ) -> Result<String, String> {
+        let contacts = load_contacts(contact_db);
+        let paths = message_db
+            .map(|path| vec![("message_0.db".to_string(), path.to_path_buf())])
+            .unwrap_or_default();
+        let store = SourceStore::from_plaintext_paths(paths);
+        let labels = message_db
+            .map(|_| vec!["message_0.db".to_string()])
+            .unwrap_or_default();
+        super::resolve_username_for_messages(query, &contacts, &store, &labels, jobs)
+    }
 
     fn create_contact_db(rows: &[(&str, &str, &str, &str)]) -> (TempDir, PathBuf) {
         let dir = tempdir().unwrap();
@@ -1806,6 +1839,24 @@ mod tests {
     }
 
     #[test]
+    fn malformed_identity_and_body_rows_fail_closed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE Name2Id(user_name INTEGER)", [])
+            .unwrap();
+        conn.execute("INSERT INTO Name2Id VALUES (7)", []).unwrap();
+        assert!(load_name2id(&conn).is_err());
+
+        conn.execute("CREATE TABLE bad_body(value INTEGER)", [])
+            .unwrap();
+        conn.execute("INSERT INTO bad_body VALUES (9)", []).unwrap();
+        assert!(conn
+            .query_row("SELECT value FROM bad_body", [], |row| {
+                read_message_body(row, 0, None)
+            })
+            .is_err());
+    }
+
+    #[test]
     fn list_sessions_reads_session_db_without_message_dbs() {
         let dir = create_decrypted_dir_with_session_table(
             &[
@@ -1832,7 +1883,7 @@ mod tests {
 
         let error = list_sessions(dir.path(), 10, None).unwrap_err();
 
-        assert!(error.contains("Session database not found"));
+        assert!(error.contains("Session database is unavailable"));
     }
 
     #[test]
@@ -2118,7 +2169,24 @@ mod tests {
             create_message_db(&[("tgid_old", 190, 1000), ("tgid_active", 2, 2000)]);
 
         let username =
-            resolve_username_for_messages("田雨坤", Some(&contact_db), &[message_db], 1).unwrap();
+            resolve_username_for_test("田雨坤", &contact_db, Some(&message_db), 1).unwrap();
+
+        assert_eq!(username, "tgid_active");
+    }
+
+    #[test]
+    fn duplicate_name_resolution_reuses_session_activity() {
+        let dir = create_decrypted_dir_with_session_table(
+            &[
+                ("tgid_old", "田雨坤", "", ""),
+                ("tgid_active", "田雨坤", "", ""),
+            ],
+            &[("tgid_old", 0, 1000, 1000), ("tgid_active", 0, 2000, 2000)],
+        );
+        let store = SourceStore::from_plaintext(dir.path()).unwrap();
+        let contacts = contact::load_contacts(&store.open(CONTACT_DB).unwrap()).unwrap();
+
+        let username = resolve_username_for_messages("田雨坤", &contacts, &store, &[], 1).unwrap();
 
         assert_eq!(username, "tgid_active");
     }
@@ -2129,7 +2197,7 @@ mod tests {
             ("linux_2025@chatroom", "Linux 俱乐部 #2025", "", ""),
             ("linux_2026@chatroom", "Linux 俱乐部 #2026🌅", "", ""),
         ]);
-        let contacts = contact::load_contacts(&contact_db).unwrap();
+        let contacts = load_contacts(&contact_db);
 
         let username = unique_exact_direct_username(&contacts, "Linux 俱乐部 #2026🌅");
 
@@ -2143,7 +2211,7 @@ mod tests {
             ("tgid_doubao", "豆宝", "", ""),
             ("tgid_meilidou", "美丽豆", "", ""),
         ]);
-        let contacts = contact::load_contacts(&contact_db).unwrap();
+        let contacts = load_contacts(&contact_db);
 
         let username = unique_exact_direct_username(&contacts, "豆");
 
@@ -2156,7 +2224,7 @@ mod tests {
             ("tgid_old", "田雨坤", "", ""),
             ("tgid_active", "田雨坤", "", ""),
         ]);
-        let contacts = contact::load_contacts(&contact_db).unwrap();
+        let contacts = load_contacts(&contact_db);
 
         let username = unique_exact_direct_username(&contacts, "田雨坤");
 
@@ -2173,8 +2241,7 @@ mod tests {
         let (_message_dir, message_db) =
             create_message_db(&[("tgid_doubao", 17, 1000), ("tgid_meilidou", 100, 2000)]);
 
-        let username =
-            resolve_username_for_messages("豆", Some(&contact_db), &[message_db], 1).unwrap();
+        let username = resolve_username_for_test("豆", &contact_db, Some(&message_db), 1).unwrap();
 
         assert_eq!(username, "tgid_meilidou");
     }
@@ -2189,7 +2256,7 @@ mod tests {
             create_message_db(&[("tgid_remark", 1, 1000), ("tgid_alias", 1, 2000)]);
 
         let username =
-            resolve_username_for_messages("Linux", Some(&contact_db), &[message_db], 1).unwrap();
+            resolve_username_for_test("Linux", &contact_db, Some(&message_db), 1).unwrap();
 
         assert_eq!(username, "tgid_remark");
     }
@@ -2206,8 +2273,7 @@ mod tests {
         ]);
 
         let username =
-            resolve_username_for_messages("Linux 2026", Some(&contact_db), &[message_db], 1)
-                .unwrap();
+            resolve_username_for_test("Linux 2026", &contact_db, Some(&message_db), 1).unwrap();
 
         assert_eq!(username, "linux_2026@chatroom");
     }
@@ -2219,8 +2285,7 @@ mod tests {
             ("tgid_bob", "Bob Lee", "", ""),
         ]);
 
-        let username =
-            resolve_username_with_context("Alic Zhang", Some(&contact_db), None, 1).unwrap();
+        let username = resolve_username_for_test("Alic Zhang", &contact_db, None, 1).unwrap();
 
         assert_eq!(username, "tgid_alice");
     }

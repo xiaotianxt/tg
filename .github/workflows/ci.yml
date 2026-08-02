@@ -56,7 +56,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential \
-            libsqlite3-dev \
+            perl \
             pkg-config
 
       - name: Verify runner architecture
@@ -73,3 +73,11 @@ jobs:
 
       - name: Verify CLI
         run: cargo run --release --bin tg -- --help
+
+      - name: Verify bundled database provider
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            ! ldd target/release/tg | grep -E 'lib(sqlite3|sqlcipher|crypto|ssl)'
+          else
+            ! otool -L target/release/tg | grep -E 'lib(sqlite3|sqlcipher|crypto|ssl)'
+          fi

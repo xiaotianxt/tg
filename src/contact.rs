@@ -1,6 +1,5 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
-use std::path::Path;
 
 /// Contact row plus the display fields tg needs for resolving chat names.
 pub(crate) struct Contact {
@@ -58,18 +57,20 @@ pub(crate) fn resolve_sender_name_with_mode(
         .to_string()
 }
 
-pub(crate) fn load_contacts(contact_db: &Path) -> Result<HashMap<String, Contact>, String> {
-    let conn = crate::sqlite::open_immutable(contact_db)?;
-
-    let mut contacts = load_contact_table(&conn, ContactTable::Contact)
+pub(crate) fn load_contacts(conn: &Connection) -> Result<HashMap<String, Contact>, String> {
+    let mut contacts = load_contact_table(conn, ContactTable::Contact)
         .map_err(|e| format!("Contact read error: {}", e))?;
-    for (username, stranger) in
-        load_contact_table(&conn, ContactTable::Stranger).unwrap_or_default()
+    if contact_table_exists(conn, ContactTable::Stranger)
+        .map_err(|e| format!("Contact schema error: {e}"))?
     {
-        contacts
-            .entry(username)
-            .and_modify(|contact| contact.is_stranger = true)
-            .or_insert(stranger);
+        for (username, stranger) in load_contact_table(conn, ContactTable::Stranger)
+            .map_err(|e| format!("Stranger contact read error: {e}"))?
+        {
+            contacts
+                .entry(username)
+                .and_modify(|contact| contact.is_stranger = true)
+                .or_insert(stranger);
+        }
     }
 
     Ok(contacts)
@@ -84,26 +85,33 @@ fn load_contact_table(
         table.name()
     );
     let mut stmt = conn.prepare(&sql)?;
-    let contacts = stmt
-        .query_map([], |row| {
-            let username: String = row.get(0)?;
-            let nick_name: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
-            let remark: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
-            let alias: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
-            Ok((
-                username.clone(),
-                Contact {
-                    username,
-                    nick_name,
-                    remark,
-                    alias,
-                    is_stranger: table.is_stranger(),
-                },
-            ))
-        })?
-        .filter_map(|row| row.ok())
-        .collect();
-    Ok(contacts)
+    let rows = stmt.query_map([], |row| {
+        let username: String = row.get(0)?;
+        let nick_name: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+        let remark: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+        let alias: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+        Ok((
+            username.clone(),
+            Contact {
+                username,
+                nick_name,
+                remark,
+                alias,
+                is_stranger: table.is_stranger(),
+            },
+        ))
+    })?;
+    rows.collect()
+}
+
+fn contact_table_exists(conn: &Connection, table: ContactTable) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
+        )",
+        [table.name()],
+        |row| row.get(0),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -134,10 +142,9 @@ fn first_non_empty<const N: usize>(values: [&str; N]) -> &str {
 }
 
 pub(crate) fn load_chat_room_member_names(
-    contact_db: &Path,
+    conn: &Connection,
     room_username: &str,
 ) -> Result<HashMap<String, String>, String> {
-    let conn = crate::sqlite::open_immutable(contact_db)?;
     let ext_buffer: Option<Vec<u8>> = conn
         .query_row(
             "SELECT ext_buffer FROM chat_room WHERE username = ?1",
@@ -330,14 +337,28 @@ mod tests {
             ],
         )
         .unwrap();
-        drop(conn);
-
-        let names = load_chat_room_member_names(&path, "room@chatroom").unwrap();
+        let names = load_chat_room_member_names(&conn, "room@chatroom").unwrap();
         assert_eq!(
             names.get("tgid_alice").map(String::as_str),
             Some("Alice In Group")
         );
         assert_eq!(names.get("tgid_cara").map(String::as_str), Some("Cara"));
         assert!(!names.contains_key("tgid_bob"));
+    }
+
+    #[test]
+    fn malformed_contact_rows_fail_instead_of_returning_partial_contacts() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE contact(
+                username INTEGER, nick_name TEXT, remark TEXT, alias TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO contact VALUES (7, 'bad', '', '')", [])
+            .unwrap();
+
+        assert!(load_contacts(&conn).is_err());
     }
 }

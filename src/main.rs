@@ -1,10 +1,8 @@
-mod cache;
 mod completion;
 mod completion_values;
 mod contact;
 mod database_keys;
 mod db;
-mod decrypt;
 mod dictionary;
 mod doctor;
 mod export;
@@ -22,12 +20,12 @@ mod parallel;
 mod paths;
 mod query;
 mod scanner;
-mod sqlite;
+mod source_store;
 mod time;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn print_output(args: std::fmt::Arguments<'_>) -> Result<(), String> {
     output::stdout_line(args).map_err(|e| format!("Error: {e}"))
@@ -63,54 +61,22 @@ fn messages_limit_or_default(
 fn is_known_subcommand(value: &str) -> bool {
     if matches!(
         value,
-        "help" | "sql" | "image" | "file" | "sticker" | "emoji" | "voice" | "__complete"
+        "help"
+            | "decrypt"
+            | "refresh"
+            | "sql"
+            | "image"
+            | "file"
+            | "sticker"
+            | "emoji"
+            | "voice"
+            | "__complete"
     ) {
         return true;
     }
     Cli::command()
         .get_subcommands()
         .any(|command| command.get_name() == value)
-}
-
-fn print_refresh_stats(label: &str, stats: &decrypt::DecryptStats) -> Result<(), String> {
-    print_output(format_args!(
-        "{}: {} succeeded, {} failed, {} skipped, {} total",
-        label, stats.success, stats.failed, stats.skipped, stats.total
-    ))
-}
-
-fn ensure_message_cache_ready(decrypted_dir: &Path, jobs: usize) -> Result<(), String> {
-    log::info!("Refreshing local message cache");
-    let refresh = cache::refresh_message_decrypted(decrypted_dir, jobs);
-    let refresh = if cache::needs_message_key_retry(&refresh) {
-        log::warn!(
-            "Decrypted message cache is incomplete ({}). Refreshing keys and retrying once.",
-            cache::retry_reason(&refresh)
-        );
-        cache::refresh_keys_and_message_decrypted(decrypted_dir, jobs)
-    } else {
-        refresh
-    };
-
-    match refresh {
-        Ok(stats) if cache::failures_can_affect_messages(&stats) => {
-            return Err(format!(
-                "Cannot read messages because the decrypted cache is still incomplete after refreshing keys. Failed: {}",
-                cache::message_failure_summary(&stats)
-            ));
-        }
-        Ok(_) => {}
-        Err(e) if decrypt::is_refresh_lock_busy_error(&e) => {
-            log::warn!(
-                "Decrypted cache refresh is already running; reading the existing decrypted cache."
-            );
-        }
-        Err(e) => {
-            return Err(format!("Cannot refresh decrypted message cache: {e}"));
-        }
-    }
-
-    Ok(())
 }
 
 #[derive(Parser)]
@@ -125,17 +91,24 @@ struct Cli {
 }
 
 #[derive(Args)]
-struct DecryptedArgs {
-    /// Path to decrypted databases
+struct SourceArgs {
+    /// Path to encrypted source databases (auto-detected if omitted)
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    db_dir: Option<PathBuf>,
+    /// Path to all_keys.json
     #[arg(
         long,
-        default_value_os_t = paths::default_decrypted_dir(),
-        value_hint = clap::ValueHint::DirPath
+        default_value_os_t = paths::default_keys_path(),
+        value_hint = clap::ValueHint::FilePath
     )]
-    decrypted_dir: PathBuf,
+    keys: PathBuf,
     /// Number of parallel jobs (0 = auto)
     #[arg(long, default_value_t = 0)]
     jobs: usize,
+}
+
+fn open_source(args: &SourceArgs) -> Result<source_store::SourceStore, String> {
+    source_store::SourceStore::discover(args.db_dir.as_deref(), &args.keys)
 }
 
 #[derive(Subcommand)]
@@ -162,38 +135,16 @@ enum Commands {
         /// Number of parallel key-derivation jobs (0 = auto)
         #[arg(long, default_value_t = 0)]
         jobs: usize,
-    },
-    /// Decrypt all encrypted databases using extracted keys
-    Decrypt {
-        /// Path to all_keys.json
+        /// Path to encrypted source databases (auto-detected if omitted)
+        #[arg(long, value_hint = clap::ValueHint::DirPath)]
+        db_dir: Option<PathBuf>,
+        /// Output path for database keys
         #[arg(
-            long,
+            long = "output",
             default_value_os_t = paths::default_keys_path(),
             value_hint = clap::ValueHint::FilePath
         )]
-        keys: PathBuf,
-        /// Output directory for decrypted databases
-        #[arg(
-            long,
-            default_value_os_t = paths::default_decrypted_dir(),
-            value_hint = clap::ValueHint::DirPath
-        )]
         output: PathBuf,
-        /// Path to Telegram db_storage directory (auto-detected if not provided)
-        #[arg(long, value_hint = clap::ValueHint::DirPath)]
-        db_dir: Option<PathBuf>,
-        /// Force decrypting every database even when cached outputs are up to date
-        #[arg(long)]
-        full: bool,
-        /// Only decrypt databases modified after this time (ISO 8601 or relative: 5min, 1h, today)
-        #[arg(long)]
-        since: Option<String>,
-        /// Show decrypt progress and summary
-        #[arg(long)]
-        verbose: bool,
-        /// Number of parallel jobs (0 = auto)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
     },
     /// List all chat sessions/conversations
     Sessions {
@@ -203,7 +154,7 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         top: usize,
         #[command(flatten)]
-        cache: DecryptedArgs,
+        source: SourceArgs,
     },
     /// List sessions with unread messages
     Unread {
@@ -213,22 +164,14 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         top: usize,
         #[command(flatten)]
-        cache: DecryptedArgs,
+        source: SourceArgs,
     },
     /// Diagnose tg setup and optionally a specific chat
     Doctor {
         /// Optional session username (tgid_xxx) or display name to inspect
         session: Option<String>,
         #[command(flatten)]
-        cache: DecryptedArgs,
-    },
-    /// Refresh decrypted cache, refreshing keys if needed
-    Refresh {
-        /// Extract keys before decrypting
-        #[arg(long)]
-        keys: bool,
-        #[command(flatten)]
-        cache: DecryptedArgs,
+        source: SourceArgs,
     },
     /// Read messages from a specific session
     Messages {
@@ -266,7 +209,7 @@ enum Commands {
         #[arg(long)]
         anonymous: bool,
         #[command(flatten)]
-        cache: DecryptedArgs,
+        source: SourceArgs,
     },
     /// Search across all sessions
     Search {
@@ -285,7 +228,7 @@ enum Commands {
         #[arg(long)]
         anonymous: bool,
         #[command(flatten)]
-        cache: DecryptedArgs,
+        source: SourceArgs,
     },
     /// Search message tables with fixed, parameterized query templates
     Query {
@@ -338,7 +281,7 @@ enum Commands {
         #[arg(long)]
         anonymous: bool,
         #[command(flatten)]
-        cache: DecryptedArgs,
+        source: SourceArgs,
     },
     /// Export a complete chat archive
     Export {
@@ -352,7 +295,7 @@ enum Commands {
         )]
         output: PathBuf,
         #[command(flatten)]
-        cache: DecryptedArgs,
+        source: SourceArgs,
     },
     /// Generate shell completion scripts
     Completions {
@@ -384,90 +327,35 @@ fn run(command: Commands) -> Result<(), String> {
             timeout,
             method,
             jobs,
+            db_dir,
+            output,
         } => {
-            let path = scanner::extract_keys_with_method_and_jobs(timeout, method, jobs)
-                .map_err(|e| format!("Error: {e}"))?;
+            let path = scanner::extract_keys_with_method_and_jobs(
+                timeout,
+                method,
+                jobs,
+                db_dir.as_deref(),
+                &output,
+            )
+            .map_err(|e| format!("Error: {e}"))?;
             print_output(format_args!("Keys saved to: {path}"))
         }
-        Commands::Decrypt {
-            keys,
-            output,
-            db_dir,
-            full,
-            since,
-            verbose,
-            jobs,
-        } => {
-            let since_ts = time::parse_since_opt(since.as_deref())
-                .map_err(|e| format!("Error parsing --since: {e}"))?;
-            let config = decrypt::DecryptConfig {
-                incremental: !full,
-                since: since_ts,
-                scope: decrypt::DecryptScope::All,
-                recent_output_grace: None,
-                quiet: !verbose,
-                jobs,
-            };
-            let stats = decrypt::decrypt_all(&keys, &output, db_dir.as_deref(), &config)
-                .map_err(|e| format!("Error: {e}"))?;
-            if verbose {
-                if stats.skipped > 0 {
-                    log::info!(
-                        "Decryption complete: {} succeeded, {} failed, {} skipped, {} total",
-                        stats.success,
-                        stats.failed,
-                        stats.skipped,
-                        stats.total
-                    );
-                } else {
-                    log::info!(
-                        "Decryption complete: {} succeeded, {} failed, {} total",
-                        stats.success,
-                        stats.failed,
-                        stats.total
-                    );
-                }
-            }
-            Ok(())
-        }
-        Commands::Sessions { query, top, cache } => {
-            let DecryptedArgs {
-                decrypted_dir,
-                jobs,
-            } = cache;
-            let refresh = cache::refresh_session_decrypted(&decrypted_dir, jobs);
-            if let Some(error) = cache::session_refresh_error(&refresh) {
-                log::warn!(
-                    "Session cache refresh had issues ({}). Using existing session cache.",
-                    error
-                );
-            }
-            let sessions = db::list_sessions(&decrypted_dir, top, query.as_deref())
+        Commands::Sessions { query, top, source } => {
+            let store = open_source(&source)?;
+            let sessions = db::list_sessions(&store, top, query.as_deref())
                 .map_err(|e| format!("Error: {e}"))?;
             if sessions.is_empty() {
                 if let Some(query) = query.as_deref().filter(|value| !value.trim().is_empty()) {
                     print_output(format_args!("No sessions matched '{}'.", query))?;
                 } else {
-                    print_output(format_args!(
-                        "No sessions found. Try running 'decrypt' first."
-                    ))?;
+                    print_output(format_args!("No sessions found."))?;
                 }
             }
             Ok(())
         }
-        Commands::Unread { query, top, cache } => {
-            let DecryptedArgs {
-                decrypted_dir,
-                jobs,
-            } = cache;
-            let refresh = cache::refresh_session_decrypted(&decrypted_dir, jobs);
-            if let Some(error) = cache::session_refresh_error(&refresh) {
-                log::warn!(
-                    "Session cache refresh had issues ({}). Using existing session cache.",
-                    error
-                );
-            }
-            let sessions = db::list_unread_sessions(&decrypted_dir, top, query.as_deref())
+        Commands::Unread { query, top, source } => {
+            let store = open_source(&source)?;
+            let sessions = db::list_unread_sessions(&store, top, query.as_deref())
                 .map_err(|e| format!("Error: {e}"))?;
             if sessions.is_empty() {
                 if let Some(query) = query.as_deref().filter(|value| !value.trim().is_empty()) {
@@ -478,40 +366,13 @@ fn run(command: Commands) -> Result<(), String> {
             }
             Ok(())
         }
-        Commands::Doctor { session, cache } => {
-            let DecryptedArgs {
-                decrypted_dir,
-                jobs,
-            } = cache;
-            doctor::run(doctor::DoctorOptions {
-                session: session.as_deref(),
-                decrypted_dir: &decrypted_dir,
-                jobs,
-            })
-            .map_err(|e| format!("Error: {e}"))
-        }
-        Commands::Refresh { keys, cache } => {
-            let DecryptedArgs {
-                decrypted_dir,
-                jobs,
-            } = cache;
-            let refresh = if keys {
-                cache::refresh_keys_and_decrypted(&decrypted_dir, jobs)
-            } else {
-                let refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
-                if cache::needs_message_key_retry(&refresh) {
-                    log::warn!(
-                        "Decrypted cache refresh had issues ({}). Refreshing keys and retrying once.",
-                        cache::retry_reason(&refresh)
-                    );
-                    cache::refresh_keys_and_decrypted(&decrypted_dir, jobs)
-                } else {
-                    refresh
-                }
-            };
-            let stats = refresh.map_err(|e| format!("Error: {e}"))?;
-            print_refresh_stats("Refresh complete", &stats)
-        }
+        Commands::Doctor { session, source } => doctor::run(doctor::DoctorOptions {
+            session: session.as_deref(),
+            db_dir: source.db_dir.as_deref(),
+            keys_path: &source.keys,
+            jobs: source.jobs,
+        })
+        .map_err(|e| format!("Error: {e}")),
         Commands::Messages {
             session,
             limit,
@@ -523,21 +384,17 @@ fn run(command: Commands) -> Result<(), String> {
             head,
             time_bucket,
             anonymous,
-            cache,
+            source,
         } => {
-            let DecryptedArgs {
-                decrypted_dir,
-                jobs,
-            } = cache;
+            let store = open_source(&source)?;
             let since_ts = time::parse_since_opt(since.as_deref())
                 .map_err(|e| format!("Error parsing --since: {e}"))?;
             let time_bucket = time::parse_message_time_bucket(&time_bucket)
                 .map_err(|e| format!("Error parsing --time-bucket: {e}"))?;
             let limit = messages_limit_or_default(limit, since_ts, all_time);
             let use_tail = tail || (!head && offset == 0);
-            ensure_message_cache_ready(&decrypted_dir, jobs)?;
             let msg_count = db::read_messages(
-                &decrypted_dir,
+                &store,
                 db::ReadMessagesOptions {
                     session_query: &session,
                     limit,
@@ -551,7 +408,7 @@ fn run(command: Commands) -> Result<(), String> {
                     } else {
                         contact::DisplayNameMode::PersonalRemark
                     },
-                    jobs,
+                    jobs: source.jobs,
                 },
             )
             .map_err(|e| format!("Error: {e}"))?;
@@ -569,12 +426,9 @@ fn run(command: Commands) -> Result<(), String> {
             since,
             all_time,
             anonymous,
-            cache,
+            source,
         } => {
-            let DecryptedArgs {
-                decrypted_dir,
-                jobs,
-            } = cache;
+            let store = open_source(&source)?;
             if limit == 0 {
                 return Err("Error: --limit must be greater than 0".to_string());
             }
@@ -585,15 +439,8 @@ fn run(command: Commands) -> Result<(), String> {
             } else {
                 Some(since_ts.unwrap_or_else(time::default_recent_since))
             };
-            let refresh = cache::refresh_search_decrypted(&decrypted_dir, jobs);
-            if cache::needs_search_refresh_warning(&refresh) {
-                log::warn!(
-                    "Decrypted cache refresh had issues ({}). Search results may be stale.",
-                    cache::search_refresh_reason(&refresh)
-                );
-            }
             let count = db::search_messages(
-                &decrypted_dir,
+                &store,
                 db::SearchMessagesOptions {
                     query: &query,
                     limit,
@@ -628,12 +475,9 @@ fn run(command: Commands) -> Result<(), String> {
             format,
             max_cell_chars,
             anonymous,
-            cache,
+            source,
         } => {
-            let DecryptedArgs {
-                decrypted_dir,
-                jobs,
-            } = cache;
+            let store = open_source(&source)?;
             let since_ts = time::parse_since_opt(since.as_deref())
                 .map_err(|e| format!("Error parsing --since: {e}"))?;
             let since_ts = if all_time {
@@ -646,7 +490,7 @@ fn run(command: Commands) -> Result<(), String> {
             let fields = query::QueryFields::parse(&fields)
                 .map_err(|e| format!("Error parsing --fields: {e}"))?;
             let query_options = query::QueryOptions {
-                decrypted_dir: &decrypted_dir,
+                store: &store,
                 session: session.as_deref(),
                 contains: &contains,
                 not_contains: &not_contains,
@@ -666,15 +510,8 @@ fn run(command: Commands) -> Result<(), String> {
                 } else {
                     contact::DisplayNameMode::PersonalRemark
                 },
-                jobs,
+                jobs: source.jobs,
             };
-            let refresh = cache::refresh_message_decrypted(&decrypted_dir, jobs);
-            if cache::needs_message_key_retry(&refresh) {
-                log::warn!(
-                    "Decrypted message cache refresh had issues ({}). Query results may be stale.",
-                    cache::retry_reason(&refresh)
-                );
-            }
             if query::run(query_options).map_err(|e| format!("Error: {e}"))? == 0 {
                 print_output(format_args!("No rows returned."))?;
             }
@@ -683,30 +520,14 @@ fn run(command: Commands) -> Result<(), String> {
         Commands::Export {
             session,
             output,
-            cache,
+            source,
         } => {
-            let DecryptedArgs {
-                decrypted_dir,
-                jobs,
-            } = cache;
-            let mut refresh = cache::refresh_decrypted(&decrypted_dir, jobs);
-            if cache::needs_export_key_retry(&refresh) {
-                log::warn!(
-                    "Decrypted cache refresh had issues ({}). Refreshing keys and retrying export refresh.",
-                    cache::export_refresh_error(&refresh).unwrap_or_else(|| "unknown".to_string())
-                );
-                refresh = cache::refresh_keys_and_decrypted(&decrypted_dir, jobs);
-            }
-            if let Some(error) = cache::export_refresh_error(&refresh) {
-                return Err(format!(
-                    "Error: export needs a complete decrypted cache, but refresh is incomplete: {error}"
-                ));
-            }
+            let store = open_source(&source)?;
             let paths = export::export_messages(export::MessageExportConfig {
-                decrypted_dir: &decrypted_dir,
+                store: &store,
                 session_query: &session,
                 output_dir: &output,
-                jobs,
+                jobs: source.jobs,
             })
             .map_err(|e| format!("Error: {e}"))?;
             print_output(format_args!("Exported to:"))?;
@@ -761,8 +582,10 @@ mod tests {
     }
 
     #[test]
-    fn retired_media_commands_are_not_rewritten_as_session_names() {
-        for command in ["image", "file", "sticker", "emoji", "voice"] {
+    fn retired_commands_are_not_rewritten_as_session_names() {
+        for command in [
+            "decrypt", "refresh", "image", "file", "sticker", "emoji", "voice",
+        ] {
             let argv = args(&["tg", command]);
             assert_eq!(normalize_args_for_default_messages(argv.clone()), argv);
             assert_eq!(
@@ -802,6 +625,7 @@ mod tests {
                 timeout,
                 method,
                 jobs,
+                ..
             } => {
                 assert_eq!(timeout, 30);
                 assert!(matches!(method, scanner::KeyExtractionMethod::Auto));

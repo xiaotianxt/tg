@@ -25,7 +25,6 @@ install: build
 	@echo ""
 	@echo "安装完成！现在可以直接使用以下命令："
 	@echo "  sudo tg keys      # 提取密钥"
-	@echo "  tg decrypt        # 解密"
 	@echo "  tg sessions       # 查看会话"
 
 install-local: build
@@ -34,7 +33,6 @@ install-local: build
 	@echo ""
 	@echo "已安装到 ~/.local/bin，请确保该目录在 PATH 中。"
 	@echo "  sudo tg keys      # 提取密钥"
-	@echo "  tg decrypt        # 解密"
 	@echo "  tg sessions       # 查看会话"
 
 clean:
