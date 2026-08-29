@@ -32,6 +32,11 @@ pub(crate) fn desktop_app_process() -> &'static str {
     }
 }
 
+pub(crate) fn desktop_app_localized_name() -> &'static str {
+    static VALUE: OnceLock<String> = OnceLock::new();
+    cached_text(&VALUE, &[191, 228, 244, 190, 229, 251])
+}
+
 pub(crate) fn container_id() -> &'static str {
     static VALUE: OnceLock<String> = OnceLock::new();
     cached_text(

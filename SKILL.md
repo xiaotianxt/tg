@@ -6,7 +6,7 @@ when_to_use: Trigger for requests mentioning Telegram聊天记录, Telegram聊�
 
 # tg
 
-Canonical source: https://github.com/xiaotianxt/skills/tree/main/skills/tg
+Canonical source: https://github.com/xiaotianxt/tg/blob/main/SKILL.md
 
 ## When To Use
 

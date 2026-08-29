@@ -35,6 +35,14 @@ tg completions zsh > ~/.zsh/completions/_tg
 tg completions bash > ~/.local/share/bash-completion/completions/tg
 ```
 
+安装随 `tg` 打包的本地 Codex/agent skill：
+
+```bash
+tg skill install
+```
+
+该命令会从公开的 [SKILL.md](SKILL.md) 模板生成本机安装版本，并按内置 dictionary 渲染应用显示名。默认写入 `$CODEX_HOME/skills/tg` 或 `~/.codex/skills/tg`；可用 `--dir` 指定其他 skill 目录。
+
 ## 第一次使用
 
 先打开并登录本机 Telegram 桌面版，然后提取数据库密钥。

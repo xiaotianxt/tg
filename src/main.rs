@@ -20,6 +20,7 @@ mod parallel;
 mod paths;
 mod query;
 mod scanner;
+mod skill;
 mod source_store;
 mod time;
 
@@ -297,10 +298,25 @@ enum Commands {
         #[command(flatten)]
         source: SourceArgs,
     },
+    /// Install or manage the local agent skill
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommands,
+    },
     /// Generate shell completion scripts
     Completions {
         /// Shell to generate completions for
         shell: CompletionShell,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillCommands {
+    /// Install the local SKILL.md generated from tg's bundled template
+    Install {
+        /// Skill directory to write; defaults to $CODEX_HOME/skills/tg or ~/.codex/skills/tg
+        #[arg(long, value_hint = clap::ValueHint::DirPath)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -536,6 +552,12 @@ fn run(command: Commands) -> Result<(), String> {
             }
             Ok(())
         }
+        Commands::Skill { command } => match command {
+            SkillCommands::Install { dir } => {
+                let path = skill::install(dir)?;
+                print_output(format_args!("Skill installed to: {}", path.display()))
+            }
+        },
         Commands::Completions { shell } => {
             completion::print_script(shell).map_err(|e| format!("Error: {e}"))
         }
@@ -572,6 +594,7 @@ mod tests {
             "export",
             "doctor",
             "refresh",
+            "skill",
             "completions",
         ] {
             assert_eq!(
