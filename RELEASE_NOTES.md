@@ -1,13 +1,9 @@
-## Direct encrypted database reader
+## Group members and local friend lookup
 
-tg now reads the encrypted source databases and live WAL directly. The retired
-`refresh` and `decrypt` commands and `~/.tg/decrypted` cache are no longer used.
+- Add `tg members GROUP --anonymous` to list the cached group roster with locally recorded speaking activity.
+- Add `--inactive-since` to identify members with no recorded activity since a cutoff, with explicit local-history coverage warnings.
+- Add `tg members GROUP --friends --anonymous` to find locally confirmed friends in the cached roster without reading message history, including newly joined groups.
+- Friend results use conservative local relationship evidence, not a live or reciprocal friendship check.
+- Restore the bundled skill installer.
 
-After verifying the new release, inspect and remove the exact legacy cache:
-
-```bash
-du -sh ~/.tg/decrypted
-rm -rf ~/.tg/decrypted
-```
-
-Custom historical output directories are never guessed or deleted.
+All source database access remains local and read-only. No messages are sent and no group membership is changed.

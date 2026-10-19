@@ -75,6 +75,18 @@ tg sessions "张三"
 tg sessions --top 50
 ```
 
+Inspect a complete current group roster or find locally inactive members:
+
+```bash
+tg members "产品讨论群" --anonymous
+tg members "产品讨论群" --friends --anonymous
+tg members "产品讨论群" --inactive-since 1y --anonymous
+```
+
+Use `members --friends --anonymous` for existing friends in a group. It intersects the cached roster with conservative local relationship flags, without reading message history. Results are not exhaustive or a live reciprocal-friendship check. Do not combine `--friends` with `--inactive-since`.
+
+Treat inactivity output as a review list, not proof of membership age or permission to remove anyone. If the local sender history starts after the cutoff, surface the command's coverage warning.
+
 Read a chat:
 
 ```bash

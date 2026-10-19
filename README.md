@@ -89,6 +89,18 @@ tg unread
 tg unread --top 50
 ```
 
+查看群成员及本地发言记录：
+
+```bash
+tg members "产品讨论群" --anonymous
+tg members "产品讨论群" --friends --anonymous
+tg members "产品讨论群" --inactive-since 1y --anonymous
+```
+
+`members` 的当前名册来自联系人库的群成员关系，发言时间聚合自全部消息分片。筛选结果只是本地记录候选；本地名册没有入群时间，且本地历史未必覆盖筛选起点，命令会明确提示这些边界。它不执行清退。
+
+`members --friends` 只读取联系人和会话元数据，将本地群成员名册与明确的好友关系标记取交集；新加入、没有消息历史的群也可以查询。保守筛选会排除单边标记、删除记录、服务账号和陌生人记录；它不保证穷尽所有好友，也不能证明对方仍保留你为好友。不能与 `--inactive-since` 同用。
+
 读取消息：
 
 ```bash
@@ -180,7 +192,7 @@ tg 自己只长期保存：
 - `~/.tg/key_material.bin`：账号级 key material，权限 `0600`。
 - 用户显式指定的导出目录。
 
-`sessions`、`unread`、`doctor`、`messages`、`search` 和 `query` 不创建消息数据库、索引或页缓存。读取期间的 SQLite 临时数据强制放在内存中。`export` 只写用户指定的归档目录。
+`sessions`、`unread`、`members`、`doctor`、`messages`、`search` 和 `query` 不创建消息数据库、索引或页缓存。读取期间的 SQLite 临时数据强制放在内存中。`export` 只写用户指定的归档目录。
 
 旧版本留下的 `~/.tg/decrypted/` 不再读取，也不会被 tg 自动删除。确认新版工作正常后，可自行清理：
 

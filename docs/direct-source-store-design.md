@@ -17,8 +17,8 @@ snapshots.
 ## Goals
 
 - Read committed data from the encrypted main database and its live WAL.
-- Preserve the result semantics of `sessions`, `unread`, `messages`, `search`,
-  `query`, `export`, and `doctor`.
+- Preserve the result semantics of `sessions`, `unread`, `members`, `messages`,
+  `search`, `query`, `export`, and `doctor`.
 - Keep the existing FTS5 tokenizer compatibility layer and upstream indexes.
 - Stop creating or reading `~/.tg/decrypted` and `*.tg-pages` files.
 - Keep macOS arm64, Linux x86_64, and Linux arm64 release artifacts independent
@@ -215,8 +215,8 @@ initialization, read-only enforcement, and per-database snapshots.
 
 Existing modules continue to own:
 
-- `db.rs`: session resolution, session/message reads, FTS table queries, global
-  merge and display behavior;
+- `db.rs`: session resolution, session/message reads, current group-member
+  activity, FTS table queries, global merge and display behavior;
 - `query.rs`: parameterized filters, limits, post-filtering, fields, sorting and
   output formats;
 - `export.rs`: archive formats, media lookup, decoding and requested output;
@@ -256,6 +256,15 @@ interface or parsing `SourceStore` error strings.
 - `messages` and `query` require every catalogued numbered message shard to open
   and query successfully. A present shard failure aborts the command instead of
   returning partial results.
+- `members` requires a complete current-member relation from
+  `contact/contact.db` and every numbered message shard. It fails instead of
+  presenting historical senders as a complete current roster.
+- `members --friends` uses only contact metadata and optional session-based name
+  resolution, never message shards. It intersects the cached roster with explicit
+  local relationship evidence, conservatively excluding single-bit, deleted,
+  verified/service, and stranger records. Missing relationship columns fail
+  explicitly; names and previous chats are never treated as friend evidence.
+  Results are neither exhaustive nor a live reciprocal relationship check.
 - `search` requires `message/message_fts.db`; it does not fall back to an
   unbounded shard scan. Contact data remains optional.
 - `export` requires the same complete message set. An absent optional media or

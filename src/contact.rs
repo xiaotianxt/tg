@@ -34,6 +34,11 @@ pub(crate) enum DisplayNameMode {
     Anonymous,
 }
 
+pub(crate) struct ChatRoomRoster {
+    pub owner: Option<String>,
+    pub usernames: Vec<String>,
+}
+
 pub(crate) fn resolve_sender_name_with_mode(
     sender_id: &str,
     contacts: &HashMap<String, Contact>,
@@ -159,6 +164,77 @@ pub(crate) fn load_chat_room_member_names(
         .as_deref()
         .map(parse_chat_room_member_names)
         .unwrap_or_default())
+}
+
+/// Conservative local friend evidence, not a server-side relationship check.
+/// Require both relationship bits; a single bit can include the account itself.
+/// Keep schema policy here rather than inferring friendship from names or chats.
+pub(crate) fn load_friend_usernames(
+    conn: &Connection,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT username FROM contact
+             WHERE local_type = 1 AND (flag & 3) = 3
+               AND delete_flag = 0 AND verify_flag = 0
+               AND username IS NOT NULL AND username != ''",
+        )
+        .map_err(|error| format!("Friend relationship metadata unavailable: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Read friend relationships: {error}"))?;
+    rows.collect::<rusqlite::Result<_>>()
+        .map_err(|error| format!("Read friend relationship row: {error}"))
+}
+
+pub(crate) fn load_chat_room_roster(
+    conn: &Connection,
+    room_username: &str,
+) -> Result<ChatRoomRoster, String> {
+    let room: Option<(i64, Option<String>)> = conn
+        .query_row(
+            "SELECT id, owner FROM chat_room WHERE username = ?1",
+            params![room_username],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("Chat room query error: {error}"))?;
+    let (room_id, owner) = room.ok_or_else(|| format!("Group not found: {room_username}"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT member.member_id, contact.username
+             FROM chatroom_member AS member
+             LEFT JOIN contact ON contact.id = member.member_id
+             WHERE member.room_id = ?1
+             ORDER BY contact.username",
+        )
+        .map_err(|error| format!("Prepare group roster: {error}"))?;
+    let rows = stmt
+        .query_map([room_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|error| format!("Read group roster: {error}"))?;
+
+    let mut usernames = Vec::new();
+    let mut unidentified = 0usize;
+    for row in rows {
+        let (_, username) = row.map_err(|error| format!("Read group roster member: {error}"))?;
+        match username.filter(|value| !value.trim().is_empty()) {
+            Some(username) => usernames.push(username),
+            None => unidentified += 1,
+        }
+    }
+    if unidentified > 0 {
+        return Err(format!(
+            "Group roster is incomplete: {unidentified} current member(s) have no contact identity"
+        ));
+    }
+
+    Ok(ChatRoomRoster {
+        owner: owner.filter(|value| !value.trim().is_empty()),
+        usernames,
+    })
 }
 
 fn parse_chat_room_member_names(data: &[u8]) -> HashMap<String, String> {
@@ -344,6 +420,25 @@ mod tests {
         );
         assert_eq!(names.get("tgid_cara").map(String::as_str), Some("Cara"));
         assert!(!names.contains_key("tgid_bob"));
+    }
+
+    #[test]
+    fn loads_complete_chat_room_roster_from_member_relations() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE contact(id INTEGER PRIMARY KEY, username TEXT, nick_name TEXT, remark TEXT, alias TEXT);
+             CREATE TABLE chat_room(id INTEGER PRIMARY KEY, username TEXT, owner TEXT, ext_buffer BLOB);
+             CREATE TABLE chatroom_member(room_id INTEGER, member_id INTEGER);
+             INSERT INTO contact(id, username) VALUES (1, 'tgid_alice'), (2, 'tgid_bob');
+             INSERT INTO chat_room(id, username, owner) VALUES (10, 'room@chatroom', 'tgid_alice');
+             INSERT INTO chatroom_member(room_id, member_id) VALUES (10, 1), (10, 2);",
+        )
+        .unwrap();
+
+        let roster = load_chat_room_roster(&conn, "room@chatroom").unwrap();
+
+        assert_eq!(roster.owner.as_deref(), Some("tgid_alice"));
+        assert_eq!(roster.usernames, ["tgid_alice", "tgid_bob"]);
     }
 
     #[test]

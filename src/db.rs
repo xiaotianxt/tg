@@ -145,6 +145,29 @@ pub(crate) struct SearchMessagesOptions<'a> {
     pub name_mode: DisplayNameMode,
 }
 
+pub(crate) struct ListMembersOptions<'a> {
+    pub session_query: &'a str,
+    pub inactive_since: Option<i64>,
+    pub name_mode: DisplayNameMode,
+    pub jobs: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MemberActivity {
+    pub username: String,
+    pub display_name: String,
+    pub is_owner: bool,
+    pub last_spoke: Option<i64>,
+    pub message_count: i64,
+}
+
+#[derive(Clone, Copy)]
+struct MemberSpeech {
+    first_spoke: i64,
+    last_spoke: i64,
+    message_count: i64,
+}
+
 pub(crate) fn msg_table_name(username: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(username.as_bytes());
@@ -288,6 +311,279 @@ pub fn list_unread_sessions(
         query,
         SessionDbListMode::Unread,
     )
+}
+
+/// Intersect the cached roster with explicit local friend relationships.
+/// Contact/session scope only: a newly joined group needs no message history.
+pub(crate) fn list_member_friends(
+    store: &SourceStore,
+    session_query: &str,
+    name_mode: DisplayNameMode,
+    jobs: usize,
+) -> Result<Vec<String>, String> {
+    let conn = store.open(CONTACT_DB)?;
+    let contacts = contact::load_contacts(&conn)?;
+    let username = resolve_username_from_contacts(session_query, &contacts, store, None, jobs)?;
+    if !username.ends_with("@chatroom") {
+        return Err(format!("Not a group session: {username}"));
+    }
+    let roster = contact::load_chat_room_roster(&conn, &username)?;
+    if roster.usernames.is_empty() {
+        return Err(format!("No cached members found for group: {username}"));
+    }
+    let friends = contact::load_friend_usernames(&conn)?;
+    let room_names = if name_mode == DisplayNameMode::Anonymous {
+        contact::load_chat_room_member_names(&conn, &username)?
+    } else {
+        HashMap::new()
+    };
+    let mut matches: Vec<_> = roster
+        .usernames
+        .iter()
+        .filter(|id| {
+            friends.contains(*id) && contacts.get(*id).is_some_and(|value| !value.is_stranger)
+        })
+        .map(|id| {
+            (
+                contact::resolve_sender_name_with_mode(id, &contacts, name_mode, &room_names),
+                id.clone(),
+            )
+        })
+        .collect();
+    matches.sort();
+    matches.dedup_by(|left, right| left.1 == right.1);
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+    out.line(format_args!(
+        "Group: {} ({username})",
+        contacts
+            .get(&username)
+            .map(|value| value.display_name(name_mode))
+            .unwrap_or(&username)
+    ))?;
+    out.line(format_args!("Cached members: {}", roster.usernames.len()))?;
+    out.line(format_args!("Locally confirmed friends: {}", matches.len()))?;
+    out.line(format_args!("Note: conservative local relationship evidence only; not a live or reciprocal friendship check."))?;
+    out.blank_line()?;
+    out.line(format_args!("{:<24} Username", "Display Name"))?;
+    for (name, id) in &matches {
+        out.line(format_args!(
+            "{:<24} {}",
+            name.escape_debug().to_string(),
+            id.escape_debug()
+        ))?;
+    }
+    out.flush()?;
+    Ok(matches.into_iter().map(|(_, id)| id).collect())
+}
+
+/// List current group members and their locally recorded speaking activity.
+pub fn list_members(
+    store: &SourceStore,
+    options: ListMembersOptions<'_>,
+) -> Result<Vec<MemberActivity>, String> {
+    let contact_conn = store
+        .open(CONTACT_DB)
+        .map_err(|error| format!("Contact database is unavailable: {error}"))?;
+    let contacts = contact::load_contacts(&contact_conn)?;
+    let message_dbs = message_databases(store);
+    let username = resolve_username_for_messages(
+        options.session_query,
+        &contacts,
+        store,
+        &message_dbs,
+        options.jobs,
+    )?;
+    if !username.ends_with("@chatroom") {
+        return Err(format!("Not a group session: {username}"));
+    }
+
+    let roster = contact::load_chat_room_roster(&contact_conn, &username)?;
+    if roster.usernames.is_empty() {
+        return Err(format!("No current members found for group: {username}"));
+    }
+    let room_member_names = if options.name_mode == DisplayNameMode::Anonymous {
+        contact::load_chat_room_member_names(&contact_conn, &username)?
+    } else {
+        HashMap::new()
+    };
+    let speech = load_member_speech(store, &message_dbs, &username, options.jobs)?;
+    let history_start = speech.values().map(|row| row.first_spoke).min();
+    let history_end = speech.values().map(|row| row.last_spoke).max();
+    let group_display = contacts
+        .get(&username)
+        .map(|value| value.display_name(options.name_mode))
+        .unwrap_or(&username);
+
+    let total_members = roster.usernames.len();
+    let mut members = roster
+        .usernames
+        .into_iter()
+        .map(|member_username| {
+            let activity = speech.get(&member_username);
+            MemberActivity {
+                display_name: contact::resolve_sender_name_with_mode(
+                    &member_username,
+                    &contacts,
+                    options.name_mode,
+                    &room_member_names,
+                ),
+                is_owner: roster.owner.as_deref() == Some(member_username.as_str()),
+                last_spoke: activity.map(|row| row.last_spoke),
+                message_count: activity.map(|row| row.message_count).unwrap_or(0),
+                username: member_username,
+            }
+        })
+        .filter(|member| {
+            options
+                .inactive_since
+                .is_none_or(|cutoff| member.last_spoke.is_none_or(|last| last < cutoff))
+        })
+        .collect::<Vec<_>>();
+    members.sort_by(|left, right| {
+        left.last_spoke
+            .cmp(&right.last_spoke)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+            .then_with(|| left.username.cmp(&right.username))
+    });
+
+    let stdout = std::io::stdout();
+    let mut out = crate::output::Output::new(stdout.lock());
+    out.line(format_args!("Group: {group_display} ({username})"))?;
+    out.line(format_args!("Current members: {total_members}"))?;
+    match (history_start, history_end) {
+        (Some(start), Some(end)) => out.line(format_args!(
+            "Local sender history: {} to {}",
+            time::format_local_timestamp_minutes(start),
+            time::format_local_timestamp_minutes(end)
+        ))?,
+        _ => out.line(format_args!("Local sender history: none"))?,
+    }
+    if let Some(cutoff) = options.inactive_since {
+        out.line(format_args!(
+            "Filter: no recorded messages since {}",
+            time::format_local_timestamp_minutes(cutoff)
+        ))?;
+        out.line(format_args!(
+            "Note: the current roster has no join times; review recent joiners before removal."
+        ))?;
+        if history_start.is_none_or(|start| start > cutoff) {
+            out.line(format_args!(
+                "Warning: local sender history does not reach the cutoff; this cannot prove a full period of silence."
+            ))?;
+        }
+    }
+    out.blank_line()?;
+    out.line(format_args!(
+        "{:<4} {:<20} {:<10} {:<7} {:<22} Username",
+        "Rank", "Last Spoke", "Messages", "Role", "Display Name"
+    ))?;
+    out.line(format_args!("{}", "-".repeat(130)))?;
+    for (index, member) in members.iter().enumerate() {
+        let last_spoke = member
+            .last_spoke
+            .map(time::format_local_timestamp_minutes)
+            .unwrap_or_else(|| "never recorded".to_string());
+        out.line(format_args!(
+            "{:<4} {:<20} {:<10} {:<7} {:<22} {}",
+            index + 1,
+            last_spoke,
+            member.message_count,
+            if member.is_owner { "owner" } else { "" },
+            member.display_name,
+            member.username
+        ))?;
+    }
+    out.blank_line()?;
+    if options.inactive_since.is_some() {
+        out.line(format_args!(
+            "Candidates: {} of {} current members (local records only)",
+            members.len(),
+            total_members
+        ))?;
+    } else {
+        out.line(format_args!("Listed: {} current members", members.len()))?;
+    }
+    out.flush()?;
+    Ok(members)
+}
+
+fn load_member_speech(
+    store: &SourceStore,
+    message_dbs: &[String],
+    username: &str,
+    jobs: usize,
+) -> Result<HashMap<String, MemberSpeech>, String> {
+    let table_name = msg_table_name(username);
+    let db_jobs = parallel::job_count(jobs, parallel::SOURCE_DB_AUTO_CAP);
+    let per_db = parallel::map_ordered(
+        message_dbs.to_vec(),
+        db_jobs,
+        |db_path| -> Result<HashMap<String, MemberSpeech>, String> {
+            let conn = store.open(&db_path)?;
+            if !table_exists(&conn, &table_name)? {
+                return Ok(HashMap::new());
+            }
+            let name2id = load_name2id(&conn)?;
+            let sender_col = quote_identifier(dictionary::msg_sender_column());
+            let sql = format!(
+                "SELECT {sender_col}, MIN(create_time), MAX(create_time), COUNT(*)
+                 FROM {table}
+                 WHERE create_time > 0 AND {sender_col} IS NOT NULL AND {sender_col} != 0
+                 GROUP BY {sender_col}",
+                table = quote_identifier(&table_name),
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|error| format!("Prepare member activity in {db_path}: {error}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(|error| format!("Read member activity in {db_path}: {error}"))?;
+            let mut activity = HashMap::new();
+            for row in rows {
+                let (sender_id, first_spoke, last_spoke, message_count) =
+                    row.map_err(|error| format!("Read member activity row in {db_path}: {error}"))?;
+                let Some(sender) = name2id.get(&sender_id) else {
+                    return Err(format!(
+                        "Cannot resolve sender identity {sender_id} in {db_path}; refusing a partial inactivity report"
+                    ));
+                };
+                activity.insert(
+                    sender.clone(),
+                    MemberSpeech {
+                        first_spoke,
+                        last_spoke,
+                        message_count,
+                    },
+                );
+            }
+            Ok(activity)
+        },
+    );
+
+    let mut activity: HashMap<String, MemberSpeech> = HashMap::new();
+    for db_activity in per_db {
+        for (username, row) in db_activity? {
+            if let Some(entry) = activity.get_mut(&username) {
+                entry.first_spoke = entry.first_spoke.min(row.first_spoke);
+                entry.last_spoke = entry.last_spoke.max(row.last_spoke);
+                entry.message_count = entry
+                    .message_count
+                    .checked_add(row.message_count)
+                    .ok_or_else(|| "Member message count overflow".to_string())?;
+            } else {
+                activity.insert(username, row);
+            }
+        }
+    }
+    Ok(activity)
 }
 
 fn list_sessions_from_connection(
@@ -1937,6 +2233,115 @@ mod tests {
         assert_eq!(sessions[0].0, "tgid_alice");
         assert_eq!(sessions[0].1, 4);
         assert_eq!(sessions[0].3, "Alice Zhang");
+    }
+
+    #[test]
+    fn member_friends_requires_relationship_evidence_without_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("contact")).unwrap();
+        let conn = Connection::open(dir.path().join("contact/contact.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE contact(id INTEGER PRIMARY KEY, username TEXT, nick_name TEXT, remark TEXT, alias TEXT,
+                local_type INTEGER, flag INTEGER, delete_flag INTEGER, verify_flag INTEGER);
+             CREATE TABLE chat_room(id INTEGER PRIMARY KEY, username TEXT, owner TEXT, ext_buffer BLOB);
+             CREATE TABLE chatroom_member(room_id INTEGER, member_id INTEGER);
+             CREATE TABLE stranger(username TEXT, nick_name TEXT, remark TEXT, alias TEXT);
+             INSERT INTO contact VALUES
+                (1, 'friend', 'Alice', '', '', 1, 3, 0, 0),
+                (2, 'extra_bits', 'Bob', '', '', 1, 32771, 0, 0),
+                (3, 'self', 'Self', '', '', 1, 1, 0, 0),
+                (4, 'stranger', 'Stranger', 'Has a remark', '', 3, 4, 0, 0),
+                (5, 'deleted', 'Deleted', '', '', 1, 3, 1, 0),
+                (6, 'service', 'Service', '', '', 1, 3, 0, 8),
+                (7, 'unknown', 'Unknown', '', '', 1, NULL, 0, 0),
+                (8, 'not_in_group', 'Absent', '', '', 1, 3, 0, 0),
+                (9, 'conflict', 'Conflicting evidence', '', '', 1, 3, 0, 0),
+                (10, 'room@chatroom', 'Study Group', '', '', 2, 2, 0, 0);
+             INSERT INTO stranger VALUES ('conflict', 'Conflicting evidence', '', '');
+             INSERT INTO chat_room(id, username) VALUES (20, 'room@chatroom');
+             INSERT INTO chatroom_member VALUES (20,1),(20,2),(20,3),(20,4),(20,5),(20,6),(20,7),(20,9);"
+        ).unwrap();
+        drop(conn);
+        let store = SourceStore::from_plaintext(dir.path()).unwrap();
+        let matches =
+            super::list_member_friends(&store, "room@chatroom", DisplayNameMode::Anonymous, 1)
+                .unwrap();
+        assert_eq!(matches, ["friend", "extra_bits"]);
+        assert!(
+            super::list_member_friends(&store, "friend", DisplayNameMode::Anonymous, 1).is_err()
+        );
+    }
+
+    #[test]
+    fn members_filters_complete_roster_by_last_recorded_speech() {
+        let dir = tempdir().unwrap();
+        let contact_dir = dir.path().join("contact");
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&contact_dir).unwrap();
+        std::fs::create_dir_all(&message_dir).unwrap();
+
+        let contact_conn = Connection::open(contact_dir.join("contact.db")).unwrap();
+        contact_conn
+            .execute_batch(
+                "CREATE TABLE contact(id INTEGER PRIMARY KEY, username TEXT, nick_name TEXT, remark TEXT, alias TEXT);
+                 CREATE TABLE chat_room(id INTEGER PRIMARY KEY, username TEXT, owner TEXT, ext_buffer BLOB);
+                 CREATE TABLE chatroom_member(room_id INTEGER, member_id INTEGER);
+                 INSERT INTO contact VALUES
+                    (1, 'tgid_alice', 'Alice', '', ''),
+                    (2, 'tgid_bob', 'Bob', '', ''),
+                    (3, 'tgid_cara', 'Cara', '', ''),
+                    (10, 'room@chatroom', 'Study Group', '', '');
+                 INSERT INTO chat_room(id, username, owner) VALUES (20, 'room@chatroom', 'tgid_bob');
+                 INSERT INTO chatroom_member VALUES (20, 1), (20, 2), (20, 3);",
+            )
+            .unwrap();
+        drop(contact_conn);
+
+        let message_conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let table = quote_identifier(&msg_table_name("room@chatroom"));
+        let sender = quote_identifier(dictionary::msg_sender_column());
+        message_conn
+            .execute_batch(
+                "CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY);
+                 INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'tgid_alice'), (2, 'tgid_bob');",
+            )
+            .unwrap();
+        message_conn
+            .execute(
+                &format!("CREATE TABLE {table}(create_time INTEGER, {sender} INTEGER)"),
+                [],
+            )
+            .unwrap();
+        message_conn
+            .execute(
+                &format!("INSERT INTO {table}(create_time, {sender}) VALUES (100, 1), (2000, 2)"),
+                [],
+            )
+            .unwrap();
+        drop(message_conn);
+
+        let store = SourceStore::from_plaintext(dir.path()).unwrap();
+        let members = super::list_members(
+            &store,
+            ListMembersOptions {
+                session_query: "Study Group",
+                inactive_since: Some(1000),
+                name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.username.as_str())
+                .collect::<Vec<_>>(),
+            ["tgid_cara", "tgid_alice"]
+        );
+        assert_eq!(members[0].last_spoke, None);
+        assert_eq!(members[1].last_spoke, Some(100));
+        assert_eq!(members[1].message_count, 1);
     }
 
     #[test]

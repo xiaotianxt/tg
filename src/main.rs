@@ -167,6 +167,22 @@ enum Commands {
         #[command(flatten)]
         source: SourceArgs,
     },
+    /// List current group members and their locally recorded speaking activity
+    Members {
+        /// Group username or display name
+        session: String,
+        /// Only show members with no recorded messages since this time
+        #[arg(long)]
+        inactive_since: Option<String>,
+        /// Only show locally confirmed friends; does not read message history
+        #[arg(long, conflicts_with = "inactive_since")]
+        friends: bool,
+        /// Use group/member public names instead of your contact remarks
+        #[arg(long)]
+        anonymous: bool,
+        #[command(flatten)]
+        source: SourceArgs,
+    },
     /// Diagnose tg setup and optionally a specific chat
     Doctor {
         /// Optional session username (tgid_xxx) or display name to inspect
@@ -382,6 +398,45 @@ fn run(command: Commands) -> Result<(), String> {
             }
             Ok(())
         }
+        Commands::Members {
+            session,
+            inactive_since,
+            friends,
+            anonymous,
+            source,
+        } => {
+            let store = open_source(&source)?;
+            if friends {
+                return db::list_member_friends(
+                    &store,
+                    &session,
+                    if anonymous {
+                        contact::DisplayNameMode::Anonymous
+                    } else {
+                        contact::DisplayNameMode::PersonalRemark
+                    },
+                    source.jobs,
+                )
+                .map(|_| ());
+            }
+            let inactive_since = time::parse_since_opt(inactive_since.as_deref())
+                .map_err(|error| format!("Error parsing --inactive-since: {error}"))?;
+            db::list_members(
+                &store,
+                db::ListMembersOptions {
+                    session_query: &session,
+                    inactive_since,
+                    name_mode: if anonymous {
+                        contact::DisplayNameMode::Anonymous
+                    } else {
+                        contact::DisplayNameMode::PersonalRemark
+                    },
+                    jobs: source.jobs,
+                },
+            )
+            .map_err(|error| format!("Error: {error}"))?;
+            Ok(())
+        }
         Commands::Doctor { session, source } => doctor::run(doctor::DoctorOptions {
             session: session.as_deref(),
             db_dir: source.db_dir.as_deref(),
@@ -587,6 +642,7 @@ mod tests {
             "decrypt",
             "sessions",
             "unread",
+            "members",
             "messages",
             "search",
             "query",
@@ -798,6 +854,54 @@ mod tests {
         match cli.command {
             Commands::Unread { query, .. } => assert_eq!(query.as_deref(), Some("alice")),
             _ => panic!("expected unread command"),
+        }
+    }
+
+    #[test]
+    fn members_accepts_friends_but_not_inactivity_together() {
+        assert!(matches!(
+            Cli::try_parse_from(["tg", "members", "room", "--friends", "--anonymous"])
+                .unwrap()
+                .command,
+            Commands::Members {
+                friends: true,
+                anonymous: true,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "tg",
+            "members",
+            "room",
+            "--friends",
+            "--inactive-since",
+            "1y"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn members_accepts_inactivity_filter() {
+        let cli = Cli::parse_from(args(&[
+            "tg",
+            "members",
+            "room",
+            "--inactive-since",
+            "1y",
+            "--anonymous",
+        ]));
+        match cli.command {
+            Commands::Members {
+                session,
+                inactive_since,
+                anonymous,
+                ..
+            } => {
+                assert_eq!(session, "room");
+                assert_eq!(inactive_since.as_deref(), Some("1y"));
+                assert!(anonymous);
+            }
+            _ => panic!("expected members command"),
         }
     }
 
