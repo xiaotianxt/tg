@@ -236,8 +236,8 @@ fn aes_ecb_decrypt(data: &[u8], key: &[u8; 16]) -> Vec<u8> {
 
     let cipher = Aes128::new_from_slice(key).expect("AES-128 key must be 16 bytes");
     let mut buf = data.to_vec();
-    for block in buf.chunks_exact_mut(16) {
-        let b: &mut Block<Aes128> = block.try_into().expect("AES block chunk is 16 bytes");
+    for block in buf.as_chunks_mut::<16>().0 {
+        let b: &mut Block<Aes128> = block.into();
         cipher.decrypt_block(b);
     }
     buf

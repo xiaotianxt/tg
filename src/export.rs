@@ -839,20 +839,20 @@ fn export_txt(
     let mut f = BufWriter::new(file);
     let write_error = |error| format!("Cannot write {}: {error}", path.display());
 
-    writeln!(f, "Telegram 聊天记录: {} ({})", display_name, username).map_err(&write_error)?;
-    writeln!(f, "总消息数: {}", messages.len()).map_err(&write_error)?;
+    writeln!(f, "Telegram 聊天记录: {} ({})", display_name, username).map_err(write_error)?;
+    writeln!(f, "总消息数: {}", messages.len()).map_err(write_error)?;
     writeln!(
         f,
         "时间范围: {} ~ {}",
         messages.first().map(|m| m.time.as_str()).unwrap_or(""),
         messages.last().map(|m| m.time.as_str()).unwrap_or("")
     )
-    .map_err(&write_error)?;
-    writeln!(f, "{}", "=".repeat(60)).map_err(&write_error)?;
-    writeln!(f).map_err(&write_error)?;
+    .map_err(write_error)?;
+    writeln!(f, "{}", "=".repeat(60)).map_err(write_error)?;
+    writeln!(f).map_err(write_error)?;
 
     for m in messages {
-        writeln!(f, "[{}] {}: {}", m.time, m.sender, m.content).map_err(&write_error)?;
+        writeln!(f, "[{}] {}: {}", m.time, m.sender, m.content).map_err(write_error)?;
     }
 
     f.flush().map_err(write_error)
@@ -865,8 +865,8 @@ fn export_csv(path: &Path, messages: &[ExportMessage]) -> Result<(), String> {
     let write_error = |error| format!("Cannot write {}: {error}", path.display());
 
     // Write BOM for Excel compatibility
-    f.write_all(&[0xEF, 0xBB, 0xBF]).map_err(&write_error)?;
-    writeln!(f, "时间,发送者,类型,内容").map_err(&write_error)?;
+    f.write_all(&[0xEF, 0xBB, 0xBF]).map_err(write_error)?;
+    writeln!(f, "时间,发送者,类型,内容").map_err(write_error)?;
 
     for m in messages {
         // Escape CSV fields
@@ -874,7 +874,7 @@ fn export_csv(path: &Path, messages: &[ExportMessage]) -> Result<(), String> {
         let sender = escape_csv(&m.sender);
         let type_name = escape_csv(&m.type_name);
         let content = escape_csv(&m.content);
-        writeln!(f, "{},{},{},{}", time, sender, type_name, content).map_err(&write_error)?;
+        writeln!(f, "{},{},{},{}", time, sender, type_name, content).map_err(write_error)?;
     }
 
     f.flush().map_err(write_error)
@@ -1181,9 +1181,8 @@ mod tests {
         let pad_len = if remainder == 0 { 16 } else { 16 - remainder };
         encrypted.extend(std::iter::repeat_n(pad_len as u8, pad_len));
         let cipher = aes::Aes128::new_from_slice(&keys.aes_key).unwrap();
-        for block in encrypted.chunks_exact_mut(16) {
-            let block: &mut Block<aes::Aes128> =
-                block.try_into().expect("AES block chunk is 16 bytes");
+        for block in encrypted.as_chunks_mut::<16>().0 {
+            let block: &mut Block<aes::Aes128> = block.into();
             cipher.encrypt_block(block);
         }
         let mut data = crate::media_decrypt::V2_MAGIC.to_vec();

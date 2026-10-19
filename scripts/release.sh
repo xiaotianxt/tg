@@ -256,6 +256,20 @@ if [[ "$HEAD_SHA" != "$(git rev-parse origin/main)" ]]; then
   git push origin HEAD:main
 fi
 
+# A release build alone does not run the lint/test matrix. Require CI for the
+# exact release commit before publishing a tag or updating the tap.
+log "waiting for CI on ${HEAD_SHA}"
+CI_RUN_ID=""
+for _ in {1..60}; do
+  CI_RUN_ID="$(gh run list --repo "$REPO_SLUG" --workflow ci.yml \
+    --commit "$HEAD_SHA" --limit 1 --json databaseId \
+    --jq '.[0].databaseId // empty')"
+  [[ -n "$CI_RUN_ID" ]] && break
+  sleep 5
+done
+[[ -n "$CI_RUN_ID" ]] || die "CI run for ${HEAD_SHA} was not found; refusing to publish"
+gh run watch "$CI_RUN_ID" --repo "$REPO_SLUG" --exit-status
+
 DARWIN_ARM64_ASSET="tg-${TAG}-darwin-arm64.tar.gz"
 LINUX_X86_64_ASSET="tg-${TAG}-linux-x86_64.tar.gz"
 LINUX_ARM64_ASSET="tg-${TAG}-linux-arm64.tar.gz"
