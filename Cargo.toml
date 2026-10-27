@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 aes = "0.9"
@@ -29,13 +29,13 @@ hex = "0.4"
 tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
-zstd = "0.13"
+zstd = "0.14"
 log = "0.4"
 zeroize = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gimli = { version = "0.34", default-features = false, features = ["read"] }
 libc = "0.2"
-object = { version = "0.39", default-features = false, features = ["elf", "read", "std"] }
+object = { version = "0.40", default-features = false, features = ["elf", "read", "std"] }
 yaxpeax-arch = { version = "0.3", default-features = false }
-yaxpeax-arm = { version = "0.4", default-features = false }
+yaxpeax-arm = { version = "0.5", default-features = false }

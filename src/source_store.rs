@@ -123,11 +123,14 @@ impl SourceStore {
         )
         .map_err(|error| format!("Cannot open {relative_path} read-only: {error}"))?;
         apply_raw_key(&conn, key, &salt, relative_path)?;
-        conn.pragma_update(None, "cipher_compatibility", 4)
+        // SQLCipher pragmas are absent from SQLite's pragma_list, which rusqlite validates.
+        conn.execute_batch("PRAGMA cipher_compatibility = 4")
             .map_err(|error| format!("Cannot configure SQLCipher for {relative_path}: {error}"))?;
-        conn.pragma_update(None, "query_only", true)
+        // Configure before any schema read: pragma helpers query pragma_list and can
+        // fail on a wrong key before the schema probe reports key-recovery guidance.
+        conn.execute_batch("PRAGMA query_only = true")
             .map_err(|error| format!("Cannot make {relative_path} query-only: {error}"))?;
-        conn.pragma_update(None, "temp_store", "MEMORY")
+        conn.execute_batch("PRAGMA temp_store = MEMORY")
             .map_err(|error| {
                 format!("Cannot keep temporary data in memory for {relative_path}: {error}")
             })?;
@@ -260,7 +263,8 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let conn = Connection::open(&path).unwrap();
         apply_raw_key(&conn, key, salt, relative_path).unwrap();
-        conn.pragma_update(None, "cipher_compatibility", 4).unwrap();
+        conn.execute_batch("PRAGMA cipher_compatibility = 4")
+            .unwrap();
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
             .unwrap();
         conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
