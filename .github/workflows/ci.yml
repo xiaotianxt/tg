@@ -5,31 +5,44 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
-  fmt:
+  # Lint is platform-independent, so it runs once instead of on every target.
+  lint:
+    name: fmt + clippy
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
         run: cargo fmt --all -- --check
 
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
   build:
-    needs: fmt
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -46,9 +59,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          components: clippy
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Linux packages
         if: runner.os == 'Linux'
@@ -62,17 +77,16 @@ jobs:
       - name: Verify runner architecture
         run: test "$(uname -m)" = "${{ matrix.uname }}"
 
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Build
-        run: cargo build --release --bin tg
-
       - name: Test
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
+
+      # Release is required here: the bundled-database check below asserts on
+      # the artifact that actually ships.
+      - name: Build
+        run: cargo build --locked --release --bin tg
 
       - name: Verify CLI
-        run: cargo run --release --bin tg -- --help
+        run: ./target/release/tg --help
 
       - name: Verify bundled database provider
         run: |
