@@ -111,7 +111,10 @@ returning. The snapshot lasts until that active read transaction ends. Current
 reader modules must not issue `BEGIN`, `COMMIT`, `END`, or `ROLLBACK`; the
 migration review and a source check enforce this contract. The returned
 connection is never shared concurrently; the existing scoped workers open one
-connection per database.
+connection per database. Search is the one reader that opens several
+connections to the same database: it scans each FTS content table on its own
+connection, so each table is read from one snapshot but different tables may
+come from slightly different instants, as with message shards.
 
 The module returns contextual `String` errors, matching the rest of this
 crate. No caller needs to branch on storage error variants after refresh and
@@ -192,7 +195,10 @@ live WAL and return stale data while the desktop client is running.
 Each connection sees a consistent committed snapshot of its database, including
 committed WAL frames. Separate contact, session, FTS, media, and message-shard
 connections may observe slightly different instants; the current independent
-database layout cannot provide a global atomic snapshot.
+database layout cannot provide a global atomic snapshot. The bundled SQLCipher
+is built without `SQLITE_ENABLE_SNAPSHOT`, so parallel connections to one
+database cannot share a snapshot either; a single table is therefore never
+split across connections.
 
 The direct reader issues no SQL writes to the main database or WAL. SQLite may
 read, lock, create, or update the native `-shm` WAL-index as required for correct

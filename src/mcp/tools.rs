@@ -337,6 +337,7 @@ fn search_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Str
             limit: None,
             since: ctx.clamp_since(since),
             name_mode: ctx.name_mode(),
+            jobs: ctx.jobs,
         },
     )?;
     // Hits arrive oldest first; return newest first.

@@ -193,6 +193,7 @@ pub(crate) struct SearchMessagesOptions<'a> {
     pub limit: Option<usize>,
     pub since: Option<i64>,
     pub name_mode: DisplayNameMode,
+    pub jobs: usize,
 }
 
 pub(crate) struct ListMembersOptions<'a> {
@@ -1082,7 +1083,7 @@ fn search_messages_with_fts(
         .filter(|_| fts::register_compatible_tokenizer(&conn).is_ok());
     let mut results = match match_query {
         Some(query) => collect_telegram_fts_rows(
-            &conn,
+            store,
             &content_tables,
             &name2id,
             options,
@@ -1091,7 +1092,7 @@ fn search_messages_with_fts(
         )
         .or_else(|match_error| {
             collect_telegram_fts_rows(
-                &conn,
+                store,
                 &content_tables,
                 &name2id,
                 options,
@@ -1105,7 +1106,7 @@ fn search_messages_with_fts(
             })
         })?,
         None => collect_telegram_fts_rows(
-            &conn,
+            store,
             &content_tables,
             &name2id,
             options,
@@ -1124,80 +1125,110 @@ fn search_messages_with_fts(
     Ok((has_more, results))
 }
 
+/// Scans each FTS table on its own connection. Rows are concatenated in
+/// table order, so the caller's stable sort sees the same sequence as one
+/// sequential scan.
 fn collect_telegram_fts_rows(
-    conn: &Connection,
+    store: &SourceStore,
     content_tables: &[String],
     name2id: &HashMap<i64, String>,
     options: &SearchMessagesOptions<'_>,
     result_limit: Option<usize>,
     match_query: Option<&str>,
 ) -> Result<Vec<SearchRow>, String> {
-    let search_pattern = like_contains_pattern(options.query);
+    // The four FTS tables total far less than the message shards that
+    // SOURCE_DB_AUTO_CAP was tuned on; one worker per table measured fastest.
+    let jobs = parallel::job_count(options.jobs, content_tables.len());
+    let per_table = parallel::map_ordered(content_tables.iter().collect(), jobs, |content_table| {
+        let conn = store
+            .open(MESSAGE_FTS_DB)
+            .map_err(|error| format!("Message search index is unavailable: {error}"))?;
+        if match_query.is_some() {
+            fts::register_compatible_tokenizer(&conn)?;
+        }
+        search_telegram_fts_table(
+            &conn,
+            content_table,
+            name2id,
+            options,
+            result_limit,
+            match_query,
+        )
+    });
     let mut results = Vec::new();
-
-    for content_table in content_tables {
-        let (table, columns, search_clause, time_column, search_value) =
-            if let Some(query) = match_query {
-                let table = content_table
-                    .strip_suffix("_content")
-                    .ok_or_else(|| format!("Invalid FTS content table name: {content_table}"))?;
-                let quoted = quote_identifier(table);
-                (
-                    quoted.clone(),
-                    "local_type, create_time, acontent, session_id",
-                    format!("{} MATCH ?1", quoted),
-                    "create_time",
-                    query,
-                )
-            } else {
-                (
-                    quote_identifier(content_table),
-                    "c3, c6, c0, c4",
-                    fts_content_like_clause().to_string(),
-                    "c6",
-                    search_pattern.as_str(),
-                )
-            };
-        let since_clause = options
-            .since
-            .map(|ts| format!(" AND {time_column} >= {ts}"))
-            .unwrap_or_default();
-        let limit_clause = result_limit
-            .map(|limit| format!(" LIMIT {limit}"))
-            .unwrap_or_default();
-        let sql = format!(
-            "SELECT {columns} FROM {table} \
-             WHERE {search_clause}{since_clause} \
-             ORDER BY {time_column} DESC{limit_clause}"
-        );
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|error| format!("Prepare search of {content_table}: {error}"))?;
-        let rows = stmt
-            .query_map(params![search_value], |row| {
-                let session_id = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
-                let session = name2id
-                    .get(&session_id)
-                    .cloned()
-                    .unwrap_or_else(|| session_id.to_string());
-                Ok((
-                    row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
-                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    session,
-                ))
-            })
-            .map_err(|error| format!("Query search index table {content_table}: {error}"))?;
-        let rows = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|error| format!("Read search index table {content_table}: {error}"))?;
-        results.extend(rows);
+    for rows in per_table {
+        results.extend(rows?);
     }
 
     if match_query.is_some() {
         results.retain(|row| row.2.contains(options.query));
     }
     Ok(results)
+}
+
+fn search_telegram_fts_table(
+    conn: &Connection,
+    content_table: &str,
+    name2id: &HashMap<i64, String>,
+    options: &SearchMessagesOptions<'_>,
+    result_limit: Option<usize>,
+    match_query: Option<&str>,
+) -> Result<Vec<SearchRow>, String> {
+    let search_pattern = like_contains_pattern(options.query);
+    let (table, columns, search_clause, time_column, search_value) =
+        if let Some(query) = match_query {
+            let table = content_table
+                .strip_suffix("_content")
+                .ok_or_else(|| format!("Invalid FTS content table name: {content_table}"))?;
+            let quoted = quote_identifier(table);
+            (
+                quoted.clone(),
+                "local_type, create_time, acontent, session_id",
+                format!("{} MATCH ?1", quoted),
+                "create_time",
+                query,
+            )
+        } else {
+            (
+                quote_identifier(content_table),
+                "c3, c6, c0, c4",
+                fts_content_like_clause().to_string(),
+                "c6",
+                search_pattern.as_str(),
+            )
+        };
+    let since_clause = options
+        .since
+        .map(|ts| format!(" AND {time_column} >= {ts}"))
+        .unwrap_or_default();
+    let limit_clause = result_limit
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT {columns} FROM {table} \
+         WHERE {search_clause}{since_clause} \
+         ORDER BY {time_column} DESC{limit_clause}"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| format!("Prepare search of {content_table}: {error}"))?;
+    let rows = stmt
+        .query_map(params![search_value], |row| {
+            let session_id = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+            let session = name2id
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_else(|| session_id.to_string());
+            Ok((
+                row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                session,
+            ))
+        })
+        .map_err(|error| format!("Query search index table {content_table}: {error}"))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Read search index table {content_table}: {error}"))
 }
 
 fn telegram_fts_content_tables(conn: &Connection) -> Result<Vec<String>, String> {
@@ -2369,11 +2400,82 @@ mod tests {
                 limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap();
 
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parallel_fts_tables_merge_ties_in_table_order() {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let conn = Connection::open(message_dir.join("message_fts.db")).unwrap();
+        crate::fts::register_compatible_tokenizer(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE name2id(username TEXT PRIMARY KEY);
+             INSERT INTO name2id (rowid, username) VALUES (7, 'tgid_fts_session');",
+        )
+        .unwrap();
+        for table in 0..3 {
+            conn.execute_batch(&format!(
+                "CREATE VIRTUAL TABLE message_fts_v4_{table} USING fts5(
+                     tokenize = 'MMFtsTokenizer disable_pinyin', acontent,
+                     message_local_id UNINDEXED, sort_seq UNINDEXED, local_type UNINDEXED,
+                     session_id UNINDEXED, sender_id UNINDEXED, create_time UNINDEXED
+                 )"
+            ))
+            .unwrap();
+            for time in [10, 20] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO message_fts_v4_{table} (
+                             acontent, message_local_id, sort_seq, local_type,
+                             session_id, sender_id, create_time
+                         ) VALUES (?1, 1, 0, 1, 7, 0, ?2)"
+                    ),
+                    params![format!("开源 needle {table}-{time}"), time],
+                )
+                .unwrap();
+            }
+        }
+        drop(conn);
+        let store = SourceStore::from_plaintext(dir.path()).unwrap();
+
+        for query in ["needle", "开源"] {
+            for jobs in [1, 3] {
+                let results = super::search_messages(
+                    &store,
+                    SearchMessagesOptions {
+                        query,
+                        limit: Some(4),
+                        since: None,
+                        name_mode: DisplayNameMode::PersonalRemark,
+                        jobs,
+                    },
+                )
+                .unwrap();
+                let hits: Vec<_> = results
+                    .hits
+                    .iter()
+                    .map(|hit| hit.content.as_str())
+                    .collect();
+                assert_eq!(
+                    hits,
+                    [
+                        "开源 needle 0-10",
+                        "开源 needle 0-20",
+                        "开源 needle 1-20",
+                        "开源 needle 2-20"
+                    ],
+                    "query {query}, jobs {jobs}"
+                );
+                assert!(results.has_more);
+            }
+        }
     }
 
     #[test]
@@ -2387,6 +2489,7 @@ mod tests {
                 limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap_err();
@@ -2413,6 +2516,7 @@ mod tests {
                 limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap_err();
@@ -2432,6 +2536,7 @@ mod tests {
                 limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap();
@@ -2451,6 +2556,7 @@ mod tests {
                 limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap();
@@ -2469,6 +2575,7 @@ mod tests {
                 limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap();
@@ -2487,6 +2594,7 @@ mod tests {
                 limit: Some(20),
                 since: Some(1001),
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap();

@@ -537,6 +537,7 @@ fn run(command: Commands) -> Result<(), String> {
                     } else {
                         contact::DisplayNameMode::PersonalRemark
                     },
+                    jobs: source.jobs,
                 },
             )
             .map_err(|e| format!("Error: {e}"))?;
