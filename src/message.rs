@@ -3,6 +3,7 @@ use crate::media;
 use crate::media_pb;
 use crate::time;
 use flate2::read::ZlibDecoder;
+use std::cell::RefCell;
 use std::fmt;
 use std::io::Read;
 
@@ -1193,15 +1194,27 @@ pub fn try_decompress(raw: &[u8]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+thread_local! {
+    /// One decompression context per thread, reused across messages. Each use
+    /// starts by resetting the session (`Decoder::with_context`), so no state
+    /// or output carries from one message to the next; only the allocation is
+    /// reused.
+    static ZSTD_DCTX: RefCell<Option<zstd::zstd_safe::DCtx<'static>>> =
+        const { RefCell::new(None) };
+}
+
 fn try_zstd(data: &[u8]) -> Result<String, ()> {
-    let mut d = zstd::Decoder::new(data).map_err(|_| ())?;
-    let mut s = String::new();
-    d.read_to_string(&mut s).map_err(|_| ())?;
-    if s.is_empty() {
-        Err(())
-    } else {
+    ZSTD_DCTX.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(zstd::zstd_safe::DCtx::try_create().ok_or(())?);
+        }
+        let context = slot.as_mut().expect("context was just created");
+        let mut d = zstd::stream::read::Decoder::with_context(data, context);
+        let mut s = String::new();
+        d.read_to_string(&mut s).map_err(|_| ())?;
         Ok(s)
-    }
+    })
 }
 
 fn try_zlib(data: &[u8]) -> Result<String, ()> {
@@ -1748,5 +1761,97 @@ continues</datadesc></dataitem><dataitem datatype="1" dataid="c"><sourcename>B</
         assert!(d.content.contains("外层回复文本"));
         assert!(!d.content.contains("<msg"));
         assert!(!d.content.contains("<appmsg"));
+    }
+
+    fn zstd_frame(text: &[u8]) -> Vec<u8> {
+        zstd::bulk::compress(text, 3).unwrap()
+    }
+
+    fn skippable_frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x50, 0x2A, 0x4D, 0x18];
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn zlib_stream(text: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(text).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn try_decompress_accepts_zstd_frames() {
+        assert_eq!(
+            try_decompress(&zstd_frame("你好".as_bytes())).as_deref(),
+            Some("你好")
+        );
+        let big = "长消息".repeat(100_000);
+        assert_eq!(try_decompress(&zstd_frame(big.as_bytes())), Some(big));
+
+        let mut two = zstd_frame(b"ab");
+        two.extend(zstd_frame(b"cd"));
+        assert_eq!(try_decompress(&two).as_deref(), Some("abcd"));
+
+        let mut skipped = skippable_frame(b"xyz");
+        skipped.extend(zstd_frame(b"ab"));
+        skipped.extend(skippable_frame(b""));
+        assert_eq!(try_decompress(&skipped).as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn try_decompress_falls_back_for_rejected_zstd() {
+        // A frame whose output is empty, invalid UTF-8, truncated, or followed by
+        // trailing bytes is not zstd text; the raw bytes then decide.
+        assert_eq!(try_decompress(&zstd_frame(b"")), None);
+        // A lone skippable frame decodes to nothing; its bytes happen to be UTF-8.
+        let lone = skippable_frame(b"hi");
+        assert_eq!(try_decompress(&lone), String::from_utf8(lone.clone()).ok());
+        assert_eq!(try_decompress(&zstd_frame(&[0xff, 0xfe])), None);
+
+        let frame = zstd_frame("你好你好你好你好".as_bytes());
+        assert_eq!(try_decompress(&frame[..frame.len() - 1]), None);
+
+        let mut trailing = zstd_frame(b"ab");
+        trailing.extend_from_slice(b"tail");
+        assert_eq!(try_decompress(&trailing), None);
+
+        let mut empty_then_text = zstd_frame(b"");
+        empty_then_text.extend(zstd_frame(b"ok"));
+        assert_eq!(try_decompress(&empty_then_text).as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn try_decompress_reuses_state_after_failures() {
+        let frame = zstd_frame(b"first");
+        assert_eq!(try_decompress(&frame[..frame.len() - 2]), None);
+        assert_eq!(try_decompress(&frame).as_deref(), Some("first"));
+        let mut trailing = zstd_frame(b"x");
+        trailing.push(0x28);
+        assert_eq!(try_decompress(&trailing), None);
+        assert_eq!(
+            try_decompress(&zstd_frame(b"second")).as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn try_decompress_zlib_and_plain_text() {
+        assert_eq!(
+            try_decompress(&zlib_stream("旧版".as_bytes())).as_deref(),
+            Some("旧版")
+        );
+        assert_eq!(try_decompress(&zlib_stream(b"")), None);
+        assert_eq!(try_decompress(b"plain text").as_deref(), Some("plain text"));
+        assert_eq!(
+            try_decompress("纯文本".as_bytes()).as_deref(),
+            Some("纯文本")
+        );
+        assert_eq!(try_decompress(b""), None);
+        assert_eq!(try_decompress(&[0xff, 0x00]), None);
+        // Starts with the zstd magic but is not a frame.
+        assert_eq!(try_decompress(&[0x28, 0xB5, 0x2F, 0xFD]), None);
+        assert_eq!(try_decompress(&[0x28, 0xB5, 0x2F, 0xFD, b'a']), None);
     }
 }
