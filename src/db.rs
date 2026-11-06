@@ -356,6 +356,37 @@ fn collect_message_table_schemas(
     Ok(tables)
 }
 
+/// Display order of a message table row: `(order column, rowid)`.
+///
+/// `ORDER BY sort_seq` is served by the single-column `sort_seq` index, whose
+/// entries are `(sort_seq, rowid)`; walking it backwards for DESC therefore
+/// orders ties by descending rowid. `sort_seq` is not unique, so the rowid
+/// is part of the key. Reading a whole table in rowid order and sorting by
+/// this key returns the index-walk order without reading the index or doing a
+/// table b-tree lookup per row.
+pub(crate) type MessageOrderKey = (Option<i64>, i64);
+
+/// SQL suffix selecting the order column and rowid for a `MessageOrderKey`.
+pub(crate) fn message_order_key_columns(order_col: &str) -> String {
+    format!("{order_col}, rowid")
+}
+
+pub(crate) fn read_message_order_key(
+    row: &rusqlite::Row<'_>,
+    first_index: usize,
+) -> rusqlite::Result<MessageOrderKey> {
+    Ok((row.get(first_index)?, row.get(first_index + 1)?))
+}
+
+pub(crate) fn sort_in_message_order<T>(rows: &mut [(MessageOrderKey, T)], descending: bool) {
+    // Keys are unique (they end in the rowid), so an unstable sort is exact.
+    if descending {
+        rows.sort_unstable_by_key(|(key, _)| Reverse(*key));
+    } else {
+        rows.sort_unstable_by_key(|(key, _)| *key);
+    }
+}
+
 pub(crate) fn load_name2id(conn: &Connection) -> Result<HashMap<i64, String>, String> {
     if !table_exists(conn, "Name2Id")? {
         return Ok(HashMap::new());
@@ -883,23 +914,25 @@ pub fn read_messages(
             } else {
                 "create_time"
             };
+            // A LIMIT can stop the index walk early; a full read goes in rowid
+            // order and is sorted afterwards (see `MessageOrderKey`).
+            let order_clause = query_limit
+                .map(|n| format!(" ORDER BY {order_col} {order_dir} LIMIT {n}"))
+                .unwrap_or_default();
             let sql = format!(
-            "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col} \
-             FROM {table_name} WHERE create_time > 0{search_clause}{since_clause}{until_clause} ORDER BY {order_col} {order_dir}{limit_clause}",
+            "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}, {order_key} \
+             FROM {table_name} WHERE create_time > 0{search_clause}{since_clause}{until_clause}{order_clause}",
             local_id_col = local_id_col,
             body_col = body_col,
             marker_col = marker_col,
             sender_col = sender_col,
             packed_col = packed_col,
+            order_key = message_order_key_columns(order_col),
             table_name = table,
-            order_col = order_col,
             search_clause = search_clause,
             since_clause = since_clause,
             until_clause = until_clause,
-            order_dir = order_dir,
-            limit_clause = query_limit
-                .map(|n| format!(" LIMIT {}", n))
-                .unwrap_or_default()
+            order_clause = order_clause,
         );
             let mut stmt = conn
                 .prepare(&sql)
@@ -910,23 +943,29 @@ pub fn read_messages(
                 let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
                 let sender_account_id = name2id.get(&sender_id).cloned().unwrap_or_default();
                 let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
-                Ok(MessageRow {
-                    local_id: row.get::<_, Option<i64>>(0)?,
-                    local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
-                    create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    content,
-                    compression_marker,
-                    sender_account_id,
-                    packed_info,
-                })
+                Ok((
+                    read_message_order_key(row, 7)?,
+                    MessageRow {
+                        local_id: row.get::<_, Option<i64>>(0)?,
+                        local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
+                        create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        content,
+                        compression_marker,
+                        sender_account_id,
+                        packed_info,
+                    },
+                ))
             };
             let rows = match &search_pattern {
                 Some(pattern) => stmt.query_map(params![pattern], map_row),
                 None => stmt.query_map([], map_row),
             }
             .map_err(|error| format!("Query messages from {db_path}: {error}"))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|error| format!("Read messages from {db_path}: {error}"))
+            let mut rows = rows
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| format!("Read messages from {db_path}: {error}"))?;
+            sort_in_message_order(&mut rows, options.tail);
+            Ok(rows.into_iter().map(|(_, row)| row).collect())
         },
     );
 

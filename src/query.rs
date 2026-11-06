@@ -463,26 +463,31 @@ fn query_message_table(
         clauses.push(format!("({})", media_clause));
     }
 
-    let limit_clause = match result_window {
-        Some(window) if !query_needs_post_filtering(options) => format!(" LIMIT {window}"),
+    // A pushed-down LIMIT can stop the index walk early. Without one the whole
+    // table is read, so read it in rowid order and sort afterwards.
+    let order_clause = match result_window {
+        Some(window) if !query_needs_post_filtering(options) => {
+            format!(
+                " ORDER BY {order_col} {} LIMIT {window}",
+                options.sort.order_dir()
+            )
+        }
         _ => String::new(),
     };
 
     let sql = format!(
-        "SELECT local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}, {local_id_col} \
+        "SELECT local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}, {local_id_col}, {order_key} \
          FROM {quoted_table} \
-         WHERE {where_clause} \
-         ORDER BY {order_col} {order_dir}{limit_clause}",
+         WHERE {where_clause}{order_clause}",
         body_col = body_col,
         marker_col = marker_col,
         sender_col = sender_col,
         packed_col = packed_col,
         local_id_col = local_id_col,
+        order_key = db::message_order_key_columns(order_col),
         quoted_table = quoted_table,
-        order_col = order_col,
         where_clause = clauses.join(" AND "),
-        order_dir = options.sort.order_dir(),
-        limit_clause = limit_clause,
+        order_clause = order_clause,
     );
 
     let mut stmt = conn
@@ -516,24 +521,33 @@ fn query_message_table(
                 &session,
                 &context.sender_display,
             );
-            Ok(MessageRow {
-                session,
-                session_id,
-                sender: display_sender(&sender_account, context),
-                local_type,
-                create_time: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                body,
-                raw_body,
-            })
+            let order_key = db::read_message_order_key(row, 7)?;
+            Ok((
+                order_key,
+                MessageRow {
+                    session,
+                    session_id,
+                    sender: display_sender(&sender_account, context),
+                    local_type,
+                    create_time: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    body,
+                    raw_body,
+                },
+            ))
         })
         .map_err(|e| format!("Message query error in {}: {}", target.label, e))?;
 
-    Ok(mapped
+    let mut rows = mapped
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|error| format!("Read message rows in {}: {error}", target.label))?
         .into_iter()
-        .filter(|row| message_row_matches_filters(row, options))
+        .filter(|(_, row)| message_row_matches_filters(row, options))
+        .collect::<Vec<_>>();
+    db::sort_in_message_order(&mut rows, options.sort == QuerySort::Newest);
+    Ok(rows
+        .into_iter()
         .take(result_window.unwrap_or(usize::MAX))
+        .map(|(_, row)| row)
         .collect())
 }
 
@@ -1186,6 +1200,72 @@ mod tests {
 
         assert_eq!(count, 1);
         assert!(output.contains("[voice:5151]"));
+    }
+
+    #[test]
+    fn message_query_keeps_sort_seq_index_order_for_ties() {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let marker_col = dictionary::msg_compression_marker_column();
+        let packed_col = dictionary::msg_packed_meta_column();
+        conn.execute_batch(&format!(
+            "CREATE TABLE Msg_test (
+                local_id INTEGER PRIMARY KEY AUTOINCREMENT, local_type INTEGER,
+                sort_seq INTEGER, create_time INTEGER, message_content TEXT,
+                {marker_col} INTEGER, real_sender_id INTEGER, {packed_col} BLOB);
+             CREATE INDEX Msg_test_SORTSEQ ON Msg_test(sort_seq);"
+        ))
+        .unwrap();
+        // Equal create_time keeps the per-table order through the global
+        // stable sort, so sort_seq ties and NULLs must follow the index walk.
+        let sort_seqs = [
+            Some(5),
+            Some(2),
+            Some(5),
+            None,
+            Some(2),
+            Some(9),
+            None,
+            Some(5),
+        ];
+        for (index, sort_seq) in sort_seqs.into_iter().enumerate() {
+            conn.execute(
+                &format!(
+                    "INSERT INTO Msg_test (local_id, local_type, sort_seq, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+                     VALUES (?1, 1, ?2, 1000, ?3, NULL, 0, x'')"
+                ),
+                params![index as i64 + 1, sort_seq, format!("tie {}", index + 1)],
+            )
+            .unwrap();
+        }
+
+        let contains = ["tie".to_string()];
+        for sort in [QuerySort::Newest, QuerySort::Oldest] {
+            let expected: Vec<String> = conn
+                .prepare(&format!(
+                    "SELECT message_content FROM Msg_test ORDER BY sort_seq {}",
+                    sort.order_dir()
+                ))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            // --contains reads the whole table; --since pushes the LIMIT down.
+            for (contains, since) in [(&contains[..], None), (&[][..], Some(1))] {
+                let mut options = default_query_options(dir.path(), contains, &[]);
+                options.sort = sort;
+                options.since = since;
+                let got: Vec<String> = query_messages(&options)
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.body)
+                    .collect();
+                assert_eq!(got, expected, "{sort:?} since={since:?}");
+            }
+        }
     }
 
     #[test]
