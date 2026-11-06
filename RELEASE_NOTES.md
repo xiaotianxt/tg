@@ -3,6 +3,12 @@
 Expose tg's read-only commands as MCP tools so local assistants and remote
 clients such as ChatGPT can read and search your local chat history.
 
+Patch follow-up: `read_messages` now pages through a whole time range. It
+accepts `until`, honors `offset` in both orders, and returns `next_offset`
+while messages remain, so clients no longer receive the same newest batch
+repeatedly. One call returns up to 2000 messages (default 200), and the
+default result cap is now 256 KB.
+
 - Add `tg mcp stdio` for local MCP clients. It needs no network or authentication.
 - Add `tg mcp init` / `tg mcp serve` for remote clients over Streamable HTTP. tg only listens on loopback or Tailscale addresses and expects your own HTTPS reverse proxy in front.
 - Remote access is protected by a built-in single-user OAuth 2.1 server: dynamic client registration with a redirect allowlist, PKCE S256, an owner passphrase on the consent page, short-lived hashed access tokens, and rotating refresh tokens with replay detection.
