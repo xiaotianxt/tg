@@ -1,7 +1,7 @@
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::contact::{self, Contact, DisplayNameMode};
 use crate::dictionary;
@@ -193,6 +193,7 @@ pub(crate) struct SearchMessagesOptions<'a> {
     pub limit: Option<usize>,
     pub since: Option<i64>,
     pub name_mode: DisplayNameMode,
+    pub jobs: usize,
 }
 
 pub(crate) struct ListMembersOptions<'a> {
@@ -351,15 +352,7 @@ pub fn list_sessions(
     top_n: usize,
     query: Option<&str>,
 ) -> Result<SessionList, String> {
-    let contact_conn = open_optional_database(store, CONTACT_DB)?;
-    let contacts = match contact_conn.as_ref() {
-        Some(conn) => contact::load_contacts(conn)?,
-        None => HashMap::new(),
-    };
-    let session_conn = store
-        .open(SESSION_DB)
-        .map_err(|error| format!("Session database is unavailable: {error}"))?;
-    list_sessions_from_connection(&session_conn, &contacts, top_n, query, SessionListKind::All)
+    list_session_kind(store, top_n, query, SessionListKind::All)
 }
 
 /// List unread chat sessions from the session database.
@@ -368,21 +361,20 @@ pub fn list_unread_sessions(
     top_n: usize,
     query: Option<&str>,
 ) -> Result<SessionList, String> {
+    list_session_kind(store, top_n, query, SessionListKind::Unread)
+}
+
+fn list_session_kind(
+    store: &SourceStore,
+    top_n: usize,
+    query: Option<&str>,
+    mode: SessionListKind,
+) -> Result<SessionList, String> {
     let contact_conn = open_optional_database(store, CONTACT_DB)?;
-    let contacts = match contact_conn.as_ref() {
-        Some(conn) => contact::load_contacts(conn)?,
-        None => HashMap::new(),
-    };
     let session_conn = store
         .open(SESSION_DB)
         .map_err(|error| format!("Session database is unavailable: {error}"))?;
-    list_sessions_from_connection(
-        &session_conn,
-        &contacts,
-        top_n,
-        query,
-        SessionListKind::Unread,
-    )
+    list_sessions_from_connection(&session_conn, contact_conn.as_ref(), top_n, query, mode)
 }
 
 /// Intersect the cached roster with explicit local friend relationships.
@@ -394,8 +386,16 @@ pub(crate) fn list_member_friends(
     jobs: usize,
 ) -> Result<MemberFriendReport, String> {
     let conn = store.open(CONTACT_DB)?;
-    let contacts = contact::load_contacts(&conn)?;
-    let username = resolve_username_from_contacts(session_query, &contacts, store, None, jobs)?;
+    // Name matching needs every contact; a direct id needs only the rows shown.
+    let (username, matched_contacts) = match direct_session_username(session_query) {
+        Some(username) => (username.to_string(), None),
+        None => {
+            let contacts = contact::load_contacts(&conn)?;
+            let username =
+                resolve_username_from_contacts(session_query, &contacts, store, None, jobs)?;
+            (username, Some(contacts))
+        }
+    };
     if !username.ends_with("@chatroom") {
         return Err(format!("Not a group session: {username}"));
     }
@@ -404,6 +404,15 @@ pub(crate) fn list_member_friends(
         return Err(format!("No cached members found for group: {username}"));
     }
     let friends = contact::load_friend_usernames(&conn)?;
+    let contacts = match matched_contacts {
+        Some(contacts) => contacts,
+        None => {
+            let members: HashSet<&str> = roster.usernames.iter().map(String::as_str).collect();
+            contact::load_contacts_where(&conn, |id| {
+                id == username || (members.contains(id) && friends.contains(id))
+            })?
+        }
+    };
     let room_names = if name_mode == DisplayNameMode::Anonymous {
         contact::load_chat_room_member_names(&conn, &username)?
     } else {
@@ -603,7 +612,7 @@ fn load_member_speech(
 
 fn list_sessions_from_connection(
     conn: &Connection,
-    contacts: &HashMap<String, Contact>,
+    contact_conn: Option<&Connection>,
     top_n: usize,
     query: Option<&str>,
     mode: SessionListKind,
@@ -634,10 +643,26 @@ fn list_sessions_from_connection(
     let session_rows = rows
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| format!("Read sessions: {}", e))?;
+    let session_rows: Vec<_> = session_rows
+        .into_iter()
+        .filter(|(username, _, activity)| !username.trim().is_empty() && *activity > 0)
+        .collect();
+
+    // Names and matching look up only these sessions' own contact rows.
+    let contacts = match contact_conn {
+        Some(contact_conn) => {
+            let wanted: HashSet<&str> = session_rows
+                .iter()
+                .map(|(username, _, _)| username.as_str())
+                .collect();
+            contact::load_contacts_where(contact_conn, |username| wanted.contains(username))?
+        }
+        None => HashMap::new(),
+    };
+    let contacts = &contacts;
 
     let mut entries = session_rows
         .into_iter()
-        .filter(|(username, _, activity)| !username.trim().is_empty() && *activity > 0)
         .map(|(username, unread_count, activity)| {
             let display = contacts
                 .get(&username)
@@ -1020,12 +1045,23 @@ pub fn search_messages(
     store: &SourceStore,
     options: SearchMessagesOptions<'_>,
 ) -> Result<SearchResults, String> {
-    let contact_conn = open_optional_database(store, CONTACT_DB)?;
-    let contacts = match contact_conn.as_ref() {
-        Some(conn) => contact::load_contacts(conn)?,
-        None => HashMap::new(),
-    };
-    let (has_more, rows) = search_messages_with_fts(store, &options)?;
+    // Contacts and the search index are separate databases; read them at
+    // the same time. Contact errors still take precedence, as when serial.
+    let (contacts, fts) = std::thread::scope(|scope| {
+        let contacts = scope.spawn(|| -> Result<_, String> {
+            Ok(match open_optional_database(store, CONTACT_DB)? {
+                Some(conn) => contact::load_contacts(&conn)?,
+                None => HashMap::new(),
+            })
+        });
+        let fts = search_messages_with_fts(store, &options);
+        (
+            contacts.join().expect("contact loader thread panicked"),
+            fts,
+        )
+    });
+    let contacts = contacts?;
+    let (has_more, rows) = fts?;
     let hits = rows
         .into_iter()
         .map(|(local_type, create_time, content, session)| SearchHit {
@@ -1058,7 +1094,7 @@ fn search_messages_with_fts(
         .filter(|_| fts::register_compatible_tokenizer(&conn).is_ok());
     let mut results = match match_query {
         Some(query) => collect_telegram_fts_rows(
-            &conn,
+            store,
             &content_tables,
             &name2id,
             options,
@@ -1067,7 +1103,7 @@ fn search_messages_with_fts(
         )
         .or_else(|match_error| {
             collect_telegram_fts_rows(
-                &conn,
+                store,
                 &content_tables,
                 &name2id,
                 options,
@@ -1081,7 +1117,7 @@ fn search_messages_with_fts(
             })
         })?,
         None => collect_telegram_fts_rows(
-            &conn,
+            store,
             &content_tables,
             &name2id,
             options,
@@ -1100,80 +1136,110 @@ fn search_messages_with_fts(
     Ok((has_more, results))
 }
 
+/// Scans each FTS table on its own connection. Rows are concatenated in
+/// table order, so the caller's stable sort sees the same sequence as one
+/// sequential scan.
 fn collect_telegram_fts_rows(
-    conn: &Connection,
+    store: &SourceStore,
     content_tables: &[String],
     name2id: &HashMap<i64, String>,
     options: &SearchMessagesOptions<'_>,
     result_limit: Option<usize>,
     match_query: Option<&str>,
 ) -> Result<Vec<SearchRow>, String> {
-    let search_pattern = like_contains_pattern(options.query);
+    // The four FTS tables total far less than the message shards that
+    // SOURCE_DB_AUTO_CAP was tuned on; one worker per table measured fastest.
+    let jobs = parallel::job_count(options.jobs, content_tables.len());
+    let per_table = parallel::map_ordered(content_tables.iter().collect(), jobs, |content_table| {
+        let conn = store
+            .open(MESSAGE_FTS_DB)
+            .map_err(|error| format!("Message search index is unavailable: {error}"))?;
+        if match_query.is_some() {
+            fts::register_compatible_tokenizer(&conn)?;
+        }
+        search_telegram_fts_table(
+            &conn,
+            content_table,
+            name2id,
+            options,
+            result_limit,
+            match_query,
+        )
+    });
     let mut results = Vec::new();
-
-    for content_table in content_tables {
-        let (table, columns, search_clause, time_column, search_value) =
-            if let Some(query) = match_query {
-                let table = content_table
-                    .strip_suffix("_content")
-                    .ok_or_else(|| format!("Invalid FTS content table name: {content_table}"))?;
-                let quoted = quote_identifier(table);
-                (
-                    quoted.clone(),
-                    "local_type, create_time, acontent, session_id",
-                    format!("{} MATCH ?1", quoted),
-                    "create_time",
-                    query,
-                )
-            } else {
-                (
-                    quote_identifier(content_table),
-                    "c3, c6, c0, c4",
-                    fts_content_like_clause().to_string(),
-                    "c6",
-                    search_pattern.as_str(),
-                )
-            };
-        let since_clause = options
-            .since
-            .map(|ts| format!(" AND {time_column} >= {ts}"))
-            .unwrap_or_default();
-        let limit_clause = result_limit
-            .map(|limit| format!(" LIMIT {limit}"))
-            .unwrap_or_default();
-        let sql = format!(
-            "SELECT {columns} FROM {table} \
-             WHERE {search_clause}{since_clause} \
-             ORDER BY {time_column} DESC{limit_clause}"
-        );
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|error| format!("Prepare search of {content_table}: {error}"))?;
-        let rows = stmt
-            .query_map(params![search_value], |row| {
-                let session_id = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
-                let session = name2id
-                    .get(&session_id)
-                    .cloned()
-                    .unwrap_or_else(|| session_id.to_string());
-                Ok((
-                    row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
-                    row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    session,
-                ))
-            })
-            .map_err(|error| format!("Query search index table {content_table}: {error}"))?;
-        let rows = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|error| format!("Read search index table {content_table}: {error}"))?;
-        results.extend(rows);
+    for rows in per_table {
+        results.extend(rows?);
     }
 
     if match_query.is_some() {
         results.retain(|row| row.2.contains(options.query));
     }
     Ok(results)
+}
+
+fn search_telegram_fts_table(
+    conn: &Connection,
+    content_table: &str,
+    name2id: &HashMap<i64, String>,
+    options: &SearchMessagesOptions<'_>,
+    result_limit: Option<usize>,
+    match_query: Option<&str>,
+) -> Result<Vec<SearchRow>, String> {
+    let search_pattern = like_contains_pattern(options.query);
+    let (table, columns, search_clause, time_column, search_value) =
+        if let Some(query) = match_query {
+            let table = content_table
+                .strip_suffix("_content")
+                .ok_or_else(|| format!("Invalid FTS content table name: {content_table}"))?;
+            let quoted = quote_identifier(table);
+            (
+                quoted.clone(),
+                "local_type, create_time, acontent, session_id",
+                format!("{} MATCH ?1", quoted),
+                "create_time",
+                query,
+            )
+        } else {
+            (
+                quote_identifier(content_table),
+                "c3, c6, c0, c4",
+                fts_content_like_clause().to_string(),
+                "c6",
+                search_pattern.as_str(),
+            )
+        };
+    let since_clause = options
+        .since
+        .map(|ts| format!(" AND {time_column} >= {ts}"))
+        .unwrap_or_default();
+    let limit_clause = result_limit
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT {columns} FROM {table} \
+         WHERE {search_clause}{since_clause} \
+         ORDER BY {time_column} DESC{limit_clause}"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| format!("Prepare search of {content_table}: {error}"))?;
+    let rows = stmt
+        .query_map(params![search_value], |row| {
+            let session_id = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+            let session = name2id
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_else(|| session_id.to_string());
+            Ok((
+                row.get::<_, Option<i64>>(0)?.unwrap_or(-1),
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                session,
+            ))
+        })
+        .map_err(|error| format!("Query search index table {content_table}: {error}"))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Read search index table {content_table}: {error}"))
 }
 
 fn telegram_fts_content_tables(conn: &Connection) -> Result<Vec<String>, String> {
@@ -1284,17 +1350,10 @@ fn resolve_username_from_contacts(
     message_dbs: Option<&[String]>,
     jobs: usize,
 ) -> Result<String, String> {
+    if let Some(username) = direct_session_username(query) {
+        return Ok(username.to_string());
+    }
     let query = query.trim();
-    if query.is_empty() {
-        return Ok(query.to_string());
-    }
-
-    if query.starts_with(dictionary::account_id_prefix())
-        || query.starts_with("gh_")
-        || query.contains("@chatroom")
-    {
-        return Ok(query.to_string());
-    }
 
     // Try exact username match
     if let Some(c) = contacts.get(query) {
@@ -1340,6 +1399,16 @@ fn resolve_username_from_contacts(
     // No contact match. Treat the input as a raw username so callers can still
     // read sessions whose contact row is missing.
     Ok(query.to_string())
+}
+
+/// A query that names a session directly and resolves without contacts.
+fn direct_session_username(query: &str) -> Option<&str> {
+    let query = query.trim();
+    (query.is_empty()
+        || query.starts_with(dictionary::account_id_prefix())
+        || query.starts_with("gh_")
+        || query.contains("@chatroom"))
+    .then_some(query)
 }
 
 const EXACT_MATCH_SCORE: i64 = 400;
@@ -2342,11 +2411,82 @@ mod tests {
                 limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap();
 
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parallel_fts_tables_merge_ties_in_table_order() {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let conn = Connection::open(message_dir.join("message_fts.db")).unwrap();
+        crate::fts::register_compatible_tokenizer(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE name2id(username TEXT PRIMARY KEY);
+             INSERT INTO name2id (rowid, username) VALUES (7, 'tgid_fts_session');",
+        )
+        .unwrap();
+        for table in 0..3 {
+            conn.execute_batch(&format!(
+                "CREATE VIRTUAL TABLE message_fts_v4_{table} USING fts5(
+                     tokenize = 'MMFtsTokenizer disable_pinyin', acontent,
+                     message_local_id UNINDEXED, sort_seq UNINDEXED, local_type UNINDEXED,
+                     session_id UNINDEXED, sender_id UNINDEXED, create_time UNINDEXED
+                 )"
+            ))
+            .unwrap();
+            for time in [10, 20] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO message_fts_v4_{table} (
+                             acontent, message_local_id, sort_seq, local_type,
+                             session_id, sender_id, create_time
+                         ) VALUES (?1, 1, 0, 1, 7, 0, ?2)"
+                    ),
+                    params![format!("开源 needle {table}-{time}"), time],
+                )
+                .unwrap();
+            }
+        }
+        drop(conn);
+        let store = SourceStore::from_plaintext(dir.path()).unwrap();
+
+        for query in ["needle", "开源"] {
+            for jobs in [1, 3] {
+                let results = super::search_messages(
+                    &store,
+                    SearchMessagesOptions {
+                        query,
+                        limit: Some(4),
+                        since: None,
+                        name_mode: DisplayNameMode::PersonalRemark,
+                        jobs,
+                    },
+                )
+                .unwrap();
+                let hits: Vec<_> = results
+                    .hits
+                    .iter()
+                    .map(|hit| hit.content.as_str())
+                    .collect();
+                assert_eq!(
+                    hits,
+                    [
+                        "开源 needle 0-10",
+                        "开源 needle 0-20",
+                        "开源 needle 1-20",
+                        "开源 needle 2-20"
+                    ],
+                    "query {query}, jobs {jobs}"
+                );
+                assert!(results.has_more);
+            }
+        }
     }
 
     #[test]
@@ -2360,6 +2500,7 @@ mod tests {
                 limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap_err();
@@ -2386,6 +2527,7 @@ mod tests {
                 limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap_err();
@@ -2405,6 +2547,7 @@ mod tests {
                 limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap();
@@ -2424,6 +2567,7 @@ mod tests {
                 limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap();
@@ -2442,6 +2586,7 @@ mod tests {
                 limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap();
@@ -2460,6 +2605,7 @@ mod tests {
                 limit: Some(20),
                 since: Some(1001),
                 name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
             },
         )
         .unwrap();
