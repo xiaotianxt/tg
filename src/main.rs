@@ -19,6 +19,7 @@ mod output;
 mod parallel;
 mod paths;
 mod query;
+mod render;
 mod scanner;
 mod skill;
 mod source_store;
@@ -30,6 +31,12 @@ use std::path::PathBuf;
 
 fn print_output(args: std::fmt::Arguments<'_>) -> Result<(), String> {
     output::stdout_line(args).map_err(|e| format!("Error: {e}"))
+}
+
+fn render_stdout(
+    render: impl FnOnce(&mut output::Output<std::io::StdoutLock<'static>>) -> Result<(), String>,
+) -> Result<(), String> {
+    render(&mut output::Output::new(std::io::stdout().lock()))
 }
 
 fn normalize_args_for_default_messages<I>(args: I) -> Vec<OsString>
@@ -374,9 +381,10 @@ fn run(command: Commands) -> Result<(), String> {
         }
         Commands::Sessions { query, top, source } => {
             let store = open_source(&source)?;
-            let sessions = db::list_sessions(&store, top, query.as_deref())
+            let list = db::list_sessions(&store, top, query.as_deref())
                 .map_err(|e| format!("Error: {e}"))?;
-            if sessions.is_empty() {
+            render_stdout(|out| render::sessions(out, &list))?;
+            if list.sessions.is_empty() {
                 if let Some(query) = query.as_deref().filter(|value| !value.trim().is_empty()) {
                     print_output(format_args!("No sessions matched '{}'.", query))?;
                 } else {
@@ -387,9 +395,10 @@ fn run(command: Commands) -> Result<(), String> {
         }
         Commands::Unread { query, top, source } => {
             let store = open_source(&source)?;
-            let sessions = db::list_unread_sessions(&store, top, query.as_deref())
+            let list = db::list_unread_sessions(&store, top, query.as_deref())
                 .map_err(|e| format!("Error: {e}"))?;
-            if sessions.is_empty() {
+            render_stdout(|out| render::sessions(out, &list))?;
+            if list.sessions.is_empty() {
                 if let Some(query) = query.as_deref().filter(|value| !value.trim().is_empty()) {
                     print_output(format_args!("No unread sessions matched '{}'.", query))?;
                 } else {
@@ -407,7 +416,7 @@ fn run(command: Commands) -> Result<(), String> {
         } => {
             let store = open_source(&source)?;
             if friends {
-                return db::list_member_friends(
+                let report = db::list_member_friends(
                     &store,
                     &session,
                     if anonymous {
@@ -416,12 +425,12 @@ fn run(command: Commands) -> Result<(), String> {
                         contact::DisplayNameMode::PersonalRemark
                     },
                     source.jobs,
-                )
-                .map(|_| ());
+                )?;
+                return render_stdout(|out| render::member_friends(out, &report));
             }
             let inactive_since = time::parse_since_opt(inactive_since.as_deref())
                 .map_err(|error| format!("Error parsing --inactive-since: {error}"))?;
-            db::list_members(
+            let report = db::list_members(
                 &store,
                 db::ListMembersOptions {
                     session_query: &session,
@@ -435,15 +444,17 @@ fn run(command: Commands) -> Result<(), String> {
                 },
             )
             .map_err(|error| format!("Error: {error}"))?;
-            Ok(())
+            render_stdout(|out| render::members(out, &report))
         }
-        Commands::Doctor { session, source } => doctor::run(doctor::DoctorOptions {
-            session: session.as_deref(),
-            db_dir: source.db_dir.as_deref(),
-            keys_path: &source.keys,
-            jobs: source.jobs,
-        })
-        .map_err(|e| format!("Error: {e}")),
+        Commands::Doctor { session, source } => {
+            let report = doctor::run(doctor::DoctorOptions {
+                session: session.as_deref(),
+                db_dir: source.db_dir.as_deref(),
+                keys_path: &source.keys,
+                jobs: source.jobs,
+            });
+            render_stdout(|out| render::doctor(out, &report)).map_err(|e| format!("Error: {e}"))
+        }
         Commands::Messages {
             session,
             limit,
@@ -464,26 +475,24 @@ fn run(command: Commands) -> Result<(), String> {
                 .map_err(|e| format!("Error parsing --time-bucket: {e}"))?;
             let limit = messages_limit_or_default(limit, since_ts, all_time);
             let use_tail = tail || (!head && offset == 0);
-            let msg_count = db::read_messages(
-                &store,
-                db::ReadMessagesOptions {
-                    session_query: &session,
-                    limit,
-                    offset,
-                    search_query: search.as_deref(),
-                    since: since_ts,
-                    tail: use_tail,
-                    time_bucket,
-                    name_mode: if anonymous {
-                        contact::DisplayNameMode::Anonymous
-                    } else {
-                        contact::DisplayNameMode::PersonalRemark
-                    },
-                    jobs: source.jobs,
+            let options = db::ReadMessagesOptions {
+                session_query: &session,
+                limit,
+                offset,
+                search_query: search.as_deref(),
+                since: since_ts,
+                tail: use_tail,
+                time_bucket,
+                name_mode: if anonymous {
+                    contact::DisplayNameMode::Anonymous
+                } else {
+                    contact::DisplayNameMode::PersonalRemark
                 },
-            )
-            .map_err(|e| format!("Error: {e}"))?;
-            if msg_count == 0 {
+                jobs: source.jobs,
+            };
+            let page = db::read_messages(&store, &options).map_err(|e| format!("Error: {e}"))?;
+            render_stdout(|out| render::messages(out, &page, &options))?;
+            if page.messages.is_empty() {
                 print_output(format_args!(
                     "No messages found for '{}'. Use 'sessions' to list available sessions.",
                     session
@@ -510,7 +519,7 @@ fn run(command: Commands) -> Result<(), String> {
             } else {
                 Some(since_ts.unwrap_or_else(time::default_recent_since))
             };
-            let count = db::search_messages(
+            let results = db::search_messages(
                 &store,
                 db::SearchMessagesOptions {
                     query: &query,
@@ -524,7 +533,8 @@ fn run(command: Commands) -> Result<(), String> {
                 },
             )
             .map_err(|e| format!("Error: {e}"))?;
-            if count == 0 {
+            render_stdout(|out| render::search(out, &query, &results))?;
+            if results.hits.is_empty() {
                 print_output(format_args!("No messages found for '{}'.", query))?;
             }
             Ok(())
@@ -573,9 +583,6 @@ fn run(command: Commands) -> Result<(), String> {
                 offset,
                 sort: order,
                 match_mode,
-                fields,
-                format,
-                max_cell_chars,
                 name_mode: if anonymous {
                     contact::DisplayNameMode::Anonymous
                 } else {
@@ -583,7 +590,15 @@ fn run(command: Commands) -> Result<(), String> {
                 },
                 jobs: source.jobs,
             };
-            if query::run(query_options).map_err(|e| format!("Error: {e}"))? == 0 {
+            let query_output = query::QueryOutput {
+                fields,
+                format,
+                max_cell_chars,
+            };
+            query_output.validate().map_err(|e| format!("Error: {e}"))?;
+            let rows = query::query_messages(&query_options).map_err(|e| format!("Error: {e}"))?;
+            render_stdout(|out| query_output.write(out, &rows))?;
+            if rows.is_empty() {
                 print_output(format_args!("No rows returned."))?;
             }
             Ok(())

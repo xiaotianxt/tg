@@ -160,9 +160,6 @@ pub(crate) struct QueryOptions<'a> {
     pub offset: usize,
     pub sort: QuerySort,
     pub match_mode: QueryMatchMode,
-    pub fields: QueryFields,
-    pub format: QueryOutputFormat,
-    pub max_cell_chars: usize,
     pub name_mode: contact::DisplayNameMode,
     pub jobs: usize,
 }
@@ -181,35 +178,56 @@ struct MessageQueryContext {
     sender_display: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
-struct MessageRow {
-    session: String,
-    sender: String,
-    local_type: i64,
-    create_time: i64,
-    body: String,
-    raw_body: String,
+/// How query results are printed; separate from the filters so non-CLI callers
+/// can run a query without choosing a text layout.
+pub(crate) struct QueryOutput {
+    pub fields: QueryFields,
+    pub format: QueryOutputFormat,
+    pub max_cell_chars: usize,
 }
 
-pub(crate) fn run(options: QueryOptions<'_>) -> Result<usize, String> {
-    let stdout = std::io::stdout();
-    let mut out = output::Output::new(stdout.lock());
-    run_messages_with_output(options, &mut out)
+impl QueryOutput {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.max_cell_chars > MAX_TABLE_CELL_CHARS {
+            return Err(format!(
+                "--max-cell-chars must be <= {}",
+                MAX_TABLE_CELL_CHARS
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write<W: Write>(
+        &self,
+        out: &mut output::Output<W>,
+        rows: &[MessageRow],
+    ) -> Result<(), String> {
+        write_message_rows(out, rows, &self.fields, self.format, self.max_cell_chars)?;
+        out.flush()
+    }
 }
 
-fn run_messages_with_output<W: Write>(
-    options: QueryOptions<'_>,
-    out: &mut output::Output<W>,
-) -> Result<usize, String> {
-    validate_message_options(&options)?;
-    let context = build_message_context(&options)?;
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct MessageRow {
+    pub session: String,
+    pub sender: String,
+    pub local_type: i64,
+    pub create_time: i64,
+    pub body: String,
+    pub raw_body: String,
+}
+
+/// Run a validated query and return the requested window, globally sorted.
+pub(crate) fn query_messages(options: &QueryOptions<'_>) -> Result<Vec<MessageRow>, String> {
+    validate_message_options(options)?;
+    let context = build_message_context(options)?;
     if context.targets.is_empty() {
         return Err("No message databases found in the source directory.".to_string());
     }
 
     let db_jobs = parallel::job_count(options.jobs, parallel::SOURCE_DB_AUTO_CAP);
     let per_db_rows = parallel::map_ordered(context.targets.clone(), db_jobs, |target| {
-        query_message_target(options.store, &target, &context, &options)
+        query_message_target(options.store, &target, &context, options)
     });
 
     let mut rows = Vec::new();
@@ -219,33 +237,16 @@ fn run_messages_with_output<W: Write>(
     }
 
     sort_message_rows(&mut rows, options.sort);
-    let rows: Vec<MessageRow> = rows
+    Ok(rows
         .into_iter()
         .skip(options.offset)
         .take(options.limit)
-        .collect();
-    let displayed = rows.len();
-
-    write_message_rows(
-        out,
-        &rows,
-        &options.fields,
-        options.format,
-        options.max_cell_chars,
-    )?;
-    out.flush()?;
-    Ok(displayed)
+        .collect())
 }
 
 fn validate_message_options(options: &QueryOptions<'_>) -> Result<(), String> {
     if options.limit == 0 {
         return Err("--limit must be greater than 0".to_string());
-    }
-    if options.max_cell_chars > MAX_TABLE_CELL_CHARS {
-        return Err(format!(
-            "--max-cell-chars must be <= {}",
-            MAX_TABLE_CELL_CHARS
-        ));
     }
     validate_query_terms("--contains", options.contains)?;
     validate_query_terms("--not", options.not_contains)?;
@@ -796,12 +797,28 @@ mod tests {
             offset: 0,
             sort: QuerySort::Newest,
             match_mode: QueryMatchMode::All,
-            fields: QueryFields::parse("timestamp,body").unwrap(),
-            format: QueryOutputFormat::Table,
-            max_cell_chars: 500,
             name_mode: contact::DisplayNameMode::PersonalRemark,
             jobs: 1,
         }
+    }
+
+    fn default_query_output() -> QueryOutput {
+        QueryOutput {
+            fields: QueryFields::parse("timestamp,body").unwrap(),
+            format: QueryOutputFormat::Table,
+            max_cell_chars: 500,
+        }
+    }
+
+    fn run_messages_with_output<W: Write>(
+        options: QueryOptions<'_>,
+        query_output: &QueryOutput,
+        out: &mut output::Output<W>,
+    ) -> Result<usize, String> {
+        query_output.validate()?;
+        let rows = query_messages(&options)?;
+        query_output.write(out, &rows)?;
+        Ok(rows.len())
     }
 
     fn run_messages_for_test(
@@ -814,6 +831,7 @@ mod tests {
             let mut out = output::Output::new(&mut bytes);
             let count = run_messages_with_output(
                 default_query_options(dir, contains, not_contains),
+                &default_query_output(),
                 &mut out,
             )?;
             out.flush()?;
@@ -895,9 +913,10 @@ mod tests {
         let contains = vec!["raw-key".to_string()];
         let mut bytes = Vec::new();
         let mut out = output::Output::new(&mut bytes);
-        let mut options = default_query_options(dir.path(), &contains, &[]);
-        options.fields = QueryFields::parse("timestamp,body,raw_body").unwrap();
-        let count = run_messages_with_output(options, &mut out).unwrap();
+        let options = default_query_options(dir.path(), &contains, &[]);
+        let mut query_output = default_query_output();
+        query_output.fields = QueryFields::parse("timestamp,body,raw_body").unwrap();
+        let count = run_messages_with_output(options, &query_output, &mut out).unwrap();
         out.flush().unwrap();
         drop(out);
         let output = String::from_utf8(bytes).unwrap();
@@ -934,7 +953,7 @@ mod tests {
         let mut out = output::Output::new(&mut bytes);
         let mut options = default_query_options(dir.path(), &[], &[]);
         options.raw_contains = &raw_contains;
-        let count = run_messages_with_output(options, &mut out).unwrap();
+        let count = run_messages_with_output(options, &default_query_output(), &mut out).unwrap();
         out.flush().unwrap();
         drop(out);
         let output = String::from_utf8(bytes).unwrap();
@@ -999,7 +1018,7 @@ mod tests {
         let mut out = output::Output::new(&mut bytes);
         let mut options = default_query_options(dir.path(), &[], &[]);
         options.has = &has;
-        let count = run_messages_with_output(options, &mut out).unwrap();
+        let count = run_messages_with_output(options, &default_query_output(), &mut out).unwrap();
         out.flush().unwrap();
         drop(out);
         let output = String::from_utf8(bytes).unwrap();
@@ -1014,7 +1033,7 @@ mod tests {
         let mut out = output::Output::new(&mut bytes);
         let mut options = default_query_options(dir.path(), &[], &[]);
         options.has = &has;
-        let count = run_messages_with_output(options, &mut out).unwrap();
+        let count = run_messages_with_output(options, &default_query_output(), &mut out).unwrap();
         out.flush().unwrap();
         drop(out);
         let output = String::from_utf8(bytes).unwrap();
@@ -1072,7 +1091,7 @@ mod tests {
         let mut out = output::Output::new(&mut bytes);
         let mut options = default_query_options(dir.path(), &contains, &[]);
         options.since = Some(crate::time::default_recent_since());
-        let count = run_messages_with_output(options, &mut out).unwrap();
+        let count = run_messages_with_output(options, &default_query_output(), &mut out).unwrap();
         out.flush().unwrap();
         drop(out);
         let output = String::from_utf8(bytes).unwrap();
@@ -1104,7 +1123,7 @@ mod tests {
         let mut out = output::Output::new(&mut bytes);
         let mut options = default_query_options(dir.path(), &contains, &[]);
         options.since = Some(crate::time::default_recent_since());
-        let count = run_messages_with_output(options, &mut out).unwrap();
+        let count = run_messages_with_output(options, &default_query_output(), &mut out).unwrap();
         out.flush().unwrap();
         drop(out);
         assert_eq!(count, 0);
@@ -1115,7 +1134,7 @@ mod tests {
         let mut options = default_query_options(dir.path(), &[], &[]);
         options.raw_contains = &raw_contains;
         options.since = Some(crate::time::default_recent_since());
-        let count = run_messages_with_output(options, &mut out).unwrap();
+        let count = run_messages_with_output(options, &default_query_output(), &mut out).unwrap();
         out.flush().unwrap();
         drop(out);
         let output = String::from_utf8(bytes).unwrap();
@@ -1148,7 +1167,7 @@ mod tests {
         let mut options = default_query_options(dir.path(), &[], &[]);
         options.has = &has;
         options.since = Some(crate::time::default_recent_since());
-        let count = run_messages_with_output(options, &mut out).unwrap();
+        let count = run_messages_with_output(options, &default_query_output(), &mut out).unwrap();
         out.flush().unwrap();
         drop(out);
         let output = String::from_utf8(bytes).unwrap();
@@ -1198,7 +1217,7 @@ mod tests {
         options.limit = MAX_QUERY_RESULT_WINDOW;
         options.offset = 1;
 
-        let err = run_messages_with_output(options, &mut out).unwrap_err();
+        let err = run_messages_with_output(options, &default_query_output(), &mut out).unwrap_err();
 
         assert!(err.contains("--limit plus --offset"));
     }
@@ -1209,10 +1228,11 @@ mod tests {
         let contains = vec!["needle".to_string()];
         let mut bytes = Vec::new();
         let mut out = output::Output::new(&mut bytes);
-        let mut options = default_query_options(dir.path(), &contains, &[]);
-        options.max_cell_chars = MAX_TABLE_CELL_CHARS + 1;
+        let options = default_query_options(dir.path(), &contains, &[]);
+        let mut query_output = default_query_output();
+        query_output.max_cell_chars = MAX_TABLE_CELL_CHARS + 1;
 
-        let err = run_messages_with_output(options, &mut out).unwrap_err();
+        let err = run_messages_with_output(options, &query_output, &mut out).unwrap_err();
 
         assert!(err.contains("--max-cell-chars"));
     }

@@ -83,9 +83,6 @@ struct MessageRow {
 }
 
 type SearchRow = (i64, i64, String, String);
-type SessionListRow = (String, i64, String, String);
-type SessionListRows = Vec<SessionListRow>;
-const SEARCH_PREVIEW_CHARS: usize = 100;
 const TELEGRAM_FTS_CONTENT_TABLE_PREFIX: &str = "message_fts_v4_";
 const TELEGRAM_FTS_CONTENT_TABLE_SUFFIX: &str = "_content";
 
@@ -101,6 +98,41 @@ pub(crate) struct ReadMessagesOptions<'a> {
     pub jobs: usize,
 }
 
+/// Messages of one session in chronological order, already decoded for display.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct MessagePage {
+    pub username: String,
+    pub display_name: String,
+    pub messages: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ChatMessage {
+    pub local_id: Option<i64>,
+    pub local_type: i64,
+    pub create_time: i64,
+    pub sender: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SearchResults {
+    /// Oldest first; holds at most the requested limit.
+    pub hits: Vec<SearchHit>,
+    /// More matches exist beyond `hits`, all older than the oldest hit.
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SearchHit {
+    pub local_type: i64,
+    pub create_time: i64,
+    pub content: String,
+    pub session: String,
+    pub session_display: String,
+}
+
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct SessionProbe {
     pub username: String,
     pub display_name: String,
@@ -109,13 +141,14 @@ pub(crate) struct SessionProbe {
     pub message_count: usize,
 }
 
-#[derive(Clone, Copy)]
-enum SessionDbListMode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionListKind {
     All,
     Unread,
 }
 
-impl SessionDbListMode {
+impl SessionListKind {
     fn where_clause(self) -> &'static str {
         match self {
             Self::All => {
@@ -129,13 +162,26 @@ impl SessionDbListMode {
             }
         }
     }
+}
 
-    fn total_label(self) -> &'static str {
-        match self {
-            Self::All => "sessions",
-            Self::Unread => "unread sessions",
-        }
-    }
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SessionSummary {
+    pub username: String,
+    pub display_name: String,
+    pub unread_count: i64,
+    /// Unix seconds of the later of the session's last and sort timestamps.
+    pub last_active: i64,
+}
+
+/// One page of the session list. `sessions` holds at most the requested top N;
+/// `matched` and `total` count before that cut.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SessionList {
+    pub kind: SessionListKind,
+    pub filtered: bool,
+    pub matched: usize,
+    pub total: usize,
+    pub sessions: Vec<SessionSummary>,
 }
 
 pub(crate) struct SearchMessagesOptions<'a> {
@@ -152,13 +198,41 @@ pub(crate) struct ListMembersOptions<'a> {
     pub jobs: usize,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct MemberActivity {
     pub username: String,
     pub display_name: String,
     pub is_owner: bool,
     pub last_spoke: Option<i64>,
     pub message_count: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct MemberReport {
+    pub group_username: String,
+    pub group_display_name: String,
+    pub total_members: usize,
+    /// Span of locally recorded sender history for the group, if any.
+    pub history_start: Option<i64>,
+    pub history_end: Option<i64>,
+    pub inactive_since: Option<i64>,
+    /// Sorted by last recorded speech, never-spoke first.
+    pub members: Vec<MemberActivity>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct MemberFriend {
+    pub username: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct MemberFriendReport {
+    pub group_username: String,
+    pub group_display_name: String,
+    pub cached_members: usize,
+    /// Sorted by display name, then username.
+    pub friends: Vec<MemberFriend>,
 }
 
 #[derive(Clone, Copy)]
@@ -272,7 +346,7 @@ pub fn list_sessions(
     store: &SourceStore,
     top_n: usize,
     query: Option<&str>,
-) -> Result<SessionListRows, String> {
+) -> Result<SessionList, String> {
     let contact_conn = open_optional_database(store, CONTACT_DB)?;
     let contacts = match contact_conn.as_ref() {
         Some(conn) => contact::load_contacts(conn)?,
@@ -281,13 +355,7 @@ pub fn list_sessions(
     let session_conn = store
         .open(SESSION_DB)
         .map_err(|error| format!("Session database is unavailable: {error}"))?;
-    list_sessions_from_connection(
-        &session_conn,
-        &contacts,
-        top_n,
-        query,
-        SessionDbListMode::All,
-    )
+    list_sessions_from_connection(&session_conn, &contacts, top_n, query, SessionListKind::All)
 }
 
 /// List unread chat sessions from the session database.
@@ -295,7 +363,7 @@ pub fn list_unread_sessions(
     store: &SourceStore,
     top_n: usize,
     query: Option<&str>,
-) -> Result<SessionListRows, String> {
+) -> Result<SessionList, String> {
     let contact_conn = open_optional_database(store, CONTACT_DB)?;
     let contacts = match contact_conn.as_ref() {
         Some(conn) => contact::load_contacts(conn)?,
@@ -309,7 +377,7 @@ pub fn list_unread_sessions(
         &contacts,
         top_n,
         query,
-        SessionDbListMode::Unread,
+        SessionListKind::Unread,
     )
 }
 
@@ -320,7 +388,7 @@ pub(crate) fn list_member_friends(
     session_query: &str,
     name_mode: DisplayNameMode,
     jobs: usize,
-) -> Result<Vec<String>, String> {
+) -> Result<MemberFriendReport, String> {
     let conn = store.open(CONTACT_DB)?;
     let contacts = contact::load_contacts(&conn)?;
     let username = resolve_username_from_contacts(session_query, &contacts, store, None, jobs)?;
@@ -352,36 +420,29 @@ pub(crate) fn list_member_friends(
         .collect();
     matches.sort();
     matches.dedup_by(|left, right| left.1 == right.1);
-    let stdout = std::io::stdout();
-    let mut out = crate::output::Output::new(stdout.lock());
-    out.line(format_args!(
-        "Group: {} ({username})",
-        contacts
-            .get(&username)
-            .map(|value| value.display_name(name_mode))
-            .unwrap_or(&username)
-    ))?;
-    out.line(format_args!("Cached members: {}", roster.usernames.len()))?;
-    out.line(format_args!("Locally confirmed friends: {}", matches.len()))?;
-    out.line(format_args!("Note: conservative local relationship evidence only; not a live or reciprocal friendship check."))?;
-    out.blank_line()?;
-    out.line(format_args!("{:<24} Username", "Display Name"))?;
-    for (name, id) in &matches {
-        out.line(format_args!(
-            "{:<24} {}",
-            name.escape_debug().to_string(),
-            id.escape_debug()
-        ))?;
-    }
-    out.flush()?;
-    Ok(matches.into_iter().map(|(_, id)| id).collect())
+    let group_display_name = contacts
+        .get(&username)
+        .map(|value| value.display_name(name_mode).to_string())
+        .unwrap_or_else(|| username.clone());
+    Ok(MemberFriendReport {
+        group_username: username,
+        group_display_name,
+        cached_members: roster.usernames.len(),
+        friends: matches
+            .into_iter()
+            .map(|(display_name, username)| MemberFriend {
+                username,
+                display_name,
+            })
+            .collect(),
+    })
 }
 
 /// List current group members and their locally recorded speaking activity.
 pub fn list_members(
     store: &SourceStore,
     options: ListMembersOptions<'_>,
-) -> Result<Vec<MemberActivity>, String> {
+) -> Result<MemberReport, String> {
     let contact_conn = store
         .open(CONTACT_DB)
         .map_err(|error| format!("Contact database is unavailable: {error}"))?;
@@ -410,10 +471,10 @@ pub fn list_members(
     let speech = load_member_speech(store, &message_dbs, &username, options.jobs)?;
     let history_start = speech.values().map(|row| row.first_spoke).min();
     let history_end = speech.values().map(|row| row.last_spoke).max();
-    let group_display = contacts
+    let group_display_name = contacts
         .get(&username)
-        .map(|value| value.display_name(options.name_mode))
-        .unwrap_or(&username);
+        .map(|value| value.display_name(options.name_mode).to_string())
+        .unwrap_or_else(|| username.clone());
 
     let total_members = roster.usernames.len();
     let mut members = roster
@@ -447,65 +508,15 @@ pub fn list_members(
             .then_with(|| left.username.cmp(&right.username))
     });
 
-    let stdout = std::io::stdout();
-    let mut out = crate::output::Output::new(stdout.lock());
-    out.line(format_args!("Group: {group_display} ({username})"))?;
-    out.line(format_args!("Current members: {total_members}"))?;
-    match (history_start, history_end) {
-        (Some(start), Some(end)) => out.line(format_args!(
-            "Local sender history: {} to {}",
-            time::format_local_timestamp_minutes(start),
-            time::format_local_timestamp_minutes(end)
-        ))?,
-        _ => out.line(format_args!("Local sender history: none"))?,
-    }
-    if let Some(cutoff) = options.inactive_since {
-        out.line(format_args!(
-            "Filter: no recorded messages since {}",
-            time::format_local_timestamp_minutes(cutoff)
-        ))?;
-        out.line(format_args!(
-            "Note: the current roster has no join times; review recent joiners before removal."
-        ))?;
-        if history_start.is_none_or(|start| start > cutoff) {
-            out.line(format_args!(
-                "Warning: local sender history does not reach the cutoff; this cannot prove a full period of silence."
-            ))?;
-        }
-    }
-    out.blank_line()?;
-    out.line(format_args!(
-        "{:<4} {:<20} {:<10} {:<7} {:<22} Username",
-        "Rank", "Last Spoke", "Messages", "Role", "Display Name"
-    ))?;
-    out.line(format_args!("{}", "-".repeat(130)))?;
-    for (index, member) in members.iter().enumerate() {
-        let last_spoke = member
-            .last_spoke
-            .map(time::format_local_timestamp_minutes)
-            .unwrap_or_else(|| "never recorded".to_string());
-        out.line(format_args!(
-            "{:<4} {:<20} {:<10} {:<7} {:<22} {}",
-            index + 1,
-            last_spoke,
-            member.message_count,
-            if member.is_owner { "owner" } else { "" },
-            member.display_name,
-            member.username
-        ))?;
-    }
-    out.blank_line()?;
-    if options.inactive_since.is_some() {
-        out.line(format_args!(
-            "Candidates: {} of {} current members (local records only)",
-            members.len(),
-            total_members
-        ))?;
-    } else {
-        out.line(format_args!("Listed: {} current members", members.len()))?;
-    }
-    out.flush()?;
-    Ok(members)
+    Ok(MemberReport {
+        group_username: username,
+        group_display_name,
+        total_members,
+        history_start,
+        history_end,
+        inactive_since: options.inactive_since,
+        members,
+    })
 }
 
 fn load_member_speech(
@@ -591,8 +602,8 @@ fn list_sessions_from_connection(
     contacts: &HashMap<String, Contact>,
     top_n: usize,
     query: Option<&str>,
-    mode: SessionDbListMode,
-) -> Result<SessionListRows, String> {
+    mode: SessionListKind,
+) -> Result<SessionList, String> {
     let sql = format!(
         "SELECT username,
                 COALESCE(unread_count, 0),
@@ -676,62 +687,24 @@ fn list_sessions_from_connection(
         entries.sort_by_key(|entry| Reverse(entry.info.latest.unwrap_or_default()));
     }
 
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-    let matched_sessions = entries.len();
-
-    let stdout = std::io::stdout();
-    let mut out = crate::output::Output::new(stdout.lock());
-
-    out.line(format_args!(
-        "{:<4} {:<8} {:<20} {:<22} Username",
-        "Rank", "Unread", "Last Activity", "Display Name"
-    ))?;
-    out.line(format_args!("{}", "-".repeat(120)))?;
-
-    let mut result = Vec::new();
-    for (i, entry) in entries.iter().enumerate().take(top_n) {
-        let activity = entry
-            .info
-            .latest
-            .map(time::format_local_timestamp_minutes)
-            .unwrap_or_default();
-
-        out.line(format_args!(
-            "{:<4} {:<8} {:<20} {:<22} {}",
-            i + 1,
-            entry.info.count,
-            activity,
-            entry.display,
-            entry.username
-        ))?;
-
-        result.push((
-            entry.username.clone(),
-            entry.info.count,
-            activity,
-            entry.display.clone(),
-        ));
-    }
-
-    out.blank_line()?;
-    if query.is_some() {
-        out.line(format_args!(
-            "Matched: {} of {} {}",
-            matched_sessions,
-            total_sessions,
-            mode.total_label()
-        ))?;
-    } else {
-        out.line(format_args!(
-            "Total: {} {}",
-            total_sessions,
-            mode.total_label()
-        ))?;
-    }
-    out.flush()?;
-    Ok(result)
+    let matched = entries.len();
+    let sessions = entries
+        .into_iter()
+        .take(top_n)
+        .map(|entry| SessionSummary {
+            username: entry.username,
+            display_name: entry.display,
+            unread_count: entry.info.count,
+            last_active: entry.info.latest.unwrap_or_default(),
+        })
+        .collect();
+    Ok(SessionList {
+        kind: mode,
+        filtered: query.is_some(),
+        matched,
+        total: total_sessions,
+        sessions,
+    })
 }
 
 fn session_match_info(
@@ -779,8 +752,8 @@ fn session_match_info(
 /// Read messages from a specific session.
 pub fn read_messages(
     store: &SourceStore,
-    options: ReadMessagesOptions<'_>,
-) -> Result<usize, String> {
+    options: &ReadMessagesOptions<'_>,
+) -> Result<MessagePage, String> {
     let message_dbs = message_databases(store);
     let contact_conn = open_optional_database(store, CONTACT_DB)?;
     let contacts = match contact_conn.as_ref() {
@@ -927,37 +900,7 @@ pub fn read_messages(
         all_messages.iter().skip(options.offset).collect()
     };
 
-    if messages.is_empty() {
-        return Ok(0);
-    }
-    let displayed_count = messages.len();
-
-    let stdout = std::io::stdout();
-    let mut out = crate::output::Output::new(stdout.lock());
-
-    out.line(format_args!("Chat with: {} ({})", display_name, username))?;
-    if let Some(q) = options.search_query {
-        out.line(format_args!("Search: '{}'", q))?;
-    }
-    if options.tail {
-        if options.limit.is_some() {
-            out.line(format_args!("Showing latest {} messages", messages.len()))?;
-        } else {
-            out.line(format_args!("Showing {} messages", messages.len()))?;
-        }
-    } else if options.limit.is_some() || options.offset > 0 {
-        out.line(format_args!(
-            "Showing messages {}-{}",
-            options.offset + 1,
-            options.offset + messages.len()
-        ))?;
-    } else {
-        out.line(format_args!("Showing {} messages", messages.len()))?;
-    }
-    out.blank_line()?;
-
-    let mut last_time_key = None;
-    let mut last_sender: Option<String> = None;
+    let mut decoded_messages = Vec::with_capacity(messages.len());
     for row in messages {
         // 1-on-1 chat: if the sender is not the chat partner, it's "me"
         let sender_display =
@@ -992,40 +935,20 @@ pub fn read_messages(
             },
         );
 
-        if options.time_bucket == time::MessageTimeBucket::PerMessage {
-            out.line(format_args!(
-                "[{}] {}: {}",
-                time::format_local_timestamp(row.create_time),
-                decoded.display_name,
-                decoded.content
-            ))?;
-        } else {
-            if let Some(time_key) = time::message_time_key(row.create_time, options.time_bucket) {
-                if last_time_key != Some(time_key) {
-                    out.line(format_args!(
-                        "[{}]",
-                        time::format_message_time_bucket(row.create_time, options.time_bucket)
-                    ))?;
-                    last_time_key = Some(time_key);
-                    last_sender = None;
-                }
-            }
-            if last_sender.as_deref() == Some(decoded.display_name.as_str()) {
-                out.line(format_args!(" {}", decoded.content))?;
-            } else {
-                out.line(format_args!(
-                    "{}: {}",
-                    decoded.display_name, decoded.content
-                ))?;
-                last_sender = Some(decoded.display_name);
-            }
-        }
+        decoded_messages.push(ChatMessage {
+            local_id: row.local_id,
+            local_type: row.local_type,
+            create_time: row.create_time,
+            sender: decoded.display_name,
+            content: decoded.content,
+        });
     }
 
-    out.blank_line()?;
-    out.line(format_args!("--- End of messages ---"))?;
-    out.flush()?;
-    Ok(displayed_count)
+    Ok(MessagePage {
+        username,
+        display_name,
+        messages: decoded_messages,
+    })
 }
 
 fn query_window_limit(limit: Option<usize>, offset: usize, tail: bool) -> Option<usize> {
@@ -1096,28 +1019,30 @@ pub(crate) fn probe_session(
 pub fn search_messages(
     store: &SourceStore,
     options: SearchMessagesOptions<'_>,
-) -> Result<usize, String> {
+) -> Result<SearchResults, String> {
     let contact_conn = open_optional_database(store, CONTACT_DB)?;
     let contacts = match contact_conn.as_ref() {
         Some(conn) => contact::load_contacts(conn)?,
         None => HashMap::new(),
     };
-    let (displayed, has_more, results) = search_messages_with_fts(store, &options)?;
-
-    print_search_results(
-        options.query,
-        displayed,
-        has_more,
-        results,
-        &contacts,
-        options.name_mode,
-    )
+    let (has_more, rows) = search_messages_with_fts(store, &options)?;
+    let hits = rows
+        .into_iter()
+        .map(|(local_type, create_time, content, session)| SearchHit {
+            session_display: search_session_display(&contacts, &session, options.name_mode),
+            local_type,
+            create_time,
+            content,
+            session,
+        })
+        .collect();
+    Ok(SearchResults { hits, has_more })
 }
 
 fn search_messages_with_fts(
     store: &SourceStore,
     options: &SearchMessagesOptions<'_>,
-) -> Result<(usize, bool, Vec<SearchRow>), String> {
+) -> Result<(bool, Vec<SearchRow>), String> {
     let conn = store
         .open(MESSAGE_FTS_DB)
         .map_err(|error| format!("Message search index is unavailable: {error}"))?;
@@ -1167,10 +1092,9 @@ fn search_messages_with_fts(
     results.sort_by_key(|row| Reverse(row.1));
     let has_more = results.len() > options.limit;
     results.truncate(options.limit);
-    let displayed = results.len();
     results.sort_by_key(|row| row.1);
 
-    Ok((displayed, has_more, results))
+    Ok((has_more, results))
 }
 
 fn collect_telegram_fts_rows(
@@ -1244,60 +1168,6 @@ fn collect_telegram_fts_rows(
         results.retain(|row| row.2.contains(options.query));
     }
     Ok(results)
-}
-
-fn print_search_results(
-    query: &str,
-    displayed: usize,
-    has_more: bool,
-    results: Vec<SearchRow>,
-    contacts: &HashMap<String, Contact>,
-    name_mode: DisplayNameMode,
-) -> Result<usize, String> {
-    if displayed == 0 {
-        return Ok(0);
-    }
-
-    let stdout = std::io::stdout();
-    let mut out = crate::output::Output::new(stdout.lock());
-
-    if has_more {
-        out.line(format_args!(
-            "Search results for '{}': showing latest {} matches (more available)",
-            query, displayed
-        ))?;
-    } else {
-        out.line(format_args!(
-            "Search results for '{}': {} matches",
-            query, displayed
-        ))?;
-    }
-    out.blank_line()?;
-
-    let display_results = &results;
-
-    for (i, (_, create_time, content, table_name)) in display_results.iter().enumerate() {
-        let time_str = time::format_local_timestamp(*create_time);
-
-        let display = search_session_display(contacts, table_name, name_mode);
-
-        let display_content = truncate_preview(content, SEARCH_PREVIEW_CHARS);
-
-        out.line(format_args!(
-            "[{}] {} | {}: {}",
-            i + 1,
-            time_str,
-            display,
-            display_content
-        ))?;
-    }
-
-    if has_more {
-        out.line(format_args!("... more older results available"))?;
-    }
-
-    out.flush()?;
-    Ok(displayed)
 }
 
 fn telegram_fts_content_tables(conn: &Connection) -> Result<Vec<String>, String> {
@@ -1376,16 +1246,6 @@ pub(crate) fn like_contains_pattern(query: &str) -> String {
     }
     pattern.push('%');
     pattern
-}
-
-fn truncate_preview(content: &str, max_chars: usize) -> String {
-    let mut chars = content.chars();
-    let preview: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{}...", preview)
-    } else {
-        content.to_string()
-    }
 }
 
 pub(crate) fn resolve_username_for_messages(
@@ -1862,7 +1722,7 @@ mod tests {
         root: &Path,
         top_n: usize,
         query: Option<&str>,
-    ) -> Result<SessionListRows, String> {
+    ) -> Result<SessionList, String> {
         let store = SourceStore::from_plaintext(root)?;
         super::list_sessions(&store, top_n, query)
     }
@@ -1871,19 +1731,19 @@ mod tests {
         root: &Path,
         top_n: usize,
         query: Option<&str>,
-    ) -> Result<SessionListRows, String> {
+    ) -> Result<SessionList, String> {
         let store = SourceStore::from_plaintext(root)?;
         super::list_unread_sessions(&store, top_n, query)
     }
 
     fn read_messages(root: &Path, options: ReadMessagesOptions<'_>) -> Result<usize, String> {
         let store = SourceStore::from_plaintext(root)?;
-        super::read_messages(&store, options)
+        super::read_messages(&store, &options).map(|page| page.messages.len())
     }
 
     fn search_messages(root: &Path, options: SearchMessagesOptions<'_>) -> Result<usize, String> {
         let store = SourceStore::from_plaintext(root)?;
-        super::search_messages(&store, options)
+        super::search_messages(&store, options).map(|results| results.hits.len())
     }
 
     fn load_contacts(path: &Path) -> HashMap<String, Contact> {
@@ -2162,15 +2022,15 @@ mod tests {
             &[("tgid_old", 0, 1000, 1000), ("tgid_recent", 3, 2000, 2100)],
         );
 
-        let sessions = list_sessions(dir.path(), 10, None).unwrap();
+        let sessions = list_sessions(dir.path(), 10, None).unwrap().sessions;
 
         assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].0, "tgid_recent");
-        assert_eq!(sessions[0].1, 3);
-        assert_eq!(sessions[0].3, "Recent Nick");
-        assert_eq!(sessions[1].0, "tgid_old");
-        assert_eq!(sessions[1].1, 0);
-        assert_eq!(sessions[1].3, "Old Remark");
+        assert_eq!(sessions[0].username, "tgid_recent");
+        assert_eq!(sessions[0].unread_count, 3);
+        assert_eq!(sessions[0].display_name, "Recent Nick");
+        assert_eq!(sessions[1].username, "tgid_old");
+        assert_eq!(sessions[1].unread_count, 0);
+        assert_eq!(sessions[1].display_name, "Old Remark");
     }
 
     #[test]
@@ -2192,11 +2052,13 @@ mod tests {
             &[("tgid_alice", 0, 1000, 1000), ("tgid_bob", 0, 2000, 2000)],
         );
 
-        let sessions = list_sessions(dir.path(), 10, Some("Alic Zhang")).unwrap();
+        let sessions = list_sessions(dir.path(), 10, Some("Alic Zhang"))
+            .unwrap()
+            .sessions;
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].0, "tgid_alice");
-        assert_eq!(sessions[0].3, "Alice Zhang");
+        assert_eq!(sessions[0].username, "tgid_alice");
+        assert_eq!(sessions[0].display_name, "Alice Zhang");
     }
 
     #[test]
@@ -2209,12 +2071,12 @@ mod tests {
             &[("tgid_read", 0, 2000, 2000), ("tgid_unread", 2, 1000, 3000)],
         );
 
-        let sessions = list_unread_sessions(dir.path(), 10, None).unwrap();
+        let sessions = list_unread_sessions(dir.path(), 10, None).unwrap().sessions;
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].0, "tgid_unread");
-        assert_eq!(sessions[0].1, 2);
-        assert_eq!(sessions[0].3, "Unread Nick");
+        assert_eq!(sessions[0].username, "tgid_unread");
+        assert_eq!(sessions[0].unread_count, 2);
+        assert_eq!(sessions[0].display_name, "Unread Nick");
     }
 
     #[test]
@@ -2227,12 +2089,14 @@ mod tests {
             &[("tgid_alice", 4, 1000, 1000), ("tgid_bob", 1, 2000, 2000)],
         );
 
-        let sessions = list_unread_sessions(dir.path(), 10, Some("Alic Zhang")).unwrap();
+        let sessions = list_unread_sessions(dir.path(), 10, Some("Alic Zhang"))
+            .unwrap()
+            .sessions;
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].0, "tgid_alice");
-        assert_eq!(sessions[0].1, 4);
-        assert_eq!(sessions[0].3, "Alice Zhang");
+        assert_eq!(sessions[0].username, "tgid_alice");
+        assert_eq!(sessions[0].unread_count, 4);
+        assert_eq!(sessions[0].display_name, "Alice Zhang");
     }
 
     #[test]
@@ -2263,9 +2127,10 @@ mod tests {
         ).unwrap();
         drop(conn);
         let store = SourceStore::from_plaintext(dir.path()).unwrap();
-        let matches =
+        let report =
             super::list_member_friends(&store, "room@chatroom", DisplayNameMode::Anonymous, 1)
                 .unwrap();
+        let matches: Vec<_> = report.friends.iter().map(|f| f.username.as_str()).collect();
         assert_eq!(matches, ["friend", "extra_bits"]);
         assert!(
             super::list_member_friends(&store, "friend", DisplayNameMode::Anonymous, 1).is_err()
@@ -2330,7 +2195,8 @@ mod tests {
                 jobs: 1,
             },
         )
-        .unwrap();
+        .unwrap()
+        .members;
 
         assert_eq!(
             members
@@ -2557,11 +2423,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn truncate_preview_handles_multibyte_content() {
-        assert_eq!(truncate_preview("提取一下", 2), "提取...");
     }
 
     #[test]
