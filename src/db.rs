@@ -385,8 +385,16 @@ pub(crate) fn list_member_friends(
     jobs: usize,
 ) -> Result<MemberFriendReport, String> {
     let conn = store.open(CONTACT_DB)?;
-    let contacts = contact::load_contacts(&conn)?;
-    let username = resolve_username_from_contacts(session_query, &contacts, store, None, jobs)?;
+    // Name matching needs every contact; a direct id needs only the rows shown.
+    let (username, matched_contacts) = match direct_session_username(session_query) {
+        Some(username) => (username.to_string(), None),
+        None => {
+            let contacts = contact::load_contacts(&conn)?;
+            let username =
+                resolve_username_from_contacts(session_query, &contacts, store, None, jobs)?;
+            (username, Some(contacts))
+        }
+    };
     if !username.ends_with("@chatroom") {
         return Err(format!("Not a group session: {username}"));
     }
@@ -395,6 +403,15 @@ pub(crate) fn list_member_friends(
         return Err(format!("No cached members found for group: {username}"));
     }
     let friends = contact::load_friend_usernames(&conn)?;
+    let contacts = match matched_contacts {
+        Some(contacts) => contacts,
+        None => {
+            let members: HashSet<&str> = roster.usernames.iter().map(String::as_str).collect();
+            contact::load_contacts_where(&conn, |id| {
+                id == username || (members.contains(id) && friends.contains(id))
+            })?
+        }
+    };
     let room_names = if name_mode == DisplayNameMode::Anonymous {
         contact::load_chat_room_member_names(&conn, &username)?
     } else {
@@ -1291,17 +1308,10 @@ fn resolve_username_from_contacts(
     message_dbs: Option<&[String]>,
     jobs: usize,
 ) -> Result<String, String> {
+    if let Some(username) = direct_session_username(query) {
+        return Ok(username.to_string());
+    }
     let query = query.trim();
-    if query.is_empty() {
-        return Ok(query.to_string());
-    }
-
-    if query.starts_with(dictionary::account_id_prefix())
-        || query.starts_with("gh_")
-        || query.contains("@chatroom")
-    {
-        return Ok(query.to_string());
-    }
 
     // Try exact username match
     if let Some(c) = contacts.get(query) {
@@ -1347,6 +1357,16 @@ fn resolve_username_from_contacts(
     // No contact match. Treat the input as a raw username so callers can still
     // read sessions whose contact row is missing.
     Ok(query.to_string())
+}
+
+/// A query that names a session directly and resolves without contacts.
+fn direct_session_username(query: &str) -> Option<&str> {
+    let query = query.trim();
+    (query.is_empty()
+        || query.starts_with(dictionary::account_id_prefix())
+        || query.starts_with("gh_")
+        || query.contains("@chatroom"))
+    .then_some(query)
 }
 
 const EXACT_MATCH_SCORE: i64 = 400;
