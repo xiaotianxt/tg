@@ -9,6 +9,7 @@ mod export;
 mod fts;
 mod key_material;
 mod logger;
+mod mcp;
 mod media;
 mod media_decrypt;
 mod media_index;
@@ -321,6 +322,11 @@ enum Commands {
         #[command(flatten)]
         source: SourceArgs,
     },
+    /// Serve read-only tools to MCP clients (stdio, or HTTP with OAuth)
+    Mcp {
+        #[command(subcommand)]
+        command: mcp::McpCommand,
+    },
     /// Install or manage the local agent skill
     Skill {
         #[command(subcommand)]
@@ -622,6 +628,7 @@ fn run(command: Commands) -> Result<(), String> {
             }
             Ok(())
         }
+        Commands::Mcp { command } => mcp::run(command).map_err(|e| format!("Error: {e}")),
         Commands::Skill { command } => match command {
             SkillCommands::Install { dir } => {
                 let path = skill::install(dir)?;

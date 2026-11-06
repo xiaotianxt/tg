@@ -209,7 +209,10 @@ impl QueryOutput {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct MessageRow {
+    /// Display name of the session.
     pub session: String,
+    /// Session username, or the table name when the session is unknown.
+    pub session_id: String,
     pub sender: String,
     pub local_type: i64,
     pub create_time: i64,
@@ -489,12 +492,16 @@ fn query_message_table(
             let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
             let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
             let local_id = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
+            let session_id = context
+                .table_to_session
+                .get(table)
+                .cloned()
+                .unwrap_or_else(|| table.to_string());
             let session = context
                 .table_to_display
                 .get(table)
                 .cloned()
-                .or_else(|| context.table_to_session.get(table).cloned())
-                .unwrap_or_else(|| table.to_string());
+                .unwrap_or_else(|| session_id.clone());
             let local_type = row.get::<_, Option<i64>>(0)?.unwrap_or(-1);
             let body = decode_query_body(
                 local_type,
@@ -507,6 +514,7 @@ fn query_message_table(
             );
             Ok(MessageRow {
                 session,
+                session_id,
                 sender: display_sender(&sender_account, context),
                 local_type,
                 create_time: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
