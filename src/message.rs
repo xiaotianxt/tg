@@ -1217,6 +1217,8 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+const ZSTD_RESERVE_CAP: u64 = 1 << 20;
+
 fn try_zstd(data: &[u8]) -> Result<String, ()> {
     ZSTD_DCTX.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -1224,10 +1226,16 @@ fn try_zstd(data: &[u8]) -> Result<String, ()> {
             *slot = Some(zstd::zstd_safe::DCtx::try_create().ok_or(())?);
         }
         let context = slot.as_mut().expect("context was just created");
+        // The declared size only sizes the first allocation; it comes from the
+        // input, so it is capped, and decoding still grows the buffer if needed.
+        let declared = zstd::zstd_safe::get_frame_content_size(data)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let mut out = Vec::with_capacity(declared.min(ZSTD_RESERVE_CAP) as usize);
         let mut d = zstd::stream::read::Decoder::with_context(data, context);
-        let mut s = String::new();
-        d.read_to_string(&mut s).map_err(|_| ())?;
-        Ok(s)
+        d.read_to_end(&mut out).map_err(|_| ())?;
+        String::from_utf8(out).map_err(|_| ())
     })
 }
 
