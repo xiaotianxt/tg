@@ -245,7 +245,39 @@ pub(crate) fn query_messages(options: &QueryOptions<'_>) -> Result<Vec<MessageRo
         .into_iter()
         .skip(options.offset)
         .take(options.limit.unwrap_or(usize::MAX))
+        .map(|candidate| candidate.finish(&context))
         .collect())
+}
+
+/// Decode inputs of a row whose body no filter reads. Ordering uses only
+/// create_time, so decoding can wait until the final window is cut.
+struct DeferredBody {
+    marker: Option<i64>,
+    packed_info: Vec<u8>,
+    local_id: i64,
+}
+
+struct CandidateRow {
+    row: MessageRow,
+    deferred: Option<DeferredBody>,
+}
+
+impl CandidateRow {
+    fn finish(self, context: &MessageQueryContext) -> MessageRow {
+        let mut row = self.row;
+        if let Some(deferred) = self.deferred {
+            row.body = decode_query_body(
+                row.local_type,
+                &row.raw_body,
+                deferred.marker,
+                &deferred.packed_info,
+                Some(deferred.local_id),
+                &row.session,
+                &context.sender_display,
+            );
+        }
+        row
+    }
 }
 
 fn validate_message_options(options: &QueryOptions<'_>) -> Result<(), String> {
@@ -308,10 +340,12 @@ fn message_query_window(options: &QueryOptions<'_>) -> Result<Option<usize>, Str
     Ok(Some(window))
 }
 
+fn query_filters_body(options: &QueryOptions<'_>) -> bool {
+    !options.contains.is_empty() || !options.not_contains.is_empty()
+}
+
 fn query_needs_post_filtering(options: &QueryOptions<'_>) -> bool {
-    !options.contains.is_empty()
-        || !options.not_contains.is_empty()
-        || media_filters_need_post_filtering(options)
+    query_filters_body(options) || media_filters_need_post_filtering(options)
 }
 
 fn media_filters_need_post_filtering(options: &QueryOptions<'_>) -> bool {
@@ -380,21 +414,21 @@ fn query_message_target(
     target: &QueryTarget,
     context: &MessageQueryContext,
     options: &QueryOptions<'_>,
-) -> Result<Vec<MessageRow>, String> {
+) -> Result<Vec<CandidateRow>, String> {
     let conn = store.open(&target.label)?;
     let tables = match &context.selected_table {
-        Some(table) => vec![table.clone()],
-        None => db::list_message_tables(&conn)?,
+        Some(table) => db::message_table_schema(&conn, table)?
+            .map(|schema| (table.clone(), schema))
+            .into_iter()
+            .collect(),
+        None => db::message_table_schemas(&conn)?,
     };
 
     let name2id = db::load_name2id(&conn)?;
     let mut rows = Vec::new();
-    for table in tables {
-        if !db::table_exists(&conn, &table)? {
-            continue;
-        }
+    for (table, schema) in tables {
         let mut table_rows =
-            query_message_table(&conn, target, &table, &name2id, context, options)?;
+            query_message_table(&conn, target, &table, schema, &name2id, context, options)?;
         rows.append(&mut table_rows);
     }
     Ok(rows)
@@ -404,24 +438,25 @@ fn query_message_table(
     conn: &Connection,
     target: &QueryTarget,
     table: &str,
+    schema: db::MessageTableSchema,
     name2id: &HashMap<i64, String>,
     context: &MessageQueryContext,
     options: &QueryOptions<'_>,
-) -> Result<Vec<MessageRow>, String> {
+) -> Result<Vec<CandidateRow>, String> {
     let body_col = db::quote_identifier(dictionary::msg_body_column());
     let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
     let sender_col = db::quote_identifier(dictionary::msg_sender_column());
-    let packed_col = if db::table_has_column(conn, table, dictionary::msg_packed_meta_column())? {
+    let packed_col = if schema.has_packed_meta {
         db::quote_identifier(dictionary::msg_packed_meta_column())
     } else {
         "x''".to_string()
     };
-    let local_id_col = if db::table_has_column(conn, table, "local_id")? {
+    let local_id_col = if schema.has_local_id {
         db::quote_identifier("local_id")
     } else {
         "rowid".to_string()
     };
-    let order_col = if db::table_has_column(conn, table, "sort_seq")? {
+    let order_col = if schema.has_sort_seq {
         "sort_seq"
     } else {
         "create_time"
@@ -462,50 +497,74 @@ fn query_message_table(
         clauses.push(format!("({})", media_clause));
     }
 
-    let limit_clause = match result_window {
-        Some(window) if !query_needs_post_filtering(options) => format!(" LIMIT {window}"),
+    // A pushed-down LIMIT can stop the index walk early. Without one the whole
+    // table is read, so read it in rowid order and sort afterwards.
+    let order_clause = match result_window {
+        Some(window) if !query_needs_post_filtering(options) => {
+            format!(
+                " ORDER BY {order_col} {} LIMIT {window}",
+                options.sort.order_dir()
+            )
+        }
         _ => String::new(),
     };
 
     let sql = format!(
-        "SELECT local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}, {local_id_col} \
+        "SELECT local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}, {local_id_col}, {order_key} \
          FROM {quoted_table} \
-         WHERE {where_clause} \
-         ORDER BY {order_col} {order_dir}{limit_clause}",
+         WHERE {where_clause}{order_clause}",
         body_col = body_col,
         marker_col = marker_col,
         sender_col = sender_col,
         packed_col = packed_col,
         local_id_col = local_id_col,
+        order_key = db::message_order_key_columns(order_col),
         quoted_table = quoted_table,
-        order_col = order_col,
         where_clause = clauses.join(" AND "),
-        order_dir = options.sort.order_dir(),
-        limit_clause = limit_clause,
+        order_clause = order_clause,
     );
+
+    let session_id = context
+        .table_to_session
+        .get(table)
+        .cloned()
+        .unwrap_or_else(|| table.to_string());
+    let session = context
+        .table_to_display
+        .get(table)
+        .cloned()
+        .unwrap_or_else(|| session_id.clone());
 
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| format!("Message query prepare error in {}: {}", target.label, e))?;
-    let mapped = stmt
-        .query_map(params_from_iter(params.iter()), |row| {
-            let marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
-            let raw_body = db::read_message_body(row, 2, marker)?;
-            let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
-            let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
-            let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
-            let local_id = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
-            let session_id = context
-                .table_to_session
-                .get(table)
-                .cloned()
-                .unwrap_or_else(|| table.to_string());
-            let session = context
-                .table_to_display
-                .get(table)
-                .cloned()
-                .unwrap_or_else(|| session_id.clone());
-            let local_type = row.get::<_, Option<i64>>(0)?.unwrap_or(-1);
+    let mut result = stmt
+        .query(params_from_iter(params.iter()))
+        .map_err(|e| format!("Message query error in {}: {}", target.label, e))?;
+    let read_error = |error| format!("Read message rows in {}: {error}", target.label);
+    // Filter while streaming so rejected rows are never materialized, and test
+    // the media filter, which needs only the raw row, before decoding the body.
+    // Without a body filter, decoding waits for the final window.
+    let mut rows = Vec::new();
+    while let Some(row) = result.next().map_err(read_error)? {
+        let local_type = row
+            .get::<_, Option<i64>>(0)
+            .map_err(read_error)?
+            .unwrap_or(-1);
+        let marker: Option<i64> = row.get::<_, Option<i64>>(3).map_err(read_error)?;
+        let raw_body = db::read_message_body(row, 2, marker).map_err(read_error)?;
+        if !message_matches_media_filters(local_type, &raw_body, options) {
+            continue;
+        }
+        let packed_info: Vec<u8> = row
+            .get::<_, Option<Vec<u8>>>(5)
+            .map_err(read_error)?
+            .unwrap_or_default();
+        let local_id = row
+            .get::<_, Option<i64>>(6)
+            .map_err(read_error)?
+            .unwrap_or(0);
+        let (body, deferred) = if query_filters_body(options) {
             let body = decode_query_body(
                 local_type,
                 &raw_body,
@@ -515,24 +574,48 @@ fn query_message_table(
                 &session,
                 &context.sender_display,
             );
-            Ok(MessageRow {
-                session,
-                session_id,
-                sender: display_sender(&sender_account, context),
-                local_type,
-                create_time: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                body,
-                raw_body,
-            })
-        })
-        .map_err(|e| format!("Message query error in {}: {}", target.label, e))?;
-
-    Ok(mapped
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|error| format!("Read message rows in {}: {error}", target.label))?
+            if !message_body_matches_filters(&body, options) {
+                continue;
+            }
+            (body, None)
+        } else {
+            let deferred = DeferredBody {
+                marker,
+                packed_info,
+                local_id,
+            };
+            (String::new(), Some(deferred))
+        };
+        let sender_id: i64 = row
+            .get::<_, Option<i64>>(4)
+            .map_err(read_error)?
+            .unwrap_or(0);
+        let sender_account = name2id.get(&sender_id).map_or("", String::as_str);
+        rows.push((
+            db::read_message_order_key(row, 7).map_err(read_error)?,
+            CandidateRow {
+                row: MessageRow {
+                    session: session.clone(),
+                    session_id: session_id.clone(),
+                    sender: display_sender(sender_account, context),
+                    local_type,
+                    create_time: row
+                        .get::<_, Option<i64>>(1)
+                        .map_err(read_error)?
+                        .unwrap_or(0),
+                    body,
+                    raw_body,
+                },
+                deferred,
+            },
+        ));
+    }
+    drop(result);
+    db::sort_in_message_order(&mut rows, options.sort == QuerySort::Newest);
+    Ok(rows
         .into_iter()
-        .filter(|row| message_row_matches_filters(row, options))
         .take(result_window.unwrap_or(usize::MAX))
+        .map(|(_, row)| row)
         .collect())
 }
 
@@ -577,38 +660,30 @@ fn decode_query_body(
     .content
 }
 
-fn message_row_matches_filters(row: &MessageRow, options: &QueryOptions<'_>) -> bool {
-    if !message_row_matches_media_filters(row, options) {
-        return false;
-    }
-
+fn message_body_matches_filters(body: &str, options: &QueryOptions<'_>) -> bool {
     if !options.contains.is_empty() {
         let matched = match options.match_mode {
-            QueryMatchMode::All => options.contains.iter().all(|term| row.body.contains(term)),
-            QueryMatchMode::Any => options.contains.iter().any(|term| row.body.contains(term)),
+            QueryMatchMode::All => options.contains.iter().all(|term| body.contains(term)),
+            QueryMatchMode::Any => options.contains.iter().any(|term| body.contains(term)),
         };
         if !matched {
             return false;
         }
     }
 
-    !options
-        .not_contains
-        .iter()
-        .any(|term| row.body.contains(term))
+    !options.not_contains.iter().any(|term| body.contains(term))
 }
 
-fn message_row_matches_media_filters(row: &MessageRow, options: &QueryOptions<'_>) -> bool {
-    if !options.has.is_empty()
-        && !options
+fn message_matches_media_filters(
+    local_type: i64,
+    raw_body: &str,
+    options: &QueryOptions<'_>,
+) -> bool {
+    options.has.is_empty()
+        || options
             .has
             .iter()
-            .any(|media_type| message_has_media(row.local_type, &row.raw_body, *media_type))
-    {
-        return false;
-    }
-
-    true
+            .any(|media_type| message_has_media(local_type, raw_body, *media_type))
 }
 
 fn legacy_indexed_media_clause(media_type: QueryMediaType, raw_body_col: &str) -> String {
@@ -629,10 +704,10 @@ fn message_has_media(local_type: i64, raw_body: &str, media_type: QueryMediaType
     media::message_media_type(local_type, raw_body) == Some(media_type.as_str())
 }
 
-fn sort_message_rows(rows: &mut [MessageRow], sort: QuerySort) {
+fn sort_message_rows(rows: &mut [CandidateRow], sort: QuerySort) {
     match sort {
-        QuerySort::Newest => rows.sort_by_key(|row| Reverse(row.create_time)),
-        QuerySort::Oldest => rows.sort_by_key(|row| row.create_time),
+        QuerySort::Newest => rows.sort_by_key(|candidate| Reverse(candidate.row.create_time)),
+        QuerySort::Oldest => rows.sort_by_key(|candidate| candidate.row.create_time),
     }
 }
 
@@ -1185,6 +1260,72 @@ mod tests {
 
         assert_eq!(count, 1);
         assert!(output.contains("[voice:5151]"));
+    }
+
+    #[test]
+    fn message_query_keeps_sort_seq_index_order_for_ties() {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let marker_col = dictionary::msg_compression_marker_column();
+        let packed_col = dictionary::msg_packed_meta_column();
+        conn.execute_batch(&format!(
+            "CREATE TABLE Msg_test (
+                local_id INTEGER PRIMARY KEY AUTOINCREMENT, local_type INTEGER,
+                sort_seq INTEGER, create_time INTEGER, message_content TEXT,
+                {marker_col} INTEGER, real_sender_id INTEGER, {packed_col} BLOB);
+             CREATE INDEX Msg_test_SORTSEQ ON Msg_test(sort_seq);"
+        ))
+        .unwrap();
+        // Equal create_time keeps the per-table order through the global
+        // stable sort, so sort_seq ties and NULLs must follow the index walk.
+        let sort_seqs = [
+            Some(5),
+            Some(2),
+            Some(5),
+            None,
+            Some(2),
+            Some(9),
+            None,
+            Some(5),
+        ];
+        for (index, sort_seq) in sort_seqs.into_iter().enumerate() {
+            conn.execute(
+                &format!(
+                    "INSERT INTO Msg_test (local_id, local_type, sort_seq, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+                     VALUES (?1, 1, ?2, 1000, ?3, NULL, 0, x'')"
+                ),
+                params![index as i64 + 1, sort_seq, format!("tie {}", index + 1)],
+            )
+            .unwrap();
+        }
+
+        let contains = ["tie".to_string()];
+        for sort in [QuerySort::Newest, QuerySort::Oldest] {
+            let expected: Vec<String> = conn
+                .prepare(&format!(
+                    "SELECT message_content FROM Msg_test ORDER BY sort_seq {}",
+                    sort.order_dir()
+                ))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            // --contains reads the whole table; --since pushes the LIMIT down.
+            for (contains, since) in [(&contains[..], None), (&[][..], Some(1))] {
+                let mut options = default_query_options(dir.path(), contains, &[]);
+                options.sort = sort;
+                options.since = since;
+                let got: Vec<String> = query_messages(&options)
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.body)
+                    .collect();
+                assert_eq!(got, expected, "{sort:?} since={since:?}");
+            }
+        }
     }
 
     #[test]

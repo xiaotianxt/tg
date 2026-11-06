@@ -1,7 +1,7 @@
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::contact::{self, Contact, DisplayNameMode};
 use crate::dictionary;
@@ -267,26 +267,6 @@ pub(crate) fn quote_identifier(name: &str) -> String {
     quoted
 }
 
-pub(crate) fn table_has_column(
-    conn: &Connection,
-    table_name: &str,
-    column_name: &str,
-) -> Result<bool, String> {
-    let sql = format!("PRAGMA table_info({})", quote_identifier(table_name));
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|error| format!("Inspect columns of {table_name}: {error}"))?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|error| format!("Read columns of {table_name}: {error}"))?;
-    for row in rows {
-        if row.map_err(|error| format!("Read column of {table_name}: {error}"))? == column_name {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 pub(crate) fn list_message_tables(conn: &Connection) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
@@ -307,6 +287,105 @@ pub(crate) fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, 
         |row| row.get(0),
     )
     .map_err(|error| format!("Check table {table_name}: {error}"))
+}
+
+/// Optional columns of one message table that change how it is read.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MessageTableSchema {
+    pub has_packed_meta: bool,
+    pub has_local_id: bool,
+    pub has_sort_seq: bool,
+}
+
+/// Every `Msg_*` table with its schema, in `list_message_tables` order, from
+/// one schema scan instead of one PRAGMA per table and column.
+pub(crate) fn message_table_schemas(
+    conn: &Connection,
+) -> Result<Vec<(String, MessageTableSchema)>, String> {
+    collect_message_table_schemas(conn, "m.name LIKE 'Msg_%'", None)
+}
+
+/// The schema of one message table, or `None` when the table is absent.
+pub(crate) fn message_table_schema(
+    conn: &Connection,
+    table_name: &str,
+) -> Result<Option<MessageTableSchema>, String> {
+    Ok(
+        collect_message_table_schemas(conn, "m.name = ?1", Some(table_name))?
+            .pop()
+            .map(|(_, schema)| schema),
+    )
+}
+
+fn collect_message_table_schemas(
+    conn: &Connection,
+    name_filter: &str,
+    name_param: Option<&str>,
+) -> Result<Vec<(String, MessageTableSchema)>, String> {
+    // sqlite_schema is the outer loop, so tables keep their schema-scan order
+    // and each table's columns arrive contiguously.
+    let sql = format!(
+        "SELECT m.name, p.name FROM sqlite_schema AS m, pragma_table_info(m.name) AS p \
+         WHERE m.type = 'table' AND {name_filter}"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| format!("Inspect message table columns: {error}"))?;
+    let map_row =
+        |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+    let rows = match name_param {
+        Some(name) => stmt.query_map([name], map_row),
+        None => stmt.query_map([], map_row),
+    }
+    .map_err(|error| format!("Read message table columns: {error}"))?;
+
+    let packed_meta = dictionary::msg_packed_meta_column();
+    let mut tables: Vec<(String, MessageTableSchema)> = Vec::new();
+    for row in rows {
+        let (table, column) = row.map_err(|error| format!("Read message table column: {error}"))?;
+        if tables.last().is_none_or(|(last, _)| *last != table) {
+            tables.push((table, MessageTableSchema::default()));
+        }
+        let schema = &mut tables.last_mut().expect("table was just pushed").1;
+        match column.as_str() {
+            "local_id" => schema.has_local_id = true,
+            "sort_seq" => schema.has_sort_seq = true,
+            name if name == packed_meta => schema.has_packed_meta = true,
+            _ => {}
+        }
+    }
+    Ok(tables)
+}
+
+/// Display order of a message table row: `(order column, rowid)`.
+///
+/// `ORDER BY sort_seq` is served by the single-column `sort_seq` index, whose
+/// entries are `(sort_seq, rowid)`; walking it backwards for DESC therefore
+/// orders ties by descending rowid. `sort_seq` is not unique, so the rowid
+/// is part of the key. Reading a whole table in rowid order and sorting by
+/// this key returns the index-walk order without reading the index or doing a
+/// table b-tree lookup per row.
+pub(crate) type MessageOrderKey = (Option<i64>, i64);
+
+/// SQL suffix selecting the order column and rowid for a `MessageOrderKey`.
+pub(crate) fn message_order_key_columns(order_col: &str) -> String {
+    format!("{order_col}, rowid")
+}
+
+pub(crate) fn read_message_order_key(
+    row: &rusqlite::Row<'_>,
+    first_index: usize,
+) -> rusqlite::Result<MessageOrderKey> {
+    Ok((row.get(first_index)?, row.get(first_index + 1)?))
+}
+
+pub(crate) fn sort_in_message_order<T>(rows: &mut [(MessageOrderKey, T)], descending: bool) {
+    // Keys are unique (they end in the rowid), so an unstable sort is exact.
+    if descending {
+        rows.sort_unstable_by_key(|(key, _)| Reverse(*key));
+    } else {
+        rows.sort_unstable_by_key(|(key, _)| *key);
+    }
 }
 
 pub(crate) fn load_name2id(conn: &Connection) -> Result<HashMap<i64, String>, String> {
@@ -550,43 +629,48 @@ fn load_member_speech(
             }
             let name2id = load_name2id(&conn)?;
             let sender_col = quote_identifier(dictionary::msg_sender_column());
+            // GROUP BY walked the sender index with a table lookup per row in
+            // sender order; one rowid-order scan reads each table page once.
             let sql = format!(
-                "SELECT {sender_col}, MIN(create_time), MAX(create_time), COUNT(*)
-                 FROM {table}
-                 WHERE create_time > 0 AND {sender_col} IS NOT NULL AND {sender_col} != 0
-                 GROUP BY {sender_col}",
+                "SELECT {sender_col}, create_time
+                 FROM {table} NOT INDEXED
+                 WHERE create_time > 0 AND {sender_col} IS NOT NULL AND {sender_col} != 0",
                 table = quote_identifier(&table_name),
             );
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(|error| format!("Prepare member activity in {db_path}: {error}"))?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                })
+            let mut rows = stmt
+                .query([])
                 .map_err(|error| format!("Read member activity in {db_path}: {error}"))?;
+            let read_error = |error| format!("Read member activity row in {db_path}: {error}");
+            // Ordered by sender id like GROUP BY, so an unresolved identity
+            // reports the same (lowest) sender id.
+            let mut by_sender: BTreeMap<i64, MemberSpeech> = BTreeMap::new();
+            while let Some(row) = rows.next().map_err(read_error)? {
+                let sender_id = row.get::<_, i64>(0).map_err(read_error)?;
+                let create_time = row.get::<_, i64>(1).map_err(read_error)?;
+                by_sender
+                    .entry(sender_id)
+                    .and_modify(|speech| {
+                        speech.first_spoke = speech.first_spoke.min(create_time);
+                        speech.last_spoke = speech.last_spoke.max(create_time);
+                        speech.message_count += 1;
+                    })
+                    .or_insert(MemberSpeech {
+                        first_spoke: create_time,
+                        last_spoke: create_time,
+                        message_count: 1,
+                    });
+            }
             let mut activity = HashMap::new();
-            for row in rows {
-                let (sender_id, first_spoke, last_spoke, message_count) =
-                    row.map_err(|error| format!("Read member activity row in {db_path}: {error}"))?;
+            for (sender_id, speech) in by_sender {
                 let Some(sender) = name2id.get(&sender_id) else {
                     return Err(format!(
                         "Cannot resolve sender identity {sender_id} in {db_path}; refusing a partial inactivity report"
                     ));
                 };
-                activity.insert(
-                    sender.clone(),
-                    MemberSpeech {
-                        first_spoke,
-                        last_spoke,
-                        message_count,
-                    },
-                );
+                activity.insert(sender.clone(), speech);
             }
             Ok(activity)
         },
@@ -837,9 +921,9 @@ pub fn read_messages(
             let conn = store.open(&db_path)?;
 
             let table = quote_identifier(&table_name);
-            if !table_exists(&conn, &table_name)? {
+            let Some(schema) = message_table_schema(&conn, &table_name)? else {
                 return Ok(Vec::new());
-            }
+            };
 
             let name2id = load_name2id(&conn)?;
 
@@ -850,33 +934,35 @@ pub fn read_messages(
             let marker_col = quote_identifier(dictionary::msg_compression_marker_column());
             let sender_col = quote_identifier(dictionary::msg_sender_column());
             let packed_col = quote_identifier(dictionary::msg_packed_meta_column());
-            let local_id_col = if table_has_column(&conn, &table_name, "local_id")? {
+            let local_id_col = if schema.has_local_id {
                 quote_identifier("local_id")
             } else {
                 "NULL".to_string()
             };
-            let order_col = if table_has_column(&conn, &table_name, "sort_seq")? {
+            let order_col = if schema.has_sort_seq {
                 "sort_seq"
             } else {
                 "create_time"
             };
+            // A LIMIT can stop the index walk early; a full read goes in rowid
+            // order and is sorted afterwards (see `MessageOrderKey`).
+            let order_clause = query_limit
+                .map(|n| format!(" ORDER BY {order_col} {order_dir} LIMIT {n}"))
+                .unwrap_or_default();
             let sql = format!(
-            "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col} \
-             FROM {table_name} WHERE create_time > 0{search_clause}{since_clause}{until_clause} ORDER BY {order_col} {order_dir}{limit_clause}",
+            "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}, {order_key} \
+             FROM {table_name} WHERE create_time > 0{search_clause}{since_clause}{until_clause}{order_clause}",
             local_id_col = local_id_col,
             body_col = body_col,
             marker_col = marker_col,
             sender_col = sender_col,
             packed_col = packed_col,
+            order_key = message_order_key_columns(order_col),
             table_name = table,
-            order_col = order_col,
             search_clause = search_clause,
             since_clause = since_clause,
             until_clause = until_clause,
-            order_dir = order_dir,
-            limit_clause = query_limit
-                .map(|n| format!(" LIMIT {}", n))
-                .unwrap_or_default()
+            order_clause = order_clause,
         );
             let mut stmt = conn
                 .prepare(&sql)
@@ -887,23 +973,29 @@ pub fn read_messages(
                 let sender_id: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
                 let sender_account_id = name2id.get(&sender_id).cloned().unwrap_or_default();
                 let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(6)?.unwrap_or_default();
-                Ok(MessageRow {
-                    local_id: row.get::<_, Option<i64>>(0)?,
-                    local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
-                    create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    content,
-                    compression_marker,
-                    sender_account_id,
-                    packed_info,
-                })
+                Ok((
+                    read_message_order_key(row, 7)?,
+                    MessageRow {
+                        local_id: row.get::<_, Option<i64>>(0)?,
+                        local_type: row.get::<_, Option<i64>>(1)?.unwrap_or(-1),
+                        create_time: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        content,
+                        compression_marker,
+                        sender_account_id,
+                        packed_info,
+                    },
+                ))
             };
             let rows = match &search_pattern {
                 Some(pattern) => stmt.query_map(params![pattern], map_row),
                 None => stmt.query_map([], map_row),
             }
             .map_err(|error| format!("Query messages from {db_path}: {error}"))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|error| format!("Read messages from {db_path}: {error}"))
+            let mut rows = rows
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| format!("Read messages from {db_path}: {error}"))?;
+            sort_in_message_order(&mut rows, options.tail);
+            Ok(rows.into_iter().map(|(_, row)| row).collect())
         },
     );
 
@@ -2283,6 +2375,59 @@ mod tests {
         assert_eq!(members[0].last_spoke, None);
         assert_eq!(members[1].last_spoke, Some(100));
         assert_eq!(members[1].message_count, 1);
+    }
+
+    #[test]
+    fn member_speech_matches_group_by_aggregates() {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let table = quote_identifier(&msg_table_name("room@chatroom"));
+        let sender = quote_identifier(dictionary::msg_sender_column());
+        conn.execute_batch(&format!(
+            "CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY);
+             INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'tgid_alice'), (2, 'tgid_bob');
+             CREATE TABLE {table}(create_time INTEGER, {sender} INTEGER);
+             CREATE INDEX sender_index ON {table}({sender});
+             INSERT INTO {table} VALUES
+                (500, 2), (100, 1), (0, 1), (900, 2), (300, 1), (50, 0), (60, NULL), (700, 2);"
+        ))
+        .unwrap();
+        let expected: HashMap<i64, (i64, i64, i64)> = conn
+            .prepare(&format!(
+                "SELECT {sender}, MIN(create_time), MAX(create_time), COUNT(*) FROM {table}
+                 WHERE create_time > 0 AND {sender} IS NOT NULL AND {sender} != 0
+                 GROUP BY {sender}"
+            ))
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?)))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let store = SourceStore::from_plaintext(dir.path()).unwrap();
+        let dbs = message_databases(&store);
+
+        let speech = super::load_member_speech(&store, &dbs, "room@chatroom", 1).unwrap();
+        for (id, username) in [(1, "tgid_alice"), (2, "tgid_bob")] {
+            let row = speech[username];
+            assert_eq!(
+                (row.first_spoke, row.last_spoke, row.message_count),
+                expected[&id]
+            );
+        }
+        assert_eq!(speech.len(), 2);
+
+        // Like GROUP BY, the error names the lowest unresolved sender id.
+        conn.execute(&format!("INSERT INTO {table} VALUES (10, 9), (20, 7)"), [])
+            .unwrap();
+        drop(conn);
+        let Err(error) = super::load_member_speech(&store, &dbs, "room@chatroom", 1) else {
+            panic!("unresolved sender ids must fail");
+        };
+        assert!(error.contains("sender identity 7 "), "{error}");
     }
 
     #[test]
