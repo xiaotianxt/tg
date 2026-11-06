@@ -859,6 +859,7 @@ dependencies = [
  "libc",
  "log",
  "md-5",
+ "memchr",
  "object",
  "pbkdf2",
  "rusqlite",

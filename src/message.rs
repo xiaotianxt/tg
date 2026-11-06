@@ -425,43 +425,57 @@ fn strip_display_prefix(content: &str) -> &str {
     trimmed
 }
 
+/// Markers that open an embedded XML fragment. Each starts with `<` or `&`.
+const XML_START_MARKERS: &[&str] = &[
+    "<?xml",
+    "<msg",
+    "<sysmsg",
+    "&lt;?xml",
+    "&lt;msg",
+    "&lt;sysmsg",
+];
+
+/// Markers that show content still carries raw XML. Each starts with `<` or `&`.
+const XML_CONTENT_MARKERS: &[&str] = &[
+    "<?xml",
+    "<msg",
+    "<appmsg",
+    "<sysmsg",
+    "<recordinfo",
+    "<datalist",
+    "<dataitem",
+    "<img",
+    "<videomsg",
+    "<voicemsg",
+    "<emoji",
+    "<location",
+    "<pushmail",
+    "&lt;?xml",
+    "&lt;msg",
+    "&lt;appmsg",
+    "&lt;sysmsg",
+    "&lt;recordinfo",
+    "&lt;dataitem",
+];
+
+/// Every marker starts with `<` or `&`, so a single pass over those bytes finds
+/// the first offset where any marker matches, the same answer as taking the
+/// minimum of a separate `find` per marker.
+fn first_marker_at(content: &str, needles: &[&str]) -> Option<usize> {
+    let bytes = content.as_bytes();
+    memchr::memchr2_iter(b'<', b'&', bytes).find(|&i| {
+        needles
+            .iter()
+            .any(|needle| bytes[i..].starts_with(needle.as_bytes()))
+    })
+}
+
 fn find_internal_xml_start(content: &str) -> Option<usize> {
-    [
-        "<?xml",
-        "<msg",
-        "<sysmsg",
-        "&lt;?xml",
-        "&lt;msg",
-        "&lt;sysmsg",
-    ]
-    .iter()
-    .filter_map(|needle| content.find(needle))
-    .min()
+    first_marker_at(content, XML_START_MARKERS)
 }
 
 fn contains_internal_xml_marker(content: &str) -> bool {
-    const NEEDLES: &[&str] = &[
-        "<?xml",
-        "<msg",
-        "<appmsg",
-        "<sysmsg",
-        "<recordinfo",
-        "<datalist",
-        "<dataitem",
-        "<img",
-        "<videomsg",
-        "<voicemsg",
-        "<emoji",
-        "<location",
-        "<pushmail",
-        "&lt;?xml",
-        "&lt;msg",
-        "&lt;appmsg",
-        "&lt;sysmsg",
-        "&lt;recordinfo",
-        "&lt;dataitem",
-    ];
-    NEEDLES.iter().any(|needle| content.contains(needle))
+    first_marker_at(content, XML_CONTENT_MARKERS).is_some()
 }
 
 fn sanitize_decoded_content(content: String) -> String {
@@ -1853,5 +1867,39 @@ continues</datadesc></dataitem><dataitem datatype="1" dataid="c"><sourcename>B</
         // Starts with the zstd magic but is not a frame.
         assert_eq!(try_decompress(&[0x28, 0xB5, 0x2F, 0xFD]), None);
         assert_eq!(try_decompress(&[0x28, 0xB5, 0x2F, 0xFD, b'a']), None);
+    }
+
+    #[test]
+    fn internal_xml_markers_match_per_needle_search() {
+        let inputs = [
+            "",
+            "plain 文本",
+            "a < b & c",
+            "前缀 <msg><img/></msg>",
+            "x &lt;msg&gt; y <?xml version",
+            "&amp;lt;sysmsg <sysmsg",
+            "<emoji> then <location",
+            "文本&lt;dataitem",
+            "<<msg",
+            "&&lt;?xml",
+            "<ms",
+            "&lt;",
+        ];
+        for needle in XML_START_MARKERS.iter().chain(XML_CONTENT_MARKERS) {
+            assert!(
+                needle.starts_with('<') || needle.starts_with('&'),
+                "{needle}"
+            );
+        }
+        for input in inputs {
+            let expected_start = XML_START_MARKERS.iter().filter_map(|n| input.find(n)).min();
+            assert_eq!(find_internal_xml_start(input), expected_start, "{input:?}");
+            let expected_marker = XML_CONTENT_MARKERS.iter().any(|n| input.contains(n));
+            assert_eq!(
+                contains_internal_xml_marker(input),
+                expected_marker,
+                "{input:?}"
+            );
+        }
     }
 }
