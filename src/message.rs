@@ -1252,26 +1252,21 @@ fn try_zlib(data: &[u8]) -> Result<String, ()> {
 
 /// Parse sender account id from message content.
 pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
-    let account_prefix = dictionary::account_id_prefix();
-    for (i, c) in content.char_indices() {
-        if c != ':' {
-            continue;
-        }
-        if i == 0 {
-            break;
-        }
-        let prefix = &content[..i];
-        let is_id = prefix.starts_with(account_prefix)
-            || prefix.starts_with("gh_")
-            || prefix
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'@'));
-        if is_id && prefix.len() >= 3 {
-            let after = &content[i + 1..];
-            let after = after.trim_start_matches([' ', '\n']);
-            return (Some(prefix), after);
-        }
-        break;
+    // Only the first `:` is considered; a byte search finds the same offset
+    // as walking chars, since `:` is ASCII.
+    let Some(i) = memchr::memchr(b':', content.as_bytes()).filter(|&i| i > 0) else {
+        return (None, content);
+    };
+    let prefix = &content[..i];
+    let is_id = prefix.starts_with(dictionary::account_id_prefix())
+        || prefix.starts_with("gh_")
+        || prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'@'));
+    if is_id && prefix.len() >= 3 {
+        let after = &content[i + 1..];
+        let after = after.trim_start_matches([' ', '\n']);
+        return (Some(prefix), after);
     }
     (None, content)
 }
@@ -1446,6 +1441,25 @@ mod tests {
         let (id, c) = parse_sender_from_content("plain text");
         assert_eq!(id, None);
         assert_eq!(c, "plain text");
+    }
+
+    #[test]
+    fn test_parse_sender_uses_only_the_first_colon() {
+        for (input, expected) in [
+            ("", (None, "")),
+            (":abc", (None, ":abc")),
+            ("ab:x", (None, "ab:x")),
+            ("a b:c", (None, "a b:c")),
+            ("中文名:x", (None, "中文名:x")),
+            ("文本 abc:def", (None, "文本 abc:def")),
+            ("abc:", (Some("abc"), "")),
+            ("abc: \n \tx:y", (Some("abc"), "\tx:y")),
+            ("gh_x y:z", (Some("gh_x y"), "z")),
+            ("a-b@c:d", (Some("a-b@c"), "d")),
+            ("x y:abc:z", (None, "x y:abc:z")),
+        ] {
+            assert_eq!(parse_sender_from_content(input), expected, "{input:?}");
+        }
     }
 
     #[test]
