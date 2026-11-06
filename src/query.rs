@@ -490,59 +490,79 @@ fn query_message_table(
         order_clause = order_clause,
     );
 
+    let session_id = context
+        .table_to_session
+        .get(table)
+        .cloned()
+        .unwrap_or_else(|| table.to_string());
+    let session = context
+        .table_to_display
+        .get(table)
+        .cloned()
+        .unwrap_or_else(|| session_id.clone());
+
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| format!("Message query prepare error in {}: {}", target.label, e))?;
-    let mapped = stmt
-        .query_map(params_from_iter(params.iter()), |row| {
-            let marker: Option<i64> = row.get::<_, Option<i64>>(3)?;
-            let raw_body = db::read_message_body(row, 2, marker)?;
-            let sender_id: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
-            let sender_account = name2id.get(&sender_id).cloned().unwrap_or_default();
-            let packed_info: Vec<u8> = row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
-            let local_id = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
-            let session_id = context
-                .table_to_session
-                .get(table)
-                .cloned()
-                .unwrap_or_else(|| table.to_string());
-            let session = context
-                .table_to_display
-                .get(table)
-                .cloned()
-                .unwrap_or_else(|| session_id.clone());
-            let local_type = row.get::<_, Option<i64>>(0)?.unwrap_or(-1);
-            let body = decode_query_body(
-                local_type,
-                &raw_body,
-                marker,
-                &packed_info,
-                Some(local_id),
-                &session,
-                &context.sender_display,
-            );
-            let order_key = db::read_message_order_key(row, 7)?;
-            Ok((
-                order_key,
-                MessageRow {
-                    session,
-                    session_id,
-                    sender: display_sender(&sender_account, context),
-                    local_type,
-                    create_time: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    body,
-                    raw_body,
-                },
-            ))
-        })
+    let mut result = stmt
+        .query(params_from_iter(params.iter()))
         .map_err(|e| format!("Message query error in {}: {}", target.label, e))?;
-
-    let mut rows = mapped
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|error| format!("Read message rows in {}: {error}", target.label))?
-        .into_iter()
-        .filter(|(_, row)| message_row_matches_filters(row, options))
-        .collect::<Vec<_>>();
+    let read_error = |error| format!("Read message rows in {}: {error}", target.label);
+    // Filter while streaming so rejected rows are never materialized, and test
+    // the media filter, which needs only the raw row, before decoding the body.
+    let mut rows = Vec::new();
+    while let Some(row) = result.next().map_err(read_error)? {
+        let local_type = row
+            .get::<_, Option<i64>>(0)
+            .map_err(read_error)?
+            .unwrap_or(-1);
+        let marker: Option<i64> = row.get::<_, Option<i64>>(3).map_err(read_error)?;
+        let raw_body = db::read_message_body(row, 2, marker).map_err(read_error)?;
+        if !message_matches_media_filters(local_type, &raw_body, options) {
+            continue;
+        }
+        let packed_info: Vec<u8> = row
+            .get::<_, Option<Vec<u8>>>(5)
+            .map_err(read_error)?
+            .unwrap_or_default();
+        let local_id = row
+            .get::<_, Option<i64>>(6)
+            .map_err(read_error)?
+            .unwrap_or(0);
+        let body = decode_query_body(
+            local_type,
+            &raw_body,
+            marker,
+            &packed_info,
+            Some(local_id),
+            &session,
+            &context.sender_display,
+        );
+        if !message_body_matches_filters(&body, options) {
+            continue;
+        }
+        let sender_id: i64 = row
+            .get::<_, Option<i64>>(4)
+            .map_err(read_error)?
+            .unwrap_or(0);
+        let sender_account = name2id.get(&sender_id).map_or("", String::as_str);
+        rows.push((
+            db::read_message_order_key(row, 7).map_err(read_error)?,
+            MessageRow {
+                session: session.clone(),
+                session_id: session_id.clone(),
+                sender: display_sender(sender_account, context),
+                local_type,
+                create_time: row
+                    .get::<_, Option<i64>>(1)
+                    .map_err(read_error)?
+                    .unwrap_or(0),
+                body,
+                raw_body,
+            },
+        ));
+    }
+    drop(result);
     db::sort_in_message_order(&mut rows, options.sort == QuerySort::Newest);
     Ok(rows
         .into_iter()
@@ -592,38 +612,30 @@ fn decode_query_body(
     .content
 }
 
-fn message_row_matches_filters(row: &MessageRow, options: &QueryOptions<'_>) -> bool {
-    if !message_row_matches_media_filters(row, options) {
-        return false;
-    }
-
+fn message_body_matches_filters(body: &str, options: &QueryOptions<'_>) -> bool {
     if !options.contains.is_empty() {
         let matched = match options.match_mode {
-            QueryMatchMode::All => options.contains.iter().all(|term| row.body.contains(term)),
-            QueryMatchMode::Any => options.contains.iter().any(|term| row.body.contains(term)),
+            QueryMatchMode::All => options.contains.iter().all(|term| body.contains(term)),
+            QueryMatchMode::Any => options.contains.iter().any(|term| body.contains(term)),
         };
         if !matched {
             return false;
         }
     }
 
-    !options
-        .not_contains
-        .iter()
-        .any(|term| row.body.contains(term))
+    !options.not_contains.iter().any(|term| body.contains(term))
 }
 
-fn message_row_matches_media_filters(row: &MessageRow, options: &QueryOptions<'_>) -> bool {
-    if !options.has.is_empty()
-        && !options
+fn message_matches_media_filters(
+    local_type: i64,
+    raw_body: &str,
+    options: &QueryOptions<'_>,
+) -> bool {
+    options.has.is_empty()
+        || options
             .has
             .iter()
-            .any(|media_type| message_has_media(row.local_type, &row.raw_body, *media_type))
-    {
-        return false;
-    }
-
-    true
+            .any(|media_type| message_has_media(local_type, raw_body, *media_type))
 }
 
 fn legacy_indexed_media_clause(media_type: QueryMediaType, raw_body_col: &str) -> String {
