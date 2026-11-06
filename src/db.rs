@@ -1,7 +1,7 @@
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::contact::{self, Contact, DisplayNameMode};
 use crate::dictionary;
@@ -351,15 +351,7 @@ pub fn list_sessions(
     top_n: usize,
     query: Option<&str>,
 ) -> Result<SessionList, String> {
-    let contact_conn = open_optional_database(store, CONTACT_DB)?;
-    let contacts = match contact_conn.as_ref() {
-        Some(conn) => contact::load_contacts(conn)?,
-        None => HashMap::new(),
-    };
-    let session_conn = store
-        .open(SESSION_DB)
-        .map_err(|error| format!("Session database is unavailable: {error}"))?;
-    list_sessions_from_connection(&session_conn, &contacts, top_n, query, SessionListKind::All)
+    list_session_kind(store, top_n, query, SessionListKind::All)
 }
 
 /// List unread chat sessions from the session database.
@@ -368,21 +360,20 @@ pub fn list_unread_sessions(
     top_n: usize,
     query: Option<&str>,
 ) -> Result<SessionList, String> {
+    list_session_kind(store, top_n, query, SessionListKind::Unread)
+}
+
+fn list_session_kind(
+    store: &SourceStore,
+    top_n: usize,
+    query: Option<&str>,
+    mode: SessionListKind,
+) -> Result<SessionList, String> {
     let contact_conn = open_optional_database(store, CONTACT_DB)?;
-    let contacts = match contact_conn.as_ref() {
-        Some(conn) => contact::load_contacts(conn)?,
-        None => HashMap::new(),
-    };
     let session_conn = store
         .open(SESSION_DB)
         .map_err(|error| format!("Session database is unavailable: {error}"))?;
-    list_sessions_from_connection(
-        &session_conn,
-        &contacts,
-        top_n,
-        query,
-        SessionListKind::Unread,
-    )
+    list_sessions_from_connection(&session_conn, contact_conn.as_ref(), top_n, query, mode)
 }
 
 /// Intersect the cached roster with explicit local friend relationships.
@@ -603,7 +594,7 @@ fn load_member_speech(
 
 fn list_sessions_from_connection(
     conn: &Connection,
-    contacts: &HashMap<String, Contact>,
+    contact_conn: Option<&Connection>,
     top_n: usize,
     query: Option<&str>,
     mode: SessionListKind,
@@ -634,10 +625,26 @@ fn list_sessions_from_connection(
     let session_rows = rows
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| format!("Read sessions: {}", e))?;
+    let session_rows: Vec<_> = session_rows
+        .into_iter()
+        .filter(|(username, _, activity)| !username.trim().is_empty() && *activity > 0)
+        .collect();
+
+    // Names and matching look up only these sessions' own contact rows.
+    let contacts = match contact_conn {
+        Some(contact_conn) => {
+            let wanted: HashSet<&str> = session_rows
+                .iter()
+                .map(|(username, _, _)| username.as_str())
+                .collect();
+            contact::load_contacts_where(contact_conn, |username| wanted.contains(username))?
+        }
+        None => HashMap::new(),
+    };
+    let contacts = &contacts;
 
     let mut entries = session_rows
         .into_iter()
-        .filter(|(username, _, activity)| !username.trim().is_empty() && *activity > 0)
         .map(|(username, unread_count, activity)| {
             let display = contacts
                 .get(&username)

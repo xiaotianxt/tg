@@ -1,4 +1,5 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::ValueRef;
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::HashMap;
 
 /// Contact row plus the display fields tg needs for resolving chat names.
@@ -63,12 +64,22 @@ pub(crate) fn resolve_sender_name_with_mode(
 }
 
 pub(crate) fn load_contacts(conn: &Connection) -> Result<HashMap<String, Contact>, String> {
-    let mut contacts = load_contact_table(conn, ContactTable::Contact)
+    load_contacts_where(conn, |_| true)
+}
+
+/// Loads the contacts whose username passes `keep`, as `load_contacts` would
+/// return them. The table is still scanned and every row type-checked, so a
+/// malformed row fails the command even when it is not kept.
+pub(crate) fn load_contacts_where(
+    conn: &Connection,
+    keep: impl Fn(&str) -> bool,
+) -> Result<HashMap<String, Contact>, String> {
+    let mut contacts = load_contact_table(conn, ContactTable::Contact, &keep)
         .map_err(|e| format!("Contact read error: {}", e))?;
     if contact_table_exists(conn, ContactTable::Stranger)
         .map_err(|e| format!("Contact schema error: {e}"))?
     {
-        for (username, stranger) in load_contact_table(conn, ContactTable::Stranger)
+        for (username, stranger) in load_contact_table(conn, ContactTable::Stranger, &keep)
             .map_err(|e| format!("Stranger contact read error: {e}"))?
         {
             contacts
@@ -84,29 +95,54 @@ pub(crate) fn load_contacts(conn: &Connection) -> Result<HashMap<String, Contact
 fn load_contact_table(
     conn: &Connection,
     table: ContactTable,
+    keep: &impl Fn(&str) -> bool,
 ) -> rusqlite::Result<HashMap<String, Contact>> {
     let sql = format!(
         "SELECT username, nick_name, remark, alias FROM {}",
         table.name()
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| {
-        let username: String = row.get(0)?;
-        let nick_name: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
-        let remark: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
-        let alias: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
-        Ok((
-            username.clone(),
+    let mut rows = stmt.query([])?;
+    let mut contacts = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let Some(username) = borrowed_text(row, 0)? else {
+            return Err(row
+                .get::<_, String>(0)
+                .expect_err("NULL username is not a String"));
+        };
+        let nick_name = borrowed_text(row, 1)?;
+        let remark = borrowed_text(row, 2)?;
+        let alias = borrowed_text(row, 3)?;
+        if !keep(username) {
+            continue;
+        }
+        // Later rows replace earlier ones, as collecting into a map did.
+        contacts.insert(
+            username.to_string(),
             Contact {
-                username,
-                nick_name,
-                remark,
-                alias,
+                username: username.to_string(),
+                nick_name: nick_name.unwrap_or_default().to_string(),
+                remark: remark.unwrap_or_default().to_string(),
+                alias: alias.unwrap_or_default().to_string(),
                 is_stranger: table.is_stranger(),
             },
-        ))
-    })?;
-    rows.collect()
+        );
+    }
+    Ok(contacts)
+}
+
+/// Reads a nullable text column without allocating. A non-text value reports
+/// the same error an owned `Option<String>` read would.
+fn borrowed_text<'row>(row: &'row Row<'_>, index: usize) -> rusqlite::Result<Option<&'row str>> {
+    match row.get_ref(index)? {
+        ValueRef::Null => Ok(None),
+        value => match value.as_str() {
+            Ok(text) => Ok(Some(text)),
+            Err(_) => Err(row
+                .get::<_, Option<String>>(index)
+                .expect_err("a value that is not valid text fails an owned read")),
+        },
+    }
 }
 
 fn contact_table_exists(conn: &Connection, table: ContactTable) -> rusqlite::Result<bool> {
@@ -455,5 +491,48 @@ mod tests {
             .unwrap();
 
         assert!(load_contacts(&conn).is_err());
+    }
+
+    #[test]
+    fn filtered_contacts_match_full_load_and_still_reject_unkept_bad_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE contact(username TEXT, nick_name TEXT, remark TEXT, alias TEXT);
+             CREATE TABLE stranger(username TEXT, nick_name TEXT, remark TEXT, alias TEXT);
+             INSERT INTO contact VALUES ('tgid_a', 'A', NULL, ''), ('tgid_b', 'B', 'Bee', 'b'),
+                                        ('tgid_a', 'A2', 'later', NULL);
+             INSERT INTO stranger VALUES ('tgid_b', 'S', '', ''), ('tgid_c', 'C', '', '');",
+        )
+        .unwrap();
+        let full = load_contacts(&conn).unwrap();
+        let kept = load_contacts_where(&conn, |username| username != "tgid_b").unwrap();
+        assert_eq!(kept.len(), 2);
+        for (username, contact) in &kept {
+            let expected = &full[username];
+            assert_eq!(
+                (
+                    &contact.nick_name,
+                    &contact.remark,
+                    &contact.alias,
+                    contact.is_stranger
+                ),
+                (
+                    &expected.nick_name,
+                    &expected.remark,
+                    &expected.alias,
+                    expected.is_stranger
+                ),
+            );
+        }
+        assert_eq!(kept["tgid_a"].remark, "later");
+
+        conn.execute("INSERT INTO contact VALUES ('tgid_x', X'07', '', '')", [])
+            .unwrap();
+        assert_eq!(
+            load_contacts_where(&conn, |username| username == "tgid_a")
+                .err()
+                .unwrap(),
+            load_contacts(&conn).err().unwrap(),
+        );
     }
 }
