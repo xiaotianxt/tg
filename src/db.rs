@@ -1,7 +1,7 @@
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::contact::{self, Contact, DisplayNameMode};
 use crate::dictionary;
@@ -620,43 +620,48 @@ fn load_member_speech(
             }
             let name2id = load_name2id(&conn)?;
             let sender_col = quote_identifier(dictionary::msg_sender_column());
+            // GROUP BY walked the sender index with a table lookup per row in
+            // sender order; one rowid-order scan reads each table page once.
             let sql = format!(
-                "SELECT {sender_col}, MIN(create_time), MAX(create_time), COUNT(*)
-                 FROM {table}
-                 WHERE create_time > 0 AND {sender_col} IS NOT NULL AND {sender_col} != 0
-                 GROUP BY {sender_col}",
+                "SELECT {sender_col}, create_time
+                 FROM {table} NOT INDEXED
+                 WHERE create_time > 0 AND {sender_col} IS NOT NULL AND {sender_col} != 0",
                 table = quote_identifier(&table_name),
             );
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(|error| format!("Prepare member activity in {db_path}: {error}"))?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                })
+            let mut rows = stmt
+                .query([])
                 .map_err(|error| format!("Read member activity in {db_path}: {error}"))?;
+            let read_error = |error| format!("Read member activity row in {db_path}: {error}");
+            // Ordered by sender id like GROUP BY, so an unresolved identity
+            // reports the same (lowest) sender id.
+            let mut by_sender: BTreeMap<i64, MemberSpeech> = BTreeMap::new();
+            while let Some(row) = rows.next().map_err(read_error)? {
+                let sender_id = row.get::<_, i64>(0).map_err(read_error)?;
+                let create_time = row.get::<_, i64>(1).map_err(read_error)?;
+                by_sender
+                    .entry(sender_id)
+                    .and_modify(|speech| {
+                        speech.first_spoke = speech.first_spoke.min(create_time);
+                        speech.last_spoke = speech.last_spoke.max(create_time);
+                        speech.message_count += 1;
+                    })
+                    .or_insert(MemberSpeech {
+                        first_spoke: create_time,
+                        last_spoke: create_time,
+                        message_count: 1,
+                    });
+            }
             let mut activity = HashMap::new();
-            for row in rows {
-                let (sender_id, first_spoke, last_spoke, message_count) =
-                    row.map_err(|error| format!("Read member activity row in {db_path}: {error}"))?;
+            for (sender_id, speech) in by_sender {
                 let Some(sender) = name2id.get(&sender_id) else {
                     return Err(format!(
                         "Cannot resolve sender identity {sender_id} in {db_path}; refusing a partial inactivity report"
                     ));
                 };
-                activity.insert(
-                    sender.clone(),
-                    MemberSpeech {
-                        first_spoke,
-                        last_spoke,
-                        message_count,
-                    },
-                );
+                activity.insert(sender.clone(), speech);
             }
             Ok(activity)
         },
@@ -2301,6 +2306,59 @@ mod tests {
         assert_eq!(members[0].last_spoke, None);
         assert_eq!(members[1].last_spoke, Some(100));
         assert_eq!(members[1].message_count, 1);
+    }
+
+    #[test]
+    fn member_speech_matches_group_by_aggregates() {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let table = quote_identifier(&msg_table_name("room@chatroom"));
+        let sender = quote_identifier(dictionary::msg_sender_column());
+        conn.execute_batch(&format!(
+            "CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY);
+             INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'tgid_alice'), (2, 'tgid_bob');
+             CREATE TABLE {table}(create_time INTEGER, {sender} INTEGER);
+             CREATE INDEX sender_index ON {table}({sender});
+             INSERT INTO {table} VALUES
+                (500, 2), (100, 1), (0, 1), (900, 2), (300, 1), (50, 0), (60, NULL), (700, 2);"
+        ))
+        .unwrap();
+        let expected: HashMap<i64, (i64, i64, i64)> = conn
+            .prepare(&format!(
+                "SELECT {sender}, MIN(create_time), MAX(create_time), COUNT(*) FROM {table}
+                 WHERE create_time > 0 AND {sender} IS NOT NULL AND {sender} != 0
+                 GROUP BY {sender}"
+            ))
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?)))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let store = SourceStore::from_plaintext(dir.path()).unwrap();
+        let dbs = message_databases(&store);
+
+        let speech = super::load_member_speech(&store, &dbs, "room@chatroom", 1).unwrap();
+        for (id, username) in [(1, "tgid_alice"), (2, "tgid_bob")] {
+            let row = speech[username];
+            assert_eq!(
+                (row.first_spoke, row.last_spoke, row.message_count),
+                expected[&id]
+            );
+        }
+        assert_eq!(speech.len(), 2);
+
+        // Like GROUP BY, the error names the lowest unresolved sender id.
+        conn.execute(&format!("INSERT INTO {table} VALUES (10, 9), (20, 7)"), [])
+            .unwrap();
+        drop(conn);
+        let Err(error) = super::load_member_speech(&store, &dbs, "room@chatroom", 1) else {
+            panic!("unresolved sender ids must fail");
+        };
+        assert!(error.contains("sender identity 7 "), "{error}");
     }
 
     #[test]
