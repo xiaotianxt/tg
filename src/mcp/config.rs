@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const DEFAULT_MAX_RESULT_BYTES: usize = 256 * 1024;
+pub(crate) const DEFAULT_MAX_RESULT_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_TEXT_CHARS: usize = 2000;
 pub(crate) const DEFAULT_MAX_LOOKBACK_DAYS: i64 = 90;
 

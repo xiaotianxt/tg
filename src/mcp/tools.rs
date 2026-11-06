@@ -16,8 +16,10 @@ use crate::source_store::SourceStore;
 use crate::{db, doctor, query, time};
 
 const MAX_SESSIONS: usize = 200;
-const MAX_MESSAGES: usize = 2000;
-const MAX_SEARCH_HITS: usize = 100;
+/// Page sizes only: the result byte cap is the single size guard, and a
+/// trimmed result always carries a continuation (`next_offset` or `has_more`).
+const DEFAULT_MESSAGES: usize = 1000;
+const DEFAULT_SEARCH_HITS: usize = 100;
 const DAY_SECONDS: i64 = 86_400;
 
 pub(crate) struct ToolContext {
@@ -128,7 +130,7 @@ pub(crate) fn definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "session": {"type": "string", "description": "Chat id from list_sessions (preferred) or a display name"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_MESSAGES, "default": 200},
+                    "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_MESSAGES, "description": "Page size; no maximum. Very large pages are trimmed to the result size cap and return next_offset."},
                     "order": {"type": "string", "enum": ["newest", "oldest"], "default": "newest"},
                     "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Messages to skip, counted from the end of the range for order=newest and from the start for order=oldest. Use the previous result's next_offset."},
                     "since": {"type": "string", "description": format!("Inclusive start; {time_hint}")},
@@ -150,7 +152,7 @@ pub(crate) fn definitions() -> Value {
                     "query": {"type": "string", "minLength": 1},
                     "since": {"type": "string", "description": time_hint},
                     "all_time": {"type": "boolean", "default": false},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SEARCH_HITS, "default": 20}
+                    "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_SEARCH_HITS}
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -173,7 +175,7 @@ pub(crate) fn definitions() -> Value {
                     "until": {"type": "string", "description": time_hint},
                     "all_time": {"type": "boolean", "default": false},
                     "order": {"type": "string", "enum": ["newest", "oldest"], "default": "newest"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_MESSAGES, "default": 100},
+                    "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_MESSAGES, "description": "Page size; no maximum. Very large pages are trimmed to the result size cap and return next_offset."},
                     "offset": {"type": "integer", "minimum": 0, "default": 0}
                 },
                 "additionalProperties": false
@@ -274,7 +276,7 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
         "session", "limit", "order", "offset", "since", "until", "contains",
     ])?;
     let session = args.required_str("session")?;
-    let limit = args.usize("limit", 200, 1, MAX_MESSAGES)?;
+    let limit = args.usize("limit", DEFAULT_MESSAGES, 1, usize::MAX)?;
     let newest = args.choice("order", &["newest", "oldest"], "newest")? == "newest";
     let offset = args.usize("offset", 0, 0, usize::MAX)?;
     let since = ctx.clamp_since(args.time("since")?);
@@ -332,7 +334,7 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
 fn search_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
     args.only(&["query", "since", "all_time", "limit"])?;
     let query = args.required_str("query")?;
-    let limit = args.usize("limit", 20, 1, MAX_SEARCH_HITS)?;
+    let limit = args.usize("limit", DEFAULT_SEARCH_HITS, 1, usize::MAX)?;
     let since = args.time("since")?;
     let since = if args.bool("all_time")? {
         since
@@ -365,7 +367,11 @@ fn search_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Str
         })
         .collect();
     let value = json!({ "hits": hits, "has_more": results.has_more });
-    Ok(fit(ctx, value, "hits", Trim::End))
+    let mut outcome = fit(ctx, value, "hits", Trim::End);
+    if outcome.value.get("truncated").is_some() {
+        outcome.value["has_more"] = json!(true);
+    }
+    Ok(outcome)
 }
 
 fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
@@ -401,7 +407,7 @@ fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Stri
     let until = args.time("until")?;
     let sort =
         query::QuerySort::from_str(args.choice("order", &["newest", "oldest"], "newest")?, true)?;
-    let limit = args.usize("limit", 100, 1, MAX_MESSAGES)?;
+    let limit = args.usize("limit", DEFAULT_MESSAGES, 1, usize::MAX)?;
     let offset = args.usize("offset", 0, 0, usize::MAX)?;
     let store = ctx.open_store()?;
     let rows = query::query_messages(&query::QueryOptions {
@@ -677,6 +683,9 @@ impl<'a> Args<'a> {
                 .and_then(|value| usize::try_from(value).ok())
                 .ok_or_else(|| format!("{name} must be a non-negative integer"))?,
         };
+        if max == usize::MAX && value < min {
+            return Err(format!("{name} must be at least {min}"));
+        }
         if value < min || value > max {
             return Err(format!("{name} must be between {min} and {max}"));
         }
@@ -753,14 +762,10 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.contains("between 1 and 200"), "{error}");
-        let error = call(
-            &ctx,
-            "read_messages",
-            &json!({"session": "a", "limit": 2001}),
-        )
-        .err()
-        .unwrap();
-        assert!(error.contains("between 1 and 2000"), "{error}");
+        let error = call(&ctx, "read_messages", &json!({"session": "a", "limit": 0}))
+            .err()
+            .unwrap();
+        assert_eq!(error, "limit must be at least 1");
         assert!(call(&ctx, "drop_tables", &json!({})).is_err());
     }
 

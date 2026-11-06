@@ -184,9 +184,9 @@ clients that ignore structured output.
 |---|---|---|---|
 | `list_sessions` | `db::list_sessions` | `query?`, `limit` (default 30, max 200) | Reads only contact and session DBs |
 | `list_unread` | `db::list_unread_sessions` | `query?`, `limit` | Same light scope |
-| `read_messages` | `db::read_messages` | `session`, `limit` (default 200, max 2000), `offset` (counted from the paging end in either order), `since?`, `until?`, `order` (`newest`/`oldest`), `contains?` | Returns `next_offset` while more remain |
-| `search_messages` | `db::search_messages` | `query`, `since?` (default recent window), `limit` (default 20, max 100) | Upstream FTS; errors point to `query_messages` if the FTS DB is missing |
-| `query_messages` | `query::run` | `session?`, `contains[]`, `not_contains[]`, `match` (`all`/`any`), `has[]` (media types), `since?`, `until?`, `order`, `limit` (max 2000), `offset` | No raw-body fields over MCP |
+| `read_messages` | `db::read_messages` | `session`, `limit` (page size, default 1000, no maximum), `offset` (counted from the paging end in either order), `since?`, `until?`, `order` (`newest`/`oldest`), `contains?` | Returns `next_offset` while more remain |
+| `search_messages` | `db::search_messages` | `query`, `since?` (default recent window), `limit` (page size, default 100, no maximum) | Upstream FTS; errors point to `query_messages` if the FTS DB is missing |
+| `query_messages` | `query::run` | `session?`, `contains[]`, `not_contains[]`, `match` (`all`/`any`), `has[]` (media types), `since?`, `until?`, `order`, `limit` (page size, default 1000, no maximum), `offset` | No raw-body fields over MCP |
 | `list_members` | `db::list_members` / `list_member_friends` | `session`, `inactive_since?`, `friends_only` | |
 | `diagnose` | `doctor::run` | `session?` | Paths are redacted in remote mode |
 
@@ -198,7 +198,7 @@ Common rules:
   mode, so your private contact remarks are not sent to a remote model unless
   the config turns them back on.
 - Each text field is capped (default 2,000 characters) and each tool result is
-  capped (default 256 KB of JSON). A capped result sets `truncated: true` and
+  capped (default 16 MiB of JSON). A capped result sets `truncated: true` and
   returns `next_offset`.
 - No raw XML, no `packed_info_data`, no media bytes, and no source file paths.
   Media appears as `kind` plus a short label such as a file name.
@@ -439,7 +439,7 @@ risk of this feature, and the design limits it as follows.
     "deny_sessions": ["tgid_..."],
     "max_lookback_days": 90,
     "show_contact_remarks": false,
-    "max_result_bytes": 262144,
+    "max_result_bytes": 16777216,
     "max_text_chars": 2000
   },
   "extra_redirect_uris": []

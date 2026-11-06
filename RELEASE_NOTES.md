@@ -6,8 +6,12 @@ clients such as ChatGPT can read and search your local chat history.
 Patch follow-up: `read_messages` now pages through a whole time range. It
 accepts `until`, honors `offset` in both orders, and returns `next_offset`
 while messages remain, so clients no longer receive the same newest batch
-repeatedly. One call returns up to 2000 messages (default 200), and the
-default result cap is now 256 KB.
+repeatedly.
+
+Second follow-up: message and search tools no longer cap `limit`; it is only a
+page size (default 1000 messages, 100 search hits). The single size guard is
+the result cap, now 16 MiB by default, and a result trimmed to it still
+returns `next_offset` or `has_more`.
 
 - Add `tg mcp stdio` for local MCP clients. It needs no network or authentication.
 - Add `tg mcp init` / `tg mcp serve` for remote clients over Streamable HTTP. tg only listens on loopback or Tailscale addresses and expects your own HTTPS reverse proxy in front.
