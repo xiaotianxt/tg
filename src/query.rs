@@ -245,7 +245,39 @@ pub(crate) fn query_messages(options: &QueryOptions<'_>) -> Result<Vec<MessageRo
         .into_iter()
         .skip(options.offset)
         .take(options.limit.unwrap_or(usize::MAX))
+        .map(|candidate| candidate.finish(&context))
         .collect())
+}
+
+/// Decode inputs of a row whose body no filter reads. Ordering uses only
+/// create_time, so decoding can wait until the final window is cut.
+struct DeferredBody {
+    marker: Option<i64>,
+    packed_info: Vec<u8>,
+    local_id: i64,
+}
+
+struct CandidateRow {
+    row: MessageRow,
+    deferred: Option<DeferredBody>,
+}
+
+impl CandidateRow {
+    fn finish(self, context: &MessageQueryContext) -> MessageRow {
+        let mut row = self.row;
+        if let Some(deferred) = self.deferred {
+            row.body = decode_query_body(
+                row.local_type,
+                &row.raw_body,
+                deferred.marker,
+                &deferred.packed_info,
+                Some(deferred.local_id),
+                &row.session,
+                &context.sender_display,
+            );
+        }
+        row
+    }
 }
 
 fn validate_message_options(options: &QueryOptions<'_>) -> Result<(), String> {
@@ -308,10 +340,12 @@ fn message_query_window(options: &QueryOptions<'_>) -> Result<Option<usize>, Str
     Ok(Some(window))
 }
 
+fn query_filters_body(options: &QueryOptions<'_>) -> bool {
+    !options.contains.is_empty() || !options.not_contains.is_empty()
+}
+
 fn query_needs_post_filtering(options: &QueryOptions<'_>) -> bool {
-    !options.contains.is_empty()
-        || !options.not_contains.is_empty()
-        || media_filters_need_post_filtering(options)
+    query_filters_body(options) || media_filters_need_post_filtering(options)
 }
 
 fn media_filters_need_post_filtering(options: &QueryOptions<'_>) -> bool {
@@ -380,7 +414,7 @@ fn query_message_target(
     target: &QueryTarget,
     context: &MessageQueryContext,
     options: &QueryOptions<'_>,
-) -> Result<Vec<MessageRow>, String> {
+) -> Result<Vec<CandidateRow>, String> {
     let conn = store.open(&target.label)?;
     let tables = match &context.selected_table {
         Some(table) => db::message_table_schema(&conn, table)?
@@ -408,7 +442,7 @@ fn query_message_table(
     name2id: &HashMap<i64, String>,
     context: &MessageQueryContext,
     options: &QueryOptions<'_>,
-) -> Result<Vec<MessageRow>, String> {
+) -> Result<Vec<CandidateRow>, String> {
     let body_col = db::quote_identifier(dictionary::msg_body_column());
     let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
     let sender_col = db::quote_identifier(dictionary::msg_sender_column());
@@ -510,6 +544,7 @@ fn query_message_table(
     let read_error = |error| format!("Read message rows in {}: {error}", target.label);
     // Filter while streaming so rejected rows are never materialized, and test
     // the media filter, which needs only the raw row, before decoding the body.
+    // Without a body filter, decoding waits for the final window.
     let mut rows = Vec::new();
     while let Some(row) = result.next().map_err(read_error)? {
         let local_type = row
@@ -529,18 +564,28 @@ fn query_message_table(
             .get::<_, Option<i64>>(6)
             .map_err(read_error)?
             .unwrap_or(0);
-        let body = decode_query_body(
-            local_type,
-            &raw_body,
-            marker,
-            &packed_info,
-            Some(local_id),
-            &session,
-            &context.sender_display,
-        );
-        if !message_body_matches_filters(&body, options) {
-            continue;
-        }
+        let (body, deferred) = if query_filters_body(options) {
+            let body = decode_query_body(
+                local_type,
+                &raw_body,
+                marker,
+                &packed_info,
+                Some(local_id),
+                &session,
+                &context.sender_display,
+            );
+            if !message_body_matches_filters(&body, options) {
+                continue;
+            }
+            (body, None)
+        } else {
+            let deferred = DeferredBody {
+                marker,
+                packed_info,
+                local_id,
+            };
+            (String::new(), Some(deferred))
+        };
         let sender_id: i64 = row
             .get::<_, Option<i64>>(4)
             .map_err(read_error)?
@@ -548,17 +593,20 @@ fn query_message_table(
         let sender_account = name2id.get(&sender_id).map_or("", String::as_str);
         rows.push((
             db::read_message_order_key(row, 7).map_err(read_error)?,
-            MessageRow {
-                session: session.clone(),
-                session_id: session_id.clone(),
-                sender: display_sender(sender_account, context),
-                local_type,
-                create_time: row
-                    .get::<_, Option<i64>>(1)
-                    .map_err(read_error)?
-                    .unwrap_or(0),
-                body,
-                raw_body,
+            CandidateRow {
+                row: MessageRow {
+                    session: session.clone(),
+                    session_id: session_id.clone(),
+                    sender: display_sender(sender_account, context),
+                    local_type,
+                    create_time: row
+                        .get::<_, Option<i64>>(1)
+                        .map_err(read_error)?
+                        .unwrap_or(0),
+                    body,
+                    raw_body,
+                },
+                deferred,
             },
         ));
     }
@@ -656,10 +704,10 @@ fn message_has_media(local_type: i64, raw_body: &str, media_type: QueryMediaType
     media::message_media_type(local_type, raw_body) == Some(media_type.as_str())
 }
 
-fn sort_message_rows(rows: &mut [MessageRow], sort: QuerySort) {
+fn sort_message_rows(rows: &mut [CandidateRow], sort: QuerySort) {
     match sort {
-        QuerySort::Newest => rows.sort_by_key(|row| Reverse(row.create_time)),
-        QuerySort::Oldest => rows.sort_by_key(|row| row.create_time),
+        QuerySort::Newest => rows.sort_by_key(|candidate| Reverse(candidate.row.create_time)),
+        QuerySort::Oldest => rows.sort_by_key(|candidate| candidate.row.create_time),
     }
 }
 
