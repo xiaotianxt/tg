@@ -749,64 +749,125 @@ struct ChatHistoryItem {
     body: String,
 }
 
+/// Deepest forwarded record expanded inside another; deeper ones render as a
+/// `[记录]` tag. Each level is a strictly smaller slice, so recursion always
+/// ends; the bound only keeps hostile input from exhausting the stack.
+const MAX_CHAT_HISTORY_DEPTH: usize = 32;
+
 fn decode_chat_history_content(content: &str, time_bucket: time::MessageTimeBucket) -> String {
     let title = crate::media::extract_xml_tag(content, "title")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "聊天记录".to_string());
-    let record_item = crate::media::extract_xml_tag(content, "recorditem")
-        .map(|s| media::strip_cdata(&s).to_string())
+    let items = crate::media::extract_xml_element(content, "recorditem")
+        .map(|record| parse_chat_history_items(media::strip_cdata(&record), time_bucket, 0))
         .unwrap_or_default();
+    let summary = || crate::media::extract_xml_tag(content, "des");
+    render_chat_history(&title, items, summary, time_bucket)
+}
 
-    let items = parse_chat_history_items(&record_item);
+/// Expands a `<recordinfo>` document nested in a forwarded item. Its own
+/// title and summary sit outside `<datalist>`, so inner records cannot
+/// supply them.
+fn decode_nested_chat_history(
+    record: &str,
+    time_bucket: time::MessageTimeBucket,
+    depth: usize,
+) -> String {
+    let list = crate::media::find_xml_element(record, "datalist");
+    let (head, tail) = match &list {
+        Some(list) => (&record[..list.start], &record[list.end..]),
+        None => (record, ""),
+    };
+    let own = |tag| {
+        crate::media::extract_xml_tag(head, tag)
+            .or_else(|| crate::media::extract_xml_tag(tail, tag))
+    };
+    let title = own("title").unwrap_or_else(|| "聊天记录".to_string());
+    let items = parse_chat_history_items(record, time_bucket, depth);
+    render_chat_history(&title, items, || own("desc"), time_bucket)
+}
+
+fn render_chat_history(
+    title: &str,
+    items: Vec<ChatHistoryItem>,
+    summary: impl FnOnce() -> Option<String>,
+    time_bucket: time::MessageTimeBucket,
+) -> String {
     if items.is_empty() {
-        let desc = crate::media::extract_xml_tag(content, "des").unwrap_or_default();
-        if desc.is_empty() {
-            return format!("[聊天记录] {}", title);
-        }
-        return format!("[聊天记录] {} - {}", title, desc);
+        return match summary() {
+            Some(desc) => format!("[聊天记录] {} - {}", title, desc),
+            None => format!("[聊天记录] {}", title),
+        };
     }
-
     let mut out = format!("[聊天记录] {} ({}条)", title, items.len());
     render_chat_history_items(&mut out, &items, time_bucket);
     out
 }
 
-fn parse_chat_history_items(record_info: &str) -> Vec<ChatHistoryItem> {
+/// Items of the record's top-level `<datalist>`; items of nested records stay
+/// inside their parent item. Records without a `<datalist>` are scanned whole.
+fn parse_chat_history_items(
+    record: &str,
+    time_bucket: time::MessageTimeBucket,
+    depth: usize,
+) -> Vec<ChatHistoryItem> {
+    let mut rest = match crate::media::find_xml_element(record, "datalist") {
+        Some(list) => &record[list.body],
+        None => record,
+    };
     let mut items = Vec::new();
-    let mut rest = record_info;
-
-    while let Some(start) = rest.find("<dataitem") {
-        rest = &rest[start..];
-        let Some(open_end) = rest.find('>') else {
-            break;
-        };
-        let Some(close_start) = rest[open_end + 1..].find("</dataitem>") else {
-            break;
-        };
-        let item_end = open_end + 1 + close_start + "</dataitem>".len();
-        let item_xml = &rest[..item_end];
-
-        if let Some(item) = parse_chat_history_item(item_xml) {
+    while let Some(element) = crate::media::find_xml_element(rest, "dataitem") {
+        let item_xml = &rest[element.start..element.end];
+        if let Some(item) = parse_chat_history_item(item_xml, time_bucket, depth) {
             items.push(item);
         }
-
-        rest = &rest[item_end..];
+        rest = &rest[element.end..];
     }
-
     items
 }
 
-fn parse_chat_history_item(item_xml: &str) -> Option<ChatHistoryItem> {
-    let source_name = crate::media::extract_xml_tag(item_xml, "sourcename")
-        .or_else(|| crate::media::extract_xml_tag(item_xml, "sourcedisplayname"))
+fn parse_chat_history_item(
+    item_xml: &str,
+    time_bucket: time::MessageTimeBucket,
+    depth: usize,
+) -> Option<ChatHistoryItem> {
+    // A forwarded record nested in this item carries its own senders, times
+    // and titles; read this item's fields from around it.
+    let nested = crate::media::find_xml_element(item_xml, "recordxml")
+        .or_else(|| crate::media::find_xml_element(item_xml, "recorditem"));
+    let (head, tail) = match &nested {
+        Some(nested) => (&item_xml[..nested.start], &item_xml[nested.end..]),
+        None => (item_xml, ""),
+    };
+    let own = |tag| {
+        crate::media::extract_xml_tag(head, tag)
+            .or_else(|| crate::media::extract_xml_tag(tail, tag))
+    };
+
+    let source_name = own("sourcename")
+        .or_else(|| own("sourcedisplayname"))
         .unwrap_or_else(|| "未知".to_string());
-    let source_time = crate::media::extract_xml_tag(item_xml, "sourcetime");
+    let source_time = own("sourcetime");
     let source_timestamp = source_time
         .as_deref()
         .and_then(time::parse_local_timestamp_minutes);
-    let datatype =
-        crate::media::extract_xml_attr(item_xml, "datatype").and_then(|s| s.parse::<i64>().ok());
-    let body = decode_chat_history_item_body(item_xml, datatype);
+    let body = match nested {
+        Some(nested) if depth < MAX_CHAT_HISTORY_DEPTH => {
+            let record = media::strip_cdata(&item_xml[nested.body]);
+            decode_nested_chat_history(record, time_bucket, depth + 1)
+        }
+        Some(_) => fallback_tag_with_title(
+            "记录",
+            &own("datatitle")
+                .or_else(|| own("title"))
+                .unwrap_or_default(),
+        ),
+        None => {
+            let datatype = crate::media::extract_xml_attr(item_xml, "datatype")
+                .and_then(|s| s.parse::<i64>().ok());
+            decode_chat_history_item_body(item_xml, datatype, time_bucket, depth)
+        }
+    };
     if body.is_empty() {
         return None;
     }
@@ -819,10 +880,16 @@ fn parse_chat_history_item(item_xml: &str) -> Option<ChatHistoryItem> {
     })
 }
 
-fn decode_chat_history_item_body(item_xml: &str, datatype: Option<i64>) -> String {
+fn decode_chat_history_item_body(
+    item_xml: &str,
+    datatype: Option<i64>,
+    time_bucket: time::MessageTimeBucket,
+    depth: usize,
+) -> String {
+    let embedded = |value: &str| decode_embedded_history_text(value, time_bucket, depth);
     let desc = crate::media::extract_xml_tag(item_xml, "datadesc").unwrap_or_default();
     if !desc.is_empty() {
-        return decode_embedded_history_text(&desc);
+        return embedded(&desc);
     }
 
     let title = crate::media::extract_xml_tag(item_xml, "datatitle")
@@ -836,13 +903,21 @@ fn decode_chat_history_item_body(item_xml: &str, datatype: Option<i64>) -> Strin
         Some(5) => fallback_tag_with_title("链接", &title),
         Some(6) => fallback_tag_with_title("位置", &title),
         Some(8) => fallback_tag_with_title("文件", &title),
-        _ if !title.is_empty() => decode_embedded_history_text(&title),
+        _ if !title.is_empty() => embedded(&title),
         Some(t) => format!("[记录:{}]", t),
         None => "[记录]".to_string(),
     }
 }
 
-fn decode_embedded_history_text(value: &str) -> String {
+fn decode_embedded_history_text(
+    value: &str,
+    time_bucket: time::MessageTimeBucket,
+    depth: usize,
+) -> String {
+    // Some items carry a nested record as entity-escaped text.
+    if depth < MAX_CHAT_HISTORY_DEPTH && value.contains("<recordinfo") {
+        return decode_nested_chat_history(value, time_bucket, depth + 1);
+    }
     if contains_internal_xml_marker(value) {
         decode_text_with_internal_xml(value, time::MessageTimeBucket::Minute(1), &|id| {
             id.to_string()
@@ -1729,6 +1804,60 @@ continues</datadesc></dataitem><dataitem datatype="1" dataid="c"><sourcename>B</
         let xml = r#"<msg><appmsg><title>Chat History</title><des>A: first</des><type>19</type></appmsg></msg>"#;
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
         assert_eq!(d.content, "[聊天记录] Chat History - A: first");
+    }
+
+    #[test]
+    fn test_decode_nested_chat_history() {
+        // The inner record sits inside an item of the outer CDATA record; its
+        // items must not be counted as items of the outer record.
+        let xml = r#"<msg><appmsg><title>Outer History</title><type>19</type><recorditem><![CDATA[<recordinfo><datalist count="2"><dataitem datatype="1" dataid="a"><sourcename>A</sourcename><sourcetime>2026-05-01 10:00</sourcetime><datadesc>hello</datadesc></dataitem><dataitem datatype="19" dataid="nested"><sourcename>B</sourcename><sourcetime>2026-05-01 10:05</sourcetime><recorditem><recordinfo><title>Inner Record</title><datalist count="2"><dataitem datatype="1" dataid="x"><sourcename>C</sourcename><sourcetime>2026-05-01 09:00</sourcetime><datadesc>inner msg 1</datadesc></dataitem><dataitem datatype="1" dataid="y"><sourcename>D</sourcename><sourcetime>2026-05-01 09:01</sourcetime><datadesc>inner msg 2</datadesc></dataitem></datalist></recordinfo></recorditem></dataitem></datalist></recordinfo>]]></recorditem></appmsg></msg>"#;
+        let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
+
+        assert_eq!(
+            d.content,
+            "[聊天记录] Outer History (2条)\n        [2026-05-01 10:00]\n        A: hello\n        [2026-05-01 10:05]\n        B: [聊天记录] Inner Record (2条)\n                  [2026-05-01 09:00]\n                  C: inner msg 1\n                  [2026-05-01 09:01]\n                  D: inner msg 2"
+        );
+    }
+
+    #[test]
+    fn test_decode_nested_record_xml_reads_fields_around_it() {
+        // The nested record comes before this item's own sender and time, and
+        // its own items carry the same field names.
+        let xml = r#"<msg><appmsg><title>Outer</title><type>19</type><recorditem><![CDATA[<recordinfo><datalist count="1"><dataitem datatype="17" dataid="n"><datatitle>Inner</datatitle><recordxml><recordinfo><title>Inner</title><desc>C: hi</desc><datalist count="1"><dataitem datatype="1"><sourcename>C</sourcename><sourcetime>2026-05-01 09:00</sourcetime><datadesc>hi</datadesc></dataitem></datalist></recordinfo></recordxml><sourcename>B</sourcename><sourcetime>2026-05-01 10:05</sourcetime></dataitem></datalist></recordinfo>]]></recorditem></appmsg></msg>"#;
+        let d = decode_message_with_time_bucket(
+            49,
+            xml,
+            "Alice",
+            None,
+            &[],
+            time::MessageTimeBucket::PerMessage,
+            |id| id.to_string(),
+        );
+
+        assert_eq!(
+            d.content,
+            "[聊天记录] Outer (1条)\n        [2026-05-01 10:05] B: [聊天记录] Inner (1条)\n                  [2026-05-01 09:00] C: hi"
+        );
+    }
+
+    #[test]
+    fn test_decode_nested_chat_history_stops_at_depth_limit() {
+        let mut record = r#"<dataitem datatype="1"><sourcename>E</sourcename><datadesc>deepest</datadesc></dataitem>"#.to_string();
+        for level in (1..=MAX_CHAT_HISTORY_DEPTH + 1).rev() {
+            record = format!(
+                r#"<dataitem datatype="17"><datatitle>L{level}</datatitle><recordxml><recordinfo><title>L{level}</title><datalist>{record}</datalist></recordinfo></recordxml><sourcename>S</sourcename></dataitem>"#
+            );
+        }
+        let xml = format!(
+            r#"<msg><appmsg><title>L0</title><type>19</type><recorditem><![CDATA[<recordinfo><datalist>{record}</datalist></recordinfo>]]></recorditem></appmsg></msg>"#
+        );
+        let d = decode_message(49, &xml, "Alice", None, &[], |id| id.to_string());
+
+        let deepest = format!("[聊天记录] L{MAX_CHAT_HISTORY_DEPTH} (1条)");
+        assert!(d.content.contains(&deepest), "content was: {}", d.content);
+        let cut = format!("S: [记录] L{}", MAX_CHAT_HISTORY_DEPTH + 1);
+        assert!(d.content.contains(&cut), "content was: {}", d.content);
+        assert!(!d.content.contains("deepest"));
     }
 
     #[test]

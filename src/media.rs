@@ -649,6 +649,86 @@ fn find_wrapped(haystack: &str, prefix: &str, tag: &str) -> Option<usize> {
     None
 }
 
+/// Byte offsets of one element in the string it was found in: `start` is its
+/// `<`, `body` lies between the open and close tags, and `end` is just past
+/// the close tag.
+#[derive(Debug, PartialEq)]
+pub(crate) struct XmlElement {
+    pub start: usize,
+    pub body: std::ops::Range<usize>,
+    pub end: usize,
+}
+
+/// First `<tag>` or `<tag attr...>` element in `xml`, closed by the `</tag>`
+/// that balances it, so a forwarded record nested inside an element of the
+/// same name stays inside its parent's body. A self-closing `<tag/>` has an
+/// empty body. `None` when the element is missing or never closed.
+///
+/// One forward pass over the occurrences of `tag`; `>` inside attribute
+/// values is not supported, as in the other helpers here.
+pub(crate) fn find_xml_element(xml: &str, tag: &str) -> Option<XmlElement> {
+    let bytes = xml.as_bytes();
+    let finder = memchr::memmem::Finder::new(tag);
+    let mut open: Option<(usize, usize)> = None;
+    let mut depth = 0usize;
+    let mut from = 0;
+    while let Some(relative) = finder.find(&bytes[from..]) {
+        let at = from + relative;
+        let name_end = at + tag.len();
+        from = name_end;
+        let next = bytes.get(name_end).copied();
+        if bytes[..at].ends_with(b"</") {
+            if next != Some(b'>') {
+                continue;
+            }
+            let Some((start, body_start)) = open else {
+                continue;
+            };
+            depth -= 1;
+            if depth == 0 {
+                return Some(XmlElement {
+                    start,
+                    body: body_start..at - 2,
+                    end: name_end + 1,
+                });
+            }
+            from = name_end + 1;
+        } else if bytes[..at].ends_with(b"<")
+            && matches!(next, Some(b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            let open_end = name_end + memchr::memchr(b'>', &bytes[name_end..])?;
+            from = open_end + 1;
+            if bytes[open_end - 1] == b'/' {
+                if depth == 0 {
+                    return Some(XmlElement {
+                        start: at - 1,
+                        body: from..from,
+                        end: from,
+                    });
+                }
+                continue;
+            }
+            if depth == 0 {
+                open = Some((at - 1, from));
+            }
+            depth += 1;
+        }
+    }
+    None
+}
+
+/// Text of the first `tag` element, balanced like [`find_xml_element`],
+/// trimmed and entity-decoded like [`extract_xml_tag`].
+pub(crate) fn extract_xml_element(xml: &str, tag: &str) -> Option<String> {
+    let element = find_xml_element(xml, tag)?;
+    let value = decode_xml_entities(xml[element.body].trim());
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 pub(crate) fn extract_xml_tag_int(xml: &str, tag: &str) -> Option<i64> {
     let text = extract_xml_tag(xml, tag)?;
     text.parse::<i64>().ok()
@@ -726,6 +806,22 @@ fn decode_xml_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_find_xml_element_balances_nested_tags() {
+        let xml = r#"x<item a="1"><itemx/><item>in</item><item/>t</item><item>2</item>"#;
+        let e = find_xml_element(xml, "item").unwrap();
+        assert_eq!(
+            &xml[e.start..e.end],
+            r#"<item a="1"><itemx/><item>in</item><item/>t</item>"#
+        );
+        assert_eq!(&xml[e.body], "<itemx/><item>in</item><item/>t");
+
+        let e = find_xml_element("</a><a/><a>x</a>", "a").unwrap();
+        assert_eq!((e.start, e.body.clone(), e.end), (4, 8..8, 8));
+        assert_eq!(find_xml_element("<a><a></a>", "a"), None);
+        assert_eq!(find_xml_element("<ab>x</ab>", "a"), None);
+    }
 
     #[test]
     fn test_decode_xml_entities_applies_passes_in_order() {
