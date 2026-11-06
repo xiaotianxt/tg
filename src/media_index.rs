@@ -1,4 +1,5 @@
 use md5::{Digest, Md5};
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,8 +21,20 @@ struct IndexedMediaFile {
     path: PathBuf,
     lower_name: String,
     lower_stem: String,
-    len: u64,
+    /// Read on first comparison: only files that compete for one key need it,
+    /// and statting every cached file dominated the directory walk.
+    len: OnceCell<u64>,
     is_thumb: bool,
+}
+
+impl IndexedMediaFile {
+    fn len(&self) -> u64 {
+        *self.len.get_or_init(|| {
+            fs::symlink_metadata(&self.path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        })
+    }
 }
 
 struct CategoryIndex {
@@ -173,7 +186,7 @@ fn insert_best(
 }
 
 fn is_better(candidate: &IndexedMediaFile, current: &IndexedMediaFile) -> bool {
-    (!candidate.is_thumb, candidate.len) > (!current.is_thumb, current.len)
+    (!candidate.is_thumb, candidate.len()) > (!current.is_thumb, current.len())
 }
 
 fn discover_media_dirs(
@@ -327,13 +340,12 @@ fn scan_files(dir: &Path, files: &mut Vec<IndexedMediaFile>) {
             .and_then(|stem| stem.to_str())
             .unwrap_or("")
             .to_string();
-        let len = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         files.push(IndexedMediaFile {
             path,
             is_thumb: is_thumb_name(&lower_name),
             lower_name,
             lower_stem,
-            len,
+            len: OnceCell::new(),
         });
     }
 }
