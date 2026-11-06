@@ -673,35 +673,35 @@ pub(crate) fn strip_cdata(value: &str) -> &str {
 /// `str::replace` calls: `&amp;` first, then `&quot;`, `&apos;`, `&lt;`,
 /// `&gt;` on its output, so `&amp;lt;` becomes `<`.
 ///
-/// The last four are done in one scan. That is the same as four passes: each
-/// contains a single `&`, at its start, so occurrences cannot overlap, and
-/// their replacements contain none of their characters, so one pass cannot
-/// create or break a match for a later one.
+/// One left-to-right scan gives the same result. The later four entities hold
+/// a single `&`, at their start, so they cannot overlap each other, and their
+/// replacements contain none of their characters. The only `&` the first pass
+/// creates comes from `&amp;`; a later entity can start there only if the
+/// input continues with that entity's body (`lt;`, ...), which has no `&` and
+/// so passes through the first pass unchanged.
 fn decode_xml_entities(s: &str) -> String {
-    let unescaped_amp;
-    let s = if s.contains("&amp;") {
-        unescaped_amp = s.replace("&amp;", "&");
-        unescaped_amp.as_str()
-    } else {
-        s
-    };
+    const LATER: [(&str, char); 4] = [("quot;", '"'), ("apos;", '\''), ("lt;", '<'), ("gt;", '>')];
     let mut out = String::with_capacity(s.len());
     let mut copied = 0;
     for at in memchr::memchr_iter(b'&', s.as_bytes()) {
-        let rest = &s[at..];
-        let Some((entity, text)) = [
-            ("&quot;", '"'),
-            ("&apos;", '\''),
-            ("&lt;", '<'),
-            ("&gt;", '>'),
-        ]
-        .into_iter()
-        .find(|(entity, _)| rest.starts_with(entity)) else {
-            continue;
+        let mut body = &s[at + 1..];
+        let mut consumed = 1;
+        if let Some(rest) = body.strip_prefix("amp;") {
+            body = rest;
+            consumed += "amp;".len();
+        }
+        let decoded = LATER
+            .iter()
+            .find(|(entity, _)| body.starts_with(entity))
+            .map(|&(entity, text)| (text, consumed + entity.len()));
+        let (text, len) = match decoded {
+            Some(found) => found,
+            None if consumed > 1 => ('&', consumed),
+            None => continue,
         };
         out.push_str(&s[copied..at]);
         out.push(text);
-        copied = at + entity.len();
+        copied = at + len;
     }
     out.push_str(&s[copied..]);
     out
