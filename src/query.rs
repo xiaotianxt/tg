@@ -383,18 +383,18 @@ fn query_message_target(
 ) -> Result<Vec<MessageRow>, String> {
     let conn = store.open(&target.label)?;
     let tables = match &context.selected_table {
-        Some(table) => vec![table.clone()],
-        None => db::list_message_tables(&conn)?,
+        Some(table) => db::message_table_schema(&conn, table)?
+            .map(|schema| (table.clone(), schema))
+            .into_iter()
+            .collect(),
+        None => db::message_table_schemas(&conn)?,
     };
 
     let name2id = db::load_name2id(&conn)?;
     let mut rows = Vec::new();
-    for table in tables {
-        if !db::table_exists(&conn, &table)? {
-            continue;
-        }
+    for (table, schema) in tables {
         let mut table_rows =
-            query_message_table(&conn, target, &table, &name2id, context, options)?;
+            query_message_table(&conn, target, &table, schema, &name2id, context, options)?;
         rows.append(&mut table_rows);
     }
     Ok(rows)
@@ -404,6 +404,7 @@ fn query_message_table(
     conn: &Connection,
     target: &QueryTarget,
     table: &str,
+    schema: db::MessageTableSchema,
     name2id: &HashMap<i64, String>,
     context: &MessageQueryContext,
     options: &QueryOptions<'_>,
@@ -411,17 +412,17 @@ fn query_message_table(
     let body_col = db::quote_identifier(dictionary::msg_body_column());
     let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
     let sender_col = db::quote_identifier(dictionary::msg_sender_column());
-    let packed_col = if db::table_has_column(conn, table, dictionary::msg_packed_meta_column())? {
+    let packed_col = if schema.has_packed_meta {
         db::quote_identifier(dictionary::msg_packed_meta_column())
     } else {
         "x''".to_string()
     };
-    let local_id_col = if db::table_has_column(conn, table, "local_id")? {
+    let local_id_col = if schema.has_local_id {
         db::quote_identifier("local_id")
     } else {
         "rowid".to_string()
     };
-    let order_col = if db::table_has_column(conn, table, "sort_seq")? {
+    let order_col = if schema.has_sort_seq {
         "sort_seq"
     } else {
         "create_time"

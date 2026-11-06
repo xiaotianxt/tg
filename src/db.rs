@@ -266,26 +266,6 @@ pub(crate) fn quote_identifier(name: &str) -> String {
     quoted
 }
 
-pub(crate) fn table_has_column(
-    conn: &Connection,
-    table_name: &str,
-    column_name: &str,
-) -> Result<bool, String> {
-    let sql = format!("PRAGMA table_info({})", quote_identifier(table_name));
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|error| format!("Inspect columns of {table_name}: {error}"))?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|error| format!("Read columns of {table_name}: {error}"))?;
-    for row in rows {
-        if row.map_err(|error| format!("Read column of {table_name}: {error}"))? == column_name {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 pub(crate) fn list_message_tables(conn: &Connection) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'")
@@ -306,6 +286,74 @@ pub(crate) fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, 
         |row| row.get(0),
     )
     .map_err(|error| format!("Check table {table_name}: {error}"))
+}
+
+/// Optional columns of one message table that change how it is read.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MessageTableSchema {
+    pub has_packed_meta: bool,
+    pub has_local_id: bool,
+    pub has_sort_seq: bool,
+}
+
+/// Every `Msg_*` table with its schema, in `list_message_tables` order, from
+/// one schema scan instead of one PRAGMA per table and column.
+pub(crate) fn message_table_schemas(
+    conn: &Connection,
+) -> Result<Vec<(String, MessageTableSchema)>, String> {
+    collect_message_table_schemas(conn, "m.name LIKE 'Msg_%'", None)
+}
+
+/// The schema of one message table, or `None` when the table is absent.
+pub(crate) fn message_table_schema(
+    conn: &Connection,
+    table_name: &str,
+) -> Result<Option<MessageTableSchema>, String> {
+    Ok(
+        collect_message_table_schemas(conn, "m.name = ?1", Some(table_name))?
+            .pop()
+            .map(|(_, schema)| schema),
+    )
+}
+
+fn collect_message_table_schemas(
+    conn: &Connection,
+    name_filter: &str,
+    name_param: Option<&str>,
+) -> Result<Vec<(String, MessageTableSchema)>, String> {
+    // sqlite_schema is the outer loop, so tables keep their schema-scan order
+    // and each table's columns arrive contiguously.
+    let sql = format!(
+        "SELECT m.name, p.name FROM sqlite_schema AS m, pragma_table_info(m.name) AS p \
+         WHERE m.type = 'table' AND {name_filter}"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| format!("Inspect message table columns: {error}"))?;
+    let map_row =
+        |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+    let rows = match name_param {
+        Some(name) => stmt.query_map([name], map_row),
+        None => stmt.query_map([], map_row),
+    }
+    .map_err(|error| format!("Read message table columns: {error}"))?;
+
+    let packed_meta = dictionary::msg_packed_meta_column();
+    let mut tables: Vec<(String, MessageTableSchema)> = Vec::new();
+    for row in rows {
+        let (table, column) = row.map_err(|error| format!("Read message table column: {error}"))?;
+        if tables.last().is_none_or(|(last, _)| *last != table) {
+            tables.push((table, MessageTableSchema::default()));
+        }
+        let schema = &mut tables.last_mut().expect("table was just pushed").1;
+        match column.as_str() {
+            "local_id" => schema.has_local_id = true,
+            "sort_seq" => schema.has_sort_seq = true,
+            name if name == packed_meta => schema.has_packed_meta = true,
+            _ => {}
+        }
+    }
+    Ok(tables)
 }
 
 pub(crate) fn load_name2id(conn: &Connection) -> Result<HashMap<i64, String>, String> {
@@ -812,9 +860,9 @@ pub fn read_messages(
             let conn = store.open(&db_path)?;
 
             let table = quote_identifier(&table_name);
-            if !table_exists(&conn, &table_name)? {
+            let Some(schema) = message_table_schema(&conn, &table_name)? else {
                 return Ok(Vec::new());
-            }
+            };
 
             let name2id = load_name2id(&conn)?;
 
@@ -825,12 +873,12 @@ pub fn read_messages(
             let marker_col = quote_identifier(dictionary::msg_compression_marker_column());
             let sender_col = quote_identifier(dictionary::msg_sender_column());
             let packed_col = quote_identifier(dictionary::msg_packed_meta_column());
-            let local_id_col = if table_has_column(&conn, &table_name, "local_id")? {
+            let local_id_col = if schema.has_local_id {
                 quote_identifier("local_id")
             } else {
                 "NULL".to_string()
             };
-            let order_col = if table_has_column(&conn, &table_name, "sort_seq")? {
+            let order_col = if schema.has_sort_seq {
                 "sort_seq"
             } else {
                 "create_time"
