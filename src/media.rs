@@ -576,7 +576,8 @@ pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
     let mut search_from = 0;
     let bytes = xml.as_bytes();
 
-    while let Some(relative_start) = xml[search_from..].find(attr) {
+    let finder = memchr::memmem::Finder::new(attr);
+    while let Some(relative_start) = finder.find(&bytes[search_from..]) {
         let start = search_from + relative_start;
         let has_attr_boundary = xml[..start]
             .chars()
@@ -617,13 +618,13 @@ pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
 pub(crate) fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
-    let start = xml.find(&open)?;
+    let start = memchr::memmem::find(xml.as_bytes(), open.as_bytes())?;
     let value_start = start + open.len();
     if value_start >= xml.len() {
         return None;
     }
     let rest = &xml[value_start..];
-    let value_end = rest.find(&close)?;
+    let value_end = memchr::memmem::find(rest.as_bytes(), close.as_bytes())?;
     let value = decode_xml_entities(rest[..value_end].trim());
     if value.is_empty() {
         None
