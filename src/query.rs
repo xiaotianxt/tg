@@ -156,7 +156,8 @@ pub(crate) struct QueryOptions<'a> {
     pub has: &'a [QueryMediaType],
     pub since: Option<i64>,
     pub until: Option<i64>,
-    pub limit: usize,
+    /// None returns every match (MCP); the CLI always passes a page size.
+    pub limit: Option<usize>,
     pub offset: usize,
     pub sort: QuerySort,
     pub match_mode: QueryMatchMode,
@@ -243,12 +244,12 @@ pub(crate) fn query_messages(options: &QueryOptions<'_>) -> Result<Vec<MessageRo
     Ok(rows
         .into_iter()
         .skip(options.offset)
-        .take(options.limit)
+        .take(options.limit.unwrap_or(usize::MAX))
         .collect())
 }
 
 fn validate_message_options(options: &QueryOptions<'_>) -> Result<(), String> {
-    if options.limit == 0 {
+    if options.limit == Some(0) {
         return Err("--limit must be greater than 0".to_string());
     }
     validate_query_terms("--contains", options.contains)?;
@@ -290,9 +291,12 @@ fn validate_query_terms(flag: &str, terms: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn message_query_window(options: &QueryOptions<'_>) -> Result<usize, String> {
-    let window = options
-        .limit
+/// The CLI's guard against huge pages; an unlimited query has no window.
+fn message_query_window(options: &QueryOptions<'_>) -> Result<Option<usize>, String> {
+    let Some(limit) = options.limit else {
+        return Ok(None);
+    };
+    let window = limit
         .checked_add(options.offset)
         .ok_or_else(|| "--limit plus --offset is too large".to_string())?;
     if window > MAX_QUERY_RESULT_WINDOW {
@@ -301,7 +305,7 @@ fn message_query_window(options: &QueryOptions<'_>) -> Result<usize, String> {
             MAX_QUERY_RESULT_WINDOW
         ));
     }
-    Ok(window)
+    Ok(Some(window))
 }
 
 fn query_needs_post_filtering(options: &QueryOptions<'_>) -> bool {
@@ -458,10 +462,9 @@ fn query_message_table(
         clauses.push(format!("({})", media_clause));
     }
 
-    let limit_clause = if query_needs_post_filtering(options) {
-        String::new()
-    } else {
-        format!(" LIMIT {}", result_window)
+    let limit_clause = match result_window {
+        Some(window) if !query_needs_post_filtering(options) => format!(" LIMIT {window}"),
+        _ => String::new(),
     };
 
     let sql = format!(
@@ -529,7 +532,7 @@ fn query_message_table(
         .map_err(|error| format!("Read message rows in {}: {error}", target.label))?
         .into_iter()
         .filter(|row| message_row_matches_filters(row, options))
-        .take(result_window)
+        .take(result_window.unwrap_or(usize::MAX))
         .collect())
 }
 
@@ -801,7 +804,7 @@ mod tests {
             has: &[],
             since: None,
             until: None,
-            limit: 100,
+            limit: Some(100),
             offset: 0,
             sort: QuerySort::Newest,
             match_mode: QueryMatchMode::All,
@@ -1222,7 +1225,7 @@ mod tests {
         let mut bytes = Vec::new();
         let mut out = output::Output::new(&mut bytes);
         let mut options = default_query_options(dir.path(), &contains, &[]);
-        options.limit = MAX_QUERY_RESULT_WINDOW;
+        options.limit = Some(MAX_QUERY_RESULT_WINDOW);
         options.offset = 1;
 
         let err = run_messages_with_output(options, &default_query_output(), &mut out).unwrap_err();

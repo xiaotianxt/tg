@@ -182,13 +182,17 @@ clients that ignore structured output.
 
 | Tool | Maps to | Inputs | Notes |
 |---|---|---|---|
-| `list_sessions` | `db::list_sessions` | `query?`, `limit` (default 30, max 200) | Reads only contact and session DBs |
-| `list_unread` | `db::list_unread_sessions` | `query?`, `limit` | Same light scope |
-| `read_messages` | `db::read_messages` | `session`, `limit` (page size, default 1000, no maximum), `offset` (counted from the paging end in either order), `since?`, `until?`, `order` (`newest`/`oldest`), `contains?` | Returns `next_offset` while more remain |
-| `search_messages` | `db::search_messages` | `query`, `since?` (default recent window), `limit` (page size, default 100, no maximum) | Upstream FTS; errors point to `query_messages` if the FTS DB is missing |
-| `query_messages` | `query::run` | `session?`, `contains[]`, `not_contains[]`, `match` (`all`/`any`), `has[]` (media types), `since?`, `until?`, `order`, `limit` (page size, default 1000, no maximum), `offset` | No raw-body fields over MCP |
+| `list_sessions` | `db::list_sessions` | `query?`, `offset?` | Every chat; reads only contact and session DBs |
+| `list_unread` | `db::list_unread_sessions` | `query?`, `offset?` | Every unread chat; same light scope |
+| `read_messages` | `db::read_messages` | `session`, `since?`, `until?`, `order` (`newest`/`oldest`, the end kept when trimming), `contains?`, `offset?` | Every message in the range |
+| `search_messages` | `db::search_messages` | `query`, `since?` (default recent window), `offset?` | Every hit, newest first; upstream FTS; errors point to `query_messages` if the FTS DB is missing |
+| `query_messages` | `query::run` | `session?`, `contains[]`, `not_contains[]`, `match` (`all`/`any`), `has[]` (media types), `since?`, `until?`, `order`, `offset?` | Every match; no raw-body fields over MCP |
 | `list_members` | `db::list_members` / `list_member_friends` | `session`, `inactive_since?`, `friends_only` | |
 | `diagnose` | `doctor::run` | `session?` | Paths are redacted in remote mode |
+
+No tool takes a page size. Each returns its whole result; only a result over
+the size cap is trimmed, and it then carries `truncated: true` and
+`next_offset`, which the next call passes as `offset`.
 
 Common rules:
 

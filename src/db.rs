@@ -189,7 +189,8 @@ pub(crate) struct SessionList {
 
 pub(crate) struct SearchMessagesOptions<'a> {
     pub query: &'a str,
-    pub limit: usize,
+    /// None returns every hit (MCP); the CLI always passes a page size.
+    pub limit: Option<usize>,
     pub since: Option<i64>,
     pub name_mode: DisplayNameMode,
 }
@@ -1051,7 +1052,8 @@ fn search_messages_with_fts(
     }
 
     let name2id = load_fts_name2id(&conn)?;
-    let result_limit = options.limit.saturating_add(1);
+    // One extra row tells whether more hits exist.
+    let result_limit = options.limit.map(|limit| limit.saturating_add(1));
     let match_query = fts::ideograph_match_query(options.query)
         .filter(|_| fts::register_compatible_tokenizer(&conn).is_ok());
     let mut results = match match_query {
@@ -1089,8 +1091,10 @@ fn search_messages_with_fts(
     };
 
     results.sort_by_key(|row| Reverse(row.1));
-    let has_more = results.len() > options.limit;
-    results.truncate(options.limit);
+    let has_more = options.limit.is_some_and(|limit| results.len() > limit);
+    if let Some(limit) = options.limit {
+        results.truncate(limit);
+    }
     results.sort_by_key(|row| row.1);
 
     Ok((has_more, results))
@@ -1101,7 +1105,7 @@ fn collect_telegram_fts_rows(
     content_tables: &[String],
     name2id: &HashMap<i64, String>,
     options: &SearchMessagesOptions<'_>,
-    result_limit: usize,
+    result_limit: Option<usize>,
     match_query: Option<&str>,
 ) -> Result<Vec<SearchRow>, String> {
     let search_pattern = like_contains_pattern(options.query);
@@ -1134,10 +1138,13 @@ fn collect_telegram_fts_rows(
             .since
             .map(|ts| format!(" AND {time_column} >= {ts}"))
             .unwrap_or_default();
+        let limit_clause = result_limit
+            .map(|limit| format!(" LIMIT {limit}"))
+            .unwrap_or_default();
         let sql = format!(
             "SELECT {columns} FROM {table} \
              WHERE {search_clause}{since_clause} \
-             ORDER BY {time_column} DESC LIMIT {result_limit}"
+             ORDER BY {time_column} DESC{limit_clause}"
         );
         let mut stmt = conn
             .prepare(&sql)
@@ -2332,7 +2339,7 @@ mod tests {
             dir.path(),
             SearchMessagesOptions {
                 query: "needle",
-                limit: 20,
+                limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
             },
@@ -2350,7 +2357,7 @@ mod tests {
             dir.path(),
             SearchMessagesOptions {
                 query: "needle",
-                limit: 20,
+                limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
             },
@@ -2376,7 +2383,7 @@ mod tests {
             dir.path(),
             SearchMessagesOptions {
                 query: "needle",
-                limit: 20,
+                limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
             },
@@ -2395,7 +2402,7 @@ mod tests {
             dir.path(),
             SearchMessagesOptions {
                 query: "开源",
-                limit: 20,
+                limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
             },
@@ -2414,7 +2421,7 @@ mod tests {
             dir.path(),
             SearchMessagesOptions {
                 query: "' OR 1=1 --",
-                limit: 20,
+                limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
             },
@@ -2432,7 +2439,7 @@ mod tests {
             dir.path(),
             SearchMessagesOptions {
                 query: "%",
-                limit: 20,
+                limit: Some(20),
                 since: None,
                 name_mode: DisplayNameMode::PersonalRemark,
             },
@@ -2450,7 +2457,7 @@ mod tests {
             dir.path(),
             SearchMessagesOptions {
                 query: "needle",
-                limit: 20,
+                limit: Some(20),
                 since: Some(1001),
                 name_mode: DisplayNameMode::PersonalRemark,
             },

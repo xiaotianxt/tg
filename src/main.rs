@@ -530,7 +530,7 @@ fn run(command: Commands) -> Result<(), String> {
                 &store,
                 db::SearchMessagesOptions {
                     query: &query,
-                    limit,
+                    limit: Some(limit),
                     since: since_ts,
                     name_mode: if anonymous {
                         contact::DisplayNameMode::Anonymous
@@ -586,7 +586,7 @@ fn run(command: Commands) -> Result<(), String> {
                 has: &has,
                 since: since_ts,
                 until: until_ts,
-                limit,
+                limit: Some(limit),
                 offset,
                 sort: order,
                 match_mode,

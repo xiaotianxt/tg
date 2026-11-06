@@ -16,6 +16,11 @@ returns `next_offset` or `has_more`.
 Third follow-up: messages are no longer cut at 2000 characters. The
 per-message cap is now opt-in through `remote.max_text_chars`.
 
+Fourth follow-up: MCP tools no longer take a `limit` parameter. Each call
+returns its whole result (every chat, message or hit in range). Only a result
+over the size cap is trimmed, and it then returns `truncated: true` and
+`next_offset` to pass as `offset`.
+
 - Add `tg mcp stdio` for local MCP clients. It needs no network or authentication.
 - Add `tg mcp init` / `tg mcp serve` for remote clients over Streamable HTTP. tg only listens on loopback or Tailscale addresses and expects your own HTTPS reverse proxy in front.
 - Remote access is protected by a built-in single-user OAuth 2.1 server: dynamic client registration with a redirect allowlist, PKCE S256, an owner passphrase on the consent page, short-lived hashed access tokens, and rotating refresh tokens with replay detection.

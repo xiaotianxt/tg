@@ -15,11 +15,6 @@ use crate::contact::DisplayNameMode;
 use crate::source_store::SourceStore;
 use crate::{db, doctor, query, time};
 
-const MAX_SESSIONS: usize = 200;
-/// Page sizes only: the result byte cap is the single size guard, and a
-/// trimmed result always carries a continuation (`next_offset` or `has_more`).
-const DEFAULT_MESSAGES: usize = 1000;
-const DEFAULT_SEARCH_HITS: usize = 100;
 const DAY_SECONDS: i64 = 86_400;
 
 pub(crate) struct ToolContext {
@@ -99,12 +94,12 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "list_sessions",
             "title": "List chats",
-            "description": "List recent chats (direct and group) from the local tg history, most recently active first. Returns each chat's stable `id`, which other tools accept as `session`.",
+            "description": "List every chat (direct and group) from the local tg history, most recently active first. Returns each chat's stable `id`, which other tools accept as `session`. Only if the list exceeds the result size cap is it trimmed, with `truncated: true` and `next_offset`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Optional name filter (fuzzy match on names and ids)"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SESSIONS, "default": 30}
+                    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Only to continue a truncated result: pass its next_offset."}
                 },
                 "additionalProperties": false
             },
@@ -113,12 +108,12 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "list_unread",
             "title": "List unread chats",
-            "description": "List chats that have unread messages, with unread counts.",
+            "description": "List every chat that has unread messages, with unread counts. Only if the list exceeds the result size cap is it trimmed, with `truncated: true` and `next_offset`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Optional name filter"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SESSIONS, "default": 30}
+                    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Only to continue a truncated result: pass its next_offset."}
                 },
                 "additionalProperties": false
             },
@@ -127,14 +122,13 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "read_messages",
             "title": "Read a chat",
-            "description": "Read messages from one chat within an optional [since, until) time range. Messages in each page are always chronological. order=newest (default) takes the latest `limit` messages of the range and `offset` steps back from the end; order=oldest takes the earliest and `offset` steps forward. When the result has `next_offset`, more messages remain: repeat the call with the same session, since, until and order and offset=next_offset. To read a whole period (for example a week), prefer order=oldest with since and until and follow next_offset until it is absent.",
+            "description": "Read every message of one chat in an optional [since, until) time range, in chronological order. There is no page size: one call returns the whole range. Only if the range exceeds the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset. order=newest (default) keeps the latest messages when trimming, order=oldest the earliest.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session": {"type": "string", "description": "Chat id from list_sessions (preferred) or a display name"},
-                    "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_MESSAGES, "description": "Page size; no maximum. Very large pages are trimmed to the result size cap and return next_offset."},
                     "order": {"type": "string", "enum": ["newest", "oldest"], "default": "newest"},
-                    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Messages to skip, counted from the end of the range for order=newest and from the start for order=oldest. Use the previous result's next_offset."},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Only to continue a truncated result: pass its next_offset. Counted from the end of the range for order=newest and from the start for order=oldest."},
                     "since": {"type": "string", "description": format!("Inclusive start; {time_hint}")},
                     "until": {"type": "string", "description": format!("Exclusive end; {time_hint}")},
                     "contains": {"type": "string", "description": "Only messages whose text contains this substring"}
@@ -147,14 +141,14 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "search_messages",
             "title": "Search messages",
-            "description": "Full-text search across all chats using the client's own search index. Defaults to the recent window unless `since` or `all_time` is given. Returns the newest matches.",
+            "description": "Full-text search across all chats using the client's own search index. Defaults to the recent window unless `since` or `all_time` is given. Returns every match, newest first. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "minLength": 1},
                     "since": {"type": "string", "description": time_hint},
                     "all_time": {"type": "boolean", "default": false},
-                    "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_SEARCH_HITS}
+                    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Only to continue a truncated result: pass its next_offset."}
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -164,7 +158,7 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "query_messages",
             "title": "Filter messages",
-            "description": "Structured message filter across all chats or one chat: keywords to include/exclude, media type, and a time range. Slower than search_messages but exhaustive. Defaults to the recent window unless `since` or `all_time` is given. When the result has `next_offset`, repeat the same call with offset=next_offset to get the rest. To read every message of one chat in a period, use read_messages instead.",
+            "description": "Structured message filter across all chats or one chat: keywords to include/exclude, media type, and a time range. Slower than search_messages but exhaustive. Defaults to the recent window unless `since` or `all_time` is given. Returns every match. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset. To read every message of one chat in a period, use read_messages instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -177,8 +171,7 @@ pub(crate) fn definitions() -> Value {
                     "until": {"type": "string", "description": time_hint},
                     "all_time": {"type": "boolean", "default": false},
                     "order": {"type": "string", "enum": ["newest", "oldest"], "default": "newest"},
-                    "limit": {"type": "integer", "minimum": 1, "default": DEFAULT_MESSAGES, "description": "Page size; no maximum. Very large pages are trimmed to the result size cap and return next_offset."},
-                    "offset": {"type": "integer", "minimum": 0, "default": 0}
+                    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Only to continue a truncated result: pass its next_offset."}
                 },
                 "additionalProperties": false
             },
@@ -246,11 +239,10 @@ fn list_sessions(
     args: Args<'_>,
     kind: db::SessionListKind,
 ) -> Result<CallOutcome, String> {
-    args.only(&["query", "limit"])?;
+    args.only(&["query", "offset"])?;
     let query = args.str("query")?;
-    let limit = args.usize("limit", 30, 1, MAX_SESSIONS)?;
+    let offset = args.offset()?;
     let store = ctx.open_store()?;
-    // Ask for every match so hidden sessions don't shrink the page.
     let list = match kind {
         db::SessionListKind::All => db::list_sessions(&store, usize::MAX, query),
         db::SessionListKind::Unread => db::list_unread_sessions(&store, usize::MAX, query),
@@ -259,7 +251,7 @@ fn list_sessions(
         .sessions
         .iter()
         .filter(|session| ctx.session_visible(&session.username))
-        .take(limit)
+        .skip(offset)
         .map(|session| {
             json!({
                 "id": session.username,
@@ -270,24 +262,24 @@ fn list_sessions(
         })
         .collect();
     let value = json!({ "sessions": sessions });
-    Ok(fit(ctx, value, "sessions", Trim::End))
+    Ok(continue_after_trim(
+        fit(ctx, value, "sessions", Trim::End),
+        offset,
+    ))
 }
 
 fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
-    args.only(&[
-        "session", "limit", "order", "offset", "since", "until", "contains",
-    ])?;
+    args.only(&["session", "order", "offset", "since", "until", "contains"])?;
     let session = args.required_str("session")?;
-    let limit = args.usize("limit", DEFAULT_MESSAGES, 1, usize::MAX)?;
     let newest = args.choice("order", &["newest", "oldest"], "newest")? == "newest";
-    let offset = args.usize("offset", 0, 0, usize::MAX)?;
+    let offset = args.offset()?;
     let since = ctx.clamp_since(args.time("since")?);
     let until = args.time("until")?;
     let contains = args.str("contains")?;
     let store = ctx.open_store()?;
     let options = db::ReadMessagesOptions {
         session_query: session,
-        limit: Some(limit),
+        limit: None,
         offset,
         search_query: contains,
         since,
@@ -301,7 +293,6 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
     if !ctx.session_visible(&page.username) {
         return Err(no_session(session));
     }
-    let count = page.messages.len();
     let messages: Vec<Value> = page
         .messages
         .iter()
@@ -314,29 +305,24 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
             })
         })
         .collect();
-    let mut value = json!({
+    let value = json!({
         "session": {"id": page.username, "name": page.display_name},
         "order": if newest { "newest" } else { "oldest" },
         "messages": messages,
     });
-    if count == limit {
-        value["next_offset"] = json!(offset + count);
-    }
     // Trim the messages farthest from the paging origin, so next_offset
     // continues exactly where the kept ones end.
     let trim = if newest { Trim::Start } else { Trim::End };
-    let mut outcome = fit(ctx, value, "messages", trim);
-    let kept = outcome.value["messages"].as_array().map_or(0, Vec::len);
-    if kept < count {
-        outcome.value["next_offset"] = json!(offset + kept);
-    }
-    Ok(outcome)
+    Ok(continue_after_trim(
+        fit(ctx, value, "messages", trim),
+        offset,
+    ))
 }
 
 fn search_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
-    args.only(&["query", "since", "all_time", "limit"])?;
+    args.only(&["query", "since", "all_time", "offset"])?;
     let query = args.required_str("query")?;
-    let limit = args.usize("limit", DEFAULT_SEARCH_HITS, 1, usize::MAX)?;
+    let offset = args.offset()?;
     let since = args.time("since")?;
     let since = if args.bool("all_time")? {
         since
@@ -348,7 +334,7 @@ fn search_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Str
         &store,
         db::SearchMessagesOptions {
             query,
-            limit,
+            limit: None,
             since: ctx.clamp_since(since),
             name_mode: ctx.name_mode(),
         },
@@ -359,6 +345,7 @@ fn search_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Str
         .iter()
         .rev()
         .filter(|hit| ctx.session_visible(&hit.session))
+        .skip(offset)
         .map(|hit| {
             json!({
                 "time": time_value(hit.create_time),
@@ -368,12 +355,11 @@ fn search_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Str
             })
         })
         .collect();
-    let value = json!({ "hits": hits, "has_more": results.has_more });
-    let mut outcome = fit(ctx, value, "hits", Trim::End);
-    if outcome.value.get("truncated").is_some() {
-        outcome.value["has_more"] = json!(true);
-    }
-    Ok(outcome)
+    let value = json!({ "hits": hits });
+    Ok(continue_after_trim(
+        fit(ctx, value, "hits", Trim::End),
+        offset,
+    ))
 }
 
 fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
@@ -387,7 +373,6 @@ fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Stri
         "until",
         "all_time",
         "order",
-        "limit",
         "offset",
     ])?;
     let session = args.str("session")?;
@@ -409,9 +394,10 @@ fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Stri
     let until = args.time("until")?;
     let sort =
         query::QuerySort::from_str(args.choice("order", &["newest", "oldest"], "newest")?, true)?;
-    let limit = args.usize("limit", DEFAULT_MESSAGES, 1, usize::MAX)?;
-    let offset = args.usize("offset", 0, 0, usize::MAX)?;
+    let offset = args.offset()?;
     let store = ctx.open_store()?;
+    // Offsets count only rows the caller can see, so hidden sessions are
+    // filtered before skipping.
     let rows = query::query_messages(&query::QueryOptions {
         store: &store,
         session,
@@ -421,17 +407,17 @@ fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Stri
         has: &has,
         since: ctx.clamp_since(since),
         until,
-        limit,
-        offset,
+        limit: None,
+        offset: 0,
         sort,
         match_mode,
         name_mode: ctx.name_mode(),
         jobs: ctx.jobs,
     })?;
-    let fetched = rows.len();
     let messages: Vec<Value> = rows
         .iter()
         .filter(|row| ctx.session_visible(&row.session_id))
+        .skip(offset)
         .map(|row| {
             json!({
                 "time": time_value(row.create_time),
@@ -442,17 +428,11 @@ fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Stri
             })
         })
         .collect();
-    let mut value = json!({ "messages": messages });
-    if fetched == limit {
-        value["next_offset"] = json!(offset + fetched);
-    }
-    let mut outcome = fit(ctx, value, "messages", Trim::End);
-    if outcome.value.get("truncated").is_some() {
-        // Trimmed rows were never seen; let the caller continue after the kept ones.
-        let kept = outcome.value["messages"].as_array().map_or(0, Vec::len);
-        outcome.value["next_offset"] = json!(offset + kept);
-    }
-    Ok(outcome)
+    let value = json!({ "messages": messages });
+    Ok(continue_after_trim(
+        fit(ctx, value, "messages", Trim::End),
+        offset,
+    ))
 }
 
 fn list_members(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
@@ -631,6 +611,15 @@ fn fit(ctx: &ToolContext, mut value: Value, key: &str, trim: Trim) -> CallOutcom
     CallOutcome { value, rows }
 }
 
+/// A trimmed result continues right after the items it kept; a whole result
+/// carries no continuation.
+fn continue_after_trim(mut outcome: CallOutcome, offset: usize) -> CallOutcome {
+    if outcome.value.get("truncated").is_some() {
+        outcome.value["next_offset"] = json!(offset + outcome.rows);
+    }
+    outcome
+}
+
 /// Typed accessors over a tool's argument object.
 struct Args<'a> {
     map: &'a Map<String, Value>,
@@ -677,21 +666,15 @@ impl<'a> Args<'a> {
         }
     }
 
-    fn usize(&self, name: &str, default: usize, min: usize, max: usize) -> Result<usize, String> {
-        let value = match self.map.get(name) {
-            None | Some(Value::Null) => return Ok(default),
+    /// Continuation offset from a previous truncated result; 0 when absent.
+    fn offset(&self) -> Result<usize, String> {
+        match self.map.get("offset") {
+            None | Some(Value::Null) => Ok(0),
             Some(value) => value
                 .as_u64()
                 .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| format!("{name} must be a non-negative integer"))?,
-        };
-        if max == usize::MAX && value < min {
-            return Err(format!("{name} must be at least {min}"));
+                .ok_or_else(|| "offset must be a non-negative integer".to_string()),
         }
-        if value < min || value > max {
-            return Err(format!("{name} must be between {min} and {max}"));
-        }
-        Ok(value)
     }
 
     fn bool(&self, name: &str) -> Result<bool, String> {
@@ -760,14 +743,18 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error, "Unknown argument: limt");
-        let error = call(&ctx, "list_sessions", &json!({"limit": 0}))
-            .err()
-            .unwrap();
-        assert!(error.contains("between 1 and 200"), "{error}");
-        let error = call(&ctx, "read_messages", &json!({"session": "a", "limit": 0}))
-            .err()
-            .unwrap();
-        assert_eq!(error, "limit must be at least 1");
+        // No tool takes a page size; continuation is offset-only.
+        for (tool, args) in [
+            ("list_sessions", json!({"limit": 10})),
+            ("list_unread", json!({"limit": 10})),
+            ("read_messages", json!({"session": "a", "limit": 10})),
+            ("search_messages", json!({"query": "a", "limit": 10})),
+            ("query_messages", json!({"limit": 10})),
+        ] {
+            let error = call(&ctx, tool, &args).err().unwrap();
+            assert_eq!(error, "Unknown argument: limit", "{tool}");
+        }
+        assert!(!definitions().to_string().contains("\"limit\""));
         assert!(call(&ctx, "drop_tables", &json!({})).is_err());
     }
 
@@ -817,6 +804,23 @@ mod tests {
 
         let outcome = fit(&ctx, json!({ "items": items }), "items", Trim::End);
         assert_eq!(outcome.value["items"][0]["n"], 0);
+    }
+
+    #[test]
+    fn trimmed_results_continue_after_the_kept_items() {
+        let mut ctx = ctx(false);
+        ctx.policy.max_result_bytes = 1024;
+        let items: Vec<Value> = (0..100)
+            .map(|n| json!({"n": n, "pad": "x".repeat(40)}))
+            .collect();
+        let outcome =
+            continue_after_trim(fit(&ctx, json!({ "items": items }), "items", Trim::End), 7);
+        assert_eq!(outcome.value["truncated"], true);
+        assert_eq!(outcome.value["next_offset"], 7 + outcome.rows);
+
+        let whole =
+            continue_after_trim(fit(&ctx, json!({ "items": [1, 2] }), "items", Trim::End), 7);
+        assert!(whole.value.get("next_offset").is_none());
     }
 
     #[test]
