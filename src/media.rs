@@ -668,27 +668,41 @@ pub(crate) fn strip_cdata(value: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
-/// Replaces the five predefined entities one after another, so `&amp;lt;`
-/// becomes `<`. Every pattern starts with `&`, so once no `&` is left the
-/// remaining passes cannot match and are skipped.
+/// Decodes the five predefined entities with the result of chained
+/// `str::replace` calls: `&amp;` first, then `&quot;`, `&apos;`, `&lt;`,
+/// `&gt;` on its output, so `&amp;lt;` becomes `<`.
+///
+/// The last four are done in one scan. That is the same as four passes: each
+/// contains a single `&`, at its start, so occurrences cannot overlap, and
+/// their replacements contain none of their characters, so one pass cannot
+/// create or break a match for a later one.
 fn decode_xml_entities(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_owned();
+    let unescaped_amp;
+    let s = if s.contains("&amp;") {
+        unescaped_amp = s.replace("&amp;", "&");
+        unescaped_amp.as_str()
+    } else {
+        s
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    for at in memchr::memchr_iter(b'&', s.as_bytes()) {
+        let rest = &s[at..];
+        let Some((entity, text)) = [
+            ("&quot;", '"'),
+            ("&apos;", '\''),
+            ("&lt;", '<'),
+            ("&gt;", '>'),
+        ]
+        .into_iter()
+        .find(|(entity, _)| rest.starts_with(entity)) else {
+            continue;
+        };
+        out.push_str(&s[copied..at]);
+        out.push(text);
+        copied = at + entity.len();
     }
-    let mut out = s.replace("&amp;", "&");
-    for (entity, text) in [
-        ("&quot;", "\""),
-        ("&apos;", "'"),
-        ("&lt;", "<"),
-        ("&gt;", ">"),
-    ] {
-        if !out.contains('&') {
-            break;
-        }
-        if out.contains(entity) {
-            out = out.replace(entity, text);
-        }
-    }
+    out.push_str(&s[copied..]);
     out
 }
 
@@ -706,6 +720,34 @@ mod tests {
         assert_eq!(decode_xml_entities("&apos;&quot;&lt;&gt;&"), "'\"<>&");
         assert_eq!(decode_xml_entities("&gt&lt;&unknown;"), "&gt<&unknown;");
         assert_eq!(decode_xml_entities(""), "");
+    }
+
+    #[test]
+    fn test_decode_xml_entities_matches_chained_replace() {
+        fn chained(s: &str) -> String {
+            s.replace("&amp;", "&")
+                .replace("&quot;", "\"")
+                .replace("&apos;", "'")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+        }
+        let pieces = [
+            "&", "amp;", "&amp;", "lt;", "gt;", "quot;", "apos;", "&lt", ";", "a", "文", "<",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..20_000 {
+            let mut input = String::new();
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let mut bits = state;
+            for _ in 0..(bits % 9) {
+                bits /= 9;
+                input.push_str(pieces[(bits % pieces.len() as u64) as usize]);
+                bits /= pieces.len() as u64;
+            }
+            assert_eq!(decode_xml_entities(&input), chained(&input), "{input:?}");
+        }
     }
 
     #[test]
