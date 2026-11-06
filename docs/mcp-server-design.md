@@ -1,6 +1,17 @@
 # MCP Server Design
 
-Status: draft for review. Nothing in this document is implemented yet.
+Status: implemented in `src/mcp/` (phases 1–3 and 5). Differences from the
+text below:
+
+- Tools return `structuredContent` plus the same JSON as text, without an
+  `outputSchema`, so a schema mismatch can never make a client reject a result.
+- The HTTP transport is stateless: no `Mcp-Session-Id` is issued, so a server
+  restart never strands a client session.
+- Session names resolve to the best fuzzy match instead of returning a
+  candidate list; every result echoes the resolved `session.id` and `name`.
+- The owner passphrase hash lives in `~/.tg/mcp/owner.json` (0600), not in the
+  Keychain. `serve --expires` and `install-service` are not implemented.
+- `read_messages` has no `until`; older pages use `query_messages` with `until`.
 
 ## Decision
 

@@ -167,6 +167,32 @@ exported/zhangsan/media/
 
 本地可用的图片、视频、表情、文件和语音会写入 `media/`。Telegram 没有缓存或缓存已清理时，只保留消息摘要；tg 不从远端 URL 下载。语音优先写成 WAV，解码器不可用或单条失败时保留 `.voice`。`tggf` 表情转换需要 `ffmpeg`。
 
+## MCP 服务
+
+`tg mcp` 把只读命令暴露成 MCP 工具：`list_sessions`、`list_unread`、`read_messages`、`search_messages`、`query_messages`、`list_members`、`diagnose`。
+
+本机客户端（Claude Desktop、Claude Code、Codex、Cursor）用 stdio，不联网也不需要认证：
+
+```json
+{ "mcpServers": { "tg": { "command": "tg", "args": ["mcp", "stdio"] } } }
+```
+
+远程客户端（例如网页版 ChatGPT）用 HTTP。tg 只监听本机回环或 Tailscale 地址，由你自己的反向代理提供公网 HTTPS，并内置单用户 OAuth：连接时要在 tg 的授权页输入你设定的 owner passphrase。
+
+```bash
+read -rs P; printf '%s\n' "$P" | tg mcp init --public-url https://mcp.example.com \
+  --listen 100.64.0.5:8765 --trusted-proxy 100.64.0.9 --passphrase-stdin; unset P
+tg mcp serve
+```
+
+在 ChatGPT 添加自定义 MCP 服务器时，URL 填 `https://mcp.example.com/mcp`，认证选 OAuth。
+
+- 远程模式默认隐藏你的联系人备注，只返回最近 90 天内的消息，并限制单条文本和单次结果大小；可在 `~/.tg/mcp/config.json` 的 `remote` 里调整，或用 `allow_sessions` / `deny_sessions` 限定会话。
+- `tg mcp status` 查看已连接客户端，`tg mcp revoke --all` 立即吊销全部令牌，`tg mcp audit` 查看调用记录（只记录工具名和参数名，不记录内容或搜索词）。
+- 工具结果会进入远程模型的上下文。只在你信任的客户端里启用远程模式。
+
+设计细节见 [docs/mcp-server-design.md](docs/mcp-server-design.md)。
+
 ## 自定义路径与并行度
 
 读取命令共同支持：
