@@ -71,10 +71,15 @@ pub fn detect_ext(data: &[u8]) -> &'static str {
     }
 }
 
-/// Decrypt a V2 .dat file and write the result to `dest`.
-///
-/// `dest` will be overwritten. On success, returns the detected extension (e.g. "jpg", "png").
-pub fn decrypt_v2_dat(src: &Path, dest: &Path, keys: &MediaKeys) -> Result<&'static str, String> {
+/// Plaintext of a V2 .dat file and the extension detected from its AES section.
+pub struct DecryptedMedia {
+    pub data: Vec<u8>,
+    /// `"tggf"` means `data` still needs [`convert_tggf_to_jpg`] before export.
+    pub ext: &'static str,
+}
+
+/// Decrypt a V2 .dat file in memory.
+pub fn decrypt_v2(src: &Path, keys: &MediaKeys) -> Result<DecryptedMedia, String> {
     let data = fs::read(src).map_err(|e| format!("Read {}: {}", src.display(), e))?;
     if data.len() < 15 {
         return Err(format!(
@@ -121,29 +126,29 @@ pub fn decrypt_v2_dat(src: &Path, dest: &Path, keys: &MediaKeys) -> Result<&'sta
     let xored = &data[xor_start..];
     result.extend(xored.iter().map(|b| b ^ keys.xor_key));
 
-    // Detect extension and write
-    let mut ext = detect_ext(&result[..plaintext_len.min(result.len())]);
-    let output = if ext == "tggf" {
-        let jpg = convert_tggf_to_jpg(&result)?;
-        ext = "jpg";
-        jpg
-    } else {
-        result
-    };
-
-    let parent = dest.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent).map_err(|e| format!("Create dir {}: {}", parent.display(), e))?;
-    fs::write(dest, &output).map_err(|e| format!("Write {}: {}", dest.display(), e))?;
-
-    Ok(ext)
+    let ext = detect_ext(&result[..plaintext_len.min(result.len())]);
+    Ok(DecryptedMedia { data: result, ext })
 }
 
 pub fn convert_tggf_to_jpg(data: &[u8]) -> Result<Vec<u8>, String> {
-    let hevc = find_tggf_hevc_partition(data)
-        .ok_or_else(|| "tggf HEVC partition not found".to_string())?;
+    convert_hevc_to_jpg(tggf_hevc_partition(data)?)
+}
 
-    let ffmpeg = std::env::var("TG_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
-    let mut child = Command::new(&ffmpeg)
+/// Extract the HEVC partition that [`convert_hevc_to_jpg`] turns into a JPEG.
+pub fn tggf_hevc_partition(data: &[u8]) -> Result<&[u8], String> {
+    find_tggf_hevc_partition(data).ok_or_else(|| "tggf HEVC partition not found".to_string())
+}
+
+fn ffmpeg_command() -> Command {
+    Command::new(std::env::var("TG_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string()))
+}
+
+/// Encoder options shared by single and batched conversions; both must stay
+/// identical so a batch produces the same bytes as one process per image.
+const JPEG_OUTPUT_ARGS: [&str; 6] = ["-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg"];
+
+pub fn convert_hevc_to_jpg(hevc: &[u8]) -> Result<Vec<u8>, String> {
+    let mut child = ffmpeg_command()
         .args([
             "-hide_banner",
             "-loglevel",
@@ -152,14 +157,9 @@ pub fn convert_tggf_to_jpg(data: &[u8]) -> Result<Vec<u8>, String> {
             "hevc",
             "-i",
             "pipe:0",
-            "-frames:v",
-            "1",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "pipe:1",
         ])
+        .args(JPEG_OUTPUT_ARGS)
+        .arg("pipe:1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -184,6 +184,57 @@ pub fn convert_tggf_to_jpg(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     Ok(output.stdout)
+}
+
+/// Convert several HEVC partitions with one ffmpeg process.
+///
+/// Process start-up costs about as much CPU as decoding one image, so batching
+/// matters when an export holds hundreds of them. Each input gets its own
+/// decoder and encoder, which yields the same bytes as [`convert_hevc_to_jpg`].
+/// Any failure fails the whole batch; callers convert items one at a time to
+/// learn which one failed and why.
+pub fn convert_hevc_batch_to_jpg(hevcs: &[&[u8]]) -> Result<Vec<Vec<u8>>, String> {
+    // The 0700 directory holds plaintext only until it is dropped.
+    let dir = tempfile::Builder::new()
+        .prefix("tg-hevc-")
+        .tempdir()
+        .map_err(|e| format!("Create temporary HEVC dir: {}", e))?;
+    let mut command = ffmpeg_command();
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    for (index, hevc) in hevcs.iter().enumerate() {
+        let input = dir.path().join(format!("{index}.hevc"));
+        fs::write(&input, hevc).map_err(|e| format!("Write temporary HEVC: {}", e))?;
+        command.args(["-f", "hevc", "-i"]).arg(input);
+    }
+    let outputs: Vec<_> = (0..hevcs.len())
+        .map(|index| dir.path().join(format!("{index}.jpg")))
+        .collect();
+    for (index, output) in outputs.iter().enumerate() {
+        command
+            .args(["-map", &format!("{index}:v")])
+            .args(JPEG_OUTPUT_ARGS)
+            .arg(output);
+    }
+
+    let output = command
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("run ffmpeg for tggf batch: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg tggf batch failed: {}", stderr.trim()));
+    }
+    outputs
+        .iter()
+        .map(|path| {
+            let jpg = fs::read(path).map_err(|e| format!("Read ffmpeg batch output: {}", e))?;
+            if detect_ext(&jpg) == "jpg" {
+                Ok(jpg)
+            } else {
+                Err("ffmpeg tggf output is not JPEG".to_string())
+            }
+        })
+        .collect()
 }
 
 fn find_tggf_hevc_partition(data: &[u8]) -> Option<&[u8]> {

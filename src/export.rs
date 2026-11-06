@@ -343,16 +343,16 @@ pub fn export_messages(
         }
 
         let media_job_count = parallel::job_count(jobs, 8);
-        let media_results = parallel::map_ordered(media_jobs, media_job_count, |job| match job {
+        let prepared = parallel::map_ordered(media_jobs, media_job_count, |job| match job {
             MediaExportJob::Cached {
                 index,
                 src,
                 category,
                 msg_type,
-            } => MediaExportResult {
+            } => (
                 index,
-                is_sticker: false,
-                result: export_media_with_decrypt(
+                false,
+                export_media_with_decrypt(
                     &src,
                     &mdir,
                     &username,
@@ -361,23 +361,43 @@ pub fn export_messages(
                     index,
                     media_keys.as_ref(),
                 ),
-            },
+            ),
             MediaExportJob::Sticker {
                 index,
                 info,
                 cached_source,
-            } => MediaExportResult {
+            } => (
                 index,
-                is_sticker: true,
-                result: export_sticker_info(
-                    &info,
-                    cached_source.as_deref(),
-                    &mdir,
-                    &username,
-                    index,
-                ),
-            },
+                true,
+                export_sticker_info(&info, cached_source.as_deref(), &mdir, &username, index)
+                    .map(CachedMediaExport::Written),
+            ),
         });
+
+        // Pending JPEG slots hold a placeholder until their batch is converted.
+        let mut media_results = Vec::with_capacity(prepared.len());
+        let mut pending_slots = Vec::new();
+        let mut pending_jpegs = Vec::new();
+        for (index, is_sticker, export) in prepared {
+            let result = match export {
+                Ok(CachedMediaExport::Written(path)) => Ok(path),
+                Ok(CachedMediaExport::NeedsJpeg { dest, hevc }) => {
+                    pending_slots.push(media_results.len());
+                    pending_jpegs.push((dest, hevc));
+                    Ok(PathBuf::new())
+                }
+                Err(error) => Err(error),
+            };
+            media_results.push(MediaExportResult {
+                index,
+                is_sticker,
+                result,
+            });
+        }
+        let converted = finish_jpeg_exports(pending_jpegs, media_job_count);
+        for (slot, result) in pending_slots.into_iter().zip(converted) {
+            media_results[slot].result = result;
+        }
 
         let mut skipped_stickers = 0usize;
         let mut first_sticker_error = None;
@@ -891,7 +911,16 @@ fn export_json(path: &Path, messages: &[ExportMessage]) -> Result<(), String> {
         .map_err(|e| format!("Cannot write {}: {}", path.display(), e))
 }
 
+/// A cached media file that is exported, or still needs HEVC-to-JPEG conversion.
+enum CachedMediaExport {
+    Written(PathBuf),
+    NeedsJpeg { dest: PathBuf, hevc: Vec<u8> },
+}
+
 /// Export a media file, decrypting V2 files on the fly.
+///
+/// Packed HEVC images are returned undecoded so the caller can convert many of
+/// them per ffmpeg process.
 fn export_media_with_decrypt(
     src: &Path,
     output_dir: &Path,
@@ -900,27 +929,35 @@ fn export_media_with_decrypt(
     msg_type: i64,
     index: usize,
     media_keys: Option<&crate::media_key::MediaKeys>,
-) -> Result<PathBuf, String> {
+) -> Result<CachedMediaExport, String> {
     let use_decrypt = crate::media_decrypt::file_has_v2_magic(src)?;
 
     if use_decrypt {
         if let Some(keys) = media_keys {
-            // Decrypt directly to a temporary output location, then rename
-            // based on the decrypted payload magic.
+            let decrypted = crate::media_decrypt::decrypt_v2(src, keys)?;
+            let ext = if decrypted.ext == "tggf" {
+                "jpg"
+            } else {
+                decrypted.ext
+            };
             let filename = format!(
-                "{}_{}_{}_{:04}.dat",
+                "{}_{}_{}_{:04}.{}",
                 media::sanitize_filename(session_name),
                 cat_name,
                 msg_type,
-                index
+                index,
+                ext
             );
             let dest = output_dir.join(&filename);
-            let ext = crate::media_decrypt::decrypt_v2_dat(src, &dest, keys)?;
-            // Rename to the correct extension
-            let final_dest = dest.with_extension(ext);
-            std::fs::rename(&dest, &final_dest)
-                .map_err(|e| format!("Rename to .{}: {}", ext, e))?;
-            return Ok(final_dest);
+            std::fs::create_dir_all(output_dir)
+                .map_err(|e| format!("Create dir {}: {}", output_dir.display(), e))?;
+            if decrypted.ext == "tggf" {
+                let hevc = crate::media_decrypt::tggf_hevc_partition(&decrypted.data)?.to_vec();
+                return Ok(CachedMediaExport::NeedsJpeg { dest, hevc });
+            }
+            std::fs::write(&dest, &decrypted.data)
+                .map_err(|e| format!("Write {}: {}", dest.display(), e))?;
+            return Ok(CachedMediaExport::Written(dest));
         }
         // No keys available: fall through to plain copy
     }
@@ -933,6 +970,47 @@ fn export_media_with_decrypt(
         &format!("{}_{}", cat_name, msg_type),
         index,
     )
+    .map(CachedMediaExport::Written)
+}
+
+/// Images per ffmpeg process. Each one keeps a decoder and an encoder alive, so
+/// larger batches trade memory for start-up cost; 64 was slower than 16.
+const JPEG_BATCH_SIZE: usize = 16;
+
+/// Convert pending HEVC images and write each JPEG to its destination.
+fn finish_jpeg_exports(
+    pending: Vec<(PathBuf, Vec<u8>)>,
+    jobs: usize,
+) -> Vec<Result<PathBuf, String>> {
+    let mut batches = Vec::new();
+    let mut pending = pending.into_iter().peekable();
+    while pending.peek().is_some() {
+        batches.push(pending.by_ref().take(JPEG_BATCH_SIZE).collect::<Vec<_>>());
+    }
+    parallel::map_ordered(batches, jobs, |batch| {
+        let hevcs: Vec<&[u8]> = batch.iter().map(|(_, hevc)| hevc.as_slice()).collect();
+        let jpgs = match crate::media_decrypt::convert_hevc_batch_to_jpg(&hevcs) {
+            Ok(jpgs) => jpgs.into_iter().map(Ok).collect(),
+            // Retry one by one so each image reports its own ffmpeg error.
+            Err(_) => hevcs
+                .iter()
+                .map(|hevc| crate::media_decrypt::convert_hevc_to_jpg(hevc))
+                .collect::<Vec<_>>(),
+        };
+        batch
+            .into_iter()
+            .zip(jpgs)
+            .map(|((dest, _), jpg)| {
+                let jpg = jpg?;
+                std::fs::write(&dest, jpg)
+                    .map_err(|e| format!("Write {}: {}", dest.display(), e))?;
+                Ok(dest)
+            })
+            .collect::<Vec<_>>()
+    })
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn export_sticker_info(
@@ -1489,6 +1567,9 @@ mod tests {
             Some(&keys),
         )
         .unwrap();
+        let CachedMediaExport::Written(exported) = exported else {
+            panic!("plain JPEG must not need conversion");
+        };
         assert_eq!(
             exported.extension().and_then(|ext| ext.to_str()),
             Some("jpg")
