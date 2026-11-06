@@ -16,7 +16,7 @@ use crate::source_store::SourceStore;
 use crate::{db, doctor, query, time};
 
 const MAX_SESSIONS: usize = 200;
-const MAX_MESSAGES: usize = 500;
+const MAX_MESSAGES: usize = 2000;
 const MAX_SEARCH_HITS: usize = 100;
 const DAY_SECONDS: i64 = 86_400;
 
@@ -123,15 +123,16 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "read_messages",
             "title": "Read a chat",
-            "description": "Read messages from one chat in chronological order. order=newest (default) returns the latest `limit` messages; order=oldest pages forward from the start with `offset`. For messages before a given time, use query_messages with `session` and `until`.",
+            "description": "Read messages from one chat within an optional [since, until) time range. Messages in each page are always chronological. order=newest (default) takes the latest `limit` messages of the range and `offset` steps back from the end; order=oldest takes the earliest and `offset` steps forward. When the result has `next_offset`, more messages remain: repeat the call with the same session, since, until and order and offset=next_offset. To read a whole period (for example a week), prefer order=oldest with since and until and follow next_offset until it is absent.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session": {"type": "string", "description": "Chat id from list_sessions (preferred) or a display name"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_MESSAGES, "default": 50},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": MAX_MESSAGES, "default": 200},
                     "order": {"type": "string", "enum": ["newest", "oldest"], "default": "newest"},
-                    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Only with order=oldest"},
-                    "since": {"type": "string", "description": time_hint},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Messages to skip, counted from the end of the range for order=newest and from the start for order=oldest. Use the previous result's next_offset."},
+                    "since": {"type": "string", "description": format!("Inclusive start; {time_hint}")},
+                    "until": {"type": "string", "description": format!("Exclusive end; {time_hint}")},
                     "contains": {"type": "string", "description": "Only messages whose text contains this substring"}
                 },
                 "required": ["session"],
@@ -159,7 +160,7 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "query_messages",
             "title": "Filter messages",
-            "description": "Structured message filter across all chats or one chat: keywords to include/exclude, media type, and a time range. Slower than search_messages but exhaustive. Defaults to the recent window unless `since` or `all_time` is given.",
+            "description": "Structured message filter across all chats or one chat: keywords to include/exclude, media type, and a time range. Slower than search_messages but exhaustive. Defaults to the recent window unless `since` or `all_time` is given. When the result has `next_offset`, repeat the same call with offset=next_offset to get the rest. To read every message of one chat in a period, use read_messages instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -269,15 +270,15 @@ fn list_sessions(
 }
 
 fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
-    args.only(&["session", "limit", "order", "offset", "since", "contains"])?;
+    args.only(&[
+        "session", "limit", "order", "offset", "since", "until", "contains",
+    ])?;
     let session = args.required_str("session")?;
-    let limit = args.usize("limit", 50, 1, MAX_MESSAGES)?;
+    let limit = args.usize("limit", 200, 1, MAX_MESSAGES)?;
     let newest = args.choice("order", &["newest", "oldest"], "newest")? == "newest";
     let offset = args.usize("offset", 0, 0, usize::MAX)?;
-    if newest && offset > 0 {
-        return Err("offset requires order=oldest".to_string());
-    }
     let since = ctx.clamp_since(args.time("since")?);
+    let until = args.time("until")?;
     let contains = args.str("contains")?;
     let store = ctx.open_store()?;
     let options = db::ReadMessagesOptions {
@@ -286,6 +287,7 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
         offset,
         search_query: contains,
         since,
+        until,
         tail: newest,
         time_bucket: time::MessageTimeBucket::PerMessage,
         name_mode: ctx.name_mode(),
@@ -313,18 +315,16 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
         "order": if newest { "newest" } else { "oldest" },
         "messages": messages,
     });
-    if !newest && count == limit {
+    if count == limit {
         value["next_offset"] = json!(offset + count);
     }
-    // Newest-first pages keep the latest messages when trimmed.
+    // Trim the messages farthest from the paging origin, so next_offset
+    // continues exactly where the kept ones end.
     let trim = if newest { Trim::Start } else { Trim::End };
     let mut outcome = fit(ctx, value, "messages", trim);
-    if !newest {
-        if let Some(kept) = outcome.value["messages"].as_array().map(Vec::len) {
-            if kept < count {
-                outcome.value["next_offset"] = json!(offset + kept);
-            }
-        }
+    let kept = outcome.value["messages"].as_array().map_or(0, Vec::len);
+    if kept < count {
+        outcome.value["next_offset"] = json!(offset + kept);
     }
     Ok(outcome)
 }
@@ -753,10 +753,14 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.contains("between 1 and 200"), "{error}");
-        let error = call(&ctx, "read_messages", &json!({"session": "a", "offset": 3}))
-            .err()
-            .unwrap();
-        assert_eq!(error, "offset requires order=oldest");
+        let error = call(
+            &ctx,
+            "read_messages",
+            &json!({"session": "a", "limit": 2001}),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("between 1 and 2000"), "{error}");
         assert!(call(&ctx, "drop_tables", &json!({})).is_err());
     }
 

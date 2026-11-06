@@ -487,6 +487,7 @@ fn run(command: Commands) -> Result<(), String> {
                 offset,
                 search_query: search.as_deref(),
                 since: since_ts,
+                until: None,
                 tail: use_tail,
                 time_bucket,
                 name_mode: if anonymous {

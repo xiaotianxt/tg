@@ -92,6 +92,9 @@ pub(crate) struct ReadMessagesOptions<'a> {
     pub offset: usize,
     pub search_query: Option<&'a str>,
     pub since: Option<i64>,
+    /// Exclusive upper bound on `create_time`.
+    pub until: Option<i64>,
+    /// Newest first: `offset` then counts back from the latest message.
     pub tail: bool,
     pub time_bucket: time::MessageTimeBucket,
     pub name_mode: DisplayNameMode,
@@ -794,8 +797,12 @@ pub fn read_messages(
         .since
         .map(|ts| format!(" AND create_time >= {}", ts))
         .unwrap_or_default();
+    let until_clause = options
+        .until
+        .map(|ts| format!(" AND create_time < {}", ts))
+        .unwrap_or_default();
 
-    let query_limit = query_window_limit(options.limit, options.offset, options.tail);
+    let query_limit = query_window_limit(options.limit, options.offset);
     let db_jobs = parallel::job_count(options.jobs, parallel::SOURCE_DB_AUTO_CAP);
     let per_db_messages = parallel::map_ordered(
         message_dbs,
@@ -829,7 +836,7 @@ pub fn read_messages(
             };
             let sql = format!(
             "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col} \
-             FROM {table_name} WHERE create_time > 0{search_clause}{since_clause} ORDER BY {order_col} {order_dir}{limit_clause}",
+             FROM {table_name} WHERE create_time > 0{search_clause}{since_clause}{until_clause} ORDER BY {order_col} {order_dir}{limit_clause}",
             local_id_col = local_id_col,
             body_col = body_col,
             marker_col = marker_col,
@@ -839,6 +846,7 @@ pub fn read_messages(
             order_col = order_col,
             search_clause = search_clause,
             since_clause = since_clause,
+            until_clause = until_clause,
             order_dir = order_dir,
             limit_clause = query_limit
                 .map(|n| format!(" LIMIT {}", n))
@@ -881,24 +889,17 @@ pub fn read_messages(
     if options.tail {
         // Each DB returns its latest rows; merge globally, then reverse for chronological display.
         all_messages.sort_by_key(|row| Reverse(row.create_time));
-        if let Some(limit) = options.limit {
-            all_messages.truncate(limit);
-        }
-        all_messages.reverse();
     } else {
         all_messages.sort_by_key(|row| row.create_time);
     }
-    let messages: Vec<_> = if options.tail {
-        all_messages.iter().collect()
-    } else if let Some(limit) = options.limit {
-        all_messages
-            .iter()
-            .skip(options.offset)
-            .take(limit)
-            .collect()
-    } else {
-        all_messages.iter().skip(options.offset).collect()
-    };
+    let mut messages: Vec<_> = all_messages
+        .iter()
+        .skip(options.offset)
+        .take(options.limit.unwrap_or(usize::MAX))
+        .collect();
+    if options.tail {
+        messages.reverse();
+    }
 
     let mut decoded_messages = Vec::with_capacity(messages.len());
     for row in messages {
@@ -951,12 +952,10 @@ pub fn read_messages(
     })
 }
 
-fn query_window_limit(limit: Option<usize>, offset: usize, tail: bool) -> Option<usize> {
-    if tail {
-        limit
-    } else {
-        limit.and_then(|n| n.checked_add(offset))
-    }
+/// Each shard must return `offset + limit` rows in either direction, because
+/// the page is cut only after shards are merged.
+fn query_window_limit(limit: Option<usize>, offset: usize) -> Option<usize> {
+    limit.and_then(|n| n.checked_add(offset))
 }
 
 pub(crate) fn probe_session(
@@ -2225,6 +2224,7 @@ mod tests {
                 offset: 0,
                 search_query: Some("needle"),
                 since: None,
+                until: None,
                 tail: false,
                 time_bucket: time::MessageTimeBucket::PerMessage,
                 name_mode: DisplayNameMode::PersonalRemark,
@@ -2251,6 +2251,7 @@ mod tests {
                 offset: 0,
                 search_query: Some("%"),
                 since: None,
+                until: None,
                 tail: false,
                 time_bucket: time::MessageTimeBucket::PerMessage,
                 name_mode: DisplayNameMode::PersonalRemark,
@@ -2277,6 +2278,7 @@ mod tests {
                 offset: 0,
                 search_query: Some("needle"),
                 since: Some(1001),
+                until: None,
                 tail: false,
                 time_bucket: time::MessageTimeBucket::PerMessage,
                 name_mode: DisplayNameMode::PersonalRemark,
@@ -2286,6 +2288,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn read_messages_pages_back_from_newest_within_until() {
+        let dir =
+            create_decrypted_dir_with_messages("tgid_page", &["m0", "m1", "m2", "m3", "m4", "m5"]);
+        let store = SourceStore::from_plaintext(dir.path()).unwrap();
+        let page = |tail: bool, offset: usize, until: Option<i64>| {
+            let options = ReadMessagesOptions {
+                session_query: "tgid_page",
+                limit: Some(2),
+                offset,
+                search_query: None,
+                since: None,
+                until,
+                tail,
+                time_bucket: time::MessageTimeBucket::PerMessage,
+                name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
+            };
+            super::read_messages(&store, &options)
+                .unwrap()
+                .messages
+                .into_iter()
+                .map(|message| message.content)
+                .collect::<Vec<_>>()
+        };
+
+        // m5 has create_time 1005 and is excluded by until.
+        assert_eq!(page(true, 0, Some(1005)), ["m3", "m4"]);
+        assert_eq!(page(true, 2, Some(1005)), ["m1", "m2"]);
+        assert_eq!(page(true, 4, Some(1005)), ["m0"]);
+        assert_eq!(page(false, 2, Some(1005)), ["m2", "m3"]);
     }
 
     #[test]

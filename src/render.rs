@@ -380,6 +380,7 @@ mod tests {
             offset: 0,
             search_query: None,
             since: None,
+            until: None,
             tail: true,
             time_bucket: time::MessageTimeBucket::Minute(1),
             name_mode: DisplayNameMode::PersonalRemark,
