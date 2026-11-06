@@ -576,7 +576,8 @@ pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
     let mut search_from = 0;
     let bytes = xml.as_bytes();
 
-    while let Some(relative_start) = xml[search_from..].find(attr) {
+    let finder = memchr::memmem::Finder::new(attr);
+    while let Some(relative_start) = finder.find(&bytes[search_from..]) {
         let start = search_from + relative_start;
         let has_attr_boundary = xml[..start]
             .chars()
@@ -615,21 +616,37 @@ pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
 }
 
 pub(crate) fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    let start = xml.find(&open)?;
-    let value_start = start + open.len();
+    let start = find_wrapped(xml, "<", tag)?;
+    let value_start = start + "<>".len() + tag.len();
     if value_start >= xml.len() {
         return None;
     }
     let rest = &xml[value_start..];
-    let value_end = rest.find(&close)?;
+    let value_end = find_wrapped(rest, "</", tag)?;
     let value = decode_xml_entities(rest[..value_end].trim());
     if value.is_empty() {
         None
     } else {
         Some(value)
     }
+}
+
+/// Offset of the first `{prefix}{tag}>` in `haystack`, found by searching for
+/// `tag` and checking the bytes around each occurrence, so no needle string is
+/// built per lookup. Every occurrence is tried in order, so the first match is
+/// the same one `haystack.find(&format!(...))` would return.
+fn find_wrapped(haystack: &str, prefix: &str, tag: &str) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let finder = memchr::memmem::Finder::new(tag);
+    let mut from = 0;
+    while let Some(relative) = finder.find(bytes.get(from..)?) {
+        let at = from + relative;
+        if bytes[..at].ends_with(prefix.as_bytes()) && bytes.get(at + tag.len()) == Some(&b'>') {
+            return Some(at - prefix.len());
+        }
+        from = at + 1;
+    }
+    None
 }
 
 pub(crate) fn extract_xml_tag_int(xml: &str, tag: &str) -> Option<i64> {
@@ -668,17 +685,115 @@ pub(crate) fn strip_cdata(value: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
+/// Decodes the five predefined entities with the result of chained
+/// `str::replace` calls: `&amp;` first, then `&quot;`, `&apos;`, `&lt;`,
+/// `&gt;` on its output, so `&amp;lt;` becomes `<`.
+///
+/// One left-to-right scan gives the same result. The later four entities hold
+/// a single `&`, at their start, so they cannot overlap each other, and their
+/// replacements contain none of their characters. The only `&` the first pass
+/// creates comes from `&amp;`; a later entity can start there only if the
+/// input continues with that entity's body (`lt;`, ...), which has no `&` and
+/// so passes through the first pass unchanged.
 fn decode_xml_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
+    const LATER: [(&str, char); 4] = [("quot;", '"'), ("apos;", '\''), ("lt;", '<'), ("gt;", '>')];
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    for at in memchr::memchr_iter(b'&', s.as_bytes()) {
+        let mut body = &s[at + 1..];
+        let mut consumed = 1;
+        if let Some(rest) = body.strip_prefix("amp;") {
+            body = rest;
+            consumed += "amp;".len();
+        }
+        let decoded = LATER
+            .iter()
+            .find(|(entity, _)| body.starts_with(entity))
+            .map(|&(entity, text)| (text, consumed + entity.len()));
+        let (text, len) = match decoded {
+            Some(found) => found,
+            None if consumed > 1 => ('&', consumed),
+            None => continue,
+        };
+        out.push_str(&s[copied..at]);
+        out.push(text);
+        copied = at + len;
+    }
+    out.push_str(&s[copied..]);
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_decode_xml_entities_applies_passes_in_order() {
+        assert_eq!(decode_xml_entities("plain 文本"), "plain 文本");
+        assert_eq!(decode_xml_entities("a&amp;b"), "a&b");
+        assert_eq!(decode_xml_entities("&amp;lt;x&amp;gt;"), "<x>");
+        assert_eq!(decode_xml_entities("&amp;amp;"), "&amp;");
+        assert_eq!(decode_xml_entities("&lt;&amp;quot;&gt;"), "<\">");
+        assert_eq!(decode_xml_entities("&apos;&quot;&lt;&gt;&"), "'\"<>&");
+        assert_eq!(decode_xml_entities("&gt&lt;&unknown;"), "&gt<&unknown;");
+        assert_eq!(decode_xml_entities(""), "");
+    }
+
+    #[test]
+    fn test_decode_xml_entities_matches_chained_replace() {
+        fn chained(s: &str) -> String {
+            s.replace("&amp;", "&")
+                .replace("&quot;", "\"")
+                .replace("&apos;", "'")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+        }
+        let pieces = [
+            "&", "amp;", "&amp;", "lt;", "gt;", "quot;", "apos;", "&lt", ";", "a", "文", "<",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..20_000 {
+            let mut input = String::new();
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let mut bits = state;
+            for _ in 0..(bits % 9) {
+                bits /= 9;
+                input.push_str(pieces[(bits % pieces.len() as u64) as usize]);
+                bits /= pieces.len() as u64;
+            }
+            assert_eq!(decode_xml_entities(&input), chained(&input), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn test_find_wrapped_matches_formatted_needle_search() {
+        let inputs = [
+            "",
+            "<a>",
+            "<<a>>",
+            "</a</a>",
+            "<aa><a>",
+            "a><a>",
+            "<a<a>",
+            "<title>文本</title><title>",
+            "<subtype>1</subtype><type>2</type>",
+            "</type><type>",
+        ];
+        for haystack in inputs {
+            for tag in ["a", "aa", "type", "title", ""] {
+                for prefix in ["<", "</"] {
+                    let expected = haystack.find(&format!("{prefix}{tag}>"));
+                    assert_eq!(
+                        find_wrapped(haystack, prefix, tag),
+                        expected,
+                        "{haystack:?} {prefix:?} {tag:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_extract_xml_attr_exact_name_and_empty_value() {

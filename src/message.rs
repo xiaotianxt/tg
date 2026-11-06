@@ -3,6 +3,7 @@ use crate::media;
 use crate::media_pb;
 use crate::time;
 use flate2::read::ZlibDecoder;
+use std::cell::RefCell;
 use std::fmt;
 use std::io::Read;
 
@@ -424,43 +425,57 @@ fn strip_display_prefix(content: &str) -> &str {
     trimmed
 }
 
+/// Markers that open an embedded XML fragment. Each starts with `<` or `&`.
+const XML_START_MARKERS: &[&str] = &[
+    "<?xml",
+    "<msg",
+    "<sysmsg",
+    "&lt;?xml",
+    "&lt;msg",
+    "&lt;sysmsg",
+];
+
+/// Markers that show content still carries raw XML. Each starts with `<` or `&`.
+const XML_CONTENT_MARKERS: &[&str] = &[
+    "<?xml",
+    "<msg",
+    "<appmsg",
+    "<sysmsg",
+    "<recordinfo",
+    "<datalist",
+    "<dataitem",
+    "<img",
+    "<videomsg",
+    "<voicemsg",
+    "<emoji",
+    "<location",
+    "<pushmail",
+    "&lt;?xml",
+    "&lt;msg",
+    "&lt;appmsg",
+    "&lt;sysmsg",
+    "&lt;recordinfo",
+    "&lt;dataitem",
+];
+
+/// Every marker starts with `<` or `&`, so a single pass over those bytes finds
+/// the first offset where any marker matches, the same answer as taking the
+/// minimum of a separate `find` per marker.
+fn first_marker_at(content: &str, needles: &[&str]) -> Option<usize> {
+    let bytes = content.as_bytes();
+    memchr::memchr2_iter(b'<', b'&', bytes).find(|&i| {
+        needles
+            .iter()
+            .any(|needle| bytes[i..].starts_with(needle.as_bytes()))
+    })
+}
+
 fn find_internal_xml_start(content: &str) -> Option<usize> {
-    [
-        "<?xml",
-        "<msg",
-        "<sysmsg",
-        "&lt;?xml",
-        "&lt;msg",
-        "&lt;sysmsg",
-    ]
-    .iter()
-    .filter_map(|needle| content.find(needle))
-    .min()
+    first_marker_at(content, XML_START_MARKERS)
 }
 
 fn contains_internal_xml_marker(content: &str) -> bool {
-    const NEEDLES: &[&str] = &[
-        "<?xml",
-        "<msg",
-        "<appmsg",
-        "<sysmsg",
-        "<recordinfo",
-        "<datalist",
-        "<dataitem",
-        "<img",
-        "<videomsg",
-        "<voicemsg",
-        "<emoji",
-        "<location",
-        "<pushmail",
-        "&lt;?xml",
-        "&lt;msg",
-        "&lt;appmsg",
-        "&lt;sysmsg",
-        "&lt;recordinfo",
-        "&lt;dataitem",
-    ];
-    NEEDLES.iter().any(|needle| content.contains(needle))
+    first_marker_at(content, XML_CONTENT_MARKERS).is_some()
 }
 
 fn sanitize_decoded_content(content: String) -> String {
@@ -1193,15 +1208,35 @@ pub fn try_decompress(raw: &[u8]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+thread_local! {
+    /// One decompression context per thread, reused across messages. Each use
+    /// starts by resetting the session (`Decoder::with_context`), so no state
+    /// or output carries from one message to the next; only the allocation is
+    /// reused.
+    static ZSTD_DCTX: RefCell<Option<zstd::zstd_safe::DCtx<'static>>> =
+        const { RefCell::new(None) };
+}
+
+const ZSTD_RESERVE_CAP: u64 = 1 << 20;
+
 fn try_zstd(data: &[u8]) -> Result<String, ()> {
-    let mut d = zstd::Decoder::new(data).map_err(|_| ())?;
-    let mut s = String::new();
-    d.read_to_string(&mut s).map_err(|_| ())?;
-    if s.is_empty() {
-        Err(())
-    } else {
-        Ok(s)
-    }
+    ZSTD_DCTX.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(zstd::zstd_safe::DCtx::try_create().ok_or(())?);
+        }
+        let context = slot.as_mut().expect("context was just created");
+        // The declared size only sizes the first allocation; it comes from the
+        // input, so it is capped, and decoding still grows the buffer if needed.
+        let declared = zstd::zstd_safe::get_frame_content_size(data)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        let mut out = Vec::with_capacity(declared.min(ZSTD_RESERVE_CAP) as usize);
+        let mut d = zstd::stream::read::Decoder::with_context(data, context);
+        d.read_to_end(&mut out).map_err(|_| ())?;
+        String::from_utf8(out).map_err(|_| ())
+    })
 }
 
 fn try_zlib(data: &[u8]) -> Result<String, ()> {
@@ -1217,26 +1252,21 @@ fn try_zlib(data: &[u8]) -> Result<String, ()> {
 
 /// Parse sender account id from message content.
 pub fn parse_sender_from_content(content: &str) -> (Option<&str>, &str) {
-    let account_prefix = dictionary::account_id_prefix();
-    for (i, c) in content.char_indices() {
-        if c != ':' {
-            continue;
-        }
-        if i == 0 {
-            break;
-        }
-        let prefix = &content[..i];
-        let is_id = prefix.starts_with(account_prefix)
-            || prefix.starts_with("gh_")
-            || prefix
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'@'));
-        if is_id && prefix.len() >= 3 {
-            let after = &content[i + 1..];
-            let after = after.trim_start_matches([' ', '\n']);
-            return (Some(prefix), after);
-        }
-        break;
+    // Only the first `:` is considered; a byte search finds the same offset
+    // as walking chars, since `:` is ASCII.
+    let Some(i) = memchr::memchr(b':', content.as_bytes()).filter(|&i| i > 0) else {
+        return (None, content);
+    };
+    let prefix = &content[..i];
+    let is_id = prefix.starts_with(dictionary::account_id_prefix())
+        || prefix.starts_with("gh_")
+        || prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'@'));
+    if is_id && prefix.len() >= 3 {
+        let after = &content[i + 1..];
+        let after = after.trim_start_matches([' ', '\n']);
+        return (Some(prefix), after);
     }
     (None, content)
 }
@@ -1411,6 +1441,25 @@ mod tests {
         let (id, c) = parse_sender_from_content("plain text");
         assert_eq!(id, None);
         assert_eq!(c, "plain text");
+    }
+
+    #[test]
+    fn test_parse_sender_uses_only_the_first_colon() {
+        for (input, expected) in [
+            ("", (None, "")),
+            (":abc", (None, ":abc")),
+            ("ab:x", (None, "ab:x")),
+            ("a b:c", (None, "a b:c")),
+            ("中文名:x", (None, "中文名:x")),
+            ("文本 abc:def", (None, "文本 abc:def")),
+            ("abc:", (Some("abc"), "")),
+            ("abc: \n \tx:y", (Some("abc"), "\tx:y")),
+            ("gh_x y:z", (Some("gh_x y"), "z")),
+            ("a-b@c:d", (Some("a-b@c"), "d")),
+            ("x y:abc:z", (None, "x y:abc:z")),
+        ] {
+            assert_eq!(parse_sender_from_content(input), expected, "{input:?}");
+        }
     }
 
     #[test]
@@ -1748,5 +1797,131 @@ continues</datadesc></dataitem><dataitem datatype="1" dataid="c"><sourcename>B</
         assert!(d.content.contains("外层回复文本"));
         assert!(!d.content.contains("<msg"));
         assert!(!d.content.contains("<appmsg"));
+    }
+
+    fn zstd_frame(text: &[u8]) -> Vec<u8> {
+        zstd::bulk::compress(text, 3).unwrap()
+    }
+
+    fn skippable_frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x50, 0x2A, 0x4D, 0x18];
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn zlib_stream(text: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(text).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn try_decompress_accepts_zstd_frames() {
+        assert_eq!(
+            try_decompress(&zstd_frame("你好".as_bytes())).as_deref(),
+            Some("你好")
+        );
+        let big = "长消息".repeat(100_000);
+        assert_eq!(try_decompress(&zstd_frame(big.as_bytes())), Some(big));
+
+        let mut two = zstd_frame(b"ab");
+        two.extend(zstd_frame(b"cd"));
+        assert_eq!(try_decompress(&two).as_deref(), Some("abcd"));
+
+        let mut skipped = skippable_frame(b"xyz");
+        skipped.extend(zstd_frame(b"ab"));
+        skipped.extend(skippable_frame(b""));
+        assert_eq!(try_decompress(&skipped).as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn try_decompress_falls_back_for_rejected_zstd() {
+        // A frame whose output is empty, invalid UTF-8, truncated, or followed by
+        // trailing bytes is not zstd text; the raw bytes then decide.
+        assert_eq!(try_decompress(&zstd_frame(b"")), None);
+        // A lone skippable frame decodes to nothing; its bytes happen to be UTF-8.
+        let lone = skippable_frame(b"hi");
+        assert_eq!(try_decompress(&lone), String::from_utf8(lone.clone()).ok());
+        assert_eq!(try_decompress(&zstd_frame(&[0xff, 0xfe])), None);
+
+        let frame = zstd_frame("你好你好你好你好".as_bytes());
+        assert_eq!(try_decompress(&frame[..frame.len() - 1]), None);
+
+        let mut trailing = zstd_frame(b"ab");
+        trailing.extend_from_slice(b"tail");
+        assert_eq!(try_decompress(&trailing), None);
+
+        let mut empty_then_text = zstd_frame(b"");
+        empty_then_text.extend(zstd_frame(b"ok"));
+        assert_eq!(try_decompress(&empty_then_text).as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn try_decompress_reuses_state_after_failures() {
+        let frame = zstd_frame(b"first");
+        assert_eq!(try_decompress(&frame[..frame.len() - 2]), None);
+        assert_eq!(try_decompress(&frame).as_deref(), Some("first"));
+        let mut trailing = zstd_frame(b"x");
+        trailing.push(0x28);
+        assert_eq!(try_decompress(&trailing), None);
+        assert_eq!(
+            try_decompress(&zstd_frame(b"second")).as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn try_decompress_zlib_and_plain_text() {
+        assert_eq!(
+            try_decompress(&zlib_stream("旧版".as_bytes())).as_deref(),
+            Some("旧版")
+        );
+        assert_eq!(try_decompress(&zlib_stream(b"")), None);
+        assert_eq!(try_decompress(b"plain text").as_deref(), Some("plain text"));
+        assert_eq!(
+            try_decompress("纯文本".as_bytes()).as_deref(),
+            Some("纯文本")
+        );
+        assert_eq!(try_decompress(b""), None);
+        assert_eq!(try_decompress(&[0xff, 0x00]), None);
+        // Starts with the zstd magic but is not a frame.
+        assert_eq!(try_decompress(&[0x28, 0xB5, 0x2F, 0xFD]), None);
+        assert_eq!(try_decompress(&[0x28, 0xB5, 0x2F, 0xFD, b'a']), None);
+    }
+
+    #[test]
+    fn internal_xml_markers_match_per_needle_search() {
+        let inputs = [
+            "",
+            "plain 文本",
+            "a < b & c",
+            "前缀 <msg><img/></msg>",
+            "x &lt;msg&gt; y <?xml version",
+            "&amp;lt;sysmsg <sysmsg",
+            "<emoji> then <location",
+            "文本&lt;dataitem",
+            "<<msg",
+            "&&lt;?xml",
+            "<ms",
+            "&lt;",
+        ];
+        for needle in XML_START_MARKERS.iter().chain(XML_CONTENT_MARKERS) {
+            assert!(
+                needle.starts_with('<') || needle.starts_with('&'),
+                "{needle}"
+            );
+        }
+        for input in inputs {
+            let expected_start = XML_START_MARKERS.iter().filter_map(|n| input.find(n)).min();
+            assert_eq!(find_internal_xml_start(input), expected_start, "{input:?}");
+            let expected_marker = XML_CONTENT_MARKERS.iter().any(|n| input.contains(n));
+            assert_eq!(
+                contains_internal_xml_marker(input),
+                expected_marker,
+                "{input:?}"
+            );
+        }
     }
 }
