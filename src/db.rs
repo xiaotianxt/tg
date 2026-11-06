@@ -1045,12 +1045,23 @@ pub fn search_messages(
     store: &SourceStore,
     options: SearchMessagesOptions<'_>,
 ) -> Result<SearchResults, String> {
-    let contact_conn = open_optional_database(store, CONTACT_DB)?;
-    let contacts = match contact_conn.as_ref() {
-        Some(conn) => contact::load_contacts(conn)?,
-        None => HashMap::new(),
-    };
-    let (has_more, rows) = search_messages_with_fts(store, &options)?;
+    // Contacts and the search index are separate databases; read them at
+    // the same time. Contact errors still take precedence, as when serial.
+    let (contacts, fts) = std::thread::scope(|scope| {
+        let contacts = scope.spawn(|| -> Result<_, String> {
+            Ok(match open_optional_database(store, CONTACT_DB)? {
+                Some(conn) => contact::load_contacts(&conn)?,
+                None => HashMap::new(),
+            })
+        });
+        let fts = search_messages_with_fts(store, &options);
+        (
+            contacts.join().expect("contact loader thread panicked"),
+            fts,
+        )
+    });
+    let contacts = contacts?;
+    let (has_more, rows) = fts?;
     let hits = rows
         .into_iter()
         .map(|(local_type, create_time, content, session)| SearchHit {
