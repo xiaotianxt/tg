@@ -668,17 +668,45 @@ pub(crate) fn strip_cdata(value: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
+/// Replaces the five predefined entities one after another, so `&amp;lt;`
+/// becomes `<`. Every pattern starts with `&`, so once no `&` is left the
+/// remaining passes cannot match and are skipped.
 fn decode_xml_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
+    if !s.contains('&') {
+        return s.to_owned();
+    }
+    let mut out = s.replace("&amp;", "&");
+    for (entity, text) in [
+        ("&quot;", "\""),
+        ("&apos;", "'"),
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+    ] {
+        if !out.contains('&') {
+            break;
+        }
+        if out.contains(entity) {
+            out = out.replace(entity, text);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_decode_xml_entities_applies_passes_in_order() {
+        assert_eq!(decode_xml_entities("plain 文本"), "plain 文本");
+        assert_eq!(decode_xml_entities("a&amp;b"), "a&b");
+        assert_eq!(decode_xml_entities("&amp;lt;x&amp;gt;"), "<x>");
+        assert_eq!(decode_xml_entities("&amp;amp;"), "&amp;");
+        assert_eq!(decode_xml_entities("&lt;&amp;quot;&gt;"), "<\">");
+        assert_eq!(decode_xml_entities("&apos;&quot;&lt;&gt;&"), "'\"<>&");
+        assert_eq!(decode_xml_entities("&gt&lt;&unknown;"), "&gt<&unknown;");
+        assert_eq!(decode_xml_entities(""), "");
+    }
 
     #[test]
     fn test_extract_xml_attr_exact_name_and_empty_value() {
