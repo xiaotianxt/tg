@@ -616,21 +616,37 @@ pub(crate) fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
 }
 
 pub(crate) fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    let start = memchr::memmem::find(xml.as_bytes(), open.as_bytes())?;
-    let value_start = start + open.len();
+    let start = find_wrapped(xml, "<", tag)?;
+    let value_start = start + "<>".len() + tag.len();
     if value_start >= xml.len() {
         return None;
     }
     let rest = &xml[value_start..];
-    let value_end = memchr::memmem::find(rest.as_bytes(), close.as_bytes())?;
+    let value_end = find_wrapped(rest, "</", tag)?;
     let value = decode_xml_entities(rest[..value_end].trim());
     if value.is_empty() {
         None
     } else {
         Some(value)
     }
+}
+
+/// Offset of the first `{prefix}{tag}>` in `haystack`, found by searching for
+/// `tag` and checking the bytes around each occurrence, so no needle string is
+/// built per lookup. Every occurrence is tried in order, so the first match is
+/// the same one `haystack.find(&format!(...))` would return.
+fn find_wrapped(haystack: &str, prefix: &str, tag: &str) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let finder = memchr::memmem::Finder::new(tag);
+    let mut from = 0;
+    while let Some(relative) = finder.find(bytes.get(from..)?) {
+        let at = from + relative;
+        if bytes[..at].ends_with(prefix.as_bytes()) && bytes.get(at + tag.len()) == Some(&b'>') {
+            return Some(at - prefix.len());
+        }
+        from = at + 1;
+    }
+    None
 }
 
 pub(crate) fn extract_xml_tag_int(xml: &str, tag: &str) -> Option<i64> {
@@ -748,6 +764,34 @@ mod tests {
                 bits /= pieces.len() as u64;
             }
             assert_eq!(decode_xml_entities(&input), chained(&input), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn test_find_wrapped_matches_formatted_needle_search() {
+        let inputs = [
+            "",
+            "<a>",
+            "<<a>>",
+            "</a</a>",
+            "<aa><a>",
+            "a><a>",
+            "<a<a>",
+            "<title>文本</title><title>",
+            "<subtype>1</subtype><type>2</type>",
+            "</type><type>",
+        ];
+        for haystack in inputs {
+            for tag in ["a", "aa", "type", "title", ""] {
+                for prefix in ["<", "</"] {
+                    let expected = haystack.find(&format!("{prefix}{tag}>"));
+                    assert_eq!(
+                        find_wrapped(haystack, prefix, tag),
+                        expected,
+                        "{haystack:?} {prefix:?} {tag:?}"
+                    );
+                }
+            }
         }
     }
 
