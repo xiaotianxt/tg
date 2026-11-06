@@ -187,7 +187,7 @@ tg mcp serve
 
 在 ChatGPT 添加自定义 MCP 服务器时，URL 填 `https://mcp.example.com/mcp`，认证选 OAuth。
 
-- 远程模式默认隐藏你的联系人备注，只返回最近 90 天内的消息，并限制单条文本和单次结果大小；可在 `~/.tg/mcp/config.json` 的 `remote` 里调整，或用 `allow_sessions` / `deny_sessions` 限定会话。
+- 远程模式默认隐藏你的联系人备注，只返回最近 90 天内的消息，单次结果最多 16 MiB（超出时分页继续）；可在 `~/.tg/mcp/config.json` 的 `remote` 里调整，`max_text_chars` 可选地截断单条长消息，或用 `allow_sessions` / `deny_sessions` 限定会话。
 - `tg mcp status` 查看已连接客户端，`tg mcp revoke --all` 立即吊销全部令牌，`tg mcp audit` 查看调用记录（只记录工具名和参数名，不记录内容或搜索词）。
 - 工具结果会进入远程模型的上下文。只在你信任的客户端里启用远程模式。
 

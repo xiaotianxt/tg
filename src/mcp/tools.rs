@@ -71,7 +71,9 @@ impl ToolContext {
     }
 
     fn text(&self, value: &str) -> Value {
-        let max = self.policy.max_text_chars;
+        let Some(max) = self.policy.max_text_chars else {
+            return Value::String(value.to_string());
+        };
         if value.chars().count() <= max {
             return Value::String(value.to_string());
         }
@@ -820,7 +822,9 @@ mod tests {
     #[test]
     fn long_text_is_capped_by_characters() {
         let mut ctx = ctx(false);
-        ctx.policy.max_text_chars = 3;
+        let long = "x".repeat(10_000);
+        assert_eq!(ctx.text(&long), json!(long));
+        ctx.policy.max_text_chars = Some(3);
         assert_eq!(ctx.text("你好世界"), json!("你好世…[truncated]"));
         assert_eq!(ctx.text("abc"), json!("abc"));
     }

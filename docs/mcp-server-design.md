@@ -197,9 +197,9 @@ Common rules:
 - `name_mode` defaults to `PersonalRemark` locally and to `Anonymous` in remote
   mode, so your private contact remarks are not sent to a remote model unless
   the config turns them back on.
-- Each text field is capped (default 2,000 characters) and each tool result is
-  capped (default 16 MiB of JSON). A capped result sets `truncated: true` and
-  returns `next_offset`.
+- Each tool result is capped (default 16 MiB of JSON). A capped result sets
+  `truncated: true` and returns `next_offset`. Messages are returned whole
+  unless the optional `max_text_chars` is set.
 - No raw XML, no `packed_info_data`, no media bytes, and no source file paths.
   Media appears as `kind` plus a short label such as a file name.
 
@@ -439,8 +439,7 @@ risk of this feature, and the design limits it as follows.
     "deny_sessions": ["tgid_..."],
     "max_lookback_days": 90,
     "show_contact_remarks": false,
-    "max_result_bytes": 16777216,
-    "max_text_chars": 2000
+    "max_result_bytes": 16777216
   },
   "extra_redirect_uris": []
 }

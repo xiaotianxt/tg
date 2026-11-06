@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const DEFAULT_MAX_RESULT_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const DEFAULT_MAX_TEXT_CHARS: usize = 2000;
 pub(crate) const DEFAULT_MAX_LOOKBACK_DAYS: i64 = 90;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +37,9 @@ pub(crate) struct RemotePolicy {
     pub max_lookback_days: i64,
     pub show_contact_remarks: bool,
     pub max_result_bytes: usize,
-    pub max_text_chars: usize,
+    /// Per-message character cap; unset keeps every message whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_text_chars: Option<usize>,
 }
 
 impl Default for RemotePolicy {
@@ -49,7 +50,7 @@ impl Default for RemotePolicy {
             max_lookback_days: DEFAULT_MAX_LOOKBACK_DAYS,
             show_contact_remarks: false,
             max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
-            max_text_chars: DEFAULT_MAX_TEXT_CHARS,
+            max_text_chars: None,
         }
     }
 }
@@ -73,7 +74,7 @@ impl Config {
         if policy.max_lookback_days <= 0 {
             return Err("remote.max_lookback_days must be positive".into());
         }
-        if policy.max_result_bytes < 1024 || policy.max_text_chars == 0 {
+        if policy.max_result_bytes < 1024 || policy.max_text_chars == Some(0) {
             return Err("remote.max_result_bytes must be >= 1024 and max_text_chars > 0".into());
         }
         Ok(())
