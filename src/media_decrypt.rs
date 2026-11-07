@@ -193,6 +193,13 @@ pub fn convert_hevc_to_jpg(hevc: &[u8]) -> Result<Vec<u8>, String> {
 /// decoder and encoder, which yields the same bytes as [`convert_hevc_to_jpg`].
 /// Any failure fails the whole batch; callers convert items one at a time to
 /// learn which one failed and why.
+///
+/// Inputs skip stream probing, which decodes every picture once more than the
+/// conversion needs (about a third of the CPU). Unprobed streams cannot be
+/// picked by automatic stream selection, so each output maps its input
+/// explicitly. The decoder and encoder still configure themselves from the
+/// first decoded frame, so the bytes match the probed single-image path; an
+/// ffmpeg that cannot run unprobed inputs fails the batch and falls back to it.
 pub fn convert_hevc_batch_to_jpg(hevcs: &[&[u8]]) -> Result<Vec<Vec<u8>>, String> {
     // The 0700 directory holds plaintext only until it is dropped.
     let dir = tempfile::Builder::new()
@@ -204,7 +211,9 @@ pub fn convert_hevc_batch_to_jpg(hevcs: &[&[u8]]) -> Result<Vec<Vec<u8>>, String
     for (index, hevc) in hevcs.iter().enumerate() {
         let input = dir.path().join(format!("{index}.hevc"));
         fs::write(&input, hevc).map_err(|e| format!("Write temporary HEVC: {}", e))?;
-        command.args(["-f", "hevc", "-i"]).arg(input);
+        command
+            .args(["-nofind_stream_info", "-f", "hevc", "-i"])
+            .arg(input);
     }
     let outputs: Vec<_> = (0..hevcs.len())
         .map(|index| dir.path().join(format!("{index}.jpg")))
@@ -353,6 +362,47 @@ mod tests {
         assert_eq!(pkcs7_unpad(b"no padding  "), b"no padding  "); // 0x20 != 16
         assert_eq!(pkcs7_unpad(b"hello\x01"), b"hello");
         assert_eq!(pkcs7_unpad(b""), b"");
+    }
+
+    fn encode_test_hevc(size: &str, pix_fmt: &str) -> Option<Vec<u8>> {
+        let output = ffmpeg_command()
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+            ])
+            .args(["-i", &format!("testsrc2=size={size}")])
+            .args(["-frames:v", "1", "-pix_fmt", pix_fmt, "-c:v", "libx265"])
+            .args(["-x265-params", "log-level=none", "-f", "hevc", "pipe:1"])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        (output.status.success() && !output.stdout.is_empty()).then_some(output.stdout)
+    }
+
+    #[test]
+    fn hevc_batch_matches_single_image_conversion() {
+        let cases = [
+            ("64x48", "yuv420p"),
+            ("66x34", "yuvj420p"),
+            ("40x40", "yuv444p"),
+        ];
+        let Some(hevcs) = cases
+            .iter()
+            .map(|(size, pix_fmt)| encode_test_hevc(size, pix_fmt))
+            .collect::<Option<Vec<_>>>()
+        else {
+            eprintln!("skipping: ffmpeg with libx265 is unavailable");
+            return;
+        };
+        let inputs: Vec<&[u8]> = hevcs.iter().map(Vec::as_slice).collect();
+        let batch = convert_hevc_batch_to_jpg(&inputs).unwrap();
+        for (hevc, jpg) in inputs.iter().zip(&batch) {
+            assert_eq!(&convert_hevc_to_jpg(hevc).unwrap(), jpg);
+        }
     }
 
     #[test]
