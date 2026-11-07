@@ -357,6 +357,7 @@ enum CompletionShell {
 }
 
 fn main() {
+    source_store::disable_sqlite_memory_statistics();
     logger::init();
     let cli = Cli::parse_from(normalize_args_for_default_messages(std::env::args_os()));
 
