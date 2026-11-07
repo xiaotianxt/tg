@@ -256,12 +256,6 @@ pub fn export_messages(
     // Export cached media files when local Telegram media cache is available.
     let mut next_index = 1usize;
     if let Some(telegram_base) = media::find_telegram_base_path() {
-        // Derive media decryption keys (V2 .dat)
-        let media_keys = crate::media_key::find_media_keys(&telegram_base);
-        if let Err(ref e) = media_keys {
-            log::warn!("Cannot derive media decryption keys: {}", e);
-        }
-        let media_keys = media_keys.ok();
         let mut index_categories = vec!["Image", "Video"];
         if all_messages.iter().any(is_file_message) {
             index_categories.push("File");
@@ -341,6 +335,19 @@ pub fn export_messages(
                 next_index += 1;
             }
         }
+
+        // Derive media decryption keys (V2 .dat), verified against this export's images and videos.
+        let key_samples = media_jobs.iter().filter_map(|job| match job {
+            MediaExportJob::Cached { src, category, .. } if *category != "File" => {
+                Some(src.as_path())
+            }
+            _ => None,
+        });
+        let media_keys = crate::media_key::find_media_keys(&telegram_base, key_samples);
+        if let Err(ref e) = media_keys {
+            log::warn!("Cannot derive media decryption keys: {}", e);
+        }
+        let media_keys = media_keys.ok();
 
         let media_job_count = parallel::job_count(jobs, 8);
         let prepared = parallel::map_ordered(media_jobs, media_job_count, |job| match job {
