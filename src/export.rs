@@ -130,6 +130,20 @@ pub fn export_messages(
         .get(&username)
         .map(|c| c.display_name(contact::DisplayNameMode::PersonalRemark))
         .unwrap_or(&username);
+    // The cache layout does not depend on the messages, so it is found and
+    // indexed while they are read. File directories are indexed later, and only
+    // when a file message needs them.
+    let media_sources = {
+        let username = username.clone();
+        std::thread::spawn(move || {
+            media::find_telegram_base_path().map(|telegram_base| {
+                let media_keys = crate::media_key::find_media_keys(&telegram_base);
+                let media_index =
+                    MediaIndex::load(&telegram_base, &username, &["Image", "Video"], jobs);
+                (telegram_base, media_keys, media_index)
+            })
+        })
+    };
     let room_member_names = HashMap::new();
     let display_context = MessageDisplayContext {
         chat_name: display_name,
@@ -255,18 +269,18 @@ pub fn export_messages(
 
     // Export cached media files when local Telegram media cache is available.
     let mut next_index = 1usize;
-    if let Some(telegram_base) = media::find_telegram_base_path() {
-        // Derive media decryption keys (V2 .dat)
-        let media_keys = crate::media_key::find_media_keys(&telegram_base);
+    let media_sources = media_sources
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    if let Some((telegram_base, media_keys, media_index)) = media_sources {
         if let Err(ref e) = media_keys {
             log::warn!("Cannot derive media decryption keys: {}", e);
         }
         let media_keys = media_keys.ok();
-        let mut index_categories = vec!["Image", "Video"];
-        if all_messages.iter().any(is_file_message) {
-            index_categories.push("File");
-        }
-        let media_index = MediaIndex::load(&telegram_base, &username, &index_categories, jobs);
+        let file_index = all_messages
+            .iter()
+            .any(is_file_message)
+            .then(|| MediaIndex::load(&telegram_base, &username, &["File"], jobs));
 
         let mut media_jobs = Vec::new();
         let category_map = [("Image", 3), ("Video", 43)];
@@ -331,7 +345,10 @@ pub fn export_messages(
                 continue;
             };
 
-            if let Some(src) = media_index.find("File", &identifier) {
+            if let Some(src) = file_index
+                .as_ref()
+                .and_then(|index| index.find("File", &identifier))
+            {
                 media_jobs.push(MediaExportJob::Cached {
                     index: next_index,
                     src,
