@@ -535,32 +535,57 @@ pub fn list_members(
     store: &SourceStore,
     options: ListMembersOptions<'_>,
 ) -> Result<MemberReport, String> {
-    let contact_conn = store
-        .open(CONTACT_DB)
-        .map_err(|error| format!("Contact database is unavailable: {error}"))?;
-    let contacts = contact::load_contacts(&contact_conn)?;
     let message_dbs = message_databases(store);
-    let username = resolve_username_for_messages(
-        options.session_query,
-        &contacts,
-        store,
-        &message_dbs,
-        options.jobs,
-    )?;
-    if !username.ends_with("@chatroom") {
-        return Err(format!("Not a group session: {username}"));
-    }
-
-    let roster = contact::load_chat_room_roster(&contact_conn, &username)?;
-    if roster.usernames.is_empty() {
-        return Err(format!("No current members found for group: {username}"));
-    }
-    let room_member_names = if options.name_mode == DisplayNameMode::Anonymous {
-        contact::load_chat_room_member_names(&contact_conn, &username)?
-    } else {
-        HashMap::new()
+    let direct_group = direct_session_username(options.session_query)
+        .filter(|username| username.ends_with("@chatroom"));
+    let (username, group, speech) = match direct_group {
+        // A direct group id resolves without contacts, so the contact scan runs
+        // beside the shard scans. Its errors still win, as when it ran first.
+        Some(username) => {
+            let username = username.to_string();
+            let (group, speech) = std::thread::scope(|scope| {
+                let group = scope.spawn(|| load_member_group(store, &username, options.name_mode));
+                let speech = load_member_speech(store, &message_dbs, &username, options.jobs);
+                let group = group
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                (group, speech)
+            });
+            let group = group?;
+            (username, group, speech?)
+        }
+        None => {
+            let contact_conn = store
+                .open(CONTACT_DB)
+                .map_err(|error| format!("Contact database is unavailable: {error}"))?;
+            let contacts = contact::load_contacts(&contact_conn)?;
+            let username = resolve_username_for_messages(
+                options.session_query,
+                &contacts,
+                store,
+                &message_dbs,
+                options.jobs,
+            )?;
+            if !username.ends_with("@chatroom") {
+                return Err(format!("Not a group session: {username}"));
+            }
+            let roster = contact::load_chat_room_roster(&contact_conn, &username)?;
+            let group = finish_member_group(
+                &contact_conn,
+                &username,
+                options.name_mode,
+                contacts,
+                roster,
+            )?;
+            let speech = load_member_speech(store, &message_dbs, &username, options.jobs)?;
+            (username, group, speech)
+        }
     };
-    let speech = load_member_speech(store, &message_dbs, &username, options.jobs)?;
+    let MemberGroup {
+        contacts,
+        roster,
+        room_member_names,
+    } = group;
     let history_start = speech.values().map(|row| row.first_spoke).min();
     let history_end = speech.values().map(|row| row.last_spoke).max();
     let group_display_name = contacts
@@ -608,6 +633,57 @@ pub fn list_members(
         history_end,
         inactive_since: options.inactive_since,
         members,
+    })
+}
+
+/// Contact-side data of a members report.
+struct MemberGroup {
+    contacts: HashMap<String, Contact>,
+    roster: contact::ChatRoomRoster,
+    room_member_names: HashMap<String, String>,
+}
+
+/// Loads the group's roster and the contact rows a members report shows:
+/// the group and its current members.
+fn load_member_group(
+    store: &SourceStore,
+    username: &str,
+    name_mode: DisplayNameMode,
+) -> Result<MemberGroup, String> {
+    let contact_conn = store
+        .open(CONTACT_DB)
+        .map_err(|error| format!("Contact database is unavailable: {error}"))?;
+    // The roster is read first to filter contacts, but a contact error is
+    // reported before a roster error, matching the unfiltered order.
+    let roster = contact::load_chat_room_roster(&contact_conn, username);
+    let members: HashSet<&str> = match &roster {
+        Ok(roster) => roster.usernames.iter().map(String::as_str).collect(),
+        Err(_) => HashSet::new(),
+    };
+    let contacts =
+        contact::load_contacts_where(&contact_conn, |id| id == username || members.contains(id))?;
+    finish_member_group(&contact_conn, username, name_mode, contacts, roster?)
+}
+
+fn finish_member_group(
+    contact_conn: &Connection,
+    username: &str,
+    name_mode: DisplayNameMode,
+    contacts: HashMap<String, Contact>,
+    roster: contact::ChatRoomRoster,
+) -> Result<MemberGroup, String> {
+    if roster.usernames.is_empty() {
+        return Err(format!("No current members found for group: {username}"));
+    }
+    let room_member_names = if name_mode == DisplayNameMode::Anonymous {
+        contact::load_chat_room_member_names(contact_conn, username)?
+    } else {
+        HashMap::new()
+    };
+    Ok(MemberGroup {
+        contacts,
+        roster,
+        room_member_names,
     })
 }
 
@@ -868,19 +944,54 @@ pub fn read_messages(
     options: &ReadMessagesOptions<'_>,
 ) -> Result<MessagePage, String> {
     let message_dbs = message_databases(store);
-    let contact_conn = open_optional_database(store, CONTACT_DB)?;
-    let contacts = match contact_conn.as_ref() {
-        Some(conn) => contact::load_contacts(conn)?,
-        None => HashMap::new(),
-    };
-    let username = resolve_username_for_messages(
-        options.session_query,
-        &contacts,
-        store,
-        &message_dbs,
-        options.jobs,
-    )?;
-    let table_name = msg_table_name(&username);
+    let (username, contacts, room_member_names, all_messages) =
+        match direct_session_username(options.session_query) {
+            // A direct id resolves without contacts, so the contact scan runs
+            // beside the shard reads. Its errors still win, as when it ran first.
+            Some(username) => {
+                let username = username.to_string();
+                let (names, rows) = std::thread::scope(|scope| {
+                    let names = scope.spawn(|| -> Result<_, String> {
+                        let contact_conn = open_optional_database(store, CONTACT_DB)?;
+                        let contacts = match contact_conn.as_ref() {
+                            Some(conn) => contact::load_contacts(conn)?,
+                            None => HashMap::new(),
+                        };
+                        let room_member_names = load_room_member_names(
+                            contact_conn.as_ref(),
+                            &username,
+                            options.name_mode,
+                        )?;
+                        Ok((contacts, room_member_names))
+                    });
+                    let rows = read_session_rows(store, message_dbs, &username, options);
+                    let names = names
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    (names, rows)
+                });
+                let (contacts, room_member_names) = names?;
+                (username, contacts, room_member_names, rows?)
+            }
+            None => {
+                let contact_conn = open_optional_database(store, CONTACT_DB)?;
+                let contacts = match contact_conn.as_ref() {
+                    Some(conn) => contact::load_contacts(conn)?,
+                    None => HashMap::new(),
+                };
+                let username = resolve_username_for_messages(
+                    options.session_query,
+                    &contacts,
+                    store,
+                    &message_dbs,
+                    options.jobs,
+                )?;
+                let room_member_names =
+                    load_room_member_names(contact_conn.as_ref(), &username, options.name_mode)?;
+                let rows = read_session_rows(store, message_dbs, &username, options)?;
+                (username, contacts, room_member_names, rows)
+            }
+        };
 
     let display_name = contacts
         .get(&username)
@@ -888,15 +999,88 @@ pub fn read_messages(
         .unwrap_or(&username)
         .to_string();
 
-    let room_member_names = if options.name_mode == DisplayNameMode::Anonymous {
-        match contact_conn.as_ref() {
-            Some(conn) => contact::load_chat_room_member_names(conn, &username)?,
-            None => HashMap::new(),
-        }
-    } else {
-        HashMap::new()
-    };
+    let mut messages: Vec<_> = all_messages
+        .iter()
+        .skip(options.offset)
+        .take(options.limit.unwrap_or(usize::MAX))
+        .collect();
+    if options.tail {
+        messages.reverse();
+    }
 
+    let mut decoded_messages = Vec::with_capacity(messages.len());
+    for row in messages {
+        // 1-on-1 chat: if the sender is not the chat partner, it's "me"
+        let sender_display =
+            if row.sender_account_id.is_empty() || row.sender_account_id == username {
+                display_name.as_str()
+            } else {
+                "我"
+            };
+
+        let voice_id = if row.local_type == 34 {
+            row.local_id.filter(|id| *id > 0)
+        } else {
+            None
+        };
+        let decoded = message::decode_message_with_context(
+            row.local_type as i32,
+            &row.content,
+            sender_display,
+            row.compression_marker,
+            &row.packed_info,
+            message::DecodeContext {
+                time_bucket: options.time_bucket,
+                voice_id,
+            },
+            |id| {
+                contact::resolve_sender_name_with_mode(
+                    id,
+                    &contacts,
+                    options.name_mode,
+                    &room_member_names,
+                )
+            },
+        );
+
+        decoded_messages.push(ChatMessage {
+            local_id: row.local_id,
+            local_type: row.local_type,
+            create_time: row.create_time,
+            sender: decoded.display_name,
+            content: decoded.content,
+        });
+    }
+
+    Ok(MessagePage {
+        username,
+        display_name,
+        messages: decoded_messages,
+    })
+}
+
+fn load_room_member_names(
+    contact_conn: Option<&Connection>,
+    username: &str,
+    name_mode: DisplayNameMode,
+) -> Result<HashMap<String, String>, String> {
+    match contact_conn {
+        Some(conn) if name_mode == DisplayNameMode::Anonymous => {
+            contact::load_chat_room_member_names(conn, username)
+        }
+        _ => Ok(HashMap::new()),
+    }
+}
+
+/// Every shard's rows of one session, merged by `create_time` in display
+/// direction but not yet cut to the requested page.
+fn read_session_rows(
+    store: &SourceStore,
+    message_dbs: Vec<String>,
+    username: &str,
+    options: &ReadMessagesOptions<'_>,
+) -> Result<Vec<MessageRow>, String> {
+    let table_name = msg_table_name(username);
     let search_pattern = options.search_query.map(like_contains_pattern);
     let search_clause = options
         .search_query
@@ -1010,64 +1194,7 @@ pub fn read_messages(
     } else {
         all_messages.sort_by_key(|row| row.create_time);
     }
-    let mut messages: Vec<_> = all_messages
-        .iter()
-        .skip(options.offset)
-        .take(options.limit.unwrap_or(usize::MAX))
-        .collect();
-    if options.tail {
-        messages.reverse();
-    }
-
-    let mut decoded_messages = Vec::with_capacity(messages.len());
-    for row in messages {
-        // 1-on-1 chat: if the sender is not the chat partner, it's "me"
-        let sender_display =
-            if row.sender_account_id.is_empty() || row.sender_account_id == username {
-                display_name.as_str()
-            } else {
-                "我"
-            };
-
-        let voice_id = if row.local_type == 34 {
-            row.local_id.filter(|id| *id > 0)
-        } else {
-            None
-        };
-        let decoded = message::decode_message_with_context(
-            row.local_type as i32,
-            &row.content,
-            sender_display,
-            row.compression_marker,
-            &row.packed_info,
-            message::DecodeContext {
-                time_bucket: options.time_bucket,
-                voice_id,
-            },
-            |id| {
-                contact::resolve_sender_name_with_mode(
-                    id,
-                    &contacts,
-                    options.name_mode,
-                    &room_member_names,
-                )
-            },
-        );
-
-        decoded_messages.push(ChatMessage {
-            local_id: row.local_id,
-            local_type: row.local_type,
-            create_time: row.create_time,
-            sender: decoded.display_name,
-            content: decoded.content,
-        });
-    }
-
-    Ok(MessagePage {
-        username,
-        display_name,
-        messages: decoded_messages,
-    })
+    Ok(all_messages)
 }
 
 /// Each shard must return `offset + limit` rows in either direction, because
@@ -2375,6 +2502,25 @@ mod tests {
         assert_eq!(members[0].last_spoke, None);
         assert_eq!(members[1].last_spoke, Some(100));
         assert_eq!(members[1].message_count, 1);
+
+        // A direct id loads only the group's and members' contact rows beside
+        // the shard scan; the report must match the name path's full load.
+        for name_mode in [DisplayNameMode::PersonalRemark, DisplayNameMode::Anonymous] {
+            let report = |session_query| {
+                let report = super::list_members(
+                    &store,
+                    ListMembersOptions {
+                        session_query,
+                        inactive_since: None,
+                        name_mode,
+                        jobs: 2,
+                    },
+                )
+                .unwrap();
+                serde_json::to_value(report).unwrap()
+            };
+            assert_eq!(report("room@chatroom"), report("Study Group"));
+        }
     }
 
     #[test]
