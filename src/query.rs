@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io::Write;
 #[cfg(test)]
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::source_store::SourceStore;
 use crate::{contact, db, dictionary, media, message, output, parallel};
@@ -229,16 +230,8 @@ pub(crate) fn query_messages(options: &QueryOptions<'_>) -> Result<Vec<MessageRo
         return Err("No message databases found in the source directory.".to_string());
     }
 
-    let db_jobs = parallel::job_count(options.jobs, parallel::SOURCE_DB_AUTO_CAP);
-    let per_db_rows = parallel::map_ordered(context.targets.clone(), db_jobs, |target| {
-        query_message_target(options.store, &target, &context, options)
-    });
-
-    let mut rows = Vec::new();
-    for db_rows in per_db_rows {
-        let db_rows = db_rows?;
-        rows.extend(db_rows);
-    }
+    let jobs = parallel::job_count(options.jobs, parallel::QUERY_SCAN_AUTO_CAP);
+    let mut rows = scan_message_tables(options, &context, jobs)?;
 
     sort_message_rows(&mut rows, options.sort);
     Ok(rows
@@ -409,12 +402,177 @@ fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryConte
     })
 }
 
-fn query_message_target(
+/// A message table and what is needed to read it, found once per shard.
+struct TablePlan {
+    name: String,
+    schema: db::MessageTableSchema,
+    session: String,
+    session_id: String,
+    /// Inclusive rowid bounds, or `None` for an empty table.
+    rowids: Option<(i64, i64)>,
+}
+
+struct ShardPlan {
+    label: String,
+    tables: Vec<TablePlan>,
+    name2id: HashMap<i64, String>,
+}
+
+/// Half-open rowid range `[start, end)`; a missing bound is unbounded, so the
+/// first and last chunk of a table also cover rows outside the planned bounds.
+#[derive(Clone, Copy)]
+struct RowidRange {
+    start: Option<i64>,
+    end: Option<i64>,
+}
+
+/// A table, or a rowid range of one.
+struct ScanPart {
+    table: usize,
+    range: RowidRange,
+}
+
+/// One unit of reader work: consecutive parts of one shard, read in order on
+/// one connection.
+struct ScanTask {
+    shard: usize,
+    parts: Vec<ScanPart>,
+    weight: i128,
+}
+
+type ScannedRows = Vec<(db::MessageOrderKey, CandidateRow)>;
+
+/// Smallest rowid range worth its own reader; smaller tables are read whole.
+const MIN_SCAN_CHUNK_ROWS: i128 = 4096;
+
+/// Ranges per reader at most, so readers that finish early find more work.
+const SCAN_CHUNKS_PER_READER: i128 = 4;
+
+/// Reads every selected table with `jobs` readers and returns the rows in
+/// shard, table, message order, each table cut to the result window.
+///
+/// Tables read in full are split into rowid ranges so one large shard or chat
+/// does not leave the other readers idle. Ranges are exact: each row belongs to
+/// exactly one range, and a table's ranges are merged and sorted by their
+/// unique (order column, rowid) key before the window is cut, as one read of
+/// the whole table would be. Each reader holds its own connection, so each has
+/// its own read snapshot of the shard, as separate shards already do.
+fn scan_message_tables(
+    options: &QueryOptions<'_>,
+    context: &MessageQueryContext,
+    jobs: usize,
+) -> Result<Vec<CandidateRow>, String> {
+    let planned = parallel::map_ordered(context.targets.clone(), jobs, |target| {
+        plan_message_shard(options.store, &target, context)
+    });
+    let mut plans = Vec::with_capacity(planned.len());
+    let mut pools = Vec::with_capacity(planned.len());
+    for result in planned {
+        match result {
+            Ok((plan, conn)) => {
+                plans.push(Ok(plan));
+                pools.push(Mutex::new(vec![conn]));
+            }
+            Err(error) => {
+                plans.push(Err(error));
+                pools.push(Mutex::new(Vec::new()));
+            }
+        }
+    }
+
+    let tasks = plan_scan_tasks(&plans, jobs, query_reads_whole_tables(options)?);
+    let mut schedule: Vec<usize> = (0..tasks.len()).collect();
+    // Largest first, so the long reads start early and short ones fill the gaps.
+    schedule.sort_by_key(|&index| Reverse(tasks[index].weight));
+
+    let scanned = parallel::map_ordered(schedule.clone(), jobs, |index| {
+        let task = &tasks[index];
+        let plan = plans[task.shard]
+            .as_ref()
+            .expect("scan tasks come only from planned shards");
+        let pooled = pools[task.shard]
+            .lock()
+            .expect("connection pool lock is never poisoned")
+            .pop();
+        let conn = match pooled {
+            Some(conn) => conn,
+            None => match options.store.open(&plan.label) {
+                Ok(conn) => conn,
+                Err(error) => return vec![Err(error)],
+            },
+        };
+        let mut results = Vec::with_capacity(task.parts.len());
+        for part in &task.parts {
+            let result = query_message_table(
+                &conn,
+                plan,
+                &plan.tables[part.table],
+                part.range,
+                context,
+                options,
+            );
+            let failed = result.is_err();
+            results.push(result);
+            // Later parts are never reached: the merge stops at this error.
+            if failed {
+                break;
+            }
+        }
+        pools[task.shard]
+            .lock()
+            .expect("connection pool lock is never poisoned")
+            .push(conn);
+        results
+    });
+    let mut by_task: Vec<Vec<Result<ScannedRows, String>>> =
+        (0..tasks.len()).map(|_| Vec::new()).collect();
+    for (index, results) in schedule.into_iter().zip(scanned) {
+        by_task[index] = results;
+    }
+
+    // Tasks and their parts are in shard, table, range order, so errors
+    // surface in the order a sequential read would hit them.
+    let result_window = message_query_window(options)?;
+    let mut parts = tasks
+        .iter()
+        .zip(by_task)
+        .flat_map(|(task, results)| {
+            let shard = task.shard;
+            let mut results = results.into_iter();
+            task.parts
+                .iter()
+                .map(move |part| (shard, part.table, results.next()))
+        })
+        .peekable();
+    let mut rows = Vec::new();
+    let mut table_rows: ScannedRows = Vec::new();
+    for (shard, plan) in plans.iter().enumerate() {
+        plan.as_ref().map_err(String::clone)?;
+        while let Some((_, table, result)) = parts.next_if(|(part_shard, ..)| *part_shard == shard)
+        {
+            table_rows.append(&mut result.expect("a task stops only after a failed part")?);
+            let table_done = parts.peek().is_none_or(|(next_shard, next_table, _)| {
+                (*next_shard, *next_table) != (shard, table)
+            });
+            if table_done {
+                db::sort_in_message_order(&mut table_rows, options.sort == QuerySort::Newest);
+                rows.extend(
+                    table_rows
+                        .drain(..)
+                        .take(result_window.unwrap_or(usize::MAX))
+                        .map(|(_, row)| row),
+                );
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn plan_message_shard(
     store: &SourceStore,
     target: &QueryTarget,
     context: &MessageQueryContext,
-    options: &QueryOptions<'_>,
-) -> Result<Vec<CandidateRow>, String> {
+) -> Result<(ShardPlan, Connection), String> {
     let conn = store.open(&target.label)?;
     let tables = match &context.selected_table {
         Some(table) => db::message_table_schema(&conn, table)?
@@ -423,26 +581,155 @@ fn query_message_target(
             .collect(),
         None => db::message_table_schemas(&conn)?,
     };
-
     let name2id = db::load_name2id(&conn)?;
-    let mut rows = Vec::new();
-    for (table, schema) in tables {
-        let mut table_rows =
-            query_message_table(&conn, target, &table, schema, &name2id, context, options)?;
-        rows.append(&mut table_rows);
+
+    let mut planned = Vec::with_capacity(tables.len());
+    for (name, schema) in tables {
+        let quoted = db::quote_identifier(&name);
+        // Two subqueries, because SQLite answers a lone min() or max() of the
+        // rowid from the b-tree edge but scans the table for both together.
+        let rowids = conn
+            .query_row(
+                &format!(
+                    "SELECT (SELECT min(rowid) FROM {quoted}), (SELECT max(rowid) FROM {quoted})"
+                ),
+                [],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .map_err(|e| format!("Message rowid bounds in {}: {}", target.label, e))?;
+        let session_id = context
+            .table_to_session
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| name.clone());
+        let session = context
+            .table_to_display
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| session_id.clone());
+        planned.push(TablePlan {
+            name,
+            schema,
+            session,
+            session_id,
+            rowids: match rowids {
+                (Some(min), Some(max)) => Some((min, max)),
+                _ => None,
+            },
+        });
     }
-    Ok(rows)
+    let plan = ShardPlan {
+        label: target.label.clone(),
+        tables: planned,
+        name2id,
+    };
+    Ok((plan, conn))
+}
+
+/// True when tables are read in full and sorted afterwards; false when a
+/// pushed-down LIMIT lets the index walk stop early.
+fn query_reads_whole_tables(options: &QueryOptions<'_>) -> Result<bool, String> {
+    Ok(message_query_window(options)?.is_none() || query_needs_post_filtering(options))
+}
+
+/// Scan tasks in shard, table, range order. With `splits`, tables larger than
+/// one chunk become contiguous rowid ranges sized to give each reader several,
+/// and smaller tables of a shard are packed together up to one chunk, so a
+/// small shard is not opened by several readers.
+fn plan_scan_tasks(
+    plans: &[Result<ShardPlan, String>],
+    jobs: usize,
+    splits: bool,
+) -> Vec<ScanTask> {
+    // i128 holds any rowid span; rowids may be sparse, so a span only
+    // estimates the row count and the parts per table are capped.
+    let span = |table: &TablePlan| {
+        table
+            .rowids
+            .map_or(0, |(min, max)| i128::from(max) - i128::from(min) + 1)
+    };
+    let total: i128 = plans
+        .iter()
+        .flatten()
+        .flat_map(|plan| &plan.tables)
+        .map(span)
+        .sum();
+    let max_parts =
+        i128::try_from(jobs.max(1)).expect("job count fits in i128") * SCAN_CHUNKS_PER_READER;
+    let chunk = (total / max_parts).max(MIN_SCAN_CHUNK_ROWS);
+
+    let mut tasks = Vec::new();
+    for (shard, plan) in plans.iter().enumerate() {
+        let Ok(plan) = plan else { continue };
+        let mut packed = Vec::new();
+        let mut packed_rows = 0;
+        for (table, table_plan) in plan.tables.iter().enumerate() {
+            let rows = span(table_plan);
+            let split = splits && rows > chunk;
+            if !packed.is_empty() && (split || packed_rows + rows > chunk) {
+                tasks.push(ScanTask {
+                    shard,
+                    parts: std::mem::take(&mut packed),
+                    weight: std::mem::take(&mut packed_rows),
+                });
+            }
+            if !split {
+                packed.push(ScanPart {
+                    table,
+                    range: RowidRange {
+                        start: None,
+                        end: None,
+                    },
+                });
+                packed_rows += rows;
+                continue;
+            }
+            let (min, max) = table_plan
+                .rowids
+                .expect("a table with rows has rowid bounds");
+            let parts = ((rows + chunk - 1) / chunk).min(max_parts);
+            let part_rows = (rows + parts - 1) / parts;
+            // Bounds never decrease, so the ranges stay disjoint and together
+            // cover every rowid; clamping to `max` keeps each one a rowid.
+            let bound = |part: i128| {
+                let bound = (i128::from(min) + part * part_rows).min(i128::from(max));
+                i64::try_from(bound).expect("a bound clamped to max is a rowid")
+            };
+            for part in 0..parts {
+                tasks.push(ScanTask {
+                    shard,
+                    parts: vec![ScanPart {
+                        table,
+                        range: RowidRange {
+                            start: (part > 0).then(|| bound(part)),
+                            end: (part + 1 < parts).then(|| bound(part + 1)),
+                        },
+                    }],
+                    weight: part_rows.min(rows - part * part_rows),
+                });
+            }
+        }
+        if !packed.is_empty() {
+            tasks.push(ScanTask {
+                shard,
+                parts: packed,
+                weight: packed_rows,
+            });
+        }
+    }
+    tasks
 }
 
 fn query_message_table(
     conn: &Connection,
-    target: &QueryTarget,
-    table: &str,
-    schema: db::MessageTableSchema,
-    name2id: &HashMap<i64, String>,
+    shard: &ShardPlan,
+    table: &TablePlan,
+    range: RowidRange,
     context: &MessageQueryContext,
     options: &QueryOptions<'_>,
-) -> Result<Vec<CandidateRow>, String> {
+) -> Result<ScannedRows, String> {
+    let schema = table.schema;
+    let name2id = &shard.name2id;
     let body_col = db::quote_identifier(dictionary::msg_body_column());
     let marker_col = db::quote_identifier(dictionary::msg_compression_marker_column());
     let sender_col = db::quote_identifier(dictionary::msg_sender_column());
@@ -461,7 +748,7 @@ fn query_message_table(
     } else {
         "create_time"
     };
-    let quoted_table = db::quote_identifier(table);
+    let quoted_table = db::quote_identifier(&table.name);
     let result_window = message_query_window(options)?;
 
     let mut clauses = vec!["create_time > 0".to_string()];
@@ -473,6 +760,14 @@ fn query_message_table(
     if let Some(until) = options.until {
         clauses.push("create_time <= ?".to_string());
         params.push(Value::Integer(until));
+    }
+    if let Some(start) = range.start {
+        clauses.push("rowid >= ?".to_string());
+        params.push(Value::Integer(start));
+    }
+    if let Some(end) = range.end {
+        clauses.push("rowid < ?".to_string());
+        params.push(Value::Integer(end));
     }
 
     if !options.raw_contains.is_empty() {
@@ -524,24 +819,15 @@ fn query_message_table(
         order_clause = order_clause,
     );
 
-    let session_id = context
-        .table_to_session
-        .get(table)
-        .cloned()
-        .unwrap_or_else(|| table.to_string());
-    let session = context
-        .table_to_display
-        .get(table)
-        .cloned()
-        .unwrap_or_else(|| session_id.clone());
-
+    let session = &table.session;
+    let session_id = &table.session_id;
     let mut stmt = conn
         .prepare(&sql)
-        .map_err(|e| format!("Message query prepare error in {}: {}", target.label, e))?;
+        .map_err(|e| format!("Message query prepare error in {}: {}", shard.label, e))?;
     let mut result = stmt
         .query(params_from_iter(params.iter()))
-        .map_err(|e| format!("Message query error in {}: {}", target.label, e))?;
-    let read_error = |error| format!("Read message rows in {}: {error}", target.label);
+        .map_err(|e| format!("Message query error in {}: {}", shard.label, e))?;
+    let read_error = |error| format!("Read message rows in {}: {error}", shard.label);
     // Filter while streaming so rejected rows are never materialized, and test
     // the media filter, which needs only the raw row, before decoding the body.
     // Without a body filter, decoding waits for the final window.
@@ -571,7 +857,7 @@ fn query_message_table(
                 marker,
                 &packed_info,
                 Some(local_id),
-                &session,
+                session,
                 &context.sender_display,
             );
             if !message_body_matches_filters(&body, options) {
@@ -610,13 +896,7 @@ fn query_message_table(
             },
         ));
     }
-    drop(result);
-    db::sort_in_message_order(&mut rows, options.sort == QuerySort::Newest);
-    Ok(rows
-        .into_iter()
-        .take(result_window.unwrap_or(usize::MAX))
-        .map(|(_, row)| row)
-        .collect())
+    Ok(rows)
 }
 
 fn display_sender(sender_account: &str, context: &MessageQueryContext) -> String {
@@ -1324,6 +1604,109 @@ mod tests {
                     .map(|row| row.body)
                     .collect();
                 assert_eq!(got, expected, "{sort:?} since={since:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn message_query_split_tables_match_whole_table_reads() {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let conn = Connection::open(message_dir.join("message_0.db")).unwrap();
+        let marker_col = dictionary::msg_compression_marker_column();
+        let packed_col = dictionary::msg_packed_meta_column();
+        // Small tables before and after a large one, so packed and split
+        // tasks interleave in the table order.
+        let tables = [
+            ("Msg_a", 300),
+            ("Msg_b", 3 * MIN_SCAN_CHUNK_ROWS as i64 + 123),
+            ("Msg_c", 200),
+        ];
+        let mut seed = 0x2545_f491_u64;
+        let mut next = move |modulo: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % modulo
+        };
+        for (table, rows) in tables {
+            conn.execute_batch(&format!(
+                "CREATE TABLE {table} (
+                    local_id INTEGER PRIMARY KEY AUTOINCREMENT, local_type INTEGER,
+                    sort_seq INTEGER, create_time INTEGER, message_content TEXT,
+                    {marker_col} INTEGER, real_sender_id INTEGER, {packed_col} BLOB);
+                 CREATE INDEX {table}_SORTSEQ ON {table}(sort_seq);"
+            ))
+            .unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            for id in 1..=rows {
+                // Few distinct create_times and repeated or NULL sort_seqs, so
+                // ties decide much of the order.
+                let sort_seq = (next(10) != 0).then(|| next(rows as u64 / 4) as i64);
+                let body = if next(3) == 0 { "miss" } else { "hit" };
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {table} (local_id, local_type, sort_seq, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
+                         VALUES (?1, 1, ?2, ?3, ?4, NULL, 0, x'')"
+                    ),
+                    params![id, sort_seq, 1000 + next(40) as i64, format!("{body} {table} {id}")],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let contains = ["hit".to_string()];
+        // Unlimited compares every row; the window also cuts each table early.
+        let windows = [(None, 0), (Some(700), 150)];
+        for (sort, (limit, offset)) in [QuerySort::Newest, QuerySort::Oldest]
+            .into_iter()
+            .flat_map(|sort| windows.map(|window| (sort, window)))
+        {
+            let window = limit.map_or(String::new(), |limit: usize| {
+                format!(" LIMIT {}", limit + offset)
+            });
+            // Each table cut to the window in sort_seq order, then a stable
+            // global sort on create_time, as a sequential whole-table read does.
+            let mut expected: Vec<(i64, String)> = Vec::new();
+            for (table, _) in tables {
+                let dir = sort.order_dir();
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT create_time, message_content FROM {table} \
+                         WHERE message_content LIKE 'hit%' \
+                         ORDER BY sort_seq {dir}, rowid {dir}{window}"
+                    ))
+                    .unwrap();
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap();
+                expected.extend(rows.map(Result::unwrap));
+            }
+            match sort {
+                QuerySort::Newest => expected.sort_by_key(|(time, _)| Reverse(*time)),
+                QuerySort::Oldest => expected.sort_by_key(|(time, _)| *time),
+            }
+            let expected: Vec<String> = expected
+                .into_iter()
+                .skip(offset)
+                .take(limit.unwrap_or(usize::MAX))
+                .map(|(_, body)| body)
+                .collect();
+
+            for jobs in [1, 3, 8] {
+                let mut options = default_query_options(dir.path(), &contains, &[]);
+                options.sort = sort;
+                options.limit = limit;
+                options.offset = offset;
+                options.jobs = jobs;
+                let got: Vec<String> = query_messages(&options)
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.body)
+                    .collect();
+                assert_eq!(got, expected, "{sort:?} {limit:?} jobs={jobs}");
             }
         }
     }
