@@ -192,6 +192,7 @@ clients that ignore structured output.
 | `search_messages` | `db::search_messages` | `query`, `since?` (default recent window), `offset?` | Every hit, newest first; upstream FTS; errors point to `query_messages` if the FTS DB is missing |
 | `query_messages` | `query::run` | `session?`, `contains[]`, `not_contains[]`, `match` (`all`/`any`), `has[]` (media types), `since?`, `until?`, `order`, `offset?` | Every match; no raw-body fields over MCP |
 | `list_members` | `db::list_members` / `list_member_friends` | `session`, `inactive_since?`, `friends_only` | |
+| `get_media` | `media_fetch::MediaCache` | `session`, `ids[]` (1–10 cache ids), `size` (`preview`/`original`) | MCP `image` blocks; off in remote mode unless `allow_media` |
 | `diagnose` | `doctor::run` | `session?` | Paths are redacted in remote mode |
 
 No tool takes a page size. Each returns its whole result; only a result over
@@ -208,10 +209,33 @@ Common rules:
 - Each tool result is capped (default 16 MiB of JSON). A capped result sets
   `truncated: true` and returns `next_offset`. Messages are returned whole
   unless the optional `max_text_chars` is set.
-- No raw XML, no `packed_info_data`, no media bytes, and no source file paths.
-  Media appears as `kind` plus a short label such as a file name.
+- No raw XML, no `packed_info_data`, and no source file paths. Message tools
+  show media as a short label; images and videos carry their 32-hex cache id
+  (`[img:<id>]`, `[视频 WxH <id>]`), and only `get_media` returns image bytes.
 
-Not included: a raw SQL tool, media download, and anything that writes.
+Not included: a raw SQL tool, files, video or voice bytes, and anything that
+writes.
+
+### Media
+
+`get_media` returns one MCP `image` block per id, each preceded by a text block
+naming the id and which cached copy was used. Lookup goes by cache name, not by
+message row: images under the chat's own `msg/attach/<md5(chat)>/<YYYY-MM>/Img`
+(`<id>.dat` standard, `_t` thumbnail, `_h` full resolution, decrypted like
+`export`), video covers under the shared `msg/video/<YYYY-MM>`. `preview` uses
+the standard copy and falls back to the thumbnail; `original` prefers the
+full-resolution copy. Ids must be 32 lowercase hex characters, so no argument
+reaches a path. An id that was never downloaded is reported as text; the call
+still succeeds for the others.
+
+Voice is not sent as audio: models take text, and the transcript already shows
+the client's own voice-to-text when it exists. Video and files stay metadata
+only.
+
+In remote mode `get_media` requires `remote.allow_media` (default off), obeys
+the session lists, and applies the lookback by whole cache month. The per-call
+byte cap counts base64 image data; an image that does not fit is named in the
+result instead of sent.
 
 ## Protocol details
 
@@ -447,7 +471,8 @@ risk of this feature, and the design limits it as follows.
     "deny_sessions": ["tgid_..."],
     "max_lookback_days": 90,
     "show_contact_remarks": false,
-    "max_result_bytes": 16777216
+    "max_result_bytes": 16777216,
+    "allow_media": false
   },
   "extra_redirect_uris": []
 }

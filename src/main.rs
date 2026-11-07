@@ -12,6 +12,7 @@ mod logger;
 mod mcp;
 mod media;
 mod media_decrypt;
+mod media_fetch;
 mod media_index;
 mod media_key;
 mod media_pb;

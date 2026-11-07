@@ -171,6 +171,8 @@ exported/zhangsan/media/
 
 `tg mcp` 把只读命令暴露成 MCP 工具：`list_sessions`、`list_unread`、`read_messages`、`search_messages`、`query_messages`、`list_members`、`diagnose`。`read_messages` 返回按天分组的纯文本记录（`HH:MM 发送者: 内容`），不带逐条 JSON 字段，读整天的群聊也不会把上下文浪费在元数据上。
 
+图片显示为 `[img:<id>]`；`get_media` 按 id 返回本机已缓存的图片（默认标准尺寸，`size: "original"` 取原图，视频返回封面），一次最多 10 张。语音不发送音频，转写文本已在消息里。
+
 本机客户端（Claude Desktop、Claude Code、Codex、Cursor）用 stdio，不联网也不需要认证：
 
 ```json
@@ -187,7 +189,7 @@ tg mcp serve
 
 在 ChatGPT 添加自定义 MCP 服务器时，URL 填 `https://mcp.example.com/mcp`，认证选 OAuth。
 
-- 远程模式默认隐藏你的联系人备注，只返回最近 90 天内的消息，单次结果最多 16 MiB（超出时分页继续）；可在 `~/.tg/mcp/config.json` 的 `remote` 里调整，`max_text_chars` 可选地截断单条长消息，或用 `allow_sessions` / `deny_sessions` 限定会话。
+- 远程模式默认隐藏你的联系人备注，只返回最近 90 天内的消息，单次结果最多 16 MiB（超出时分页继续）；可在 `~/.tg/mcp/config.json` 的 `remote` 里调整，`max_text_chars` 可选地截断单条长消息，或用 `allow_sessions` / `deny_sessions` 限定会话。图片默认不对远程客户端开放，需要时设置 `"allow_media": true`（同样受会话名单和回看期限约束，回看按缓存月份计算）。
 - `tg mcp status` 查看已连接客户端，`tg mcp revoke --all` 立即吊销全部令牌，`tg mcp audit` 查看调用记录（只记录工具名和参数名，不记录内容或搜索词）。
 - 工具结果会进入远程模型的上下文。只在你信任的客户端里启用远程模式。
 

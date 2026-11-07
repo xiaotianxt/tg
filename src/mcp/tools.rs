@@ -7,15 +7,21 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use clap::ValueEnum;
 use serde_json::{json, Map, Value};
 
 use super::config::RemotePolicy;
 use crate::contact::DisplayNameMode;
+use crate::media_fetch::{self, MediaCache, MediaSize};
 use crate::source_store::SourceStore;
-use crate::{db, doctor, query, time};
+use crate::{db, doctor, media, query, time};
 
 const DAY_SECONDS: i64 = 86_400;
+/// Images per get_media call; each one costs the model about as much as a
+/// page of text.
+const MAX_MEDIA_PER_CALL: usize = 10;
 
 pub(crate) struct ToolContext {
     pub db_dir: Option<PathBuf>,
@@ -39,6 +45,8 @@ pub(crate) enum Content {
     /// Sent as text only. Used where JSON field names would outweigh the data
     /// itself; a single copy keeps clients from feeding the model both forms.
     Text(String),
+    /// Raw MCP content blocks, for results that carry images.
+    Blocks(Vec<Value>),
 }
 
 /// A JSON result while it is being trimmed to the size cap.
@@ -145,7 +153,7 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "read_messages",
             "title": "Read a chat",
-            "description": "Read every message of one chat in an optional [since, until) time range. Returns a plain-text transcript in chronological order: a `== YYYY-MM-DD ==` line per local day, then one `HH:MM sender: text` line per message, with indented continuation lines. Non-text messages appear as bracketed placeholders such as [图片]. There is no page size: one call returns the whole range. Only if the range exceeds the result size cap is the transcript trimmed and ends with a `[truncated]` line giving the offset to repeat the same call with. order=newest (default) keeps the latest messages when trimming, order=oldest the earliest.",
+            "description": "Read every message of one chat in an optional [since, until) time range. Returns a plain-text transcript in chronological order: a `== YYYY-MM-DD ==` line per local day, then one `HH:MM sender: text` line per message, with indented continuation lines. Non-text messages appear as bracketed placeholders; images show as [img:<id>], which get_media can display. There is no page size: one call returns the whole range. Only if the range exceeds the result size cap is the transcript trimmed and ends with a `[truncated]` line giving the offset to repeat the same call with. order=newest (default) keeps the latest messages when trimming, order=oldest the earliest.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -217,6 +225,22 @@ pub(crate) fn definitions() -> Value {
             "annotations": read_only,
         }),
         json!({
+            "name": "get_media",
+            "title": "View cached images",
+            "description": format!("View images from one chat. Pass the 32-character ids that read_messages and the other message tools show as [img:<id>] (images) or as the name in [视频 WxH <id>] (video cover). Returns each image the local client has cached, up to {MAX_MEDIA_PER_CALL} per call; an id that was never downloaded reports so instead. size=preview (default) returns the client's standard copy, size=original the full-resolution copy when one was downloaded. Each image costs about as much context as a page of text, so fetch only the ones the task needs."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": {"type": "string", "description": "Chat id or display name the images were sent in"},
+                    "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": MAX_MEDIA_PER_CALL},
+                    "size": {"type": "string", "enum": ["preview", "original"], "default": "preview"}
+                },
+                "required": ["session", "ids"],
+                "additionalProperties": false
+            },
+            "annotations": read_only,
+        }),
+        json!({
             "name": "diagnose",
             "title": "Diagnose tg",
             "description": "Check whether tg can read the local history, optionally for one chat. Use when another tool fails.",
@@ -252,6 +276,7 @@ pub(crate) fn call(
         "search_messages" => search_messages(ctx, args),
         "query_messages" => query_messages(ctx, args),
         "list_members" => list_members(ctx, args),
+        "get_media" => get_media(ctx, args),
         "diagnose" => diagnose(ctx, args),
         _ => Err(format!("Unknown tool: {name}")),
     }
@@ -621,6 +646,79 @@ fn list_members(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String
     Ok(fit(ctx, value, "members").into())
 }
 
+fn get_media(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
+    args.only(&["session", "ids", "size"])?;
+    if ctx.remote && !ctx.policy.allow_media {
+        return Err(
+            "Images are disabled for remote clients. The owner can enable them \
+                    with remote.allow_media in the tg MCP config."
+                .to_string(),
+        );
+    }
+    let session = args.required_str("session")?;
+    let size = match args.choice("size", &["preview", "original"], "preview")? {
+        "original" => MediaSize::Original,
+        _ => MediaSize::Preview,
+    };
+    let ids = args.str_list("ids")?;
+    if ids.is_empty() || ids.len() > MAX_MEDIA_PER_CALL {
+        return Err(format!("ids must list 1 to {MAX_MEDIA_PER_CALL} media ids"));
+    }
+    // Models often copy the whole tag; the id inside it is what counts.
+    let ids: Vec<&str> = ids
+        .iter()
+        .map(|id| id.trim().trim_start_matches("[img:").trim_end_matches(']'))
+        .collect();
+    if let Some(bad) = ids.iter().find(|id| !media_fetch::is_media_id(id)) {
+        return Err(format!(
+            "'{bad}' is not a media id; pass the 32-character id from [img:<id>]"
+        ));
+    }
+
+    let store = ctx.open_store()?;
+    let username = db::resolve_session(&store, session, ctx.jobs)?;
+    if !ctx.session_visible(&username) {
+        return Err(no_session(session));
+    }
+    // The cache is filed by month, so the lookback applies per whole month.
+    let min_month = ctx
+        .lookback_floor()
+        .map(|floor| time::format_message_time_bucket(floor, time::MessageTimeBucket::Month));
+    let cache = MediaCache::open(&username, min_month.as_deref())?;
+
+    let text = |text: String| json!({"type": "text", "text": text});
+    let mut budget = ctx.policy.max_result_bytes;
+    let mut blocks = Vec::new();
+    let mut rows = 0;
+    for id in ids {
+        match cache.load(id, size) {
+            Ok(image) => {
+                let data = BASE64.encode(&image.data);
+                if data.len() > budget {
+                    blocks.push(text(format!(
+                        "{id}: left out to fit the result size cap; request it in its own call \
+                         or with size=preview"
+                    )));
+                    continue;
+                }
+                budget -= data.len();
+                blocks.push(text(format!(
+                    "{id} ({}, {})",
+                    image.variant,
+                    media::format_file_size(image.data.len() as u64)
+                )));
+                blocks.push(json!({"type": "image", "data": data, "mimeType": image.mime}));
+                rows += 1;
+            }
+            Err(error) => blocks.push(text(format!("{id}: {error}"))),
+        }
+    }
+    Ok(CallOutcome {
+        content: Content::Blocks(blocks),
+        rows,
+    })
+}
+
 fn diagnose(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
     args.only(&["session"])?;
     let session = args.str("session")?;
@@ -839,7 +937,7 @@ mod tests {
     fn every_tool_is_read_only_and_closed_world() {
         let tools = definitions();
         let tools = tools.as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         for tool in tools {
             assert_eq!(
                 tool["annotations"]["readOnlyHint"], true,
@@ -969,6 +1067,37 @@ mod tests {
         assert!(oldest.text.len() <= max);
         assert!(oldest.text.contains("12:00 a: 000\n"));
         assert!(oldest.text.contains("Newer messages"));
+    }
+
+    #[test]
+    fn get_media_validates_ids_before_touching_the_cache() {
+        let ctx = ctx(false);
+        let call_ids = |ids: Value| {
+            call(
+                &ctx,
+                "get_media",
+                &json!({"session": "room@chatroom", "ids": ids}),
+            )
+            .err()
+            .unwrap()
+        };
+        assert!(call_ids(json!([])).contains("1 to 10"));
+        assert!(call_ids(json!(vec!["0".repeat(32); 11])).contains("1 to 10"));
+        assert!(call_ids(json!(["../../etc/passwd"])).contains("not a media id"));
+        // A copied tag is accepted; the store lookup is what fails here.
+        let error = call_ids(json!([format!("[img:{}]", "a".repeat(32))]));
+        assert!(!error.contains("not a media id"), "{error}");
+    }
+
+    #[test]
+    fn remote_media_is_off_unless_the_owner_allows_it() {
+        let mut ctx = ctx(true);
+        let args = json!({"session": "room@chatroom", "ids": ["a".repeat(32)]});
+        let error = call(&ctx, "get_media", &args).err().unwrap();
+        assert!(error.contains("remote.allow_media"), "{error}");
+        ctx.policy.allow_media = true;
+        let error = call(&ctx, "get_media", &args).err().unwrap();
+        assert!(!error.contains("remote.allow_media"), "{error}");
     }
 
     #[test]

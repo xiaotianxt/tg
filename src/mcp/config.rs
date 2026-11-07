@@ -40,6 +40,10 @@ pub(crate) struct RemotePolicy {
     /// Per-message character cap; unset keeps every message whole.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_text_chars: Option<usize>,
+    /// Lets remote clients view cached images with `get_media`. Off by
+    /// default: images can show faces, documents and places that the text
+    /// never mentions.
+    pub allow_media: bool,
 }
 
 impl Default for RemotePolicy {
@@ -51,6 +55,7 @@ impl Default for RemotePolicy {
             show_contact_remarks: false,
             max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
             max_text_chars: None,
+            allow_media: false,
         }
     }
 }

@@ -1639,6 +1639,23 @@ fn resolve_username_from_contacts(
     Ok(query.to_string())
 }
 
+/// Resolve a session query to its username, loading contacts only when the
+/// query is not already a direct id.
+pub(crate) fn resolve_session(
+    store: &SourceStore,
+    query: &str,
+    jobs: usize,
+) -> Result<String, String> {
+    if let Some(username) = direct_session_username(query) {
+        return Ok(username.to_string());
+    }
+    let contacts = match open_optional_database(store, CONTACT_DB)?.as_ref() {
+        Some(conn) => contact::load_contacts(conn)?,
+        None => HashMap::new(),
+    };
+    resolve_username_for_messages(query, &contacts, store, &message_databases(store), jobs)
+}
+
 /// A query that names a session directly and resolves without contacts.
 fn direct_session_username(query: &str) -> Option<&str> {
     let query = query.trim();

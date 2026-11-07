@@ -17,6 +17,7 @@ const INVALID_PARAMS: i64 = -32602;
 const INSTRUCTIONS: &str = "Read-only access to the owner's local tg chat history. \
 Start with list_sessions or list_unread to get chat ids, then read_messages with an id. \
 Use search_messages for keywords across chats and query_messages for exhaustive filters. \
+Use get_media to view images shown as [img:<id>]. \
 Results contain private message text; quote only what the user asked for.";
 
 /// What a tool call did, for the audit log.
@@ -142,6 +143,7 @@ fn call_tool(ctx: &ToolContext, id: Value, params: &Value) -> Handled {
                     "content": [{ "type": "text", "text": text }],
                     "isError": false,
                 }),
+                Content::Blocks(blocks) => json!({ "content": blocks, "isError": false }),
             };
             (result, outcome.rows, true)
         }
@@ -257,6 +259,6 @@ mod tests {
         let response =
             respond(json!({"jsonrpc": "2.0", "id": "a", "method": "tools/list"})).unwrap();
         assert_eq!(response["id"], "a");
-        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 8);
     }
 }
