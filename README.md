@@ -169,7 +169,7 @@ exported/zhangsan/media/
 
 ## MCP 服务
 
-`tg mcp` 把只读命令暴露成 MCP 工具：`list_sessions`、`list_unread`、`read_messages`、`search_messages`、`query_messages`、`list_members`、`diagnose`。
+`tg mcp` 把只读命令暴露成 MCP 工具：`list_sessions`、`list_unread`、`read_messages`、`search_messages`、`query_messages`、`list_members`、`diagnose`。`read_messages` 返回按天分组的纯文本记录（`HH:MM 发送者: 内容`），不带逐条 JSON 字段，读整天的群聊也不会把上下文浪费在元数据上。
 
 本机客户端（Claude Desktop、Claude Code、Codex、Cursor）用 stdio，不联网也不需要认证：
 

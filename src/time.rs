@@ -147,6 +147,15 @@ pub fn format_local_timestamp_minutes(timestamp: i64) -> String {
     format_local_timestamp_with(timestamp, MINUTE_FORMAT)
 }
 
+/// Local `(YYYY-MM-DD, HH:MM)` for a timestamp, for layouts that print the
+/// date once per day.
+pub(crate) fn format_local_date_and_minute(timestamp: i64) -> (String, String) {
+    (
+        format_local_timestamp_with(timestamp, DATE_FORMAT),
+        format_local_timestamp_with(timestamp, "%H:%M"),
+    )
+}
+
 pub(crate) fn parse_local_timestamp_minutes(s: &str) -> Option<i64> {
     NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M")
         .or_else(|_| NaiveDateTime::parse_from_str(s, DATETIME_FORMAT))

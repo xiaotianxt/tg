@@ -3,7 +3,7 @@
 
 use serde_json::{json, Value};
 
-use super::tools::{self, ToolContext};
+use super::tools::{self, Content, ToolContext};
 
 /// Newest first. The answer to `initialize` echoes the client's version when
 /// supported, otherwise offers the newest.
@@ -132,16 +132,18 @@ fn call_tool(ctx: &ToolContext, id: Value, params: &Value) -> Handled {
         .unwrap_or_default();
     let (result, rows, ok) = match tools::call(ctx, name, &arguments) {
         Ok(outcome) => {
-            let text = serde_json::to_string(&outcome.value).unwrap_or_default();
-            (
-                json!({
-                    "content": [{ "type": "text", "text": text }],
-                    "structuredContent": outcome.value,
+            let result = match outcome.content {
+                Content::Json(value) => json!({
+                    "content": [{ "type": "text", "text": value.to_string() }],
+                    "structuredContent": value,
                     "isError": false,
                 }),
-                outcome.rows,
-                true,
-            )
+                Content::Text(text) => json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": false,
+                }),
+            };
+            (result, outcome.rows, true)
         }
         // Tool failures are results, not protocol errors, so the model can read
         // them and correct its arguments.

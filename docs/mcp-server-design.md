@@ -5,6 +5,10 @@ text below:
 
 - Tools return `structuredContent` plus the same JSON as text, without an
   `outputSchema`, so a schema mismatch can never make a client reject a result.
+  `read_messages` is the exception: it returns only a plain-text transcript
+  (one `HH:MM sender: text` line per message under per-day headers). Per-message
+  JSON keys and duplicated timestamps were about 80% of a 24-hour group read,
+  and a text-only result keeps clients from feeding the model two copies.
 - The HTTP transport is stateless: no `Mcp-Session-Id` is issued, so a server
   restart never strands a client session.
 - Session names resolve to the best fuzzy match instead of returning a

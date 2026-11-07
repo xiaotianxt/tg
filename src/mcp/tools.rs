@@ -28,9 +28,32 @@ pub(crate) struct ToolContext {
 }
 
 pub(crate) struct CallOutcome {
-    pub value: Value,
+    pub content: Content,
     /// Item count for the audit log.
     pub rows: usize,
+}
+
+pub(crate) enum Content {
+    /// Sent as `structuredContent` plus the same JSON as text.
+    Json(Value),
+    /// Sent as text only. Used where JSON field names would outweigh the data
+    /// itself; a single copy keeps clients from feeding the model both forms.
+    Text(String),
+}
+
+/// A JSON result while it is being trimmed to the size cap.
+struct JsonPage {
+    value: Value,
+    rows: usize,
+}
+
+impl From<JsonPage> for CallOutcome {
+    fn from(page: JsonPage) -> Self {
+        Self {
+            content: Content::Json(page.value),
+            rows: page.rows,
+        }
+    }
 }
 
 impl ToolContext {
@@ -65,16 +88,16 @@ impl ToolContext {
         }
     }
 
-    fn text(&self, value: &str) -> Value {
+    fn text(&self, value: &str) -> String {
         let Some(max) = self.policy.max_text_chars else {
-            return Value::String(value.to_string());
+            return value.to_string();
         };
         if value.chars().count() <= max {
-            return Value::String(value.to_string());
+            return value.to_string();
         }
         let mut text: String = value.chars().take(max).collect();
         text.push_str("…[truncated]");
-        Value::String(text)
+        text
     }
 
     fn open_store(&self) -> Result<SourceStore, String> {
@@ -122,7 +145,7 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "read_messages",
             "title": "Read a chat",
-            "description": "Read every message of one chat in an optional [since, until) time range, in chronological order. There is no page size: one call returns the whole range. Only if the range exceeds the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset. order=newest (default) keeps the latest messages when trimming, order=oldest the earliest.",
+            "description": "Read every message of one chat in an optional [since, until) time range. Returns a plain-text transcript in chronological order: a `== YYYY-MM-DD ==` line per local day, then one `HH:MM sender: text` line per message, with indented continuation lines. Non-text messages appear as bracketed placeholders such as [图片]. There is no page size: one call returns the whole range. Only if the range exceeds the result size cap is the transcript trimmed and ends with a `[truncated]` line giving the offset to repeat the same call with. order=newest (default) keeps the latest messages when trimming, order=oldest the earliest.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -262,10 +285,7 @@ fn list_sessions(
         })
         .collect();
     let value = json!({ "sessions": sessions });
-    Ok(continue_after_trim(
-        fit(ctx, value, "sessions", Trim::End),
-        offset,
-    ))
+    Ok(continue_after_trim(fit(ctx, value, "sessions"), offset).into())
 }
 
 fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
@@ -293,30 +313,138 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
     if !ctx.session_visible(&page.username) {
         return Err(no_session(session));
     }
-    let messages: Vec<Value> = page
+    let messages: Vec<TranscriptMessage> = page
         .messages
         .iter()
         .map(|message| {
-            json!({
-                "time": time_value(message.create_time),
-                "sender": message.sender,
-                "type": message_kind(message.local_type),
-                "text": ctx.text(&message.content),
-            })
+            let (date, minute) = time::format_local_date_and_minute(message.create_time);
+            TranscriptMessage {
+                date,
+                block: transcript_block(&minute, &message.sender, &ctx.text(&message.content)),
+            }
         })
         .collect();
-    let value = json!({
-        "session": {"id": page.username, "name": page.display_name},
-        "order": if newest { "newest" } else { "oldest" },
-        "messages": messages,
-    });
-    // Trim the messages farthest from the paging origin, so next_offset
-    // continues exactly where the kept ones end.
-    let trim = if newest { Trim::Start } else { Trim::End };
-    Ok(continue_after_trim(
-        fit(ctx, value, "messages", trim),
+    let header = format!(
+        "Chat: {} (id: {})\n{{count}} messages in time order. Times are local; \
+         an indented line continues the message above it.\n",
+        page.display_name, page.username
+    );
+    let transcript = fit_transcript(
+        &header,
+        &messages,
+        newest,
+        ctx.policy.max_result_bytes,
         offset,
-    ))
+    );
+    Ok(CallOutcome {
+        content: Content::Text(transcript.text),
+        rows: transcript.rows,
+    })
+}
+
+struct TranscriptMessage {
+    date: String,
+    /// `HH:MM sender: text` plus indented continuation lines, newline-terminated.
+    block: String,
+}
+
+/// One message as transcript lines. Continuation lines are indented so they
+/// can never be mistaken for a new message.
+fn transcript_block(minute: &str, sender: &str, text: &str) -> String {
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or("");
+    let mut block = if sender.is_empty() {
+        format!("{minute} {first}\n")
+    } else {
+        format!("{minute} {sender}: {first}\n")
+    };
+    for line in lines {
+        block.push_str("  ");
+        block.push_str(line);
+        block.push('\n');
+    }
+    block
+}
+
+fn day_header(date: &str) -> String {
+    format!("== {date} ==\n")
+}
+
+struct Transcript {
+    text: String,
+    rows: usize,
+}
+
+/// Render `messages` (chronological) under the byte cap. When they do not all
+/// fit, keep those nearest the paging origin (the newest when `newest`), so
+/// `offset + rows` continues exactly where the kept ones end. `header` holds a
+/// `{count}` placeholder for the number of messages kept.
+fn fit_transcript(
+    header: &str,
+    messages: &[TranscriptMessage],
+    newest: bool,
+    max_bytes: usize,
+    offset: usize,
+) -> Transcript {
+    // Upper bounds: the count only shrinks, and the footer's offset is at most
+    // `offset + messages.len()`.
+    let header_bytes = header.replace("{count}", &messages.len().to_string()).len();
+    let footer_bytes = truncation_footer(newest, offset + messages.len()).len();
+    let budget = max_bytes.saturating_sub(header_bytes);
+
+    let order: Box<dyn Iterator<Item = &TranscriptMessage>> = if newest {
+        Box::new(messages.iter().rev())
+    } else {
+        Box::new(messages.iter())
+    };
+    let mut used = 0;
+    let mut kept = 0;
+    let mut last_date: Option<&str> = None;
+    for message in order {
+        let mut cost = message.block.len();
+        if last_date != Some(message.date.as_str()) {
+            cost += day_header(&message.date).len();
+        }
+        // Reserve room for the footer whenever something would be left out.
+        let reserve = if kept + 1 < messages.len() {
+            footer_bytes
+        } else {
+            0
+        };
+        if used + cost + reserve > budget {
+            break;
+        }
+        used += cost;
+        kept += 1;
+        last_date = Some(&message.date);
+    }
+
+    let range = if newest {
+        messages.len() - kept..messages.len()
+    } else {
+        0..kept
+    };
+    let mut text = header.replace("{count}", &kept.to_string());
+    let mut last_date: Option<&str> = None;
+    for message in &messages[range] {
+        if last_date != Some(message.date.as_str()) {
+            text.push_str(&day_header(&message.date));
+            last_date = Some(&message.date);
+        }
+        text.push_str(&message.block);
+    }
+    if kept < messages.len() {
+        text.push_str(&truncation_footer(newest, offset + kept));
+    }
+    Transcript { text, rows: kept }
+}
+
+fn truncation_footer(newest: bool, next_offset: usize) -> String {
+    let omitted = if newest { "Older" } else { "Newer" };
+    format!(
+        "[truncated] {omitted} messages were left out to fit the size cap. \
+         Repeat the same call with offset={next_offset} to read them.\n"
+    )
 }
 
 fn search_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
@@ -357,10 +485,7 @@ fn search_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Str
         })
         .collect();
     let value = json!({ "hits": hits });
-    Ok(continue_after_trim(
-        fit(ctx, value, "hits", Trim::End),
-        offset,
-    ))
+    Ok(continue_after_trim(fit(ctx, value, "hits"), offset).into())
 }
 
 fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
@@ -430,10 +555,7 @@ fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Stri
         })
         .collect();
     let value = json!({ "messages": messages });
-    Ok(continue_after_trim(
-        fit(ctx, value, "messages", Trim::End),
-        offset,
-    ))
+    Ok(continue_after_trim(fit(ctx, value, "messages"), offset).into())
 }
 
 fn list_members(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
@@ -460,7 +582,7 @@ fn list_members(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String
             "cached_members": report.cached_members,
             "friends": friends,
         });
-        return Ok(fit(ctx, value, "friends", Trim::End));
+        return Ok(fit(ctx, value, "friends").into());
     }
     let report = db::list_members(
         &store,
@@ -496,7 +618,7 @@ fn list_members(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String
         },
         "members": members,
     });
-    Ok(fit(ctx, value, "members", Trim::End))
+    Ok(fit(ctx, value, "members").into())
 }
 
 fn diagnose(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
@@ -542,7 +664,10 @@ fn diagnose(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
         };
     }
     let rows = report.checks.len();
-    Ok(CallOutcome { value, rows })
+    Ok(CallOutcome {
+        content: Content::Json(value),
+        rows,
+    })
 }
 
 /// Same text for a hidden session as for a missing one, so a remote caller
@@ -571,15 +696,9 @@ fn message_kind(local_type: i64) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Trim {
-    Start,
-    End,
-}
-
-/// Drop items from `key` until the serialized result fits the byte cap, and
-/// mark the result `truncated` if anything was dropped.
-fn fit(ctx: &ToolContext, mut value: Value, key: &str, trim: Trim) -> CallOutcome {
+/// Drop items from the end of `key` until the serialized result fits the byte
+/// cap, and mark the result `truncated` if anything was dropped.
+fn fit(ctx: &ToolContext, mut value: Value, key: &str) -> JsonPage {
     let max = ctx.policy.max_result_bytes;
     let size = |value: &Value| serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
     let mut dropped = 0;
@@ -597,24 +716,19 @@ fn fit(ctx: &ToolContext, mut value: Value, key: &str, trim: Trim) -> CallOutcom
             .max(1);
         let per_item = (size(&Value::Array(items.clone())) / total).max(1);
         let remove = over.div_ceil(per_item).clamp(1, total);
-        match trim {
-            Trim::Start => {
-                items.drain(..remove);
-            }
-            Trim::End => items.truncate(total - remove),
-        }
+        items.truncate(total - remove);
         dropped += remove;
     }
     if dropped > 0 {
         value["truncated"] = json!(true);
     }
     let rows = value.get(key).and_then(Value::as_array).map_or(0, Vec::len);
-    CallOutcome { value, rows }
+    JsonPage { value, rows }
 }
 
 /// A trimmed result continues right after the items it kept; a whole result
 /// carries no continuation.
-fn continue_after_trim(mut outcome: CallOutcome, offset: usize) -> CallOutcome {
+fn continue_after_trim(mut outcome: JsonPage, offset: usize) -> JsonPage {
     if outcome.value.get("truncated").is_some() {
         outcome.value["next_offset"] = json!(offset + outcome.rows);
     }
@@ -781,30 +895,18 @@ mod tests {
     }
 
     #[test]
-    fn oversized_results_are_trimmed_from_the_requested_end() {
+    fn oversized_results_are_trimmed_from_the_end() {
         let mut ctx = ctx(false);
         ctx.policy.max_result_bytes = 2048;
         let items: Vec<Value> = (0..200)
             .map(|i| json!({"n": i, "pad": "x".repeat(40)}))
             .collect();
-        let outcome = fit(
-            &ctx,
-            json!({ "items": items.clone() }),
-            "items",
-            Trim::Start,
-        );
+        let outcome = fit(&ctx, json!({ "items": items }), "items");
         assert!(serde_json::to_vec(&outcome.value).unwrap().len() <= 2048);
         assert_eq!(outcome.value["truncated"], true);
         let kept = outcome.value["items"].as_array().unwrap();
-        assert_eq!(
-            kept.last().unwrap()["n"],
-            199,
-            "Start trimming keeps the newest"
-        );
+        assert_eq!(kept[0]["n"], 0);
         assert_eq!(outcome.rows, kept.len());
-
-        let outcome = fit(&ctx, json!({ "items": items }), "items", Trim::End);
-        assert_eq!(outcome.value["items"][0]["n"], 0);
     }
 
     #[test]
@@ -814,23 +916,68 @@ mod tests {
         let items: Vec<Value> = (0..100)
             .map(|n| json!({"n": n, "pad": "x".repeat(40)}))
             .collect();
-        let outcome =
-            continue_after_trim(fit(&ctx, json!({ "items": items }), "items", Trim::End), 7);
+        let outcome = continue_after_trim(fit(&ctx, json!({ "items": items }), "items"), 7);
         assert_eq!(outcome.value["truncated"], true);
         assert_eq!(outcome.value["next_offset"], 7 + outcome.rows);
 
-        let whole =
-            continue_after_trim(fit(&ctx, json!({ "items": [1, 2] }), "items", Trim::End), 7);
+        let whole = continue_after_trim(fit(&ctx, json!({ "items": [1, 2] }), "items"), 7);
         assert!(whole.value.get("next_offset").is_none());
+    }
+
+    fn message(date: &str, minute: &str, sender: &str, text: &str) -> TranscriptMessage {
+        TranscriptMessage {
+            date: date.to_string(),
+            block: transcript_block(minute, sender, text),
+        }
+    }
+
+    #[test]
+    fn transcript_prints_each_day_once_and_indents_continuations() {
+        let messages = [
+            message("2026-11-06", "23:59", "张三", "晚安"),
+            message("2026-11-07", "08:00", "李四", "早\n第二行"),
+            message("2026-11-07", "08:01", "", "[系统消息]"),
+        ];
+        let transcript = fit_transcript("{count} msgs\n", &messages, true, usize::MAX, 0);
+        assert_eq!(
+            transcript.text,
+            "3 msgs\n== 2026-11-06 ==\n23:59 张三: 晚安\n\
+             == 2026-11-07 ==\n08:00 李四: 早\n  第二行\n08:01 [系统消息]\n"
+        );
+        assert_eq!(transcript.rows, 3);
+    }
+
+    #[test]
+    fn oversized_transcripts_keep_the_paging_end_and_point_to_the_rest() {
+        let messages: Vec<TranscriptMessage> = (0..100)
+            .map(|n| message("2026-11-07", "12:00", "a", &format!("{n:03}")))
+            .collect();
+        let max = 600;
+
+        let newest = fit_transcript("{count}\n", &messages, true, max, 5);
+        assert!(newest.text.len() <= max);
+        assert!(newest.rows > 0 && newest.rows < 100);
+        assert!(newest.text.contains("12:00 a: 099\n"));
+        assert!(!newest.text.contains(": 000\n"));
+        assert!(newest.text.starts_with(&format!("{}\n", newest.rows)));
+        assert!(newest.text.ends_with(&format!(
+            "Repeat the same call with offset={} to read them.\n",
+            5 + newest.rows
+        )));
+
+        let oldest = fit_transcript("{count}\n", &messages, false, max, 0);
+        assert!(oldest.text.len() <= max);
+        assert!(oldest.text.contains("12:00 a: 000\n"));
+        assert!(oldest.text.contains("Newer messages"));
     }
 
     #[test]
     fn long_text_is_capped_by_characters() {
         let mut ctx = ctx(false);
         let long = "x".repeat(10_000);
-        assert_eq!(ctx.text(&long), json!(long));
+        assert_eq!(ctx.text(&long), long);
         ctx.policy.max_text_chars = Some(3);
-        assert_eq!(ctx.text("你好世界"), json!("你好世…[truncated]"));
-        assert_eq!(ctx.text("abc"), json!("abc"));
+        assert_eq!(ctx.text("你好世界"), "你好世…[truncated]");
+        assert_eq!(ctx.text("abc"), "abc");
     }
 }
