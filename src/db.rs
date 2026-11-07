@@ -1568,7 +1568,7 @@ fn resolve_username_from_contacts(
         return Ok(c.username.clone());
     }
 
-    let scored = score_contacts(contacts, query);
+    let scored = score_contacts(contacts, query, jobs);
     if let Some(username) = unique_exact_direct_username(&scored) {
         return Ok(username);
     }
@@ -1710,21 +1710,37 @@ fn unique_exact_direct_username(scored: &[(&Contact, ContactFieldScore)]) -> Opt
     (direct.next().is_none() && score.score == EXACT_MATCH_SCORE).then(|| contact.username.clone())
 }
 
-/// Scores every contact once, in map iteration order.
+const NAME_SCORE_AUTO_CAP: usize = 8;
+/// Below this many contacts per worker, thread startup costs more than the
+/// scoring it would split.
+const NAME_SCORE_MIN_CHUNK: usize = 2048;
+
+/// Scores every contact once, in map iteration order. Chunks are scored on
+/// up to `jobs` threads and concatenated in order, so the result does not
+/// depend on the job count.
 fn score_contacts<'a>(
     contacts: &'a HashMap<String, Contact>,
     query: &str,
+    jobs: usize,
 ) -> Vec<(&'a Contact, ContactFieldScore)> {
-    let Some(mut scorer) = FieldScorer::new(query) else {
+    if FieldScorer::new(query).is_none() {
         return Vec::new();
-    };
-    contacts
-        .values()
-        .filter_map(|contact| {
-            let score = scorer.best(&contact_match_fields(contact))?;
-            Some((contact, score))
-        })
-        .collect()
+    }
+    let contacts: Vec<&Contact> = contacts.values().collect();
+    let jobs = parallel::job_count(jobs, NAME_SCORE_AUTO_CAP);
+    let chunk_len = contacts.len().div_ceil(jobs).max(NAME_SCORE_MIN_CHUNK);
+    let chunks: Vec<&[&Contact]> = contacts.chunks(chunk_len).collect();
+    parallel::map_ordered(chunks, jobs, |chunk| {
+        let mut scorer = FieldScorer::new(query).expect("query was checked above");
+        chunk
+            .iter()
+            .filter_map(|&contact| {
+                let score = scorer.best(&contact_match_fields(contact))?;
+                Some((contact, score))
+            })
+            .collect::<Vec<_>>()
+    })
+    .concat()
 }
 
 fn contact_match_fields(contact: &Contact) -> [(usize, &str); 5] {
@@ -3062,7 +3078,7 @@ mod tests {
         let contacts = load_contacts(&contact_db);
 
         let username =
-            unique_exact_direct_username(&score_contacts(&contacts, "Linux 俱乐部 #2026🌅"));
+            unique_exact_direct_username(&score_contacts(&contacts, "Linux 俱乐部 #2026🌅", 1));
 
         assert_eq!(username.as_deref(), Some("linux_2026@chatroom"));
     }
@@ -3076,7 +3092,7 @@ mod tests {
         ]);
         let contacts = load_contacts(&contact_db);
 
-        let username = unique_exact_direct_username(&score_contacts(&contacts, "豆"));
+        let username = unique_exact_direct_username(&score_contacts(&contacts, "豆", 1));
 
         assert_eq!(username, None);
     }
@@ -3089,9 +3105,55 @@ mod tests {
         ]);
         let contacts = load_contacts(&contact_db);
 
-        let username = unique_exact_direct_username(&score_contacts(&contacts, "田雨坤"));
+        let username = unique_exact_direct_username(&score_contacts(&contacts, "田雨坤", 1));
 
         assert_eq!(username, None);
+    }
+
+    #[test]
+    fn parallel_contact_scoring_keeps_map_order_and_scores() {
+        let contacts: HashMap<String, Contact> = (0..3 * NAME_SCORE_MIN_CHUNK + 17)
+            .map(|i| {
+                let username = format!("tgid_{i:05}");
+                let contact = Contact {
+                    username: username.clone(),
+                    nick_name: format!("nick {}", i % 97),
+                    remark: if i % 3 == 0 {
+                        format!("Remark{}", i % 41)
+                    } else {
+                        String::new()
+                    },
+                    alias: format!("al{}", i % 13),
+                    is_stranger: false,
+                };
+                (username, contact)
+            })
+            .collect();
+        let summary = |scored: Vec<(&Contact, ContactFieldScore)>| -> Vec<_> {
+            scored
+                .into_iter()
+                .map(|(c, s)| {
+                    (
+                        c.username.clone(),
+                        s.score,
+                        s.field_priority,
+                        s.distance,
+                        s.field_len,
+                    )
+                })
+                .collect()
+        };
+        for query in ["nick 5", "remark4", "al1", "tgid_0001", "nikc 9", "zz"] {
+            let expected = summary(score_contacts(&contacts, query, 1));
+            assert!(!expected.is_empty() || query == "zz", "{query}");
+            for jobs in [2, 3, 4, 8] {
+                assert_eq!(
+                    summary(score_contacts(&contacts, query, jobs)),
+                    expected,
+                    "{query} jobs={jobs}"
+                );
+            }
+        }
     }
 
     #[test]
