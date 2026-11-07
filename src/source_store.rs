@@ -189,6 +189,21 @@ impl SourceStore {
     }
 }
 
+/// Turns off SQLite's allocation statistics, which take one process-wide
+/// mutex on every allocation and serialize parallel shard readers (schema
+/// parsing allocates per table). tg never reads those statistics or sets a
+/// heap limit. Must run before the first connection initializes SQLite.
+pub(crate) fn disable_sqlite_memory_statistics() {
+    // SAFETY: SQLITE_CONFIG_MEMSTATUS takes one int argument, and main calls
+    // this before any thread or connection exists.
+    let rc = unsafe { ffi::sqlite3_config(ffi::SQLITE_CONFIG_MEMSTATUS, 0 as std::ffi::c_int) };
+    assert_eq!(
+        rc,
+        ffi::SQLITE_OK,
+        "SQLite was initialized before its memory statistics could be disabled"
+    );
+}
+
 fn decode_keys(
     raw_keys: &mut database_keys::DatabaseKeys,
 ) -> Result<HashMap<String, Zeroizing<[u8; 32]>>, String> {
