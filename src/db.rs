@@ -902,40 +902,17 @@ fn session_match_info(
     display: &str,
     query: &str,
 ) -> Option<SessionMatchInfo> {
-    if let Some(contact) = contacts.get(username) {
-        return best_contact_score(contact, query).map(|score| SessionMatchInfo {
-            score: score.score,
-            field_priority: score.field_priority,
-            distance: score.distance,
-            field_len: score.field_len,
-        });
-    }
-
-    let normalized_query = normalize_match_text(query);
-    if normalized_query.is_empty() {
-        return None;
-    }
-    let query_tokens = tokenize_match_text(query);
-
-    [(0, display), (4, username)]
-        .iter()
-        .filter_map(|(priority, field)| {
-            field_score(field, query, &normalized_query, &query_tokens).map(
-                |(score, distance, field_len)| SessionMatchInfo {
-                    score,
-                    field_priority: *priority,
-                    distance,
-                    field_len,
-                },
-            )
-        })
-        .max_by(|a, b| {
-            b.field_priority
-                .cmp(&a.field_priority)
-                .then_with(|| a.score.cmp(&b.score))
-                .then_with(|| b.distance.cmp(&a.distance))
-                .then_with(|| b.field_len.cmp(&a.field_len))
-        })
+    let mut scorer = FieldScorer::new(query)?;
+    let score = match contacts.get(username) {
+        Some(contact) => scorer.best(&contact_match_fields(contact)),
+        None => scorer.best(&[(0, display), (4, username)]),
+    }?;
+    Some(SessionMatchInfo {
+        score: score.score,
+        field_priority: score.field_priority,
+        distance: score.distance,
+        field_len: score.field_len,
+    })
 }
 
 /// Read messages from a specific session.
@@ -1355,6 +1332,7 @@ fn search_messages_with_fts(
     let mut results = match match_query {
         Some(query) => collect_telegram_fts_rows(
             store,
+            &conn,
             &content_tables,
             &name2id,
             options,
@@ -1364,6 +1342,7 @@ fn search_messages_with_fts(
         .or_else(|match_error| {
             collect_telegram_fts_rows(
                 store,
+                &conn,
                 &content_tables,
                 &name2id,
                 options,
@@ -1378,6 +1357,7 @@ fn search_messages_with_fts(
         })?,
         None => collect_telegram_fts_rows(
             store,
+            &conn,
             &content_tables,
             &name2id,
             options,
@@ -1396,39 +1376,75 @@ fn search_messages_with_fts(
     Ok((has_more, results))
 }
 
-/// Scans each FTS table on its own connection. Rows are concatenated in
-/// table order, so the caller's stable sort sees the same sequence as one
-/// sequential scan.
+// Content scans are page-decryption bound and the tables differ in size
+// by 4x, so the largest table set the wall time when each had one worker.
+const FTS_SCAN_AUTO_CAP: usize = 8;
+
+/// One worker's share of a content table: rowids `lo..=hi`, or every row.
+struct FtsScan<'a> {
+    table: usize,
+    content_table: &'a str,
+    rowids: Option<(i64, i64)>,
+}
+
+/// Scans the FTS tables in parallel, one connection per scan. Rows are
+/// concatenated in table order, so the caller's stable sort sees the same
+/// sequence as one sequential scan.
 fn collect_telegram_fts_rows(
     store: &SourceStore,
+    conn: &Connection,
     content_tables: &[String],
     name2id: &HashMap<i64, String>,
     options: &SearchMessagesOptions<'_>,
     result_limit: Option<usize>,
     match_query: Option<&str>,
 ) -> Result<Vec<SearchRow>, String> {
-    // The four FTS tables total far less than the message shards that
-    // SOURCE_DB_AUTO_CAP was tuned on; one worker per table measured fastest.
-    let jobs = parallel::job_count(options.jobs, content_tables.len());
-    let per_table = parallel::map_ordered(content_tables.iter().collect(), jobs, |content_table| {
+    let jobs = parallel::job_count(options.jobs, FTS_SCAN_AUTO_CAP);
+    // Splitting is exact only for the LIMIT form of the content query; see
+    // `search_telegram_fts_table`.
+    let scans = if match_query.is_none() && result_limit.is_some() {
+        plan_fts_content_scans(conn, content_tables, jobs)
+    } else {
+        whole_table_scans(content_tables)
+    };
+    let per_scan = parallel::map_ordered(scans, jobs, |scan| {
         let conn = store
             .open(MESSAGE_FTS_DB)
             .map_err(|error| format!("Message search index is unavailable: {error}"))?;
         if match_query.is_some() {
             fts::register_compatible_tokenizer(&conn)?;
         }
-        search_telegram_fts_table(
+        let rows = search_telegram_fts_table(
             &conn,
-            content_table,
+            scan.content_table,
+            scan.rowids,
             name2id,
             options,
             result_limit,
             match_query,
-        )
+        )?;
+        Ok::<_, String>((scan.table, scan.rowids.is_some(), rows))
     });
+
     let mut results = Vec::new();
-    for rows in per_table {
-        results.extend(rows?);
+    let mut per_scan = per_scan.into_iter().peekable();
+    while let Some(first) = per_scan.next() {
+        let (table, split, mut rows) = first?;
+        if split {
+            // Ranges arrive in rowid order, each sorted by (time DESC, rowid),
+            // so a stable sort by time yields the whole table's order.
+            while let Some(next) = per_scan.next_if(|next| {
+                next.as_ref()
+                    .map_or(true, |(next_table, ..)| *next_table == table)
+            }) {
+                rows.extend(next?.2);
+            }
+            rows.sort_by_key(|row| Reverse(row.1));
+            if let Some(limit) = result_limit {
+                rows.truncate(limit);
+            }
+        }
+        results.extend(rows);
     }
 
     if match_query.is_some() {
@@ -1437,9 +1453,105 @@ fn collect_telegram_fts_rows(
     Ok(results)
 }
 
+fn whole_table_scans(content_tables: &[String]) -> Vec<FtsScan<'_>> {
+    content_tables
+        .iter()
+        .enumerate()
+        .map(|(table, content_table)| FtsScan {
+            table,
+            content_table,
+            rowids: None,
+        })
+        .collect()
+}
+
+/// Splits tables into contiguous rowid ranges so that at most `jobs` scans
+/// (or one per table, if more) exist and the largest range is about as small
+/// as that allows. Rowid span stands in for row count.
+fn plan_fts_content_scans<'a>(
+    conn: &Connection,
+    content_tables: &'a [String],
+    jobs: usize,
+) -> Vec<FtsScan<'a>> {
+    if jobs < 2 {
+        return whole_table_scans(content_tables);
+    }
+    // A table whose bounds cannot be read is scanned whole; that scan
+    // reports any real error.
+    let bounds: Vec<Option<(i64, i64)>> = content_tables
+        .iter()
+        .map(|content_table| content_rowid_bounds(conn, content_table).ok().flatten())
+        .collect();
+    let spans: Vec<i128> = bounds
+        .iter()
+        .map(|bounds| bounds.map_or(0, |(lo, hi)| i128::from(hi) - i128::from(lo) + 1))
+        .collect();
+    let budget = i128::try_from(jobs.max(content_tables.len())).expect("job count fits i128");
+    let parts_for = |chunk: i128| -> Vec<i128> {
+        spans
+            .iter()
+            .map(|span| ((span + chunk - 1) / chunk).max(1))
+            .collect()
+    };
+    let total: i128 = spans.iter().sum();
+    let mut chunk = ((total + budget - 1) / budget).max(1);
+    let mut parts = parts_for(chunk);
+    while parts.iter().sum::<i128>() > budget {
+        chunk += chunk / 16 + 1;
+        parts = parts_for(chunk);
+    }
+
+    let mut scans = Vec::new();
+    for (table, content_table) in content_tables.iter().enumerate() {
+        let Some((lo, hi)) = bounds[table].filter(|_| parts[table] > 1) else {
+            scans.push(FtsScan {
+                table,
+                content_table,
+                rowids: None,
+            });
+            continue;
+        };
+        let width = (spans[table] + parts[table] - 1) / parts[table];
+        let mut start = i128::from(lo);
+        while start <= i128::from(hi) {
+            let end = (start + width - 1).min(i128::from(hi));
+            scans.push(FtsScan {
+                table,
+                content_table,
+                rowids: Some((
+                    i64::try_from(start).expect("range start lies within table bounds"),
+                    i64::try_from(end).expect("range end lies within table bounds"),
+                )),
+            });
+            start = end + 1;
+        }
+    }
+    scans
+}
+
+fn content_rowid_bounds(
+    conn: &Connection,
+    content_table: &str,
+) -> rusqlite::Result<Option<(i64, i64)>> {
+    // Separate subqueries: SQLite answers a lone min() or max() from the
+    // rowid b-tree, but a query with both scans the whole table.
+    let table = quote_identifier(content_table);
+    let sql = format!("SELECT (SELECT min(rowid) FROM {table}), (SELECT max(rowid) FROM {table})");
+    conn.query_row(&sql, [], |row| {
+        Ok(row
+            .get::<_, Option<i64>>(0)?
+            .zip(row.get::<_, Option<i64>>(1)?))
+    })
+}
+
+/// Without `rowids`, this is the reference query. For LIMIT, SQLite orders
+/// equal times by scan (rowid) order and keeps the earliest at the cutoff,
+/// so a rowid range ordered by `(time DESC, rowid)` returns exactly that
+/// table query's rows from the range, in the same relative order.
 fn search_telegram_fts_table(
     conn: &Connection,
     content_table: &str,
+    rowids: Option<(i64, i64)>,
     name2id: &HashMap<i64, String>,
     options: &SearchMessagesOptions<'_>,
     result_limit: Option<usize>,
@@ -1472,13 +1584,17 @@ fn search_telegram_fts_table(
         .since
         .map(|ts| format!(" AND {time_column} >= {ts}"))
         .unwrap_or_default();
+    let (range_clause, tie_order) = match rowids {
+        Some((lo, hi)) => (format!("rowid BETWEEN {lo} AND {hi} AND "), ", rowid"),
+        None => (String::new(), ""),
+    };
     let limit_clause = result_limit
         .map(|limit| format!(" LIMIT {limit}"))
         .unwrap_or_default();
     let sql = format!(
         "SELECT {columns} FROM {table} \
-         WHERE {search_clause}{since_clause} \
-         ORDER BY {time_column} DESC{limit_clause}"
+         WHERE {range_clause}{search_clause}{since_clause} \
+         ORDER BY {time_column} DESC{tie_order}{limit_clause}"
     );
     let mut stmt = conn
         .prepare(&sql)
@@ -1620,11 +1736,12 @@ fn resolve_username_from_contacts(
         return Ok(c.username.clone());
     }
 
-    if let Some(username) = unique_exact_direct_username(contacts, query) {
+    let scored = score_contacts(contacts, query, jobs);
+    if let Some(username) = unique_exact_direct_username(&scored) {
         return Ok(username);
     }
 
-    let candidates = contact_match_candidates(contacts, query, store, message_dbs, jobs)?;
+    let candidates = contact_match_candidates(scored, store, message_dbs, jobs)?;
     if let Some(best) = candidates.first() {
         if candidates.len() > 1 || best.score < EXACT_MATCH_SCORE {
             log::info!(
@@ -1697,24 +1814,20 @@ struct ContactMatch<'a> {
 }
 
 fn contact_match_candidates<'a>(
-    contacts: &'a HashMap<String, Contact>,
-    query: &str,
+    scored: Vec<(&'a Contact, ContactFieldScore)>,
     store: &SourceStore,
     message_dbs: Option<&[String]>,
     jobs: usize,
 ) -> Result<Vec<ContactMatch<'a>>, String> {
-    let mut candidates: Vec<_> = contacts
-        .values()
-        .filter_map(|contact| {
-            let score = best_contact_score(contact, query)?;
-            Some(ContactMatch {
-                contact,
-                score: score.score,
-                field_priority: score.field_priority,
-                distance: score.distance,
-                field_len: score.field_len,
-                latest_message_time: None,
-            })
+    let mut candidates: Vec<_> = scored
+        .into_iter()
+        .map(|(contact, score)| ContactMatch {
+            contact,
+            score: score.score,
+            field_priority: score.field_priority,
+            distance: score.distance,
+            field_len: score.field_len,
+            latest_message_time: None,
         })
         .collect();
 
@@ -1755,67 +1868,47 @@ fn contact_match_candidates<'a>(
     Ok(candidates)
 }
 
-fn unique_exact_direct_username(
-    contacts: &HashMap<String, Contact>,
-    query: &str,
-) -> Option<String> {
-    let mut direct_matches = 0usize;
-    let mut exact_username = None;
-
-    for contact in contacts.values() {
-        let Some(score) = best_contact_score(contact, query) else {
-            continue;
-        };
-        if score.score < DIRECT_MATCH_SCORE_FLOOR {
-            continue;
-        }
-
-        direct_matches += 1;
-        if score.score == EXACT_MATCH_SCORE {
-            exact_username = Some(contact.username.clone());
-        }
-        if direct_matches > 1 {
-            return None;
-        }
-    }
-
-    exact_username
-}
-
-fn best_contact_score(contact: &Contact, query: &str) -> Option<ContactFieldScore> {
-    let fields = contact_match_fields(contact);
-    best_contact_field_score(&fields, query)
-}
-
-pub(crate) fn best_contact_field_score(
-    fields: &[(usize, &str)],
-    query: &str,
-) -> Option<ContactFieldScore> {
-    let normalized_query = normalize_match_text(query);
-    if normalized_query.is_empty() {
-        return None;
-    }
-    let query_tokens = tokenize_match_text(query);
-
-    fields
+/// The one contact a query names exactly, provided no other contact is a
+/// direct (token-or-better) match.
+fn unique_exact_direct_username(scored: &[(&Contact, ContactFieldScore)]) -> Option<String> {
+    let mut direct = scored
         .iter()
-        .filter_map(|(priority, field)| {
-            field_score(field, query, &normalized_query, &query_tokens).map(
-                |(score, distance, field_len)| ContactFieldScore {
-                    score,
-                    field_priority: *priority,
-                    distance,
-                    field_len,
-                },
-            )
-        })
-        .max_by(|a, b| {
-            b.field_priority
-                .cmp(&a.field_priority)
-                .then_with(|| a.score.cmp(&b.score))
-                .then_with(|| b.distance.cmp(&a.distance))
-                .then_with(|| b.field_len.cmp(&a.field_len))
-        })
+        .filter(|(_, score)| score.score >= DIRECT_MATCH_SCORE_FLOOR);
+    let (contact, score) = direct.next()?;
+    (direct.next().is_none() && score.score == EXACT_MATCH_SCORE).then(|| contact.username.clone())
+}
+
+const NAME_SCORE_AUTO_CAP: usize = 8;
+/// Below this many contacts per worker, thread startup costs more than the
+/// scoring it would split.
+const NAME_SCORE_MIN_CHUNK: usize = 2048;
+
+/// Scores every contact once, in map iteration order. Chunks are scored on
+/// up to `jobs` threads and concatenated in order, so the result does not
+/// depend on the job count.
+fn score_contacts<'a>(
+    contacts: &'a HashMap<String, Contact>,
+    query: &str,
+    jobs: usize,
+) -> Vec<(&'a Contact, ContactFieldScore)> {
+    if FieldScorer::new(query).is_none() {
+        return Vec::new();
+    }
+    let contacts: Vec<&Contact> = contacts.values().collect();
+    let jobs = parallel::job_count(jobs, NAME_SCORE_AUTO_CAP);
+    let chunk_len = contacts.len().div_ceil(jobs).max(NAME_SCORE_MIN_CHUNK);
+    let chunks: Vec<&[&Contact]> = contacts.chunks(chunk_len).collect();
+    parallel::map_ordered(chunks, jobs, |chunk| {
+        let mut scorer = FieldScorer::new(query).expect("query was checked above");
+        chunk
+            .iter()
+            .filter_map(|&contact| {
+                let score = scorer.best(&contact_match_fields(contact))?;
+                Some((contact, score))
+            })
+            .collect::<Vec<_>>()
+    })
+    .concat()
 }
 
 fn contact_match_fields(contact: &Contact) -> [(usize, &str); 5] {
@@ -1828,70 +1921,146 @@ fn contact_match_fields(contact: &Contact) -> [(usize, &str); 5] {
     ]
 }
 
-fn field_score(
-    field: &str,
-    query: &str,
-    normalized_query: &str,
-    query_tokens: &[String],
-) -> Option<(i64, usize, usize)> {
-    let field = field.trim();
-    if field.is_empty() {
-        return None;
-    }
-
-    let normalized_field = normalize_match_text(field);
-    let field_len = normalized_field.chars().count();
-    if field_len == 0 {
-        return None;
-    }
-
-    if field == query {
-        return Some((EXACT_MATCH_SCORE, 0, field_len));
-    }
-    if normalized_field == normalized_query {
-        return Some((NORMALIZED_EXACT_MATCH_SCORE, 0, field_len));
-    }
-    if field.contains(query) {
-        return Some((CONTAINS_MATCH_SCORE, 0, field_len));
-    }
-    if normalized_field.contains(normalized_query) {
-        return Some((NORMALIZED_CONTAINS_MATCH_SCORE, 0, field_len));
-    }
-    if query_tokens.len() > 1
-        && query_tokens
-            .iter()
-            .all(|token| normalized_field.contains(token))
-    {
-        return Some((TOKEN_MATCH_SCORE, 0, field_len));
-    }
-
-    let query_len = normalized_query.chars().count();
-    if query_len < 2 {
-        return None;
-    }
-
-    let distance = levenshtein_distance(&normalized_field, normalized_query);
-    let max_len = field_len.max(query_len);
-    let allowed_distance = if max_len <= 3 {
-        1
-    } else {
-        (max_len / 3).max(1)
-    };
-    if distance > allowed_distance {
-        return None;
-    }
-
-    let similarity = ((max_len - distance) * 100 / max_len) as i64;
-    Some((FUZZY_MATCH_SCORE + similarity, distance, field_len))
+/// A query prepared once for scoring many fields. The scratch buffers are
+/// reused across fields; results do not depend on earlier calls.
+struct FieldScorer<'q> {
+    query: &'q str,
+    normalized_query: String,
+    query_chars: Vec<char>,
+    query_tokens: Vec<String>,
+    field: String,
+    field_chars: Vec<char>,
+    row: Vec<usize>,
 }
 
-fn normalize_match_text(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
+impl<'q> FieldScorer<'q> {
+    /// `None` when the query normalizes to nothing, which matches no field.
+    fn new(query: &'q str) -> Option<Self> {
+        let mut normalized_query = String::new();
+        normalize_match_text_into(query, &mut normalized_query);
+        if normalized_query.is_empty() {
+            return None;
+        }
+        Some(Self {
+            query,
+            query_chars: normalized_query.chars().collect(),
+            normalized_query,
+            query_tokens: tokenize_match_text(query),
+            field: String::new(),
+            field_chars: Vec::new(),
+            row: Vec::new(),
+        })
+    }
+
+    fn best(&mut self, fields: &[(usize, &str)]) -> Option<ContactFieldScore> {
+        fields
+            .iter()
+            .filter_map(|(priority, field)| {
+                self.score(field)
+                    .map(|(score, distance, field_len)| ContactFieldScore {
+                        score,
+                        field_priority: *priority,
+                        distance,
+                        field_len,
+                    })
+            })
+            .max_by(|a, b| {
+                b.field_priority
+                    .cmp(&a.field_priority)
+                    .then_with(|| a.score.cmp(&b.score))
+                    .then_with(|| b.distance.cmp(&a.distance))
+                    .then_with(|| b.field_len.cmp(&a.field_len))
+            })
+    }
+
+    /// Returns `(score, distance, normalized field length in chars)`.
+    fn score(&mut self, field: &str) -> Option<(i64, usize, usize)> {
+        let field = field.trim();
+        if field.is_empty() {
+            return None;
+        }
+
+        normalize_match_text_into(field, &mut self.field);
+        let normalized_field = self.field.as_str();
+        let field_len = if normalized_field.is_ascii() {
+            normalized_field.len()
+        } else {
+            normalized_field.chars().count()
+        };
+        if field_len == 0 {
+            return None;
+        }
+
+        if field == self.query {
+            return Some((EXACT_MATCH_SCORE, 0, field_len));
+        }
+        if normalized_field == self.normalized_query {
+            return Some((NORMALIZED_EXACT_MATCH_SCORE, 0, field_len));
+        }
+        if field.contains(self.query) {
+            return Some((CONTAINS_MATCH_SCORE, 0, field_len));
+        }
+        if normalized_field.contains(self.normalized_query.as_str()) {
+            return Some((NORMALIZED_CONTAINS_MATCH_SCORE, 0, field_len));
+        }
+        if self.query_tokens.len() > 1
+            && self
+                .query_tokens
+                .iter()
+                .all(|token| normalized_field.contains(token.as_str()))
+        {
+            return Some((TOKEN_MATCH_SCORE, 0, field_len));
+        }
+
+        let query_len = self.query_chars.len();
+        if query_len < 2 {
+            return None;
+        }
+
+        let max_len = field_len.max(query_len);
+        let allowed_distance = if max_len <= 3 {
+            1
+        } else {
+            (max_len / 3).max(1)
+        };
+        // The length difference is a lower bound on the edit distance.
+        if field_len.abs_diff(query_len) > allowed_distance {
+            return None;
+        }
+        self.field_chars.clear();
+        self.field_chars.extend(normalized_field.chars());
+        let distance = bounded_levenshtein(
+            &self.field_chars,
+            &self.query_chars,
+            allowed_distance,
+            &mut self.row,
+        )?;
+
+        let similarity = ((max_len - distance) * 100 / max_len) as i64;
+        Some((FUZZY_MATCH_SCORE + similarity, distance, field_len))
+    }
+}
+
+/// Lowercases `value` and drops all whitespace, writing into `out`.
+fn normalize_match_text_into(value: &str, out: &mut String) {
+    out.clear();
+    if value.is_ascii() {
+        // For ASCII, `char::to_lowercase` is `to_ascii_lowercase` and yields
+        // exactly one char.
+        out.extend(
+            value
+                .bytes()
+                .filter(|byte| !(*byte as char).is_whitespace())
+                .map(|byte| byte.to_ascii_lowercase() as char),
+        );
+    } else {
+        out.extend(
+            value
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .flat_map(char::to_lowercase),
+        );
+    }
 }
 
 fn tokenize_match_text(value: &str) -> Vec<String> {
@@ -1912,32 +2081,42 @@ fn tokenize_match_text(value: &str) -> Vec<String> {
     tokens
 }
 
-fn levenshtein_distance(left: &str, right: &str) -> usize {
-    let left: Vec<char> = left.chars().collect();
-    let right: Vec<char> = right.chars().collect();
-
-    if left.is_empty() {
-        return right.len();
+/// Levenshtein distance over chars, or `None` once it must exceed `limit`.
+/// Row minima never decrease, so a row whose minimum exceeds `limit` proves
+/// the final distance does too.
+fn bounded_levenshtein(
+    left: &[char],
+    right: &[char],
+    limit: usize,
+    row: &mut Vec<usize>,
+) -> Option<usize> {
+    if left.is_empty() || right.is_empty() {
+        let distance = left.len().max(right.len());
+        return (distance <= limit).then_some(distance);
     }
-    if right.is_empty() {
-        return left.len();
-    }
 
-    let mut prev: Vec<usize> = (0..=right.len()).collect();
-    let mut curr = vec![0; right.len() + 1];
-
+    // Single-row DP: `row[j]` holds the previous row until overwritten.
+    row.clear();
+    row.extend(0..=right.len());
     for (i, left_char) in left.iter().enumerate() {
-        curr[0] = i + 1;
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        let mut row_min = row[0];
         for (j, right_char) in right.iter().enumerate() {
-            let substitution = prev[j] + if left_char == right_char { 0 } else { 1 };
-            let insertion = curr[j] + 1;
-            let deletion = prev[j + 1] + 1;
-            curr[j + 1] = substitution.min(insertion).min(deletion);
+            let substitution = diagonal + usize::from(left_char != right_char);
+            let insertion = row[j] + 1;
+            let deletion = row[j + 1] + 1;
+            diagonal = row[j + 1];
+            row[j + 1] = substitution.min(insertion).min(deletion);
+            row_min = row_min.min(row[j + 1]);
         }
-        std::mem::swap(&mut prev, &mut curr);
+        if row_min > limit {
+            return None;
+        }
     }
 
-    prev[right.len()]
+    let distance = row[right.len()];
+    (distance <= limit).then_some(distance)
 }
 
 fn latest_message_times_for_candidates(
@@ -2836,6 +3015,106 @@ mod tests {
     }
 
     #[test]
+    fn split_content_scans_match_whole_table_query() {
+        let dir = tempdir().unwrap();
+        let message_dir = dir.path().join("message");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        let conn = Connection::open(message_dir.join("message_fts.db")).unwrap();
+        crate::fts::register_compatible_tokenizer(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE name2id(username TEXT PRIMARY KEY);
+             INSERT INTO name2id (rowid, username) VALUES (7, 'tgid_a'), (8, 'tgid_b');",
+        )
+        .unwrap();
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        // Unequal tables, sparse and negative rowids, and few distinct
+        // times, so ties straddle range boundaries and the LIMIT cutoff.
+        for (table, rows) in [(0, 40), (1, 700), (2, 0), (3, 300)] {
+            conn.execute_batch(&format!(
+                "CREATE VIRTUAL TABLE message_fts_v4_{table} USING fts5(
+                     tokenize = 'MMFtsTokenizer disable_pinyin', acontent,
+                     message_local_id UNINDEXED, sort_seq UNINDEXED, local_type UNINDEXED,
+                     session_id UNINDEXED, sender_id UNINDEXED, create_time UNINDEXED
+                 )"
+            ))
+            .unwrap();
+            let mut rowid = -50i64;
+            for row in 0..rows {
+                rowid += 1 + next(4) as i64 * next(30) as i64;
+                let content = if next(3) == 0 {
+                    format!("x Needle {table}-{row}")
+                } else {
+                    format!("hay {table}-{row}")
+                };
+                conn.execute(
+                    &format!(
+                        "INSERT INTO message_fts_v4_{table} (
+                             rowid, acontent, message_local_id, sort_seq, local_type,
+                             session_id, sender_id, create_time
+                         ) VALUES (?1, ?2, 1, 0, ?3, ?4, 0, ?5)"
+                    ),
+                    params![
+                        rowid,
+                        content,
+                        next(3) as i64,
+                        7 + next(2) as i64,
+                        100 + next(6) as i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        drop(conn);
+        let store = SourceStore::from_plaintext(dir.path()).unwrap();
+
+        let search = |limit, since, jobs| {
+            let results = super::search_messages(
+                &store,
+                SearchMessagesOptions {
+                    query: "needle",
+                    limit: Some(limit),
+                    since,
+                    name_mode: DisplayNameMode::PersonalRemark,
+                    jobs,
+                },
+            )
+            .unwrap();
+            let hits: Vec<_> = results
+                .hits
+                .iter()
+                .map(|hit| {
+                    (
+                        hit.create_time,
+                        hit.local_type,
+                        hit.content.clone(),
+                        hit.session.clone(),
+                    )
+                })
+                .collect();
+            (hits, results.has_more)
+        };
+        for limit in [1, 3, 17, 60, 200, 1000] {
+            for since in [None, Some(103)] {
+                // One job scans each table whole: the reference query.
+                let expected = search(limit, since, 1);
+                for jobs in [2, 3, 5, 8, 13] {
+                    assert_eq!(
+                        search(limit, since, jobs),
+                        expected,
+                        "limit {limit} since {since:?} jobs {jobs}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn search_messages_requires_fts() {
         let dir = tempdir().unwrap();
 
@@ -2999,7 +3278,8 @@ mod tests {
         ]);
         let contacts = load_contacts(&contact_db);
 
-        let username = unique_exact_direct_username(&contacts, "Linux 俱乐部 #2026🌅");
+        let username =
+            unique_exact_direct_username(&score_contacts(&contacts, "Linux 俱乐部 #2026🌅", 1));
 
         assert_eq!(username.as_deref(), Some("linux_2026@chatroom"));
     }
@@ -3013,7 +3293,7 @@ mod tests {
         ]);
         let contacts = load_contacts(&contact_db);
 
-        let username = unique_exact_direct_username(&contacts, "豆");
+        let username = unique_exact_direct_username(&score_contacts(&contacts, "豆", 1));
 
         assert_eq!(username, None);
     }
@@ -3026,9 +3306,55 @@ mod tests {
         ]);
         let contacts = load_contacts(&contact_db);
 
-        let username = unique_exact_direct_username(&contacts, "田雨坤");
+        let username = unique_exact_direct_username(&score_contacts(&contacts, "田雨坤", 1));
 
         assert_eq!(username, None);
+    }
+
+    #[test]
+    fn parallel_contact_scoring_keeps_map_order_and_scores() {
+        let contacts: HashMap<String, Contact> = (0..3 * NAME_SCORE_MIN_CHUNK + 17)
+            .map(|i| {
+                let username = format!("tgid_{i:05}");
+                let contact = Contact {
+                    username: username.clone(),
+                    nick_name: format!("nick {}", i % 97),
+                    remark: if i % 3 == 0 {
+                        format!("Remark{}", i % 41)
+                    } else {
+                        String::new()
+                    },
+                    alias: format!("al{}", i % 13),
+                    is_stranger: false,
+                };
+                (username, contact)
+            })
+            .collect();
+        let summary = |scored: Vec<(&Contact, ContactFieldScore)>| -> Vec<_> {
+            scored
+                .into_iter()
+                .map(|(c, s)| {
+                    (
+                        c.username.clone(),
+                        s.score,
+                        s.field_priority,
+                        s.distance,
+                        s.field_len,
+                    )
+                })
+                .collect()
+        };
+        for query in ["nick 5", "remark4", "al1", "tgid_0001", "nikc 9", "zz"] {
+            let expected = summary(score_contacts(&contacts, query, 1));
+            assert!(!expected.is_empty() || query == "zz", "{query}");
+            for jobs in [2, 3, 4, 8] {
+                assert_eq!(
+                    summary(score_contacts(&contacts, query, jobs)),
+                    expected,
+                    "{query} jobs={jobs}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3088,5 +3414,189 @@ mod tests {
         let username = resolve_username_for_test("Alic Zhang", &contact_db, None, 1).unwrap();
 
         assert_eq!(username, "tgid_alice");
+    }
+
+    /// The v2.5.0 scorer, kept verbatim as the reference for `FieldScorer`.
+    mod reference {
+        use super::super::{
+            CONTAINS_MATCH_SCORE, EXACT_MATCH_SCORE, FUZZY_MATCH_SCORE,
+            NORMALIZED_CONTAINS_MATCH_SCORE, NORMALIZED_EXACT_MATCH_SCORE, TOKEN_MATCH_SCORE,
+        };
+
+        pub fn field_score(
+            field: &str,
+            query: &str,
+            normalized_query: &str,
+            query_tokens: &[String],
+        ) -> Option<(i64, usize, usize)> {
+            let field = field.trim();
+            if field.is_empty() {
+                return None;
+            }
+            let normalized_field = normalize_match_text(field);
+            let field_len = normalized_field.chars().count();
+            if field_len == 0 {
+                return None;
+            }
+            if field == query {
+                return Some((EXACT_MATCH_SCORE, 0, field_len));
+            }
+            if normalized_field == normalized_query {
+                return Some((NORMALIZED_EXACT_MATCH_SCORE, 0, field_len));
+            }
+            if field.contains(query) {
+                return Some((CONTAINS_MATCH_SCORE, 0, field_len));
+            }
+            if normalized_field.contains(normalized_query) {
+                return Some((NORMALIZED_CONTAINS_MATCH_SCORE, 0, field_len));
+            }
+            if query_tokens.len() > 1
+                && query_tokens
+                    .iter()
+                    .all(|token| normalized_field.contains(token))
+            {
+                return Some((TOKEN_MATCH_SCORE, 0, field_len));
+            }
+            let query_len = normalized_query.chars().count();
+            if query_len < 2 {
+                return None;
+            }
+            let distance = levenshtein_distance(&normalized_field, normalized_query);
+            let max_len = field_len.max(query_len);
+            let allowed_distance = if max_len <= 3 {
+                1
+            } else {
+                (max_len / 3).max(1)
+            };
+            if distance > allowed_distance {
+                return None;
+            }
+            let similarity = ((max_len - distance) * 100 / max_len) as i64;
+            Some((FUZZY_MATCH_SCORE + similarity, distance, field_len))
+        }
+
+        pub fn normalize_match_text(value: &str) -> String {
+            value
+                .trim()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .flat_map(|c| c.to_lowercase())
+                .collect()
+        }
+
+        pub fn levenshtein_distance(left: &str, right: &str) -> usize {
+            let left: Vec<char> = left.chars().collect();
+            let right: Vec<char> = right.chars().collect();
+            if left.is_empty() {
+                return right.len();
+            }
+            if right.is_empty() {
+                return left.len();
+            }
+            let mut prev: Vec<usize> = (0..=right.len()).collect();
+            let mut curr = vec![0; right.len() + 1];
+            for (i, left_char) in left.iter().enumerate() {
+                curr[0] = i + 1;
+                for (j, right_char) in right.iter().enumerate() {
+                    let substitution = prev[j] + if left_char == right_char { 0 } else { 1 };
+                    let insertion = curr[j] + 1;
+                    let deletion = prev[j + 1] + 1;
+                    curr[j + 1] = substitution.min(insertion).min(deletion);
+                }
+                std::mem::swap(&mut prev, &mut curr);
+            }
+            prev[right.len()]
+        }
+    }
+
+    #[test]
+    fn field_scorer_matches_reference_scorer() {
+        // Mixed scripts, case-changing and multi-char lowercase letters, and
+        // every whitespace kind that trim/filter treat differently.
+        const ALPHABET: &[char] = &[
+            'a', 'b', 'c', 'A', 'B', 'C', 'x', '1', '-', '_', '.', ' ', '\t', '\u{b}', '\u{1f}',
+            '\u{a0}', '\u{3000}', '李', '雨', '田', 'İ', 'ß', 'Σ', 'σ', 'ς', '\u{212a}', 'k', 'é',
+            '\u{301}', '😀', 'Ǆ',
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let mut random_text = |max_len: usize| -> String {
+            let len = next(max_len + 1);
+            (0..len).map(|_| ALPHABET[next(ALPHABET.len())]).collect()
+        };
+        let fields: Vec<String> = (0..400).map(|_| random_text(14)).collect();
+        let mut queries: Vec<String> = (0..150).map(|_| random_text(8)).collect();
+        // Near-misses of real fields exercise the fuzzy and contains paths.
+        for field in fields.iter().take(150) {
+            let chars: Vec<char> = field.chars().collect();
+            if chars.len() < 2 {
+                continue;
+            }
+            let cut = chars.len() / 2;
+            queries.push(chars[..cut].iter().collect());
+            queries.push(chars[1..].iter().collect());
+            let mut edited = chars.clone();
+            edited[cut] = 'z';
+            queries.push(edited.iter().collect());
+            queries.push(field.to_uppercase());
+            queries.push(field.clone());
+        }
+
+        let mut compared = 0usize;
+        let mut fuzzy = 0usize;
+        for query in &queries {
+            let normalized_query = reference::normalize_match_text(query);
+            let mut scorer = FieldScorer::new(query);
+            assert_eq!(scorer.is_none(), normalized_query.is_empty(), "{query:?}");
+            let Some(scorer) = scorer.as_mut() else {
+                continue;
+            };
+            let tokens = tokenize_match_text(query);
+            for field in &fields {
+                let expected = reference::field_score(field, query, &normalized_query, &tokens);
+                assert_eq!(scorer.score(field), expected, "{field:?} vs {query:?}");
+                compared += 1;
+                fuzzy += usize::from(expected.is_some_and(|(score, ..)| score < 200));
+            }
+        }
+        assert!(compared > 100_000 && fuzzy > 100, "{compared} {fuzzy}");
+    }
+
+    #[test]
+    fn bounded_levenshtein_matches_full_distance() {
+        let words = [
+            "",
+            "a",
+            "ab",
+            "ba",
+            "abc",
+            "kitten",
+            "sitting",
+            "李雨田",
+            "田雨",
+            "flaw",
+            "lawn",
+        ];
+        let mut row = Vec::new();
+        for left in words {
+            for right in words {
+                let full = reference::levenshtein_distance(left, right);
+                let left_chars: Vec<char> = left.chars().collect();
+                let right_chars: Vec<char> = right.chars().collect();
+                for limit in 0..8 {
+                    let bounded = bounded_levenshtein(&left_chars, &right_chars, limit, &mut row);
+                    assert_eq!(
+                        bounded,
+                        (full <= limit).then_some(full),
+                        "{left} {right} {limit}"
+                    );
+                }
+            }
+        }
     }
 }
