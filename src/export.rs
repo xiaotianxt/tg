@@ -130,6 +130,19 @@ pub fn export_messages(
         .get(&username)
         .map(|c| c.display_name(contact::DisplayNameMode::PersonalRemark))
         .unwrap_or(&username);
+    // The cache layout does not depend on the messages, so it is found and
+    // indexed while they are read. File directories are indexed later, and only
+    // when a file message needs them.
+    let media_sources = {
+        let username = username.clone();
+        std::thread::spawn(move || {
+            media::find_telegram_base_path().map(|telegram_base| {
+                let media_index =
+                    MediaIndex::load(&telegram_base, &username, &["Image", "Video"], jobs);
+                (telegram_base, media_index)
+            })
+        })
+    };
     let room_member_names = HashMap::new();
     let display_context = MessageDisplayContext {
         chat_name: display_name,
@@ -233,19 +246,33 @@ pub fn export_messages(
     // Create output directory
     std::fs::create_dir_all(output_dir).map_err(|e| format!("Cannot create output dir: {}", e))?;
 
-    let mut results = Vec::new();
-
-    let path_txt = output_dir.join("chat.txt");
-    export_txt(&path_txt, &username, display_name, &all_messages)?;
-    results.push(("txt", path_txt));
-
-    let path_csv = output_dir.join("chat.csv");
-    export_csv(&path_csv, &all_messages)?;
-    results.push(("csv", path_csv));
-
-    let path_json = output_dir.join("chat.json");
-    export_json(&path_json, &all_messages)?;
-    results.push(("json", path_json));
+    let media_sources = media_sources
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    // Planning media jobs only reads the cache, so it overlaps the text
+    // exports; a writer error is still reported before any media work.
+    let (results, media_plan) = std::thread::scope(|scope| {
+        let writer =
+            scope.spawn(|| write_text_exports(output_dir, &username, display_name, &all_messages));
+        let media_plan = media_sources.map(|(telegram_base, media_index)| {
+            let media_jobs =
+                plan_media_jobs(&all_messages, &telegram_base, &username, &media_index, jobs);
+            // Keys are verified against this export's cached images and videos.
+            let key_samples = media_jobs.iter().filter_map(|job| match job {
+                MediaExportJob::Cached { src, category, .. } if *category != "File" => {
+                    Some(src.as_path())
+                }
+                _ => None,
+            });
+            let media_keys = crate::media_key::find_media_keys(&telegram_base, key_samples);
+            (media_keys, media_jobs)
+        });
+        let results = writer
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (results, media_plan)
+    });
+    let results = results?;
 
     let stdout = std::io::stdout();
     let mut out = crate::output::Output::new(stdout.lock());
@@ -255,99 +282,12 @@ pub fn export_messages(
 
     // Export cached media files when local Telegram media cache is available.
     let mut next_index = 1usize;
-    if let Some(telegram_base) = media::find_telegram_base_path() {
-        let mut index_categories = vec!["Image", "Video"];
-        if all_messages.iter().any(is_file_message) {
-            index_categories.push("File");
-        }
-        let media_index = MediaIndex::load(&telegram_base, &username, &index_categories, jobs);
-
-        let mut media_jobs = Vec::new();
-        let category_map = [("Image", 3), ("Video", 43)];
-
-        for (cat_name, local_type) in &category_map {
-            for m in &all_messages {
-                if m.msg_type != *local_type {
-                    continue;
-                }
-                // Try protobuf filename first, then fall back to XML aeskey
-                let identifier = try_protobuf_identifier(&m.packed_info)
-                    .or_else(|| media::extract_xml_attr(&m.raw_content, "aeskey"))
-                    .or_else(|| media::extract_xml_attr(&m.raw_content, "cdnthumburl"));
-                let identifier = match identifier {
-                    Some(ref s) if !s.is_empty() => s.clone(),
-                    _ => continue,
-                };
-
-                if let Some(src) = media_index.find(cat_name, &identifier) {
-                    media_jobs.push(MediaExportJob::Cached {
-                        index: next_index,
-                        src,
-                        category: cat_name,
-                        msg_type: m.msg_type,
-                    });
-                    next_index += 1;
-                }
-            }
-        }
-
-        let mut seen_stickers = HashSet::new();
-        for m in &all_messages {
-            if m.msg_type != 47 {
-                continue;
-            }
-
-            let info = media::parse_sticker_info(&m.raw_content);
-            if info.md5.is_empty() || !record_new_sticker(&mut seen_stickers, &info) {
-                continue;
-            }
-
-            let Some(cached_source) =
-                media::find_cached_sticker_in_layout(&telegram_base, &info.md5)
-            else {
-                continue;
-            };
-
-            media_jobs.push(MediaExportJob::Sticker {
-                index: next_index,
-                info: Box::new(info),
-                cached_source: Some(cached_source),
-            });
-            next_index += 1;
-        }
-
-        for m in &all_messages {
-            if !is_file_message(m) {
-                continue;
-            }
-
-            let Some(identifier) = file_identifier(m) else {
-                continue;
-            };
-
-            if let Some(src) = media_index.find("File", &identifier) {
-                media_jobs.push(MediaExportJob::Cached {
-                    index: next_index,
-                    src,
-                    category: "File",
-                    msg_type: file_export_type(m.msg_type),
-                });
-                next_index += 1;
-            }
-        }
-
-        // Derive media decryption keys (V2 .dat), verified against this export's images and videos.
-        let key_samples = media_jobs.iter().filter_map(|job| match job {
-            MediaExportJob::Cached { src, category, .. } if *category != "File" => {
-                Some(src.as_path())
-            }
-            _ => None,
-        });
-        let media_keys = crate::media_key::find_media_keys(&telegram_base, key_samples);
+    if let Some((media_keys, media_jobs)) = media_plan {
         if let Err(ref e) = media_keys {
             log::warn!("Cannot derive media decryption keys: {}", e);
         }
         let media_keys = media_keys.ok();
+        next_index += media_jobs.len();
 
         let media_job_count = parallel::job_count(jobs, 8);
         let prepared = parallel::map_ordered(media_jobs, media_job_count, |job| match job {
@@ -456,6 +396,115 @@ pub fn export_messages(
     ))?;
     out.flush()?;
     Ok(results)
+}
+
+fn write_text_exports(
+    output_dir: &Path,
+    username: &str,
+    display_name: &str,
+    messages: &[ExportMessage],
+) -> Result<Vec<(&'static str, PathBuf)>, String> {
+    let path_txt = output_dir.join("chat.txt");
+    export_txt(&path_txt, username, display_name, messages)?;
+    let path_csv = output_dir.join("chat.csv");
+    export_csv(&path_csv, messages)?;
+    let path_json = output_dir.join("chat.json");
+    export_json(&path_json, messages)?;
+    Ok(vec![
+        ("txt", path_txt),
+        ("csv", path_csv),
+        ("json", path_json),
+    ])
+}
+
+/// Find the cached file for every media message, numbering jobs from 1 in
+/// export order: images, videos, new stickers, then files.
+fn plan_media_jobs(
+    all_messages: &[ExportMessage],
+    telegram_base: &Path,
+    username: &str,
+    media_index: &MediaIndex,
+    jobs: usize,
+) -> Vec<MediaExportJob> {
+    let file_index = all_messages
+        .iter()
+        .any(is_file_message)
+        .then(|| MediaIndex::load(telegram_base, username, &["File"], jobs));
+
+    let mut media_jobs = Vec::new();
+    let category_map = [("Image", 3), ("Video", 43)];
+
+    for (cat_name, local_type) in &category_map {
+        for m in all_messages {
+            if m.msg_type != *local_type {
+                continue;
+            }
+            // Try protobuf filename first, then fall back to XML aeskey
+            let identifier = try_protobuf_identifier(&m.packed_info)
+                .or_else(|| media::extract_xml_attr(&m.raw_content, "aeskey"))
+                .or_else(|| media::extract_xml_attr(&m.raw_content, "cdnthumburl"));
+            let identifier = match identifier {
+                Some(ref s) if !s.is_empty() => s.clone(),
+                _ => continue,
+            };
+
+            if let Some(src) = media_index.find(cat_name, &identifier) {
+                media_jobs.push(MediaExportJob::Cached {
+                    index: media_jobs.len() + 1,
+                    src,
+                    category: cat_name,
+                    msg_type: m.msg_type,
+                });
+            }
+        }
+    }
+
+    let mut seen_stickers = HashSet::new();
+    for m in all_messages {
+        if m.msg_type != 47 {
+            continue;
+        }
+
+        let info = media::parse_sticker_info(&m.raw_content);
+        if info.md5.is_empty() || !record_new_sticker(&mut seen_stickers, &info) {
+            continue;
+        }
+
+        let Some(cached_source) = media::find_cached_sticker_in_layout(telegram_base, &info.md5)
+        else {
+            continue;
+        };
+
+        media_jobs.push(MediaExportJob::Sticker {
+            index: media_jobs.len() + 1,
+            info: Box::new(info),
+            cached_source: Some(cached_source),
+        });
+    }
+
+    for m in all_messages {
+        if !is_file_message(m) {
+            continue;
+        }
+
+        let Some(identifier) = file_identifier(m) else {
+            continue;
+        };
+
+        if let Some(src) = file_index
+            .as_ref()
+            .and_then(|index| index.find("File", &identifier))
+        {
+            media_jobs.push(MediaExportJob::Cached {
+                index: media_jobs.len() + 1,
+                src,
+                category: "File",
+                msg_type: file_export_type(m.msg_type),
+            });
+        }
+    }
+
+    media_jobs
 }
 
 fn try_protobuf_identifier(data: &[u8]) -> Option<String> {

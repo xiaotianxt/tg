@@ -51,8 +51,8 @@ impl MediaIndex {
         categories: &[&str],
         jobs: usize,
     ) -> Self {
-        let scan_jobs = discover_media_dirs(base_path, session_id, categories);
         let scan_job_count = parallel::job_count(jobs, 8);
+        let scan_jobs = discover_media_dirs(base_path, session_id, categories, scan_job_count);
         let scanned = parallel::map_ordered(scan_jobs, scan_job_count, scan_media_dir);
 
         let mut files_by_category: HashMap<String, Vec<IndexedMediaFile>> = HashMap::new();
@@ -189,10 +189,13 @@ fn is_better(candidate: &IndexedMediaFile, current: &IndexedMediaFile) -> bool {
     (!candidate.is_thumb, candidate.len()) > (!current.is_thumb, current.len())
 }
 
+/// Lists candidate directories. A candidate may be missing or not a directory;
+/// scanning it then finds no files, exactly as if it had been left out.
 fn discover_media_dirs(
     base_path: &Path,
     session_id: &str,
     categories: &[&str],
+    jobs: usize,
 ) -> Vec<MediaDirSpec> {
     let mut dirs = Vec::new();
 
@@ -210,7 +213,7 @@ fn discover_media_dirs(
     if categories.contains(&"Image") {
         let attach_dir = base_path.join("msg/attach");
         if attach_dir.is_dir() {
-            discover_attach_image_dirs(&attach_dir, &mut dirs);
+            discover_attach_image_dirs(&attach_dir, &mut dirs, jobs);
         }
     }
 
@@ -251,28 +254,32 @@ fn discover_media_dirs(
     dirs
 }
 
-fn discover_attach_image_dirs(attach_dir: &Path, dirs: &mut Vec<MediaDirSpec>) {
+/// Every chat directory has month directories that may hold `Img`. Statting
+/// each `Img` serially dominated discovery, so the scan's own `read_dir`
+/// rejects the missing ones, in parallel. Listing months needs one directory
+/// open per chat, so that runs in parallel too.
+fn discover_attach_image_dirs(attach_dir: &Path, dirs: &mut Vec<MediaDirSpec>, jobs: usize) {
     let Ok(accounts) = fs::read_dir(attach_dir) else {
         return;
     };
+    let account_paths = accounts.flatten().map(|account| account.path()).collect();
 
-    for account in accounts.flatten() {
-        let account_path = account.path();
-        if !account_path.is_dir() {
-            continue;
-        }
-        let Ok(months) = fs::read_dir(account_path) else {
-            continue;
-        };
-        for month in months.flatten() {
-            let img_dir = month.path().join("Img");
-            if img_dir.is_dir() {
-                dirs.push(MediaDirSpec {
-                    path: img_dir,
-                    category: "Image".to_string(),
-                });
-            }
-        }
+    // `read_dir` follows symlinks and fails on non-directories, as `is_dir` did.
+    let img_dirs = parallel::map_ordered(account_paths, jobs, |account_path: PathBuf| {
+        fs::read_dir(account_path)
+            .map(|months| {
+                months
+                    .flatten()
+                    .map(|month| month.path().join("Img"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    for img_dir in img_dirs.into_iter().flatten() {
+        dirs.push(MediaDirSpec {
+            path: img_dir,
+            category: "Image".to_string(),
+        });
     }
 }
 
@@ -284,7 +291,13 @@ fn discover_attach_file_dirs(attach_dir: &Path, session_id: &str, dirs: &mut Vec
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            // The entry type comes from the directory listing; only symlinks
+            // need a stat to learn whether they point at a directory.
+            let is_dir = match entry.file_type() {
+                Ok(file_type) if !file_type.is_symlink() => file_type.is_dir(),
+                _ => path.is_dir(),
+            };
+            if !is_dir {
                 continue;
             }
             if path.file_name().and_then(|name| name.to_str()) == Some("F") {
@@ -377,11 +390,53 @@ mod tests {
         let img_dir = temp.path().join("msg/attach/account/2026-04/Img");
         fs::create_dir_all(&img_dir).unwrap();
 
-        let dirs = discover_media_dirs(temp.path(), "session", &["Image"]);
+        let dirs = discover_media_dirs(temp.path(), "session", &["Image"], 1);
 
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0].path, img_dir);
         assert_eq!(dirs[0].category, "Image");
+    }
+
+    #[test]
+    fn skips_missing_and_non_directory_candidates_and_follows_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let attach = temp.path().join("msg/attach");
+        let img_dir = attach.join("chat/2026-01/Img");
+        fs::create_dir_all(&img_dir).unwrap();
+        fs::write(img_dir.join("plain.dat"), b"a").unwrap();
+        fs::create_dir_all(attach.join("chat/2026-02")).unwrap();
+        fs::write(attach.join("chat/2026-03"), b"month is a file").unwrap();
+        fs::create_dir_all(attach.join("chat/2026-04")).unwrap();
+        fs::write(attach.join("chat/2026-04/Img"), b"img is a file").unwrap();
+        fs::write(attach.join("not-a-chat"), b"chat is a file").unwrap();
+
+        let linked = temp.path().join("elsewhere");
+        fs::create_dir_all(linked.join("2026-05/Img")).unwrap();
+        fs::write(linked.join("2026-05/Img/linked.dat"), b"b").unwrap();
+        std::os::unix::fs::symlink(&linked, attach.join("linked-chat")).unwrap();
+
+        let session_dir = attach.join(session_attach_dir_name("session"));
+        let file_target = temp.path().join("file-target");
+        fs::create_dir_all(file_target.join("F")).unwrap();
+        fs::write(file_target.join("F/report.pdf"), b"pdf").unwrap();
+        fs::create_dir_all(session_dir.join("2026-06/Rec")).unwrap();
+        std::os::unix::fs::symlink(&file_target, session_dir.join("2026-06/Rec/item")).unwrap();
+
+        let index = MediaIndex::load(temp.path(), "session", &["Image", "File"], 4);
+
+        assert_eq!(
+            index.find("Image", "plain").unwrap(),
+            img_dir.join("plain.dat")
+        );
+        assert_eq!(
+            index.find("Image", "linked").unwrap(),
+            attach.join("linked-chat/2026-05/Img/linked.dat")
+        );
+        assert!(index.find("Image", "file").is_none());
+        assert_eq!(
+            index.find("File", "report.pdf").unwrap(),
+            session_dir.join("2026-06/Rec/item/F/report.pdf")
+        );
     }
 
     #[test]
@@ -396,7 +451,7 @@ mod tests {
         fs::create_dir_all(&file_dir).unwrap();
         fs::create_dir_all(temp.path().join("msg/attach/other/2026-04/Rec/item/F")).unwrap();
 
-        let dirs = discover_media_dirs(temp.path(), "session", &["File"]);
+        let dirs = discover_media_dirs(temp.path(), "session", &["File"], 1);
 
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0].path, file_dir);
