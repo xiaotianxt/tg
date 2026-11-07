@@ -1,49 +1,39 @@
-## Faster reads, round two
+## Leaner MCP reads, and images over MCP
 
-tg still reads the same local databases read-only and prints byte-identical
-output for the same data. No caches, plaintext copies or derived indexes were
-added. Most of the gain comes from doing independent work at the same time,
-so some commands use a little more CPU and memory in exchange for lower wall
-time.
+The MCP server now sends much less text per message, and can show cached
+images to the model. Everything stays read-only and local; nothing new is
+written to disk.
 
-Measured on an 8-core Linux machine against a synthetic encrypted workset of
-about 2.2 million messages (interleaved runs, median wall time):
+### `read_messages` returns a transcript
 
-| command | 2.5.0 | 2.6.0 | speedup |
-|---|---|---|---|
-| `query --contains` across all chats | 4.8 s | 2.8 s | 1.7x |
-| `query --has` media across all chats | 3.6 s | 2.2 s | 1.7x |
-| `query --format json` across all chats | 5.1 s | 3.1 s | 1.7x |
-| `query --order oldest` | 1.3 s | 0.9 s | 1.4x |
-| `messages` (session id) | 400 ms | 240 ms | 1.6x |
-| `messages` (display name) | 520-600 ms | 320 ms | 1.6-1.9x |
-| `messages --all-time` (large group) | 1.5 s | 1.2 s | 1.2x |
-| `members` | 420 ms | 210 ms | 2.0x |
-| `export` (group with media) | 1.06 s | 0.82 s | 1.3x |
-| `doctor` (session id) | 430 ms | 220 ms | 1.9x |
+`read_messages` now returns a plain-text transcript instead of JSON: one
+`== YYYY-MM-DD ==` line per local day, then one `HH:MM sender: text` line per
+message, with indented continuation lines for multi-line messages. A trimmed
+result ends with a `[truncated]` line naming the `offset` to continue from.
 
-`sessions`, `unread` and `search` with ASCII queries are unchanged.
+On one busy group (2,211 messages in 24 hours) the result went from 277k to
+88k characters, with every message kept. Before, about 80% of the result was
+JSON field names and the same timestamp written twice, and the whole result
+was sent a second time as `structuredContent`. The transcript is sent once, as
+text only.
 
-- `query` splits large message tables into row ranges and reads them on up
-  to four threads (`--jobs` overrides). Global queries use 5-10% more CPU and
-  more peak memory.
-- SQLite allocation statistics are turned off, so parallel readers no longer
-  wait on one process-wide lock.
-- `messages`, `members` and `doctor` given a session id load contacts while
-  the message databases are read.
-- Display-name lookups score each contact once, with a bounded edit distance,
-  in parallel chunks.
-- `export` indexes the media cache while messages are read, plans media jobs
-  while the text files are written, lists cache directories without a stat
-  per candidate, and skips a redundant probe when converting batched HEVC
-  images.
+This changes the result format: a client that parsed `read_messages` JSON must
+read the text lines instead. The other tools still return JSON.
 
-## Fixes
+### New `get_media` tool
 
-- `export` picks the media key that actually decrypts this chat's cached
-  images and videos when the client keeps keys for several codes. Before, it
-  took whichever key file the directory listed first and could write media as
-  undecrypted `.bin` files.
-- Forwarded chat records nested inside other forwarded records now expand as
-  indented inner records instead of being flattened into the parent (#13,
-  thanks @thezzisu).
+Message tools already show images as `[img:<id>]`. `get_media` takes up to 10
+of those ids for one chat and returns them as MCP images:
+
+- `size: "preview"` (default) returns the client's standard copy, falling back
+  to the thumbnail; `size: "original"` returns the full-resolution copy when it
+  was downloaded.
+- A video id (the name in `[视频 WxH <id>]`) returns the cached cover.
+- An id that was never downloaded is reported as text; the other ids in the
+  call still return.
+
+Remote clients get images only after the owner sets
+`"allow_media": true` under `remote` in `~/.tg/mcp/config.json`. Session
+allow/deny lists apply, and the lookback window applies per cache month.
+Voice is still sent as text: the transcript already includes the client's own
+voice-to-text when it exists.
