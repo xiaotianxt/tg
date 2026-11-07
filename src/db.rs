@@ -1209,19 +1209,67 @@ pub(crate) fn probe_session(
     jobs: usize,
 ) -> Result<SessionProbe, String> {
     let message_dbs = message_databases(store);
-    let contact_conn = open_optional_database(store, CONTACT_DB)?;
-    let contacts = match contact_conn.as_ref() {
-        Some(conn) => contact::load_contacts(conn)?,
-        None => HashMap::new(),
-    };
-    let username =
-        resolve_username_for_messages(session_query, &contacts, store, &message_dbs, jobs)?;
-    let table_name = msg_table_name(&username);
-    let display_name = contacts
-        .get(&username)
+    let (username, display_contact, (matching_dbs, message_count)) =
+        match direct_session_username(session_query) {
+            // A direct id resolves without contacts and shows only its own row,
+            // so the contact scan runs beside the shard counts. Its errors still
+            // win, as when it ran first.
+            Some(username) => {
+                let username = username.to_string();
+                let (contacts, counts) = std::thread::scope(|scope| {
+                    let contacts = scope.spawn(|| -> Result<_, String> {
+                        match open_optional_database(store, CONTACT_DB)? {
+                            Some(conn) => contact::load_contacts_where(&conn, |id| id == username),
+                            None => Ok(HashMap::new()),
+                        }
+                    });
+                    let counts = count_session_messages(store, message_dbs, &username, jobs);
+                    let contacts = contacts
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    (contacts, counts)
+                });
+                let display_contact = contacts?.remove(&username);
+                (username, display_contact, counts?)
+            }
+            None => {
+                let mut contacts = match open_optional_database(store, CONTACT_DB)? {
+                    Some(conn) => contact::load_contacts(&conn)?,
+                    None => HashMap::new(),
+                };
+                let username = resolve_username_for_messages(
+                    session_query,
+                    &contacts,
+                    store,
+                    &message_dbs,
+                    jobs,
+                )?;
+                let counts = count_session_messages(store, message_dbs, &username, jobs)?;
+                let display_contact = contacts.remove(&username);
+                (username, display_contact, counts)
+            }
+        };
+    let display_name = display_contact
         .map(|contact| contact.personal_display_name().to_string())
         .unwrap_or_else(|| username.clone());
 
+    Ok(SessionProbe {
+        table_name: msg_table_name(&username),
+        username,
+        display_name,
+        matching_dbs,
+        message_count,
+    })
+}
+
+/// Counts the session's dated messages: (shards holding its table, total).
+fn count_session_messages(
+    store: &SourceStore,
+    message_dbs: Vec<String>,
+    username: &str,
+    jobs: usize,
+) -> Result<(usize, usize), String> {
+    let table_name = msg_table_name(username);
     let db_jobs = parallel::job_count(jobs, parallel::SOURCE_DB_AUTO_CAP);
     let per_db_counts = parallel::map_ordered(
         message_dbs,
@@ -1249,14 +1297,7 @@ pub(crate) fn probe_session(
             message_count += count;
         }
     }
-
-    Ok(SessionProbe {
-        username,
-        display_name,
-        table_name,
-        matching_dbs,
-        message_count,
-    })
+    Ok((matching_dbs, message_count))
 }
 
 /// Search across all sessions.
@@ -2521,6 +2562,20 @@ mod tests {
             };
             assert_eq!(report("room@chatroom"), report("Study Group"));
         }
+
+        // Doctor's direct-id probe keeps only the session's own contact row.
+        let probe = |session_query| {
+            let probe = super::probe_session(&store, session_query, 2).unwrap();
+            (
+                probe.username,
+                probe.display_name,
+                probe.table_name,
+                probe.matching_dbs,
+                probe.message_count,
+            )
+        };
+        assert_eq!(probe("room@chatroom"), probe("Study Group"));
+        assert_eq!(probe("room@chatroom").1, "Study Group");
     }
 
     #[test]
