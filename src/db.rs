@@ -1332,7 +1332,6 @@ fn search_messages_with_fts(
     let mut results = match match_query {
         Some(query) => collect_telegram_fts_rows(
             store,
-            &conn,
             &content_tables,
             &name2id,
             options,
@@ -1342,7 +1341,6 @@ fn search_messages_with_fts(
         .or_else(|match_error| {
             collect_telegram_fts_rows(
                 store,
-                &conn,
                 &content_tables,
                 &name2id,
                 options,
@@ -1357,7 +1355,6 @@ fn search_messages_with_fts(
         })?,
         None => collect_telegram_fts_rows(
             store,
-            &conn,
             &content_tables,
             &name2id,
             options,
@@ -1376,75 +1373,39 @@ fn search_messages_with_fts(
     Ok((has_more, results))
 }
 
-// Content scans are page-decryption bound and the tables differ in size
-// by 4x, so the largest table set the wall time when each had one worker.
-const FTS_SCAN_AUTO_CAP: usize = 8;
-
-/// One worker's share of a content table: rowids `lo..=hi`, or every row.
-struct FtsScan<'a> {
-    table: usize,
-    content_table: &'a str,
-    rowids: Option<(i64, i64)>,
-}
-
-/// Scans the FTS tables in parallel, one connection per scan. Rows are
-/// concatenated in table order, so the caller's stable sort sees the same
-/// sequence as one sequential scan.
+/// Scans each FTS table on its own connection. Rows are concatenated in
+/// table order, so the caller's stable sort sees the same sequence as one
+/// sequential scan.
 fn collect_telegram_fts_rows(
     store: &SourceStore,
-    conn: &Connection,
     content_tables: &[String],
     name2id: &HashMap<i64, String>,
     options: &SearchMessagesOptions<'_>,
     result_limit: Option<usize>,
     match_query: Option<&str>,
 ) -> Result<Vec<SearchRow>, String> {
-    let jobs = parallel::job_count(options.jobs, FTS_SCAN_AUTO_CAP);
-    // Splitting is exact only for the LIMIT form of the content query; see
-    // `search_telegram_fts_table`.
-    let scans = if match_query.is_none() && result_limit.is_some() {
-        plan_fts_content_scans(conn, content_tables, jobs)
-    } else {
-        whole_table_scans(content_tables)
-    };
-    let per_scan = parallel::map_ordered(scans, jobs, |scan| {
+    // The four FTS tables total far less than the message shards that
+    // SOURCE_DB_AUTO_CAP was tuned on; one worker per table measured fastest.
+    let jobs = parallel::job_count(options.jobs, content_tables.len());
+    let per_table = parallel::map_ordered(content_tables.iter().collect(), jobs, |content_table| {
         let conn = store
             .open(MESSAGE_FTS_DB)
             .map_err(|error| format!("Message search index is unavailable: {error}"))?;
         if match_query.is_some() {
             fts::register_compatible_tokenizer(&conn)?;
         }
-        let rows = search_telegram_fts_table(
+        search_telegram_fts_table(
             &conn,
-            scan.content_table,
-            scan.rowids,
+            content_table,
             name2id,
             options,
             result_limit,
             match_query,
-        )?;
-        Ok::<_, String>((scan.table, scan.rowids.is_some(), rows))
+        )
     });
-
     let mut results = Vec::new();
-    let mut per_scan = per_scan.into_iter().peekable();
-    while let Some(first) = per_scan.next() {
-        let (table, split, mut rows) = first?;
-        if split {
-            // Ranges arrive in rowid order, each sorted by (time DESC, rowid),
-            // so a stable sort by time yields the whole table's order.
-            while let Some(next) = per_scan.next_if(|next| {
-                next.as_ref()
-                    .map_or(true, |(next_table, ..)| *next_table == table)
-            }) {
-                rows.extend(next?.2);
-            }
-            rows.sort_by_key(|row| Reverse(row.1));
-            if let Some(limit) = result_limit {
-                rows.truncate(limit);
-            }
-        }
-        results.extend(rows);
+    for rows in per_table {
+        results.extend(rows?);
     }
 
     if match_query.is_some() {
@@ -1453,105 +1414,9 @@ fn collect_telegram_fts_rows(
     Ok(results)
 }
 
-fn whole_table_scans(content_tables: &[String]) -> Vec<FtsScan<'_>> {
-    content_tables
-        .iter()
-        .enumerate()
-        .map(|(table, content_table)| FtsScan {
-            table,
-            content_table,
-            rowids: None,
-        })
-        .collect()
-}
-
-/// Splits tables into contiguous rowid ranges so that at most `jobs` scans
-/// (or one per table, if more) exist and the largest range is about as small
-/// as that allows. Rowid span stands in for row count.
-fn plan_fts_content_scans<'a>(
-    conn: &Connection,
-    content_tables: &'a [String],
-    jobs: usize,
-) -> Vec<FtsScan<'a>> {
-    if jobs < 2 {
-        return whole_table_scans(content_tables);
-    }
-    // A table whose bounds cannot be read is scanned whole; that scan
-    // reports any real error.
-    let bounds: Vec<Option<(i64, i64)>> = content_tables
-        .iter()
-        .map(|content_table| content_rowid_bounds(conn, content_table).ok().flatten())
-        .collect();
-    let spans: Vec<i128> = bounds
-        .iter()
-        .map(|bounds| bounds.map_or(0, |(lo, hi)| i128::from(hi) - i128::from(lo) + 1))
-        .collect();
-    let budget = i128::try_from(jobs.max(content_tables.len())).expect("job count fits i128");
-    let parts_for = |chunk: i128| -> Vec<i128> {
-        spans
-            .iter()
-            .map(|span| ((span + chunk - 1) / chunk).max(1))
-            .collect()
-    };
-    let total: i128 = spans.iter().sum();
-    let mut chunk = ((total + budget - 1) / budget).max(1);
-    let mut parts = parts_for(chunk);
-    while parts.iter().sum::<i128>() > budget {
-        chunk += chunk / 16 + 1;
-        parts = parts_for(chunk);
-    }
-
-    let mut scans = Vec::new();
-    for (table, content_table) in content_tables.iter().enumerate() {
-        let Some((lo, hi)) = bounds[table].filter(|_| parts[table] > 1) else {
-            scans.push(FtsScan {
-                table,
-                content_table,
-                rowids: None,
-            });
-            continue;
-        };
-        let width = (spans[table] + parts[table] - 1) / parts[table];
-        let mut start = i128::from(lo);
-        while start <= i128::from(hi) {
-            let end = (start + width - 1).min(i128::from(hi));
-            scans.push(FtsScan {
-                table,
-                content_table,
-                rowids: Some((
-                    i64::try_from(start).expect("range start lies within table bounds"),
-                    i64::try_from(end).expect("range end lies within table bounds"),
-                )),
-            });
-            start = end + 1;
-        }
-    }
-    scans
-}
-
-fn content_rowid_bounds(
-    conn: &Connection,
-    content_table: &str,
-) -> rusqlite::Result<Option<(i64, i64)>> {
-    // Separate subqueries: SQLite answers a lone min() or max() from the
-    // rowid b-tree, but a query with both scans the whole table.
-    let table = quote_identifier(content_table);
-    let sql = format!("SELECT (SELECT min(rowid) FROM {table}), (SELECT max(rowid) FROM {table})");
-    conn.query_row(&sql, [], |row| {
-        Ok(row
-            .get::<_, Option<i64>>(0)?
-            .zip(row.get::<_, Option<i64>>(1)?))
-    })
-}
-
-/// Without `rowids`, this is the reference query. For LIMIT, SQLite orders
-/// equal times by scan (rowid) order and keeps the earliest at the cutoff,
-/// so a rowid range ordered by `(time DESC, rowid)` returns exactly that
-/// table query's rows from the range, in the same relative order.
 fn search_telegram_fts_table(
     conn: &Connection,
     content_table: &str,
-    rowids: Option<(i64, i64)>,
     name2id: &HashMap<i64, String>,
     options: &SearchMessagesOptions<'_>,
     result_limit: Option<usize>,
@@ -1584,17 +1449,13 @@ fn search_telegram_fts_table(
         .since
         .map(|ts| format!(" AND {time_column} >= {ts}"))
         .unwrap_or_default();
-    let (range_clause, tie_order) = match rowids {
-        Some((lo, hi)) => (format!("rowid BETWEEN {lo} AND {hi} AND "), ", rowid"),
-        None => (String::new(), ""),
-    };
     let limit_clause = result_limit
         .map(|limit| format!(" LIMIT {limit}"))
         .unwrap_or_default();
     let sql = format!(
         "SELECT {columns} FROM {table} \
-         WHERE {range_clause}{search_clause}{since_clause} \
-         ORDER BY {time_column} DESC{tie_order}{limit_clause}"
+         WHERE {search_clause}{since_clause} \
+         ORDER BY {time_column} DESC{limit_clause}"
     );
     let mut stmt = conn
         .prepare(&sql)
@@ -3010,106 +2871,6 @@ mod tests {
                     "query {query}, jobs {jobs}"
                 );
                 assert!(results.has_more);
-            }
-        }
-    }
-
-    #[test]
-    fn split_content_scans_match_whole_table_query() {
-        let dir = tempdir().unwrap();
-        let message_dir = dir.path().join("message");
-        std::fs::create_dir_all(&message_dir).unwrap();
-        let conn = Connection::open(message_dir.join("message_fts.db")).unwrap();
-        crate::fts::register_compatible_tokenizer(&conn).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE name2id(username TEXT PRIMARY KEY);
-             INSERT INTO name2id (rowid, username) VALUES (7, 'tgid_a'), (8, 'tgid_b');",
-        )
-        .unwrap();
-        let mut state = 0x2545_f491_4f6c_dd1d_u64;
-        let mut next = move |bound: u64| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state % bound
-        };
-        // Unequal tables, sparse and negative rowids, and few distinct
-        // times, so ties straddle range boundaries and the LIMIT cutoff.
-        for (table, rows) in [(0, 40), (1, 700), (2, 0), (3, 300)] {
-            conn.execute_batch(&format!(
-                "CREATE VIRTUAL TABLE message_fts_v4_{table} USING fts5(
-                     tokenize = 'MMFtsTokenizer disable_pinyin', acontent,
-                     message_local_id UNINDEXED, sort_seq UNINDEXED, local_type UNINDEXED,
-                     session_id UNINDEXED, sender_id UNINDEXED, create_time UNINDEXED
-                 )"
-            ))
-            .unwrap();
-            let mut rowid = -50i64;
-            for row in 0..rows {
-                rowid += 1 + next(4) as i64 * next(30) as i64;
-                let content = if next(3) == 0 {
-                    format!("x Needle {table}-{row}")
-                } else {
-                    format!("hay {table}-{row}")
-                };
-                conn.execute(
-                    &format!(
-                        "INSERT INTO message_fts_v4_{table} (
-                             rowid, acontent, message_local_id, sort_seq, local_type,
-                             session_id, sender_id, create_time
-                         ) VALUES (?1, ?2, 1, 0, ?3, ?4, 0, ?5)"
-                    ),
-                    params![
-                        rowid,
-                        content,
-                        next(3) as i64,
-                        7 + next(2) as i64,
-                        100 + next(6) as i64
-                    ],
-                )
-                .unwrap();
-            }
-        }
-        drop(conn);
-        let store = SourceStore::from_plaintext(dir.path()).unwrap();
-
-        let search = |limit, since, jobs| {
-            let results = super::search_messages(
-                &store,
-                SearchMessagesOptions {
-                    query: "needle",
-                    limit: Some(limit),
-                    since,
-                    name_mode: DisplayNameMode::PersonalRemark,
-                    jobs,
-                },
-            )
-            .unwrap();
-            let hits: Vec<_> = results
-                .hits
-                .iter()
-                .map(|hit| {
-                    (
-                        hit.create_time,
-                        hit.local_type,
-                        hit.content.clone(),
-                        hit.session.clone(),
-                    )
-                })
-                .collect();
-            (hits, results.has_more)
-        };
-        for limit in [1, 3, 17, 60, 200, 1000] {
-            for since in [None, Some(103)] {
-                // One job scans each table whole: the reference query.
-                let expected = search(limit, since, 1);
-                for jobs in [2, 3, 5, 8, 13] {
-                    assert_eq!(
-                        search(limit, since, jobs),
-                        expected,
-                        "limit {limit} since {since:?} jobs {jobs}"
-                    );
-                }
             }
         }
     }
