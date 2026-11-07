@@ -3,6 +3,8 @@ use std::sync::{mpsc, Mutex};
 
 // ponytail: two SQLCipher readers avoid storage contention; --jobs overrides when hardware differs.
 pub(crate) const SOURCE_DB_AUTO_CAP: usize = 2;
+/// Readers for `query`, which splits large tables into rowid ranges.
+pub(crate) const QUERY_SCAN_AUTO_CAP: usize = 4;
 
 pub(crate) fn job_count(requested: usize, auto_cap: usize) -> usize {
     if requested > 0 {
