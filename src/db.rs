@@ -826,40 +826,17 @@ fn session_match_info(
     display: &str,
     query: &str,
 ) -> Option<SessionMatchInfo> {
-    if let Some(contact) = contacts.get(username) {
-        return best_contact_score(contact, query).map(|score| SessionMatchInfo {
-            score: score.score,
-            field_priority: score.field_priority,
-            distance: score.distance,
-            field_len: score.field_len,
-        });
-    }
-
-    let normalized_query = normalize_match_text(query);
-    if normalized_query.is_empty() {
-        return None;
-    }
-    let query_tokens = tokenize_match_text(query);
-
-    [(0, display), (4, username)]
-        .iter()
-        .filter_map(|(priority, field)| {
-            field_score(field, query, &normalized_query, &query_tokens).map(
-                |(score, distance, field_len)| SessionMatchInfo {
-                    score,
-                    field_priority: *priority,
-                    distance,
-                    field_len,
-                },
-            )
-        })
-        .max_by(|a, b| {
-            b.field_priority
-                .cmp(&a.field_priority)
-                .then_with(|| a.score.cmp(&b.score))
-                .then_with(|| b.distance.cmp(&a.distance))
-                .then_with(|| b.field_len.cmp(&a.field_len))
-        })
+    let mut scorer = FieldScorer::new(query)?;
+    let score = match contacts.get(username) {
+        Some(contact) => scorer.best(&contact_match_fields(contact)),
+        None => scorer.best(&[(0, display), (4, username)]),
+    }?;
+    Some(SessionMatchInfo {
+        score: score.score,
+        field_priority: score.field_priority,
+        distance: score.distance,
+        field_len: score.field_len,
+    })
 }
 
 /// Read messages from a specific session.
@@ -1452,11 +1429,12 @@ fn resolve_username_from_contacts(
         return Ok(c.username.clone());
     }
 
-    if let Some(username) = unique_exact_direct_username(contacts, query) {
+    let scored = score_contacts(contacts, query);
+    if let Some(username) = unique_exact_direct_username(&scored) {
         return Ok(username);
     }
 
-    let candidates = contact_match_candidates(contacts, query, store, message_dbs, jobs)?;
+    let candidates = contact_match_candidates(scored, store, message_dbs, jobs)?;
     if let Some(best) = candidates.first() {
         if candidates.len() > 1 || best.score < EXACT_MATCH_SCORE {
             log::info!(
@@ -1529,24 +1507,20 @@ struct ContactMatch<'a> {
 }
 
 fn contact_match_candidates<'a>(
-    contacts: &'a HashMap<String, Contact>,
-    query: &str,
+    scored: Vec<(&'a Contact, ContactFieldScore)>,
     store: &SourceStore,
     message_dbs: Option<&[String]>,
     jobs: usize,
 ) -> Result<Vec<ContactMatch<'a>>, String> {
-    let mut candidates: Vec<_> = contacts
-        .values()
-        .filter_map(|contact| {
-            let score = best_contact_score(contact, query)?;
-            Some(ContactMatch {
-                contact,
-                score: score.score,
-                field_priority: score.field_priority,
-                distance: score.distance,
-                field_len: score.field_len,
-                latest_message_time: None,
-            })
+    let mut candidates: Vec<_> = scored
+        .into_iter()
+        .map(|(contact, score)| ContactMatch {
+            contact,
+            score: score.score,
+            field_priority: score.field_priority,
+            distance: score.distance,
+            field_len: score.field_len,
+            latest_message_time: None,
         })
         .collect();
 
@@ -1587,67 +1561,31 @@ fn contact_match_candidates<'a>(
     Ok(candidates)
 }
 
-fn unique_exact_direct_username(
-    contacts: &HashMap<String, Contact>,
-    query: &str,
-) -> Option<String> {
-    let mut direct_matches = 0usize;
-    let mut exact_username = None;
-
-    for contact in contacts.values() {
-        let Some(score) = best_contact_score(contact, query) else {
-            continue;
-        };
-        if score.score < DIRECT_MATCH_SCORE_FLOOR {
-            continue;
-        }
-
-        direct_matches += 1;
-        if score.score == EXACT_MATCH_SCORE {
-            exact_username = Some(contact.username.clone());
-        }
-        if direct_matches > 1 {
-            return None;
-        }
-    }
-
-    exact_username
-}
-
-fn best_contact_score(contact: &Contact, query: &str) -> Option<ContactFieldScore> {
-    let fields = contact_match_fields(contact);
-    best_contact_field_score(&fields, query)
-}
-
-pub(crate) fn best_contact_field_score(
-    fields: &[(usize, &str)],
-    query: &str,
-) -> Option<ContactFieldScore> {
-    let normalized_query = normalize_match_text(query);
-    if normalized_query.is_empty() {
-        return None;
-    }
-    let query_tokens = tokenize_match_text(query);
-
-    fields
+/// The one contact a query names exactly, provided no other contact is a
+/// direct (token-or-better) match.
+fn unique_exact_direct_username(scored: &[(&Contact, ContactFieldScore)]) -> Option<String> {
+    let mut direct = scored
         .iter()
-        .filter_map(|(priority, field)| {
-            field_score(field, query, &normalized_query, &query_tokens).map(
-                |(score, distance, field_len)| ContactFieldScore {
-                    score,
-                    field_priority: *priority,
-                    distance,
-                    field_len,
-                },
-            )
+        .filter(|(_, score)| score.score >= DIRECT_MATCH_SCORE_FLOOR);
+    let (contact, score) = direct.next()?;
+    (direct.next().is_none() && score.score == EXACT_MATCH_SCORE).then(|| contact.username.clone())
+}
+
+/// Scores every contact once, in map iteration order.
+fn score_contacts<'a>(
+    contacts: &'a HashMap<String, Contact>,
+    query: &str,
+) -> Vec<(&'a Contact, ContactFieldScore)> {
+    let Some(mut scorer) = FieldScorer::new(query) else {
+        return Vec::new();
+    };
+    contacts
+        .values()
+        .filter_map(|contact| {
+            let score = scorer.best(&contact_match_fields(contact))?;
+            Some((contact, score))
         })
-        .max_by(|a, b| {
-            b.field_priority
-                .cmp(&a.field_priority)
-                .then_with(|| a.score.cmp(&b.score))
-                .then_with(|| b.distance.cmp(&a.distance))
-                .then_with(|| b.field_len.cmp(&a.field_len))
-        })
+        .collect()
 }
 
 fn contact_match_fields(contact: &Contact) -> [(usize, &str); 5] {
@@ -1660,70 +1598,146 @@ fn contact_match_fields(contact: &Contact) -> [(usize, &str); 5] {
     ]
 }
 
-fn field_score(
-    field: &str,
-    query: &str,
-    normalized_query: &str,
-    query_tokens: &[String],
-) -> Option<(i64, usize, usize)> {
-    let field = field.trim();
-    if field.is_empty() {
-        return None;
-    }
-
-    let normalized_field = normalize_match_text(field);
-    let field_len = normalized_field.chars().count();
-    if field_len == 0 {
-        return None;
-    }
-
-    if field == query {
-        return Some((EXACT_MATCH_SCORE, 0, field_len));
-    }
-    if normalized_field == normalized_query {
-        return Some((NORMALIZED_EXACT_MATCH_SCORE, 0, field_len));
-    }
-    if field.contains(query) {
-        return Some((CONTAINS_MATCH_SCORE, 0, field_len));
-    }
-    if normalized_field.contains(normalized_query) {
-        return Some((NORMALIZED_CONTAINS_MATCH_SCORE, 0, field_len));
-    }
-    if query_tokens.len() > 1
-        && query_tokens
-            .iter()
-            .all(|token| normalized_field.contains(token))
-    {
-        return Some((TOKEN_MATCH_SCORE, 0, field_len));
-    }
-
-    let query_len = normalized_query.chars().count();
-    if query_len < 2 {
-        return None;
-    }
-
-    let distance = levenshtein_distance(&normalized_field, normalized_query);
-    let max_len = field_len.max(query_len);
-    let allowed_distance = if max_len <= 3 {
-        1
-    } else {
-        (max_len / 3).max(1)
-    };
-    if distance > allowed_distance {
-        return None;
-    }
-
-    let similarity = ((max_len - distance) * 100 / max_len) as i64;
-    Some((FUZZY_MATCH_SCORE + similarity, distance, field_len))
+/// A query prepared once for scoring many fields. The scratch buffers are
+/// reused across fields; results do not depend on earlier calls.
+struct FieldScorer<'q> {
+    query: &'q str,
+    normalized_query: String,
+    query_chars: Vec<char>,
+    query_tokens: Vec<String>,
+    field: String,
+    field_chars: Vec<char>,
+    row: Vec<usize>,
 }
 
-fn normalize_match_text(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
+impl<'q> FieldScorer<'q> {
+    /// `None` when the query normalizes to nothing, which matches no field.
+    fn new(query: &'q str) -> Option<Self> {
+        let mut normalized_query = String::new();
+        normalize_match_text_into(query, &mut normalized_query);
+        if normalized_query.is_empty() {
+            return None;
+        }
+        Some(Self {
+            query,
+            query_chars: normalized_query.chars().collect(),
+            normalized_query,
+            query_tokens: tokenize_match_text(query),
+            field: String::new(),
+            field_chars: Vec::new(),
+            row: Vec::new(),
+        })
+    }
+
+    fn best(&mut self, fields: &[(usize, &str)]) -> Option<ContactFieldScore> {
+        fields
+            .iter()
+            .filter_map(|(priority, field)| {
+                self.score(field)
+                    .map(|(score, distance, field_len)| ContactFieldScore {
+                        score,
+                        field_priority: *priority,
+                        distance,
+                        field_len,
+                    })
+            })
+            .max_by(|a, b| {
+                b.field_priority
+                    .cmp(&a.field_priority)
+                    .then_with(|| a.score.cmp(&b.score))
+                    .then_with(|| b.distance.cmp(&a.distance))
+                    .then_with(|| b.field_len.cmp(&a.field_len))
+            })
+    }
+
+    /// Returns `(score, distance, normalized field length in chars)`.
+    fn score(&mut self, field: &str) -> Option<(i64, usize, usize)> {
+        let field = field.trim();
+        if field.is_empty() {
+            return None;
+        }
+
+        normalize_match_text_into(field, &mut self.field);
+        let normalized_field = self.field.as_str();
+        let field_len = if normalized_field.is_ascii() {
+            normalized_field.len()
+        } else {
+            normalized_field.chars().count()
+        };
+        if field_len == 0 {
+            return None;
+        }
+
+        if field == self.query {
+            return Some((EXACT_MATCH_SCORE, 0, field_len));
+        }
+        if normalized_field == self.normalized_query {
+            return Some((NORMALIZED_EXACT_MATCH_SCORE, 0, field_len));
+        }
+        if field.contains(self.query) {
+            return Some((CONTAINS_MATCH_SCORE, 0, field_len));
+        }
+        if normalized_field.contains(self.normalized_query.as_str()) {
+            return Some((NORMALIZED_CONTAINS_MATCH_SCORE, 0, field_len));
+        }
+        if self.query_tokens.len() > 1
+            && self
+                .query_tokens
+                .iter()
+                .all(|token| normalized_field.contains(token.as_str()))
+        {
+            return Some((TOKEN_MATCH_SCORE, 0, field_len));
+        }
+
+        let query_len = self.query_chars.len();
+        if query_len < 2 {
+            return None;
+        }
+
+        let max_len = field_len.max(query_len);
+        let allowed_distance = if max_len <= 3 {
+            1
+        } else {
+            (max_len / 3).max(1)
+        };
+        // The length difference is a lower bound on the edit distance.
+        if field_len.abs_diff(query_len) > allowed_distance {
+            return None;
+        }
+        self.field_chars.clear();
+        self.field_chars.extend(normalized_field.chars());
+        let distance = bounded_levenshtein(
+            &self.field_chars,
+            &self.query_chars,
+            allowed_distance,
+            &mut self.row,
+        )?;
+
+        let similarity = ((max_len - distance) * 100 / max_len) as i64;
+        Some((FUZZY_MATCH_SCORE + similarity, distance, field_len))
+    }
+}
+
+/// Lowercases `value` and drops all whitespace, writing into `out`.
+fn normalize_match_text_into(value: &str, out: &mut String) {
+    out.clear();
+    if value.is_ascii() {
+        // For ASCII, `char::to_lowercase` is `to_ascii_lowercase` and yields
+        // exactly one char.
+        out.extend(
+            value
+                .bytes()
+                .filter(|byte| !(*byte as char).is_whitespace())
+                .map(|byte| byte.to_ascii_lowercase() as char),
+        );
+    } else {
+        out.extend(
+            value
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .flat_map(char::to_lowercase),
+        );
+    }
 }
 
 fn tokenize_match_text(value: &str) -> Vec<String> {
@@ -1744,32 +1758,42 @@ fn tokenize_match_text(value: &str) -> Vec<String> {
     tokens
 }
 
-fn levenshtein_distance(left: &str, right: &str) -> usize {
-    let left: Vec<char> = left.chars().collect();
-    let right: Vec<char> = right.chars().collect();
-
-    if left.is_empty() {
-        return right.len();
+/// Levenshtein distance over chars, or `None` once it must exceed `limit`.
+/// Row minima never decrease, so a row whose minimum exceeds `limit` proves
+/// the final distance does too.
+fn bounded_levenshtein(
+    left: &[char],
+    right: &[char],
+    limit: usize,
+    row: &mut Vec<usize>,
+) -> Option<usize> {
+    if left.is_empty() || right.is_empty() {
+        let distance = left.len().max(right.len());
+        return (distance <= limit).then_some(distance);
     }
-    if right.is_empty() {
-        return left.len();
-    }
 
-    let mut prev: Vec<usize> = (0..=right.len()).collect();
-    let mut curr = vec![0; right.len() + 1];
-
+    // Single-row DP: `row[j]` holds the previous row until overwritten.
+    row.clear();
+    row.extend(0..=right.len());
     for (i, left_char) in left.iter().enumerate() {
-        curr[0] = i + 1;
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        let mut row_min = row[0];
         for (j, right_char) in right.iter().enumerate() {
-            let substitution = prev[j] + if left_char == right_char { 0 } else { 1 };
-            let insertion = curr[j] + 1;
-            let deletion = prev[j + 1] + 1;
-            curr[j + 1] = substitution.min(insertion).min(deletion);
+            let substitution = diagonal + usize::from(left_char != right_char);
+            let insertion = row[j] + 1;
+            let deletion = row[j + 1] + 1;
+            diagonal = row[j + 1];
+            row[j + 1] = substitution.min(insertion).min(deletion);
+            row_min = row_min.min(row[j + 1]);
         }
-        std::mem::swap(&mut prev, &mut curr);
+        if row_min > limit {
+            return None;
+        }
     }
 
-    prev[right.len()]
+    let distance = row[right.len()];
+    (distance <= limit).then_some(distance)
 }
 
 fn latest_message_times_for_candidates(
@@ -2798,7 +2822,8 @@ mod tests {
         ]);
         let contacts = load_contacts(&contact_db);
 
-        let username = unique_exact_direct_username(&contacts, "Linux 俱乐部 #2026🌅");
+        let username =
+            unique_exact_direct_username(&score_contacts(&contacts, "Linux 俱乐部 #2026🌅"));
 
         assert_eq!(username.as_deref(), Some("linux_2026@chatroom"));
     }
@@ -2812,7 +2837,7 @@ mod tests {
         ]);
         let contacts = load_contacts(&contact_db);
 
-        let username = unique_exact_direct_username(&contacts, "豆");
+        let username = unique_exact_direct_username(&score_contacts(&contacts, "豆"));
 
         assert_eq!(username, None);
     }
@@ -2825,7 +2850,7 @@ mod tests {
         ]);
         let contacts = load_contacts(&contact_db);
 
-        let username = unique_exact_direct_username(&contacts, "田雨坤");
+        let username = unique_exact_direct_username(&score_contacts(&contacts, "田雨坤"));
 
         assert_eq!(username, None);
     }
@@ -2887,5 +2912,189 @@ mod tests {
         let username = resolve_username_for_test("Alic Zhang", &contact_db, None, 1).unwrap();
 
         assert_eq!(username, "tgid_alice");
+    }
+
+    /// The v2.5.0 scorer, kept verbatim as the reference for `FieldScorer`.
+    mod reference {
+        use super::super::{
+            CONTAINS_MATCH_SCORE, EXACT_MATCH_SCORE, FUZZY_MATCH_SCORE,
+            NORMALIZED_CONTAINS_MATCH_SCORE, NORMALIZED_EXACT_MATCH_SCORE, TOKEN_MATCH_SCORE,
+        };
+
+        pub fn field_score(
+            field: &str,
+            query: &str,
+            normalized_query: &str,
+            query_tokens: &[String],
+        ) -> Option<(i64, usize, usize)> {
+            let field = field.trim();
+            if field.is_empty() {
+                return None;
+            }
+            let normalized_field = normalize_match_text(field);
+            let field_len = normalized_field.chars().count();
+            if field_len == 0 {
+                return None;
+            }
+            if field == query {
+                return Some((EXACT_MATCH_SCORE, 0, field_len));
+            }
+            if normalized_field == normalized_query {
+                return Some((NORMALIZED_EXACT_MATCH_SCORE, 0, field_len));
+            }
+            if field.contains(query) {
+                return Some((CONTAINS_MATCH_SCORE, 0, field_len));
+            }
+            if normalized_field.contains(normalized_query) {
+                return Some((NORMALIZED_CONTAINS_MATCH_SCORE, 0, field_len));
+            }
+            if query_tokens.len() > 1
+                && query_tokens
+                    .iter()
+                    .all(|token| normalized_field.contains(token))
+            {
+                return Some((TOKEN_MATCH_SCORE, 0, field_len));
+            }
+            let query_len = normalized_query.chars().count();
+            if query_len < 2 {
+                return None;
+            }
+            let distance = levenshtein_distance(&normalized_field, normalized_query);
+            let max_len = field_len.max(query_len);
+            let allowed_distance = if max_len <= 3 {
+                1
+            } else {
+                (max_len / 3).max(1)
+            };
+            if distance > allowed_distance {
+                return None;
+            }
+            let similarity = ((max_len - distance) * 100 / max_len) as i64;
+            Some((FUZZY_MATCH_SCORE + similarity, distance, field_len))
+        }
+
+        pub fn normalize_match_text(value: &str) -> String {
+            value
+                .trim()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .flat_map(|c| c.to_lowercase())
+                .collect()
+        }
+
+        pub fn levenshtein_distance(left: &str, right: &str) -> usize {
+            let left: Vec<char> = left.chars().collect();
+            let right: Vec<char> = right.chars().collect();
+            if left.is_empty() {
+                return right.len();
+            }
+            if right.is_empty() {
+                return left.len();
+            }
+            let mut prev: Vec<usize> = (0..=right.len()).collect();
+            let mut curr = vec![0; right.len() + 1];
+            for (i, left_char) in left.iter().enumerate() {
+                curr[0] = i + 1;
+                for (j, right_char) in right.iter().enumerate() {
+                    let substitution = prev[j] + if left_char == right_char { 0 } else { 1 };
+                    let insertion = curr[j] + 1;
+                    let deletion = prev[j + 1] + 1;
+                    curr[j + 1] = substitution.min(insertion).min(deletion);
+                }
+                std::mem::swap(&mut prev, &mut curr);
+            }
+            prev[right.len()]
+        }
+    }
+
+    #[test]
+    fn field_scorer_matches_reference_scorer() {
+        // Mixed scripts, case-changing and multi-char lowercase letters, and
+        // every whitespace kind that trim/filter treat differently.
+        const ALPHABET: &[char] = &[
+            'a', 'b', 'c', 'A', 'B', 'C', 'x', '1', '-', '_', '.', ' ', '\t', '\u{b}', '\u{1f}',
+            '\u{a0}', '\u{3000}', '李', '雨', '田', 'İ', 'ß', 'Σ', 'σ', 'ς', '\u{212a}', 'k', 'é',
+            '\u{301}', '😀', 'Ǆ',
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let mut random_text = |max_len: usize| -> String {
+            let len = next(max_len + 1);
+            (0..len).map(|_| ALPHABET[next(ALPHABET.len())]).collect()
+        };
+        let fields: Vec<String> = (0..400).map(|_| random_text(14)).collect();
+        let mut queries: Vec<String> = (0..150).map(|_| random_text(8)).collect();
+        // Near-misses of real fields exercise the fuzzy and contains paths.
+        for field in fields.iter().take(150) {
+            let chars: Vec<char> = field.chars().collect();
+            if chars.len() < 2 {
+                continue;
+            }
+            let cut = chars.len() / 2;
+            queries.push(chars[..cut].iter().collect());
+            queries.push(chars[1..].iter().collect());
+            let mut edited = chars.clone();
+            edited[cut] = 'z';
+            queries.push(edited.iter().collect());
+            queries.push(field.to_uppercase());
+            queries.push(field.clone());
+        }
+
+        let mut compared = 0usize;
+        let mut fuzzy = 0usize;
+        for query in &queries {
+            let normalized_query = reference::normalize_match_text(query);
+            let mut scorer = FieldScorer::new(query);
+            assert_eq!(scorer.is_none(), normalized_query.is_empty(), "{query:?}");
+            let Some(scorer) = scorer.as_mut() else {
+                continue;
+            };
+            let tokens = tokenize_match_text(query);
+            for field in &fields {
+                let expected = reference::field_score(field, query, &normalized_query, &tokens);
+                assert_eq!(scorer.score(field), expected, "{field:?} vs {query:?}");
+                compared += 1;
+                fuzzy += usize::from(expected.is_some_and(|(score, ..)| score < 200));
+            }
+        }
+        assert!(compared > 100_000 && fuzzy > 100, "{compared} {fuzzy}");
+    }
+
+    #[test]
+    fn bounded_levenshtein_matches_full_distance() {
+        let words = [
+            "",
+            "a",
+            "ab",
+            "ba",
+            "abc",
+            "kitten",
+            "sitting",
+            "李雨田",
+            "田雨",
+            "flaw",
+            "lawn",
+        ];
+        let mut row = Vec::new();
+        for left in words {
+            for right in words {
+                let full = reference::levenshtein_distance(left, right);
+                let left_chars: Vec<char> = left.chars().collect();
+                let right_chars: Vec<char> = right.chars().collect();
+                for limit in 0..8 {
+                    let bounded = bounded_levenshtein(&left_chars, &right_chars, limit, &mut row);
+                    assert_eq!(
+                        bounded,
+                        (full <= limit).then_some(full),
+                        "{left} {right} {limit}"
+                    );
+                }
+            }
+        }
     }
 }
