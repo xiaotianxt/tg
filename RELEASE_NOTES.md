@@ -1,39 +1,27 @@
-## Leaner MCP reads, and images over MCP
+## `tg messages --offset` pages back through history
 
-The MCP server now sends much less text per message, and can show cached
-images to the model. Everything stays read-only and local; nothing new is
-written to disk.
+`tg messages` shows the latest messages by default, but paging with `--offset`
+used to jump to the start of the chat: `--limit 50 --offset 50` returned
+messages 51–100 counted from the oldest message. `--offset` now counts back
+from the newest message, so each page is the one just before the last. This
+matches how MCP `read_messages` already pages with `order=newest`.
 
-### `read_messages` returns a transcript
+```bash
+tg messages "张三" --limit 20               # latest 20
+tg messages "张三" --limit 20 --offset 20   # the 20 before those
+tg messages "张三" --head --limit 20 --offset 20   # messages 21–40 from the start
+```
 
-`read_messages` now returns a plain-text transcript instead of JSON: one
-`== YYYY-MM-DD ==` line per local day, then one `HH:MM sender: text` line per
-message, with indented continuation lines for multi-line messages. A trimmed
-result ends with a `[truncated]` line naming the `offset` to continue from.
+With an offset, the header now reads `Showing 20 messages before the latest 20`
+instead of claiming to show the latest messages.
 
-On one busy group (2,211 messages in 24 hours) the result went from 277k to
-88k characters, with every message kept. Before, about 80% of the result was
-JSON field names and the same timestamp written twice, and the whole result
-was sent a second time as `structuredContent`. The transcript is sent once, as
-text only.
+This changes paging for scripts: a script that paged with `--offset` and no
+`--head` now gets older messages counted back from the newest. Add `--head` to
+keep the old pages. `--tail` is still accepted; it is now the default and does
+nothing.
 
-This changes the result format: a client that parsed `read_messages` JSON must
-read the text lines instead. The other tools still return JSON.
+### Internal
 
-### New `get_media` tool
-
-Message tools already show images as `[img:<id>]`. `get_media` takes up to 10
-of those ids for one chat and returns them as MCP images:
-
-- `size: "preview"` (default) returns the client's standard copy, falling back
-  to the thumbnail; `size: "original"` returns the full-resolution copy when it
-  was downloaded.
-- A video id (the name in `[视频 WxH <id>]`) returns the cached cover.
-- An id that was never downloaded is reported as text; the other ids in the
-  call still return.
-
-Remote clients get images only after the owner sets
-`"allow_media": true` under `remote` in `~/.tg/mcp/config.json`. Session
-allow/deny lists apply, and the lookback window applies per cache month.
-Voice is still sent as text: the transcript already includes the client's own
-voice-to-text when it exists.
+Message direction is one `newest`/`oldest` type shared by `messages`,
+`query --order`, and the MCP tools, and the default one-year search window is
+decided in one place. Neither changes output.
