@@ -316,7 +316,8 @@ fn list_sessions(
 fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
     args.only(&["session", "order", "offset", "since", "until", "contains"])?;
     let session = args.required_str("session")?;
-    let newest = args.choice("order", &["newest", "oldest"], "newest")? == "newest";
+    let order =
+        db::MessageOrder::from_str(args.choice("order", &["newest", "oldest"], "newest")?, true)?;
     let offset = args.offset()?;
     let since = ctx.clamp_since(args.time("since")?);
     let until = args.time("until")?;
@@ -329,7 +330,7 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
         search_query: contains,
         since,
         until,
-        tail: newest,
+        order,
         time_bucket: time::MessageTimeBucket::PerMessage,
         name_mode: ctx.name_mode(),
         jobs: ctx.jobs,
@@ -357,7 +358,7 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
     let transcript = fit_transcript(
         &header,
         &messages,
-        newest,
+        order,
         ctx.policy.max_result_bytes,
         offset,
     );
@@ -401,31 +402,30 @@ struct Transcript {
 }
 
 /// Render `messages` (chronological) under the byte cap. When they do not all
-/// fit, keep those nearest the paging origin (the newest when `newest`), so
+/// fit, keep those nearest the paging origin (the end `order` puts first), so
 /// `offset + rows` continues exactly where the kept ones end. `header` holds a
 /// `{count}` placeholder for the number of messages kept.
 fn fit_transcript(
     header: &str,
     messages: &[TranscriptMessage],
-    newest: bool,
+    order: db::MessageOrder,
     max_bytes: usize,
     offset: usize,
 ) -> Transcript {
     // Upper bounds: the count only shrinks, and the footer's offset is at most
     // `offset + messages.len()`.
     let header_bytes = header.replace("{count}", &messages.len().to_string()).len();
-    let footer_bytes = truncation_footer(newest, offset + messages.len()).len();
+    let footer_bytes = truncation_footer(order, offset + messages.len()).len();
     let budget = max_bytes.saturating_sub(header_bytes);
 
-    let order: Box<dyn Iterator<Item = &TranscriptMessage>> = if newest {
-        Box::new(messages.iter().rev())
-    } else {
-        Box::new(messages.iter())
+    let from_origin: Box<dyn Iterator<Item = &TranscriptMessage>> = match order {
+        db::MessageOrder::Newest => Box::new(messages.iter().rev()),
+        db::MessageOrder::Oldest => Box::new(messages.iter()),
     };
     let mut used = 0;
     let mut kept = 0;
     let mut last_date: Option<&str> = None;
-    for message in order {
+    for message in from_origin {
         let mut cost = message.block.len();
         if last_date != Some(message.date.as_str()) {
             cost += day_header(&message.date).len();
@@ -444,10 +444,9 @@ fn fit_transcript(
         last_date = Some(&message.date);
     }
 
-    let range = if newest {
-        messages.len() - kept..messages.len()
-    } else {
-        0..kept
+    let range = match order {
+        db::MessageOrder::Newest => messages.len() - kept..messages.len(),
+        db::MessageOrder::Oldest => 0..kept,
     };
     let mut text = header.replace("{count}", &kept.to_string());
     let mut last_date: Option<&str> = None;
@@ -459,13 +458,16 @@ fn fit_transcript(
         text.push_str(&message.block);
     }
     if kept < messages.len() {
-        text.push_str(&truncation_footer(newest, offset + kept));
+        text.push_str(&truncation_footer(order, offset + kept));
     }
     Transcript { text, rows: kept }
 }
 
-fn truncation_footer(newest: bool, next_offset: usize) -> String {
-    let omitted = if newest { "Older" } else { "Newer" };
+fn truncation_footer(order: db::MessageOrder, next_offset: usize) -> String {
+    let omitted = match order {
+        db::MessageOrder::Newest => "Older",
+        db::MessageOrder::Oldest => "Newer",
+    };
     format!(
         "[truncated] {omitted} messages were left out to fit the size cap. \
          Repeat the same call with offset={next_offset} to read them.\n"
@@ -477,11 +479,7 @@ fn search_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Str
     let query = args.required_str("query")?;
     let offset = args.offset()?;
     let since = args.time("since")?;
-    let since = if args.bool("all_time")? {
-        since
-    } else {
-        Some(since.unwrap_or_else(time::default_recent_since))
-    };
+    let since = time::since_or_recent(since, args.bool("all_time")?);
     let store = ctx.open_store()?;
     let results = db::search_messages(
         &store,
@@ -537,14 +535,10 @@ fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Stri
         .map(|value| query::QueryMediaType::from_str(value, true))
         .collect::<Result<Vec<_>, _>>()?;
     let since = args.time("since")?;
-    let since = if args.bool("all_time")? {
-        since
-    } else {
-        Some(since.unwrap_or_else(time::default_recent_since))
-    };
+    let since = time::since_or_recent(since, args.bool("all_time")?);
     let until = args.time("until")?;
     let sort =
-        query::QuerySort::from_str(args.choice("order", &["newest", "oldest"], "newest")?, true)?;
+        db::MessageOrder::from_str(args.choice("order", &["newest", "oldest"], "newest")?, true)?;
     let offset = args.offset()?;
     let store = ctx.open_store()?;
     // Offsets count only rows the caller can see, so hidden sessions are
@@ -1036,7 +1030,13 @@ mod tests {
             message("2026-11-07", "08:00", "李四", "早\n第二行"),
             message("2026-11-07", "08:01", "", "[系统消息]"),
         ];
-        let transcript = fit_transcript("{count} msgs\n", &messages, true, usize::MAX, 0);
+        let transcript = fit_transcript(
+            "{count} msgs\n",
+            &messages,
+            db::MessageOrder::Newest,
+            usize::MAX,
+            0,
+        );
         assert_eq!(
             transcript.text,
             "3 msgs\n== 2026-11-06 ==\n23:59 张三: 晚安\n\
@@ -1052,7 +1052,7 @@ mod tests {
             .collect();
         let max = 600;
 
-        let newest = fit_transcript("{count}\n", &messages, true, max, 5);
+        let newest = fit_transcript("{count}\n", &messages, db::MessageOrder::Newest, max, 5);
         assert!(newest.text.len() <= max);
         assert!(newest.rows > 0 && newest.rows < 100);
         assert!(newest.text.contains("12:00 a: 099\n"));
@@ -1063,7 +1063,7 @@ mod tests {
             5 + newest.rows
         )));
 
-        let oldest = fit_transcript("{count}\n", &messages, false, max, 0);
+        let oldest = fit_transcript("{count}\n", &messages, db::MessageOrder::Oldest, max, 0);
         assert!(oldest.text.len() <= max);
         assert!(oldest.text.contains("12:00 a: 000\n"));
         assert!(oldest.text.contains("Newer messages"));

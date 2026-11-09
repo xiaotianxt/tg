@@ -60,6 +60,16 @@ fn should_default_to_messages(args: &[OsString]) -> bool {
     !first_arg.starts_with('-') && !is_known_subcommand(first_arg)
 }
 
+/// `--offset` and `--limit` count from the end this picks, so paging with
+/// `--offset` walks back through history unless `--head` is given.
+fn messages_order(head: bool) -> db::MessageOrder {
+    if head {
+        db::MessageOrder::Oldest
+    } else {
+        db::MessageOrder::Newest
+    }
+}
+
 fn messages_limit_or_default(
     limit: Option<usize>,
     since: Option<i64>,
@@ -206,7 +216,7 @@ enum Commands {
         /// Number of messages to show (defaults to 50 unless --since or --all-time is used)
         #[arg(long)]
         limit: Option<usize>,
-        /// Offset for pagination
+        /// Skip this many messages, counted back from the newest (from the oldest with --head)
         #[arg(long, default_value_t = 0)]
         offset: usize,
         /// Search within messages
@@ -218,7 +228,7 @@ enum Commands {
         /// Show the full history instead of the default latest 50 messages
         #[arg(long)]
         all_time: bool,
-        /// Show the latest N messages (newest appears last; uses --limit for count)
+        /// Read from the newest end (the default; accepted for older scripts)
         #[arg(long)]
         tail: bool,
         /// Show earliest messages instead of the default latest messages
@@ -290,7 +300,7 @@ enum Commands {
         offset: usize,
         /// Sort order: newest or oldest
         #[arg(long, value_enum, default_value = "newest")]
-        order: query::QuerySort,
+        order: db::MessageOrder,
         /// Keyword matching mode when --contains is repeated: all or any
         #[arg(long, value_enum, default_value = "all")]
         match_mode: query::QueryMatchMode,
@@ -470,7 +480,7 @@ fn run(command: Commands) -> Result<(), String> {
             search,
             since,
             all_time,
-            tail,
+            tail: _,
             head,
             time_bucket,
             anonymous,
@@ -482,7 +492,6 @@ fn run(command: Commands) -> Result<(), String> {
             let time_bucket = time::parse_message_time_bucket(&time_bucket)
                 .map_err(|e| format!("Error parsing --time-bucket: {e}"))?;
             let limit = messages_limit_or_default(limit, since_ts, all_time);
-            let use_tail = tail || (!head && offset == 0);
             let options = db::ReadMessagesOptions {
                 session_query: &session,
                 limit,
@@ -490,7 +499,7 @@ fn run(command: Commands) -> Result<(), String> {
                 search_query: search.as_deref(),
                 since: since_ts,
                 until: None,
-                tail: use_tail,
+                order: messages_order(head),
                 time_bucket,
                 name_mode: if anonymous {
                     contact::DisplayNameMode::Anonymous
@@ -523,11 +532,7 @@ fn run(command: Commands) -> Result<(), String> {
             }
             let since_ts = time::parse_since_opt(since.as_deref())
                 .map_err(|e| format!("Error parsing --since: {e}"))?;
-            let since_ts = if all_time {
-                since_ts
-            } else {
-                Some(since_ts.unwrap_or_else(time::default_recent_since))
-            };
+            let since_ts = time::since_or_recent(since_ts, all_time);
             let results = db::search_messages(
                 &store,
                 db::SearchMessagesOptions {
@@ -571,11 +576,7 @@ fn run(command: Commands) -> Result<(), String> {
             let store = open_source(&source)?;
             let since_ts = time::parse_since_opt(since.as_deref())
                 .map_err(|e| format!("Error parsing --since: {e}"))?;
-            let since_ts = if all_time {
-                since_ts
-            } else {
-                Some(since_ts.unwrap_or_else(time::default_recent_since))
-            };
+            let since_ts = time::since_or_recent(since_ts, all_time);
             let until_ts = time::parse_since_opt(until.as_deref())
                 .map_err(|e| format!("Error parsing --until: {e}"))?;
             let fields = query::QueryFields::parse(&fields)
@@ -845,6 +846,15 @@ mod tests {
         assert_eq!(messages_limit_or_default(None, None, true), None);
         assert_eq!(messages_limit_or_default(None, Some(1), false), None);
         assert_eq!(messages_limit_or_default(Some(20), None, true), Some(20));
+    }
+
+    #[test]
+    fn messages_offset_pages_back_from_newest_unless_head() {
+        assert_eq!(messages_order(false), db::MessageOrder::Newest);
+        assert_eq!(messages_order(true), db::MessageOrder::Oldest);
+        let cli = Cli::try_parse_from(["tg", "messages", "Alice", "--tail", "--offset", "50"])
+            .expect("--tail stays accepted");
+        assert!(matches!(cli.command, Commands::Messages { tail: true, .. }));
     }
 
     #[test]

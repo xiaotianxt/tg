@@ -86,6 +86,25 @@ type SearchRow = (i64, i64, String, String);
 const TELEGRAM_FTS_CONTENT_TABLE_PREFIX: &str = "message_fts_v4_";
 const TELEGRAM_FTS_CONTENT_TABLE_SUFFIX: &str = "_content";
 
+/// Which end of a message range comes first. Paging (`offset`, `limit`) counts
+/// from that end, so the order also decides which messages a page holds.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageOrder {
+    #[value(help = "Newest messages first")]
+    Newest,
+    #[value(help = "Oldest messages first")]
+    Oldest,
+}
+
+impl MessageOrder {
+    pub(crate) fn sql_direction(self) -> &'static str {
+        match self {
+            Self::Newest => "DESC",
+            Self::Oldest => "ASC",
+        }
+    }
+}
+
 pub(crate) struct ReadMessagesOptions<'a> {
     pub session_query: &'a str,
     pub limit: Option<usize>,
@@ -94,8 +113,9 @@ pub(crate) struct ReadMessagesOptions<'a> {
     pub since: Option<i64>,
     /// Exclusive upper bound on `create_time`.
     pub until: Option<i64>,
-    /// Newest first: `offset` then counts back from the latest message.
-    pub tail: bool,
+    /// The end `offset` and `limit` count from. Returned messages are always
+    /// chronological.
+    pub order: MessageOrder,
     pub time_bucket: time::MessageTimeBucket,
     pub name_mode: DisplayNameMode,
     pub jobs: usize,
@@ -379,12 +399,11 @@ pub(crate) fn read_message_order_key(
     Ok((row.get(first_index)?, row.get(first_index + 1)?))
 }
 
-pub(crate) fn sort_in_message_order<T>(rows: &mut [(MessageOrderKey, T)], descending: bool) {
+pub(crate) fn sort_in_message_order<T>(rows: &mut [(MessageOrderKey, T)], order: MessageOrder) {
     // Keys are unique (they end in the rowid), so an unstable sort is exact.
-    if descending {
-        rows.sort_unstable_by_key(|(key, _)| Reverse(*key));
-    } else {
-        rows.sort_unstable_by_key(|(key, _)| *key);
+    match order {
+        MessageOrder::Newest => rows.sort_unstable_by_key(|(key, _)| Reverse(*key)),
+        MessageOrder::Oldest => rows.sort_unstable_by_key(|(key, _)| *key),
     }
 }
 
@@ -981,7 +1000,7 @@ pub fn read_messages(
         .skip(options.offset)
         .take(options.limit.unwrap_or(usize::MAX))
         .collect();
-    if options.tail {
+    if options.order == MessageOrder::Newest {
         messages.reverse();
     }
 
@@ -1088,7 +1107,7 @@ fn read_session_rows(
 
             let name2id = load_name2id(&conn)?;
 
-            let order_dir = if options.tail { "DESC" } else { "ASC" };
+            let order_dir = options.order.sql_direction();
 
             // Query messages - collect eagerly to avoid borrow issues
             let body_col = quote_identifier(dictionary::msg_body_column());
@@ -1155,7 +1174,7 @@ fn read_session_rows(
             let mut rows = rows
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|error| format!("Read messages from {db_path}: {error}"))?;
-            sort_in_message_order(&mut rows, options.tail);
+            sort_in_message_order(&mut rows, options.order);
             Ok(rows.into_iter().map(|(_, row)| row).collect())
         },
     );
@@ -1165,7 +1184,7 @@ fn read_session_rows(
         all_messages.extend(rows?);
     }
 
-    if options.tail {
+    if options.order == MessageOrder::Newest {
         // Each DB returns its latest rows; merge globally, then reverse for chronological display.
         all_messages.sort_by_key(|row| Reverse(row.create_time));
     } else {
@@ -2704,7 +2723,7 @@ mod tests {
                 search_query: Some("needle"),
                 since: None,
                 until: None,
-                tail: false,
+                order: MessageOrder::Oldest,
                 time_bucket: time::MessageTimeBucket::PerMessage,
                 name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
@@ -2731,7 +2750,7 @@ mod tests {
                 search_query: Some("%"),
                 since: None,
                 until: None,
-                tail: false,
+                order: MessageOrder::Oldest,
                 time_bucket: time::MessageTimeBucket::PerMessage,
                 name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
@@ -2758,7 +2777,7 @@ mod tests {
                 search_query: Some("needle"),
                 since: Some(1001),
                 until: None,
-                tail: false,
+                order: MessageOrder::Oldest,
                 time_bucket: time::MessageTimeBucket::PerMessage,
                 name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
@@ -2774,7 +2793,7 @@ mod tests {
         let dir =
             create_decrypted_dir_with_messages("tgid_page", &["m0", "m1", "m2", "m3", "m4", "m5"]);
         let store = SourceStore::from_plaintext(dir.path()).unwrap();
-        let page = |tail: bool, offset: usize, until: Option<i64>| {
+        let page = |order: MessageOrder, offset: usize, until: Option<i64>| {
             let options = ReadMessagesOptions {
                 session_query: "tgid_page",
                 limit: Some(2),
@@ -2782,7 +2801,7 @@ mod tests {
                 search_query: None,
                 since: None,
                 until,
-                tail,
+                order,
                 time_bucket: time::MessageTimeBucket::PerMessage,
                 name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
@@ -2796,10 +2815,10 @@ mod tests {
         };
 
         // m5 has create_time 1005 and is excluded by until.
-        assert_eq!(page(true, 0, Some(1005)), ["m3", "m4"]);
-        assert_eq!(page(true, 2, Some(1005)), ["m1", "m2"]);
-        assert_eq!(page(true, 4, Some(1005)), ["m0"]);
-        assert_eq!(page(false, 2, Some(1005)), ["m2", "m3"]);
+        assert_eq!(page(MessageOrder::Newest, 0, Some(1005)), ["m3", "m4"]);
+        assert_eq!(page(MessageOrder::Newest, 2, Some(1005)), ["m1", "m2"]);
+        assert_eq!(page(MessageOrder::Newest, 4, Some(1005)), ["m0"]);
+        assert_eq!(page(MessageOrder::Oldest, 2, Some(1005)), ["m2", "m3"]);
     }
 
     #[test]

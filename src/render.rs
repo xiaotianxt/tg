@@ -7,8 +7,8 @@
 use std::io::Write;
 
 use crate::db::{
-    MemberFriendReport, MemberReport, MessagePage, ReadMessagesOptions, SearchResults, SessionList,
-    SessionListKind,
+    MemberFriendReport, MemberReport, MessageOrder, MessagePage, ReadMessagesOptions,
+    SearchResults, SessionList, SessionListKind,
 };
 use crate::doctor::{CheckStatus, DoctorReport, SessionDiagnosis};
 use crate::output::Output;
@@ -65,8 +65,14 @@ pub(crate) fn messages<W: Write>(
     if let Some(query) = options.search_query {
         out.line(format_args!("Search: '{query}'"))?;
     }
-    if options.tail {
-        if options.limit.is_some() {
+    if options.order == MessageOrder::Newest {
+        if options.offset > 0 {
+            out.line(format_args!(
+                "Showing {} messages before the latest {}",
+                messages.len(),
+                options.offset
+            ))?;
+        } else if options.limit.is_some() {
             out.line(format_args!("Showing latest {} messages", messages.len()))?;
         } else {
             out.line(format_args!("Showing {} messages", messages.len()))?;
@@ -381,7 +387,7 @@ mod tests {
             search_query: None,
             since: None,
             until: None,
-            tail: true,
+            order: MessageOrder::Newest,
             time_bucket: time::MessageTimeBucket::Minute(1),
             name_mode: DisplayNameMode::PersonalRemark,
             jobs: 1,

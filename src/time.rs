@@ -100,6 +100,16 @@ pub(crate) fn default_recent_since() -> i64 {
     now_timestamp() - DEFAULT_RECENT_DAYS * 86400
 }
 
+/// Lower time bound for searches: an explicit `since` wins, `all_time` lifts the
+/// bound, otherwise the default recent window applies.
+pub(crate) fn since_or_recent(since: Option<i64>, all_time: bool) -> Option<i64> {
+    match (since, all_time) {
+        (Some(since), _) => Some(since),
+        (None, true) => None,
+        (None, false) => Some(default_recent_since()),
+    }
+}
+
 pub(crate) fn now_timestamp() -> i64 {
     Local::now().timestamp()
 }
@@ -221,6 +231,15 @@ fn local_timestamp(dt: NaiveDateTime) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn since_or_recent_prefers_explicit_since() {
+        assert_eq!(since_or_recent(Some(7), false), Some(7));
+        assert_eq!(since_or_recent(Some(7), true), Some(7));
+        assert_eq!(since_or_recent(None, true), None);
+        let recent = since_or_recent(None, false).unwrap();
+        assert!((recent - default_recent_since()).abs() <= 1);
+    }
 
     #[test]
     fn date_only_uses_local_midnight() {

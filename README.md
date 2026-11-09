@@ -110,10 +110,11 @@ tg messages "张三" --since today
 tg messages "张三" --all-time
 tg messages "张三" --search "项目"
 tg messages "张三" --head --limit 20
+tg messages "张三" --limit 20 --offset 20
 tg messages "产品讨论群" --anonymous
 ```
 
-`messages` 默认显示最新 50 条。`--since` 支持日期、日期时间、`5min`、`1h`、`2d`、`1w`、`1y`、`today` 和 `yesterday`。群聊或全局结果建议加 `--anonymous`，避免输出个人备注名。
+`messages` 默认显示最新 50 条；`--offset` 从最新往前翻页，加 `--head` 则从最早往后翻。`--since` 支持日期、日期时间、`5min`、`1h`、`2d`、`1w`、`1y`、`today` 和 `yesterday`。群聊或全局结果建议加 `--anonymous`，避免输出个人备注名。
 
 快速全局搜索：
 

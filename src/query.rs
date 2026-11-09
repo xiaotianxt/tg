@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::db::MessageOrder;
 use crate::source_store::SourceStore;
 use crate::{contact, db, dictionary, media, message, output, parallel};
 
@@ -22,23 +23,6 @@ pub(crate) enum QueryOutputFormat {
     Table,
     #[value(help = "JSON output")]
     Json,
-}
-
-#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QuerySort {
-    #[value(help = "Newest messages first")]
-    Newest,
-    #[value(help = "Oldest messages first")]
-    Oldest,
-}
-
-impl QuerySort {
-    fn order_dir(self) -> &'static str {
-        match self {
-            Self::Newest => "DESC",
-            Self::Oldest => "ASC",
-        }
-    }
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,7 +144,7 @@ pub(crate) struct QueryOptions<'a> {
     /// None returns every match (MCP); the CLI always passes a page size.
     pub limit: Option<usize>,
     pub offset: usize,
-    pub sort: QuerySort,
+    pub sort: MessageOrder,
     pub match_mode: QueryMatchMode,
     pub name_mode: contact::DisplayNameMode,
     pub jobs: usize,
@@ -555,7 +539,7 @@ fn scan_message_tables(
                 (*next_shard, *next_table) != (shard, table)
             });
             if table_done {
-                db::sort_in_message_order(&mut table_rows, options.sort == QuerySort::Newest);
+                db::sort_in_message_order(&mut table_rows, options.sort);
                 rows.extend(
                     table_rows
                         .drain(..)
@@ -798,7 +782,7 @@ fn query_message_table(
         Some(window) if !query_needs_post_filtering(options) => {
             format!(
                 " ORDER BY {order_col} {} LIMIT {window}",
-                options.sort.order_dir()
+                options.sort.sql_direction()
             )
         }
         _ => String::new(),
@@ -984,10 +968,10 @@ fn message_has_media(local_type: i64, raw_body: &str, media_type: QueryMediaType
     media::message_media_type(local_type, raw_body) == Some(media_type.as_str())
 }
 
-fn sort_message_rows(rows: &mut [CandidateRow], sort: QuerySort) {
+fn sort_message_rows(rows: &mut [CandidateRow], sort: MessageOrder) {
     match sort {
-        QuerySort::Newest => rows.sort_by_key(|candidate| Reverse(candidate.row.create_time)),
-        QuerySort::Oldest => rows.sort_by_key(|candidate| candidate.row.create_time),
+        MessageOrder::Newest => rows.sort_by_key(|candidate| Reverse(candidate.row.create_time)),
+        MessageOrder::Oldest => rows.sort_by_key(|candidate| candidate.row.create_time),
     }
 }
 
@@ -1161,7 +1145,7 @@ mod tests {
             until: None,
             limit: Some(100),
             offset: 0,
-            sort: QuerySort::Newest,
+            sort: MessageOrder::Newest,
             match_mode: QueryMatchMode::All,
             name_mode: contact::DisplayNameMode::PersonalRemark,
             jobs: 1,
@@ -1582,11 +1566,11 @@ mod tests {
         }
 
         let contains = ["tie".to_string()];
-        for sort in [QuerySort::Newest, QuerySort::Oldest] {
+        for sort in [MessageOrder::Newest, MessageOrder::Oldest] {
             let expected: Vec<String> = conn
                 .prepare(&format!(
                     "SELECT message_content FROM Msg_test ORDER BY sort_seq {}",
-                    sort.order_dir()
+                    sort.sql_direction()
                 ))
                 .unwrap()
                 .query_map([], |row| row.get(0))
@@ -1660,7 +1644,7 @@ mod tests {
         let contains = ["hit".to_string()];
         // Unlimited compares every row; the window also cuts each table early.
         let windows = [(None, 0), (Some(700), 150)];
-        for (sort, (limit, offset)) in [QuerySort::Newest, QuerySort::Oldest]
+        for (sort, (limit, offset)) in [MessageOrder::Newest, MessageOrder::Oldest]
             .into_iter()
             .flat_map(|sort| windows.map(|window| (sort, window)))
         {
@@ -1671,7 +1655,7 @@ mod tests {
             // global sort on create_time, as a sequential whole-table read does.
             let mut expected: Vec<(i64, String)> = Vec::new();
             for (table, _) in tables {
-                let dir = sort.order_dir();
+                let dir = sort.sql_direction();
                 let mut stmt = conn
                     .prepare(&format!(
                         "SELECT create_time, message_content FROM {table} \
@@ -1685,8 +1669,8 @@ mod tests {
                 expected.extend(rows.map(Result::unwrap));
             }
             match sort {
-                QuerySort::Newest => expected.sort_by_key(|(time, _)| Reverse(*time)),
-                QuerySort::Oldest => expected.sort_by_key(|(time, _)| *time),
+                MessageOrder::Newest => expected.sort_by_key(|(time, _)| Reverse(*time)),
+                MessageOrder::Oldest => expected.sort_by_key(|(time, _)| *time),
             }
             let expected: Vec<String> = expected
                 .into_iter()

@@ -97,7 +97,7 @@ tg messages "张三" --since today
 tg messages "张三" --all-time
 tg messages "张三" --search "关键词"
 tg messages "张三" --head --limit 20
-tg messages "张三" --tail --limit 20
+tg messages "张三" --limit 20 --offset 20   # 再往前翻一页
 tg messages "产品讨论群" --limit 100 --anonymous
 ```
 
