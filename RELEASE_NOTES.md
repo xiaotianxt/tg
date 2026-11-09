@@ -1,27 +1,16 @@
-## `tg messages --offset` pages back through history
+## Bulk reads no longer starve the desktop client's database writes
 
-`tg messages` shows the latest messages by default, but paging with `--offset`
-used to jump to the start of the chat: `--limit 50 --offset 50` returned
-messages 51–100 counted from the oldest message. `--offset` now counts back
-from the newest message, so each page is the one just before the last. This
-matches how MCP `read_messages` already pages with `order=newest`.
+A read on the live database keeps the desktop client from finishing its WAL
+checkpoints. Running many tg commands back to back, such as a script that
+dumps the whole history in time windows, held that read on the main message
+database almost without a break for minutes, and the client dropped the
+messages that arrived during that window.
 
-```bash
-tg messages "张三" --limit 20               # latest 20
-tg messages "张三" --limit 20 --offset 20   # the 20 before those
-tg messages "张三" --head --limit 20 --offset 20   # messages 21–40 from the start
-```
+On macOS, tg now holds the live database only long enough to make an APFS
+copy-on-write clone of it and its WAL, then reads the clone for the rest of
+the command. The clone stays encrypted, takes almost no disk space, and is
+deleted when the command exits. Results are unchanged; every connection to one
+database in a command now also reads the same snapshot.
 
-With an offset, the header now reads `Showing 20 messages before the latest 20`
-instead of claiming to show the latest messages.
-
-This changes paging for scripts: a script that paged with `--offset` and no
-`--head` now gets older messages counted back from the newest. Add `--head` to
-keep the old pages. `--tail` is still accepted; it is now the default and does
-nothing.
-
-### Internal
-
-Message direction is one `newest`/`oldest` type shared by `messages`,
-`query --order`, and the MCP tools, and the default one-year search window is
-decided in one place. Neither changes output.
+Where cloning is unavailable (Linux, a non-APFS volume, or a `--db-dir` on a
+different volume than `$TMPDIR`), tg reads the live database as before.
