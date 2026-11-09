@@ -140,6 +140,9 @@ operation; they never contain key material.
 7. Verify `Connection::is_readonly(MAIN_DB)`.
 8. Execute `BEGIN` and read `sqlite_schema`. This both validates the key/cipher
    format and pins that database's SQLite snapshot for the active transaction.
+   On macOS the first open of a database per command runs steps 3–8 on the
+   live file, clones it while pinned, and then runs them on the clone (see the
+   WAL contract below).
 9. Return the connection with that read transaction active. Existing reader
    modules may prepare and run queries but must not execute transaction-control
    SQL. Dropping the connection ends the transaction and erases the Rust-owned
@@ -195,24 +198,37 @@ live WAL and return stale data while the desktop client is running.
 Each connection sees a consistent committed snapshot of its database, including
 committed WAL frames. Separate contact, session, FTS, media, and message-shard
 connections may observe slightly different instants; the current independent
-database layout cannot provide a global atomic snapshot. The bundled SQLCipher
-is built without `SQLITE_ENABLE_SNAPSHOT`, so parallel connections to one
-database cannot share a snapshot either; a single table is therefore never
-split across connections.
+database layout cannot provide a global atomic snapshot.
+
+A read transaction on the live file keeps the desktop client's WAL checkpoints
+from completing. Back-to-back bulk queries held one on `message_0.db` almost
+continuously for minutes, and the client dropped every message that arrived in
+that window. So on macOS the first `open` of a database in a command pins a
+live snapshot, clones the main file and then its `-wal` with APFS `clonefile`
+into a per-command temporary directory, and releases the live read; that and
+every later connection to the database in the command read the clone. The pin
+keeps checkpoints from backfilling past the snapshot or restarting the WAL, so
+the two files, cloned at two instants, replay to one committed state. A clone
+is copy-on-write and stays encrypted; the directory is removed when the
+command's `SourceStore` drops. Where `clonefile` is unsupported (Linux, a
+non-APFS volume, or a source on another volume than the temporary directory)
+reads stay on the live file: a full copy would hold the live read for the
+copy's duration and write the whole database on every command.
 
 The direct reader issues no SQL writes to the main database or WAL. SQLite may
 read, lock, create, or update the native `-shm` WAL-index as required for correct
 coordination. Therefore the promise is:
 
-- no tg-owned plaintext database or persistent page cache;
+- no tg-owned plaintext database or persistent page cache; the only copies are
+  the encrypted per-command clones above;
 - no writes to source main database or WAL content;
 - normal SQLite SHM coordination is allowed;
 - if a live WAL snapshot cannot be established, fail instead of reading only
   the base database.
 
-Strict zero-byte changes in the source directory would require a snapshot or
-custom VFS and conflicts with the no-copy, no-persistent-cache goal. It is not
-part of this design.
+Strict zero-byte changes in the source directory would require a custom VFS:
+the pin that precedes each clone still coordinates through the live `-shm`. It
+is not part of this design.
 
 ## Ownership of behavior
 

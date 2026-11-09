@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use rusqlite::{ffi, Connection, OpenFlags, MAIN_DB};
 use zeroize::{Zeroize, Zeroizing};
@@ -11,6 +13,20 @@ const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 pub(crate) struct SourceStore {
     databases: BTreeMap<String, SourceEntry>,
     key_recovery: String,
+    /// Per-command copy-on-write clones of live databases, keyed by relative
+    /// path; `None` records that this filesystem cannot clone, so reads stay
+    /// on the live file. A long read transaction on the live file keeps the
+    /// desktop client's WAL checkpoints from completing, and the client was
+    /// observed to drop incoming messages while back-to-back tg runs held one
+    /// almost continuously. A clone moves that read off the live file after a
+    /// lock held only for the clone itself.
+    clones: Mutex<Clones>,
+}
+
+#[derive(Default)]
+struct Clones {
+    dir: Option<tempfile::TempDir>,
+    sources: HashMap<String, Option<PathBuf>>,
 }
 
 struct SourceEntry {
@@ -72,6 +88,7 @@ impl SourceStore {
         Ok(Self {
             databases,
             key_recovery,
+            clones: Mutex::default(),
         })
     }
 
@@ -117,12 +134,70 @@ impl SourceStore {
             .try_into()
             .expect("page 1 always contains a 16-byte salt");
 
+        let source = self.read_source(relative_path, &entry.path, key, &salt)?;
+        self.open_encrypted(&source, key, &salt, relative_path)
+    }
+
+    /// Returns the file this command reads `relative_path` from: one clone per
+    /// database per command, so every connection to it shares one snapshot,
+    /// or the live file where cloning is unsupported.
+    fn read_source(
+        &self,
+        relative_path: &str,
+        live: &Path,
+        key: &[u8; 32],
+        salt: &[u8; 16],
+    ) -> Result<PathBuf, String> {
+        let mut clones = self
+            .clones
+            .lock()
+            .expect("clone cache lock is never poisoned");
+        if let Some(source) = clones.sources.get(relative_path) {
+            return Ok(source.clone().unwrap_or_else(|| live.to_path_buf()));
+        }
+        let clone = if CAN_CLONE {
+            // The pinned read keeps checkpoints from backfilling past this
+            // snapshot or restarting the WAL, so the main file and WAL, cloned
+            // at two instants, still replay to one committed state.
+            let pin = self.open_encrypted(live, key, salt, relative_path)?;
+            let dir = match &mut clones.dir {
+                Some(dir) => dir.path().to_path_buf(),
+                dir @ None => dir
+                    .insert(
+                        tempfile::Builder::new()
+                            .prefix("tg-snapshot-")
+                            .tempdir()
+                            .map_err(|error| {
+                                format!("Cannot create a snapshot directory: {error}")
+                            })?,
+                    )
+                    .path()
+                    .to_path_buf(),
+            };
+            let clone = clone_database(live, &dir, relative_path)?;
+            drop(pin);
+            clone
+        } else {
+            None
+        };
+        let source = clone.clone().unwrap_or_else(|| live.to_path_buf());
+        clones.sources.insert(relative_path.to_string(), clone);
+        Ok(source)
+    }
+
+    fn open_encrypted(
+        &self,
+        path: &Path,
+        key: &[u8; 32],
+        salt: &[u8; 16],
+        relative_path: &str,
+    ) -> Result<Connection, String> {
         let conn = Connection::open_with_flags(
-            &entry.path,
+            path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|error| format!("Cannot open {relative_path} read-only: {error}"))?;
-        apply_raw_key(&conn, key, &salt, relative_path)?;
+        apply_raw_key(&conn, key, salt, relative_path)?;
         // SQLCipher pragmas are absent from SQLite's pragma_list, which rusqlite validates.
         conn.execute_batch("PRAGMA cipher_compatibility = 4")
             .map_err(|error| format!("Cannot configure SQLCipher for {relative_path}: {error}"))?;
@@ -185,8 +260,76 @@ impl SourceStore {
         Self {
             databases,
             key_recovery: "tg keys".to_string(),
+            clones: Mutex::default(),
         }
     }
+}
+
+const CAN_CLONE: bool = cfg!(target_os = "macos");
+
+/// Clones the main file and its WAL into `dir`. Returns `None` when the
+/// filesystem cannot clone (not APFS, or `dir` is on another volume); a full
+/// copy is not a substitute, as it would hold the live read for the copy's
+/// duration and write the whole database on every command.
+fn clone_database(live: &Path, dir: &Path, relative_path: &str) -> Result<Option<PathBuf>, String> {
+    let target = dir.join(relative_path);
+    let parent = target.parent().expect("a catalogued database has a parent");
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!("Cannot create a snapshot directory for {relative_path}: {error}")
+    })?;
+    match clone_file(live, &target) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(format!("Cannot clone {relative_path}: {error}")),
+    }
+    match clone_file(&sidecar(live, "-wal"), &sidecar(&target, "-wal")) {
+        // No WAL: the database is not in WAL mode, so the main file is complete.
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Cannot clone the WAL of {relative_path}: {error}")),
+    }
+    Ok(Some(target))
+}
+
+#[cfg(target_os = "macos")]
+fn clone_file(source: &Path, target: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // <sys/clonefile.h>; the libc crate does not export it.
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+
+    let source = CString::new(source.as_os_str().as_bytes())?;
+    let target = CString::new(target.as_os_str().as_bytes())?;
+    // SAFETY: both pointers are NUL-terminated strings that outlive the call.
+    let rc = unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), CLONE_NOFOLLOW) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOTSUP) {
+        Err(io::Error::new(io::ErrorKind::Unsupported, error))
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_file(_source: &Path, _target: &Path) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 /// Turns off SQLite's allocation statistics, which take one process-wide
@@ -288,12 +431,6 @@ mod tests {
         conn
     }
 
-    fn sidecar(path: &Path, suffix: &str) -> PathBuf {
-        let mut value = path.as_os_str().to_os_string();
-        value.push(suffix);
-        PathBuf::from(value)
-    }
-
     fn file_state(path: &Path) -> (Vec<u8>, std::time::SystemTime) {
         (
             fs::read(path).unwrap(),
@@ -364,7 +501,19 @@ mod tests {
                 .unwrap(),
             1
         );
-        let new_reader = store.open(relative_path).unwrap();
+        // Connections of one command share its first snapshot; the next
+        // command sees the newer commit.
+        assert_eq!(
+            store
+                .open(relative_path)
+                .unwrap()
+                .query_row("SELECT count(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            if CAN_CLONE { 1 } else { 2 }
+        );
+        let new_store = SourceStore::discover(Some(dir.path()), &keys_path).unwrap();
+        let new_reader = new_store.open(relative_path).unwrap();
         assert_eq!(
             new_reader
                 .query_row("SELECT count(*) FROM messages", [], |row| row
@@ -380,6 +529,38 @@ mod tests {
         drop(new_reader);
         assert_eq!(file_state(&db_path), db_state);
         assert_eq!(file_state(&wal_path), wal_state);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn open_reader_does_not_block_the_writers_truncate_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [53u8; 32];
+        let salt = [59u8; 16];
+        let relative_path = "message/message_0.db";
+        let writer = create_encrypted_writer(dir.path(), relative_path, &key, &salt);
+        writer
+            .execute("INSERT INTO messages(body) VALUES ('wal-only')", [])
+            .unwrap();
+        let keys_path = dir.path().join("all_keys.json");
+        write_keys(&keys_path, relative_path, &key, &salt);
+        let store = SourceStore::discover(Some(dir.path()), &keys_path).unwrap();
+
+        let reader = store.open(relative_path).unwrap();
+        writer
+            .execute("INSERT INTO messages(body) VALUES ('later')", [])
+            .unwrap();
+        let busy: i64 = writer
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy, 0, "a tg reader blocked the writer's checkpoint");
+        assert_eq!(
+            reader
+                .query_row("SELECT count(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
