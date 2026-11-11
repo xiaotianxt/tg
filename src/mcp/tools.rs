@@ -177,13 +177,12 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "search_messages",
             "title": "Search messages",
-            "description": "Full-text search across all chats using the client's own search index. Defaults to the recent window unless `since` or `all_time` is given. Returns every match, newest first. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset.",
+            "description": "Full-text search across all chats using the client's own search index, over the full history unless `since` is given. Returns every match, newest first. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "minLength": 1},
                     "since": {"type": "string", "description": time_hint},
-                    "all_time": {"type": "boolean", "default": false},
                     "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Only to continue a truncated result: pass its next_offset."}
                 },
                 "required": ["query"],
@@ -194,7 +193,7 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "query_messages",
             "title": "Filter messages",
-            "description": "Structured message filter across all chats or one chat: keywords to include/exclude, media type, sender, and a time range. Each message carries `sender` (the account owner is 我) and its stable `sender_id`. Slower than search_messages but exhaustive. Defaults to the recent window unless `since` or `all_time` is given. Returns every match. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset. To read every message of one chat in a period, use read_messages instead.",
+            "description": "Structured message filter across all chats or one chat: keywords to include/exclude, media type, sender, and a time range. Each message carries `sender` (the account owner is 我) and its stable `sender_id`. Slower than search_messages but exhaustive. Covers the full history unless `since` is given; with no session, give at least one filter or `since`. Returns every match. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset. To read every message of one chat in a period, use read_messages instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -206,7 +205,6 @@ pub(crate) fn definitions() -> Value {
                     "sender": {"type": "string", "description": SENDER_HINT},
                     "since": {"type": "string", "description": time_hint},
                     "until": {"type": "string", "description": time_hint},
-                    "all_time": {"type": "boolean", "default": false},
                     "order": {"type": "string", "enum": ["newest", "oldest"], "default": "newest"},
                     "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Only to continue a truncated result: pass its next_offset."}
                 },
@@ -321,7 +319,7 @@ fn list_sessions(
 
 fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
     args.only(&[
-        "session", "order", "offset", "since", "until", "contains", "sender",
+        "session", "order", "offset", "since", "until", "contains", "sender", "all_time",
     ])?;
     let session = args.required_str("session")?;
     let order =
@@ -331,6 +329,7 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
     let until = args.time("until")?;
     let contains = args.str("contains")?;
     let sender = args.str("sender")?;
+    args.bool("all_time")?;
     let store = ctx.open_store()?;
     let options = db::ReadMessagesOptions {
         session_query: session,
@@ -529,7 +528,9 @@ fn search_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Str
     let query = args.required_str("query")?;
     let offset = args.offset()?;
     let since = args.time("since")?;
-    let since = time::since_or_recent(since, args.bool("all_time")?);
+    // Every tool reads the full history by default; `all_time` is only
+    // type-checked for callers written against the old recent window.
+    args.bool("all_time")?;
     let store = ctx.open_store()?;
     let results = db::search_messages(
         &store,
@@ -587,7 +588,7 @@ fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Stri
         .collect::<Result<Vec<_>, _>>()?;
     let sender = args.str("sender")?;
     let since = args.time("since")?;
-    let since = time::since_or_recent(since, args.bool("all_time")?);
+    args.bool("all_time")?;
     let until = args.time("until")?;
     let sort =
         db::MessageOrder::from_str(args.choice("order", &["newest", "oldest"], "newest")?, true)?;

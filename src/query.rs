@@ -278,10 +278,11 @@ fn validate_message_options(options: &QueryOptions<'_>) -> Result<(), String> {
         && options.raw_contains.is_empty()
         && options.has.is_empty()
         && options.sender.is_none()
+        && options.session.is_none()
         && options.since.is_none()
     {
         return Err(
-            "refusing an unbounded message query; pass --contains, --raw-contains, --has, --sender, or --since"
+            "refusing to return every message of every chat; pass --session, --contains, --raw-contains, --has, --sender, or --since"
                 .to_string(),
         );
     }
@@ -1497,7 +1498,7 @@ mod tests {
         let conn = Connection::open(dir.path().join("message/message_0.db")).unwrap();
         let marker_col = dictionary::msg_compression_marker_column();
         let packed_col = dictionary::msg_packed_meta_column();
-        let create_time = crate::time::default_recent_since() + 1;
+        let create_time = 1_700_000_000 + 1;
         let quote_xml = r#"<msg><appmsg><title>索引回复</title><type>57</type><refermsg><type>1</type><displayname>Bob</displayname><content>索引引用</content></refermsg></appmsg></msg>"#;
         conn.execute(
             &format!(
@@ -1512,7 +1513,7 @@ mod tests {
         let mut bytes = Vec::new();
         let mut out = output::Output::new(&mut bytes);
         let mut options = default_query_options(dir.path(), &contains, &[]);
-        options.since = Some(crate::time::default_recent_since());
+        options.since = Some(1_700_000_000);
         let count = run_messages_with_output(options, &default_query_output(), &mut out).unwrap();
         out.flush().unwrap();
         drop(out);
@@ -1529,7 +1530,7 @@ mod tests {
         let conn = Connection::open(dir.path().join("message/message_0.db")).unwrap();
         let marker_col = dictionary::msg_compression_marker_column();
         let packed_col = dictionary::msg_packed_meta_column();
-        let create_time = crate::time::default_recent_since() + 1;
+        let create_time = 1_700_000_000 + 1;
         let xml = r#"<msg><appmsg><title>indexed visible title</title><type>5</type><secret>indexed-raw-only</secret></appmsg></msg>"#;
         conn.execute(
             &format!(
@@ -1544,7 +1545,7 @@ mod tests {
         let mut bytes = Vec::new();
         let mut out = output::Output::new(&mut bytes);
         let mut options = default_query_options(dir.path(), &contains, &[]);
-        options.since = Some(crate::time::default_recent_since());
+        options.since = Some(1_700_000_000);
         let count = run_messages_with_output(options, &default_query_output(), &mut out).unwrap();
         out.flush().unwrap();
         drop(out);
@@ -1555,7 +1556,7 @@ mod tests {
         let mut out = output::Output::new(&mut bytes);
         let mut options = default_query_options(dir.path(), &[], &[]);
         options.raw_contains = &raw_contains;
-        options.since = Some(crate::time::default_recent_since());
+        options.since = Some(1_700_000_000);
         let count = run_messages_with_output(options, &default_query_output(), &mut out).unwrap();
         out.flush().unwrap();
         drop(out);
@@ -1579,7 +1580,7 @@ mod tests {
                 "INSERT INTO Msg_test (local_id, local_type, create_time, message_content, {marker_col}, real_sender_id, {packed_col})
                  VALUES (5151, 34, ?1, '', NULL, 7, x'')"
             ),
-            params![crate::time::default_recent_since() + 1],
+            params![1_700_000_000 + 1],
         )
         .unwrap();
         drop(conn);
@@ -1588,7 +1589,7 @@ mod tests {
         let mut out = output::Output::new(&mut bytes);
         let mut options = default_query_options(dir.path(), &[], &[]);
         options.has = &has;
-        options.since = Some(crate::time::default_recent_since());
+        options.since = Some(1_700_000_000);
         let count = run_messages_with_output(options, &default_query_output(), &mut out).unwrap();
         out.flush().unwrap();
         drop(out);
@@ -1844,8 +1845,12 @@ mod tests {
     fn message_query_requires_a_bound() {
         let dir = create_query_test_dir();
         let err = run_messages_for_test(dir.path(), &[], &[]).unwrap_err();
+        assert!(err.contains("every message of every chat"), "{err}");
 
-        assert!(err.contains("unbounded"));
+        // One chat is bound enough, as reading it with `messages` would be.
+        let mut options = default_query_options(dir.path(), &[], &[]);
+        options.session = Some("tgid_one");
+        assert_eq!(validate_message_options(&options), Ok(()));
     }
 
     #[test]

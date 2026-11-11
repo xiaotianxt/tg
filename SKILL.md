@@ -25,7 +25,7 @@ Do not wait for the user to name tg. tg is the tool; the user goal is local desk
 Chat data is private. Keep work local by default, avoid printing more message content than the user asked for, and treat exports as sensitive.
 For summary requests, choose display names by the target. If the user clearly names a 1-on-1 person, omit `--anonymous` so the summary uses the user's intended name for that person. If the target is a group chat, a room, a global search, or the target type is unclear, use `--anonymous` whenever the command supports it to avoid exposing personal contact remarks in assistant-visible output and exported sender names.
 `~/.tg/all_keys.json` and `~/.tg/key_material.bin` are sensitive local state. Read commands open Telegram's encrypted databases directly and never create a decrypted database cache.
-For exhaustive keyword lookup over locally cached messages, prefer `tg query --contains "..." --all-time`; `tg search` is the faster upstream-FTS path and does not cover every message type or nested card body.
+For exhaustive keyword lookup over locally cached messages, prefer `tg query --contains "..."`; `tg search` is the faster upstream-FTS path and does not cover every message type or nested card body.
 
 ## First Setup
 
@@ -106,7 +106,6 @@ Search globally:
 ```bash
 tg search "关键词" --limit 50 --anonymous
 tg search "关键词" --since today --anonymous
-tg search "关键词" --all-time --anonymous
 ```
 
 Use structured lookup when the user wants precise filters, multiple keywords,
@@ -119,8 +118,7 @@ tg query --session "张三" --contains "关键词" --fields time,sender,body --l
 tg query --session "产品讨论群" --contains "关键词" --fields time,sender,body --limit 20 --anonymous
 tg query --contains "项目" --contains "上线" --match-mode all --since today --anonymous
 tg query --contains "项目" --not "已取消" --format json --fields timestamp,session,body --anonymous
-tg query --contains "项目" --all-time --anonymous
-tg query --session "产品讨论群" --sender "张三" --all-time --format json --fields timestamp,sender,sender_id,body
+tg query --session "产品讨论群" --sender "张三" --format json --fields timestamp,sender,sender_id,body
 tg messages "产品讨论群" --sender me --all-time
 ```
 
@@ -133,8 +131,8 @@ Use `tg query --help` when the user asks what `query` can return or filter on.
 
 Query safety rules:
 
-- `search` and `query` default to the recent 365-day window; `export` always writes the complete chat archive.
-- With `--all-time`, `query` requires at least `--contains`, `--raw-contains`, `--has`, `--sender`, or `--since`.
+- `search` and `query` cover the full local history unless `--since` / `--until` narrow it; `--all-time` is still accepted and changes nothing. `export` always writes the complete chat archive.
+- `query` requires at least `--session`, `--contains`, `--raw-contains`, `--has`, `--sender`, or `--since`.
 - Empty `--contains` / `--not` values are rejected.
 - Use `--session`, `--since`, and a reasonable `--limit` when results could be large.
 - Table output escapes terminal control characters; use `--format json` for machine parsing.

@@ -121,7 +121,6 @@ tg messages "产品讨论群" --anonymous
 ```bash
 tg search "关键词" --limit 50 --anonymous
 tg search "关键词" --since today --anonymous
-tg search "关键词" --all-time --anonymous
 ```
 
 `search` 直接复用上游 FTS，速度最快，但只覆盖上游已经收录的正文。群公告、部分卡片深层内容等可能未进入 FTS。
@@ -135,8 +134,7 @@ tg query --contains "项目" --contains "上线" --match-mode all --since today 
 tg query --contains "项目" --not "取消" --format json --fields timestamp,session,body --anonymous
 tg query --has voice --session "张三" --limit 20
 tg query --raw-contains "<appmsg" --fields time,session,raw_body --limit 20
-tg query --contains "关键词" --all-time --anonymous
-tg query --session "产品讨论群" --sender "张三" --all-time --format json --fields timestamp,sender,sender_id,body
+tg query --session "产品讨论群" --sender "张三" --format json --fields timestamp,sender,sender_id,body
 tg messages "产品讨论群" --sender me --all-time
 ```
 
@@ -146,7 +144,7 @@ tg messages "产品讨论群" --sender me --all-time
 
 `messages --since` 早于该会话本机最早一条记录时，会提示本机历史从何时开始，更早的消息不在本机。
 
-`search` 和 `query` 默认查询最近 365 天。全量历史用 `--all-time`；为避免误扫全库，`query --all-time` 仍要求至少提供 `--contains`、`--raw-contains`、`--has`、`--sender` 或 `--since` 之一。
+`search` 和 `query` 默认查询全部本地历史，用 `--since` / `--until` 缩小范围（`--all-time` 仍可传，已是默认行为）。为避免把所有会话的全部消息一次输出，`query` 至少需要 `--session`、`--contains`、`--raw-contains`、`--has`、`--sender` 或 `--since` 之一。
 
 诊断：
 

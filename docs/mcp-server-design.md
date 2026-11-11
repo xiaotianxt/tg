@@ -189,7 +189,7 @@ clients that ignore structured output.
 | `list_sessions` | `db::list_sessions` | `query?`, `offset?` | Every chat; reads only contact and session DBs |
 | `list_unread` | `db::list_unread_sessions` | `query?`, `offset?` | Every unread chat; same light scope |
 | `read_messages` | `db::read_messages` | `session`, `since?`, `until?`, `order` (`newest`/`oldest`, the end kept when trimming), `contains?`, `sender?`, `offset?` | Every message in the range; the header names the readable history start (local start, raised to the remote lookback floor) and maps each shown sender name to its account id |
-| `search_messages` | `db::search_messages` | `query`, `since?` (default recent window), `offset?` | Every hit, newest first; upstream FTS; errors point to `query_messages` if the FTS DB is missing |
+| `search_messages` | `db::search_messages` | `query`, `since?` (default full history), `offset?` | Every hit, newest first; upstream FTS; errors point to `query_messages` if the FTS DB is missing |
 | `query_messages` | `query::run` | `session?`, `contains[]`, `not_contains[]`, `match` (`all`/`any`), `has[]` (media types), `sender?`, `since?`, `until?`, `order`, `offset?` | Every match with `sender_id`; no raw-body fields over MCP |
 | `list_members` | `db::list_members` / `list_member_friends` | `session`, `inactive_since?`, `friends_only` | |
 | `get_media` | `media_fetch::MediaCache` | `session`, `ids[]` (1–10 cache ids), `size` (`preview`/`original`) | MCP `image` blocks; off in remote mode unless `allow_media` |

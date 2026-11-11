@@ -259,9 +259,9 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Show matches after this time (ISO 8601 or relative: 5min, 1h, today)
-        #[arg(long, conflicts_with = "all_time")]
+        #[arg(long)]
         since: Option<String>,
-        /// Search the full history instead of the default recent window
+        /// Search the full history (the default; accepted for older scripts)
         #[arg(long)]
         all_time: bool,
         /// Use public names instead of your contact remarks in output
@@ -291,9 +291,9 @@ enum Commands {
         #[arg(long)]
         sender: Option<String>,
         /// Show messages after this time (ISO 8601 or relative: 5min, 1h, today)
-        #[arg(long, conflicts_with = "all_time")]
+        #[arg(long)]
         since: Option<String>,
-        /// Search the full history instead of the default recent window
+        /// Search the full history (the default; accepted for older scripts)
         #[arg(long)]
         all_time: bool,
         /// Show messages before this time (ISO 8601 or relative: 5min, 1h, today)
@@ -540,7 +540,7 @@ fn run(command: Commands) -> Result<(), String> {
             query,
             limit,
             since,
-            all_time,
+            all_time: _,
             anonymous,
             source,
         } => {
@@ -550,7 +550,6 @@ fn run(command: Commands) -> Result<(), String> {
             }
             let since_ts = time::parse_since_opt(since.as_deref())
                 .map_err(|e| format!("Error parsing --since: {e}"))?;
-            let since_ts = time::since_or_recent(since_ts, all_time);
             let results = db::search_messages(
                 &store,
                 db::SearchMessagesOptions {
@@ -580,7 +579,7 @@ fn run(command: Commands) -> Result<(), String> {
             has,
             sender,
             since,
-            all_time,
+            all_time: _,
             until,
             limit,
             offset,
@@ -595,7 +594,6 @@ fn run(command: Commands) -> Result<(), String> {
             let store = open_source(&source)?;
             let since_ts = time::parse_since_opt(since.as_deref())
                 .map_err(|e| format!("Error parsing --since: {e}"))?;
-            let since_ts = time::since_or_recent(since_ts, all_time);
             let until_ts = time::parse_since_opt(until.as_deref())
                 .map_err(|e| format!("Error parsing --until: {e}"))?;
             let fields = query::QueryFields::parse(&fields)
