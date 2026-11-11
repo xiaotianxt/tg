@@ -192,6 +192,8 @@ read -rs P; printf '%s\n' "$P" | tg mcp init --public-url https://mcp.example.co
 tg mcp serve
 ```
 
+`tg mcp init` 不会交互提示输入 passphrase：不带 `--passphrase-stdin` 时只更新配置、保留原 passphrase。要改 passphrase，用上面同样的 `read … | tg mcp init --passphrase-stdin`，再重启 `tg mcp serve`。
+
 在 ChatGPT 添加自定义 MCP 服务器时，URL 填 `https://mcp.example.com/mcp`，认证选 OAuth。
 
 名称和描述由你在这一步填写，ChatGPT 不从服务器读取；工具按需加载时，模型最先只看到这两项，再决定要不要用这个服务器。名称用你平时对这份数据的叫法（例如“聊天记录”），不要只写 `tg`；描述写清什么时候该用、什么时候不该用，例如：

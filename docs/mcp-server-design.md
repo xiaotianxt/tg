@@ -290,7 +290,7 @@ it needs no auth, and policy limits apply only when `--remote-policy` is given.
 
 ## Auth: a single-user authorization server inside tg
 
-The "secret" is an **owner passphrase** set with `tg mcp init`. ChatGPT never
+The "secret" is an **owner passphrase** set with `tg mcp init --passphrase-stdin`. ChatGPT never
 sees it. ChatGPT gets an OAuth token only after you type the passphrase into
 tg's consent page in your own browser during the connector linking flow.
 
@@ -360,9 +360,14 @@ connector callback.
 
 ### Passphrase
 
-- `tg mcp init` asks for a passphrase of at least 16 characters and stores a
-  PBKDF2-HMAC-SHA256 hash (600,000 iterations, random salt) in
-  `~/.tg/mcp/owner.json`. Stored in the macOS Keychain instead when available.
+- `tg mcp init --passphrase-stdin` reads the passphrase (at least 16
+  characters) from the first line of stdin and stores a PBKDF2-HMAC-SHA256 hash
+  (600,000 iterations, random salt) in `~/.tg/mcp/owner.json` (0600). It never
+  prompts: without the flag, `init` keeps the existing passphrase and only
+  updates the config, and the first `init` fails until one is given.
+- The same command changes the passphrase. `serve` reads `owner.json` at
+  startup, so restart it afterwards. Existing grants stay valid; revoke them
+  with `tg mcp revoke` if the old passphrase leaked.
 - Failed attempts: 5 per 15 minutes globally (there is one owner, so a global
   limit is correct), then the authorize endpoint answers `429` until the window
   passes.
@@ -501,7 +506,7 @@ User-facing caveats to document in the README:
 
 ```text
 tg mcp stdio [--remote-policy]
-tg mcp init                     # passphrase, public_url, writes ~/.tg/mcp/
+tg mcp init [--passphrase-stdin]  # public_url, listen; new passphrase from stdin
 tg mcp serve [--expires 8h]     # HTTP on the tailnet address, requires init
 tg mcp status                   # config, grants, last requests
 tg mcp revoke [--client ID | --all]
