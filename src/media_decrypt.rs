@@ -139,8 +139,29 @@ pub fn tggf_hevc_partition(data: &[u8]) -> Result<&[u8], String> {
     find_tggf_hevc_partition(data).ok_or_else(|| "tggf HEVC partition not found".to_string())
 }
 
-fn ffmpeg_command() -> Command {
-    Command::new(std::env::var("TG_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string()))
+/// The ffmpeg binary tggf conversion runs; `tg doctor` reports the same one.
+pub(crate) fn resolve_ffmpeg() -> Result<std::path::PathBuf, String> {
+    if let Some(path) = std::env::var_os("TG_FFMPEG").filter(|value| !value.is_empty()) {
+        return Ok(path.into());
+    }
+    crate::paths::find_tool("ffmpeg").ok_or_else(|| {
+        "ffmpeg not found; converting tggf images needs it. Install it with \
+         `brew install ffmpeg` or set TG_FFMPEG to its path"
+            .to_string()
+    })
+}
+
+fn ffmpeg_command() -> Result<Command, String> {
+    resolve_ffmpeg().map(Command::new)
+}
+
+/// Describe a failure to start ffmpeg, which differs from a failed decode.
+fn ffmpeg_spawn_error(command: &Command, error: std::io::Error) -> String {
+    format!(
+        "start ffmpeg ({}) for tggf: {}",
+        command.get_program().to_string_lossy(),
+        error
+    )
 }
 
 /// Encoder options shared by single and batched conversions; both must stay
@@ -148,7 +169,8 @@ fn ffmpeg_command() -> Command {
 const JPEG_OUTPUT_ARGS: [&str; 6] = ["-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg"];
 
 pub fn convert_hevc_to_jpg(hevc: &[u8]) -> Result<Vec<u8>, String> {
-    let mut child = ffmpeg_command()
+    let mut command = ffmpeg_command()?;
+    command
         .args([
             "-hide_banner",
             "-loglevel",
@@ -162,9 +184,10 @@ pub fn convert_hevc_to_jpg(hevc: &[u8]) -> Result<Vec<u8>, String> {
         .arg("pipe:1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
         .spawn()
-        .map_err(|e| format!("run ffmpeg for tggf: {}", e))?;
+        .map_err(|e| ffmpeg_spawn_error(&command, e))?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin
@@ -206,7 +229,7 @@ pub fn convert_hevc_batch_to_jpg(hevcs: &[&[u8]]) -> Result<Vec<Vec<u8>>, String
         .prefix("tg-hevc-")
         .tempdir()
         .map_err(|e| format!("Create temporary HEVC dir: {}", e))?;
-    let mut command = ffmpeg_command();
+    let mut command = ffmpeg_command()?;
     command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     for (index, hevc) in hevcs.iter().enumerate() {
         let input = dir.path().join(format!("{index}.hevc"));
@@ -228,7 +251,7 @@ pub fn convert_hevc_batch_to_jpg(hevcs: &[&[u8]]) -> Result<Vec<Vec<u8>>, String
     let output = command
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("run ffmpeg for tggf batch: {}", e))?;
+        .map_err(|e| ffmpeg_spawn_error(&command, e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffmpeg tggf batch failed: {}", stderr.trim()));
@@ -366,6 +389,7 @@ mod tests {
 
     fn encode_test_hevc(size: &str, pix_fmt: &str) -> Option<Vec<u8>> {
         let output = ffmpeg_command()
+            .ok()?
             .args([
                 "-hide_banner",
                 "-loglevel",

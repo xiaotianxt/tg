@@ -762,6 +762,12 @@ fn get_media(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
             Err(error) => blocks.push(text(format!("{id}: {error}"))),
         }
     }
+    // With no image at all the notes are all failures; isError lets clients
+    // tell that from a result.
+    if rows == 0 {
+        let notes: Vec<&str> = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
+        return Err(notes.join("\n"));
+    }
     Ok(CallOutcome {
         content: Content::Blocks(blocks),
         rows,

@@ -81,6 +81,38 @@ pub(crate) fn find_db_storage_dir(home: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Default Homebrew `bin` directories on Apple Silicon, Intel macOS and Linux.
+const HOMEBREW_BIN_DIRS: [&str; 3] = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/home/linuxbrew/.linuxbrew/bin",
+];
+
+/// Find an external tool such as ffmpeg.
+///
+/// launchd and systemd start services with a minimal PATH that leaves out the
+/// Homebrew prefix where `brew install tg` puts its dependencies. After PATH
+/// this checks the prefix tg itself was installed into, then the default
+/// Homebrew prefixes.
+pub(crate) fn find_tool(name: &str) -> Option<PathBuf> {
+    let path_dirs = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default();
+    path_dirs
+        .into_iter()
+        .chain(own_homebrew_bin_dir())
+        .chain(HOMEBREW_BIN_DIRS.iter().map(PathBuf::from))
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// `<prefix>/bin` when tg runs from `<prefix>/Cellar/tg/<version>/bin/tg`.
+fn own_homebrew_bin_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let cellar = exe.ancestors().find(|dir| dir.ends_with("Cellar"))?;
+    Some(cellar.parent()?.join("bin"))
+}
+
 pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Ok(());

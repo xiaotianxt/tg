@@ -739,13 +739,13 @@ fn export_voice_wav(
     }
 }
 
-fn resolve_voice_decoder() -> Result<PathBuf, String> {
+pub(crate) fn resolve_voice_decoder() -> Result<PathBuf, String> {
     if let Ok(value) = env::var("TG_VOICE_DECODER") {
         return Ok(PathBuf::from(value));
     }
 
     let command = current_voice_decoder_command();
-    find_command_in_path(&command).ok_or_else(|| {
+    crate::paths::find_tool(&command).ok_or_else(|| {
         "No native voice decoder found. Install the Homebrew decoder or set TG_VOICE_DECODER."
             .to_string()
     })
@@ -757,17 +757,6 @@ fn native_codec_token() -> String {
 
 fn current_voice_decoder_command() -> String {
     format!("rust-{}", native_codec_token())
-}
-
-fn find_command_in_path(name: &str) -> Option<PathBuf> {
-    let paths = env::var_os("PATH")?;
-    for dir in env::split_paths(&paths) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 fn run_native_rust_decoder(decoder: &Path, input: &Path, output: &Path) -> Result<(), String> {

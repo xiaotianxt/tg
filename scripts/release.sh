@@ -358,7 +358,9 @@ def keep_line(pattern):
 desc = keep_line(r'^  desc .*$')
 homepage = keep_line(r'^  homepage .*$')
 license_line = keep_line(r'^  license .*$')
-native_decoder_dep = '  depends_on "rust-" + "si" + "lk"\n'
+# ffmpeg converts tggf images; services such as the launchd MCP server find
+# it in the Homebrew prefix even without it on PATH.
+native_decoder_dep = '  depends_on "ffmpeg"\n  depends_on "rust-" + "si" + "lk"\n'
 caveats = '''  def caveats
     <<~EOS
       `tg keys --method login` uses LLDB on macOS or GDB on Linux while you log out and back in once.

@@ -170,7 +170,7 @@ exported/zhangsan/chat.json
 exported/zhangsan/media/
 ```
 
-本地可用的图片、视频、表情、文件和语音会写入 `media/`。Telegram 没有缓存或缓存已清理时，只保留消息摘要；tg 不从远端 URL 下载。语音优先写成 WAV，解码器不可用或单条失败时保留 `.voice`。`tggf` 表情转换需要 `ffmpeg`。
+本地可用的图片、视频、表情、文件和语音会写入 `media/`。Telegram 没有缓存或缓存已清理时，只保留消息摘要；tg 不从远端 URL 下载。语音优先写成 WAV，解码器不可用或单条失败时保留 `.voice`。`tggf` 图片和表情转换需要 `ffmpeg`，`brew install` 会一并安装。
 
 ## MCP 服务
 
@@ -289,6 +289,8 @@ tg sessions --top 30
 先在 Telegram 中打开或下载该媒体，再重新运行 `tg export`。
 
 ### `tggf` 转换失败
+
+tg 先在 PATH 里找 `ffmpeg`，找不到时再看 Homebrew 的 `bin` 目录，所以 launchd 启动的 `tg mcp serve` 也能用上 Homebrew 装的 ffmpeg。不是用 Homebrew 安装的 tg，手动装上 ffmpeg，或者用 `TG_FFMPEG` 指定路径：
 
 ```bash
 brew install ffmpeg

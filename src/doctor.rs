@@ -74,6 +74,16 @@ pub(crate) fn run(options: DoctorOptions<'_>) -> DoctorReport {
         session: None,
     };
     check_process(&mut report);
+    check_tool(
+        &mut report,
+        "ffmpeg",
+        crate::media_decrypt::resolve_ffmpeg(),
+    );
+    check_tool(
+        &mut report,
+        "voice decoder",
+        crate::export::resolve_voice_decoder(),
+    );
     let keys = check_keys(&mut report, options.keys_path);
     let root = check_source(&mut report, options.db_dir, keys.as_ref());
     drop(keys);
@@ -105,6 +115,15 @@ fn check_process(report: &mut DoctorReport) {
             Some(format!("pid {pid}")),
         ),
         Err(error) => report.status("Telegram process", CheckStatus::Missing, Some(error)),
+    }
+}
+
+/// Media conversion runs these tools; resolving them here uses the same
+/// lookup, so a service's PATH problem shows up before a conversion fails.
+fn check_tool(report: &mut DoctorReport, label: &'static str, path: Result<PathBuf, String>) {
+    match path {
+        Ok(path) => report.status(label, CheckStatus::Ok, Some(path.display().to_string())),
+        Err(error) => report.status(label, CheckStatus::Missing, Some(error)),
     }
 }
 
