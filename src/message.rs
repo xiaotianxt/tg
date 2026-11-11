@@ -58,6 +58,13 @@ impl fmt::Display for MessageType {
     }
 }
 
+impl MessageType {
+    /// System notices and recalls, which no account sent.
+    pub(crate) fn is_system(self) -> bool {
+        matches!(self, MessageType::System | MessageType::Revoke)
+    }
+}
+
 impl From<i32> for MessageType {
     fn from(t: i32) -> Self {
         match t {

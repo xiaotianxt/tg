@@ -65,6 +65,9 @@ pub(crate) fn messages<W: Write>(
     if let Some(query) = options.search_query {
         out.line(format_args!("Search: '{query}'"))?;
     }
+    if let Some(sender) = options.sender {
+        out.line(format_args!("Sender: '{sender}'"))?;
+    }
     if options.order == MessageOrder::Newest {
         if options.offset > 0 {
             out.line(format_args!(
@@ -369,11 +372,13 @@ mod tests {
             local_type: 1,
             create_time: 1_700_000_000,
             sender: sender.to_string(),
+            sender_id: String::new(),
             content: content.to_string(),
         };
         let page = MessagePage {
             username: "tgid_a".to_string(),
             display_name: "Alice".to_string(),
+            history_start: None,
             messages: vec![
                 message("Alice", "one"),
                 message("Alice", "two"),
@@ -388,6 +393,7 @@ mod tests {
             since: None,
             until: None,
             order: MessageOrder::Newest,
+            sender: None,
             time_bucket: time::MessageTimeBucket::Minute(1),
             name_mode: DisplayNameMode::PersonalRemark,
             jobs: 1,

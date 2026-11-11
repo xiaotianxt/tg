@@ -120,14 +120,21 @@ tg query --session "产品讨论群" --contains "关键词" --fields time,sender
 tg query --contains "项目" --contains "上线" --match-mode all --since today --anonymous
 tg query --contains "项目" --not "已取消" --format json --fields timestamp,session,body --anonymous
 tg query --contains "项目" --all-time --anonymous
+tg query --session "产品讨论群" --sender "张三" --all-time --format json --fields timestamp,sender,sender_id,body
+tg messages "产品讨论群" --sender me --all-time
 ```
+
+`--sender` takes `me`, an account id, or a name exactly as tg prints it; a name
+shared by several accounts fails and lists their ids. Use the `sender_id` field
+to count or group one person across chats and names. `search` cannot filter by
+sender.
 
 Use `tg query --help` when the user asks what `query` can return or filter on.
 
 Query safety rules:
 
 - `search` and `query` default to the recent 365-day window; `export` always writes the complete chat archive.
-- With `--all-time`, `query` requires at least `--contains`, `--raw-contains`, `--has`, or `--since`.
+- With `--all-time`, `query` requires at least `--contains`, `--raw-contains`, `--has`, `--sender`, or `--since`.
 - Empty `--contains` / `--not` values are rejected.
 - Use `--session`, `--since`, and a reasonable `--limit` when results could be large.
 - Table output escapes terminal control characters; use `--format json` for machine parsing.

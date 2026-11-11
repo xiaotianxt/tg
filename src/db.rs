@@ -8,6 +8,7 @@ use crate::dictionary;
 use crate::fts;
 use crate::message;
 use crate::parallel;
+use crate::sender;
 use crate::source_store::SourceStore;
 use crate::time;
 
@@ -116,6 +117,8 @@ pub(crate) struct ReadMessagesOptions<'a> {
     /// The end `offset` and `limit` count from. Returned messages are always
     /// chronological.
     pub order: MessageOrder,
+    /// Only messages from this sender: `me`, an account id, or a shown name.
+    pub sender: Option<&'a str>,
     pub time_bucket: time::MessageTimeBucket,
     pub name_mode: DisplayNameMode,
     pub jobs: usize,
@@ -126,6 +129,9 @@ pub(crate) struct ReadMessagesOptions<'a> {
 pub(crate) struct MessagePage {
     pub username: String,
     pub display_name: String,
+    /// Time of the session's earliest message stored on this device, whatever
+    /// the requested range; `None` when none is stored.
+    pub history_start: Option<i64>,
     pub messages: Vec<ChatMessage>,
 }
 
@@ -135,6 +141,8 @@ pub(crate) struct ChatMessage {
     pub local_type: i64,
     pub create_time: i64,
     pub sender: String,
+    /// Sender account username; empty for system messages.
+    pub sender_id: String,
     pub content: String,
 }
 
@@ -940,54 +948,73 @@ pub fn read_messages(
     options: &ReadMessagesOptions<'_>,
 ) -> Result<MessagePage, String> {
     let message_dbs = message_databases(store);
-    let (username, contacts, room_member_names, all_messages) =
-        match direct_session_username(options.session_query) {
-            // A direct id resolves without contacts, so the contact scan runs
-            // beside the shard reads. Its errors still win, as when it ran first.
-            Some(username) => {
-                let username = username.to_string();
-                let (names, rows) = std::thread::scope(|scope| {
-                    let names = scope.spawn(|| -> Result<_, String> {
-                        let contact_conn = open_optional_database(store, CONTACT_DB)?;
-                        let contacts = match contact_conn.as_ref() {
-                            Some(conn) => contact::load_contacts(conn)?,
-                            None => HashMap::new(),
-                        };
-                        let room_member_names = load_room_member_names(
-                            contact_conn.as_ref(),
-                            &username,
-                            options.name_mode,
-                        )?;
-                        Ok((contacts, room_member_names))
-                    });
-                    let rows = read_session_rows(store, message_dbs, &username, options);
-                    let names = names
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    (names, rows)
+    let direct =
+        direct_session_username(options.session_query).filter(|_| options.sender.is_none());
+    let (username, contacts, room_member_names, session_rows) = match direct {
+        // A direct id resolves without contacts, so the contact scan runs
+        // beside the shard reads. Its errors still win, as when it ran first.
+        Some(username) => {
+            let username = username.to_string();
+            let (names, rows) = std::thread::scope(|scope| {
+                let names = scope.spawn(|| -> Result<_, String> {
+                    let contact_conn = open_optional_database(store, CONTACT_DB)?;
+                    let contacts = match contact_conn.as_ref() {
+                        Some(conn) => contact::load_contacts(conn)?,
+                        None => HashMap::new(),
+                    };
+                    let room_member_names = load_room_member_names(
+                        contact_conn.as_ref(),
+                        &username,
+                        options.name_mode,
+                    )?;
+                    Ok((contacts, room_member_names))
                 });
-                let (contacts, room_member_names) = names?;
-                (username, contacts, room_member_names, rows?)
-            }
-            None => {
-                let contact_conn = open_optional_database(store, CONTACT_DB)?;
-                let contacts = match contact_conn.as_ref() {
-                    Some(conn) => contact::load_contacts(conn)?,
-                    None => HashMap::new(),
-                };
-                let username = resolve_username_for_messages(
+                let rows = read_session_rows(store, message_dbs, &username, None, options);
+                let names = names
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                (names, rows)
+            });
+            let (contacts, room_member_names) = names?;
+            (username, contacts, room_member_names, rows?)
+        }
+        None => {
+            let contact_conn = open_optional_database(store, CONTACT_DB)?;
+            let contacts = match contact_conn.as_ref() {
+                Some(conn) => contact::load_contacts(conn)?,
+                None => HashMap::new(),
+            };
+            let username = match direct_session_username(options.session_query) {
+                Some(username) => username.to_string(),
+                None => resolve_username_for_messages(
                     options.session_query,
                     &contacts,
                     store,
                     &message_dbs,
                     options.jobs,
-                )?;
-                let room_member_names =
-                    load_room_member_names(contact_conn.as_ref(), &username, options.name_mode)?;
-                let rows = read_session_rows(store, message_dbs, &username, options)?;
-                (username, contacts, room_member_names, rows)
-            }
-        };
+                )?,
+            };
+            let room_member_names =
+                load_room_member_names(contact_conn.as_ref(), &username, options.name_mode)?;
+            let sender = match options.sender {
+                Some(value) => Some(sender::resolve_sender(
+                    value,
+                    store,
+                    &message_dbs,
+                    &contacts,
+                    &sender::load_group_names(contact_conn.as_ref(), &username)?,
+                    options.name_mode,
+                )?),
+                None => None,
+            };
+            let rows = read_session_rows(store, message_dbs, &username, sender.as_ref(), options)?;
+            (username, contacts, room_member_names, rows)
+        }
+    };
+    let SessionRows {
+        rows: all_messages,
+        history_start,
+    } = session_rows;
 
     let display_name = contacts
         .get(&username)
@@ -1004,6 +1031,7 @@ pub fn read_messages(
         messages.reverse();
     }
 
+    let account_username = store.account_username();
     let mut decoded_messages = Vec::with_capacity(messages.len());
     for row in messages {
         // 1-on-1 chat: if the sender is not the chat partner, it's "me"
@@ -1011,7 +1039,7 @@ pub fn read_messages(
             if row.sender_account_id.is_empty() || row.sender_account_id == username {
                 display_name.as_str()
             } else {
-                "我"
+                sender::SELF_DISPLAY_NAME
             };
 
         let voice_id = if row.local_type == 34 {
@@ -1039,11 +1067,26 @@ pub fn read_messages(
             },
         );
 
+        // Without a sender row, a private chat's message is the partner's, as
+        // its display name says; a group's sender is then unknown.
+        let sender_id = if decoded.msg_type.is_system() {
+            String::new()
+        } else if row.sender_account_id.is_empty() && !username.ends_with("@chatroom") {
+            username.clone()
+        } else {
+            row.sender_account_id.clone()
+        };
+        let sender = if sender::is_self(&sender_id, account_username) {
+            sender::SELF_DISPLAY_NAME.to_string()
+        } else {
+            decoded.display_name
+        };
         decoded_messages.push(ChatMessage {
             local_id: row.local_id,
             local_type: row.local_type,
             create_time: row.create_time,
-            sender: decoded.display_name,
+            sender,
+            sender_id,
             content: decoded.content,
         });
     }
@@ -1051,6 +1094,7 @@ pub fn read_messages(
     Ok(MessagePage {
         username,
         display_name,
+        history_start,
         messages: decoded_messages,
     })
 }
@@ -1068,14 +1112,21 @@ fn load_room_member_names(
     }
 }
 
+struct SessionRows {
+    rows: Vec<MessageRow>,
+    history_start: Option<i64>,
+}
+
 /// Every shard's rows of one session, merged by `create_time` in display
-/// direction but not yet cut to the requested page.
+/// direction but not yet cut to the requested page, plus the session's
+/// earliest stored message time.
 fn read_session_rows(
     store: &SourceStore,
     message_dbs: Vec<String>,
     username: &str,
+    sender: Option<&sender::SenderFilter>,
     options: &ReadMessagesOptions<'_>,
-) -> Result<Vec<MessageRow>, String> {
+) -> Result<SessionRows, String> {
     let table_name = msg_table_name(username);
     let search_pattern = options.search_query.map(like_contains_pattern);
     let search_clause = options
@@ -1097,12 +1148,40 @@ fn read_session_rows(
     let per_db_messages = parallel::map_ordered(
         message_dbs,
         db_jobs,
-        |db_path| -> Result<Vec<MessageRow>, String> {
+        |db_path| -> Result<(Vec<MessageRow>, Option<i64>), String> {
             let conn = store.open(&db_path)?;
 
             let table = quote_identifier(&table_name);
             let Some(schema) = message_table_schema(&conn, &table_name)? else {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), None));
+            };
+            let order_col = if schema.has_sort_seq {
+                "sort_seq"
+            } else {
+                "create_time"
+            };
+            // The first message in display order, found on the order index.
+            let history_start = conn
+                .query_row(
+                    &format!(
+                        "SELECT create_time FROM {table} WHERE create_time > 0 \
+                         ORDER BY {order_col} LIMIT 1"
+                    ),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| format!("Earliest message in {db_path}: {error}"))?;
+            let sender_col = quote_identifier(dictionary::msg_sender_column());
+            let sender_clause = match sender {
+                Some(filter) => {
+                    let rowids = filter.rowids(&conn, &db_path)?;
+                    match sender::sender_rowid_clause(&sender_col, &rowids) {
+                        Some(clause) => format!(" AND {clause}"),
+                        None => return Ok((Vec::new(), history_start)),
+                    }
+                }
+                None => String::new(),
             };
 
             let name2id = load_name2id(&conn)?;
@@ -1112,17 +1191,11 @@ fn read_session_rows(
             // Query messages - collect eagerly to avoid borrow issues
             let body_col = quote_identifier(dictionary::msg_body_column());
             let marker_col = quote_identifier(dictionary::msg_compression_marker_column());
-            let sender_col = quote_identifier(dictionary::msg_sender_column());
             let packed_col = quote_identifier(dictionary::msg_packed_meta_column());
             let local_id_col = if schema.has_local_id {
                 quote_identifier("local_id")
             } else {
                 "NULL".to_string()
-            };
-            let order_col = if schema.has_sort_seq {
-                "sort_seq"
-            } else {
-                "create_time"
             };
             // A LIMIT can stop the index walk early; a full read goes in rowid
             // order and is sorted afterwards (see `MessageOrderKey`).
@@ -1131,7 +1204,7 @@ fn read_session_rows(
                 .unwrap_or_default();
             let sql = format!(
             "SELECT {local_id_col}, local_type, create_time, {body_col}, {marker_col}, {sender_col}, {packed_col}, {order_key} \
-             FROM {table_name} WHERE create_time > 0{search_clause}{since_clause}{until_clause}{order_clause}",
+             FROM {table_name} WHERE create_time > 0{search_clause}{sender_clause}{since_clause}{until_clause}{order_clause}",
             local_id_col = local_id_col,
             body_col = body_col,
             marker_col = marker_col,
@@ -1175,13 +1248,22 @@ fn read_session_rows(
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|error| format!("Read messages from {db_path}: {error}"))?;
             sort_in_message_order(&mut rows, options.order);
-            Ok(rows.into_iter().map(|(_, row)| row).collect())
+            Ok((
+                rows.into_iter().map(|(_, row)| row).collect(),
+                history_start,
+            ))
         },
     );
 
     let mut all_messages = Vec::new();
-    for rows in per_db_messages {
-        all_messages.extend(rows?);
+    let mut history_start: Option<i64> = None;
+    for result in per_db_messages {
+        let (rows, start) = result?;
+        all_messages.extend(rows);
+        history_start = match (history_start, start) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
     }
 
     if options.order == MessageOrder::Newest {
@@ -1190,7 +1272,10 @@ fn read_session_rows(
     } else {
         all_messages.sort_by_key(|row| row.create_time);
     }
-    Ok(all_messages)
+    Ok(SessionRows {
+        rows: all_messages,
+        history_start,
+    })
 }
 
 /// Each shard must return `offset + limit` rows in either direction, because
@@ -2724,6 +2809,7 @@ mod tests {
                 since: None,
                 until: None,
                 order: MessageOrder::Oldest,
+                sender: None,
                 time_bucket: time::MessageTimeBucket::PerMessage,
                 name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
@@ -2751,6 +2837,7 @@ mod tests {
                 since: None,
                 until: None,
                 order: MessageOrder::Oldest,
+                sender: None,
                 time_bucket: time::MessageTimeBucket::PerMessage,
                 name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
@@ -2778,6 +2865,7 @@ mod tests {
                 since: Some(1001),
                 until: None,
                 order: MessageOrder::Oldest,
+                sender: None,
                 time_bucket: time::MessageTimeBucket::PerMessage,
                 name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,
@@ -2786,6 +2874,151 @@ mod tests {
         .unwrap();
 
         assert_eq!(count, 1);
+    }
+
+    /// A group where the account owner sends with and without the member
+    /// prefix, plus a system notice, in a shard holding sort_seq.
+    fn create_sender_group_dir() -> TempDir {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("message")).unwrap();
+        std::fs::create_dir_all(dir.path().join("contact")).unwrap();
+        let contacts = Connection::open(dir.path().join("contact/contact.db")).unwrap();
+        contacts
+            .execute_batch(
+                "CREATE TABLE contact(username TEXT, nick_name TEXT, remark TEXT, alias TEXT);
+                 CREATE TABLE chat_room(id INTEGER PRIMARY KEY, username TEXT, owner TEXT, ext_buffer BLOB);
+                 CREATE TABLE chatroom_member(room_id INTEGER, member_id INTEGER);
+                 INSERT INTO contact VALUES ('tgid_bob', 'Bob', '', '');
+                 INSERT INTO contact VALUES ('tgid_me', 'wolf', '', '');
+                 INSERT INTO contact VALUES ('room@chatroom', 'Room', '', '');",
+            )
+            .unwrap();
+        let conn = Connection::open(dir.path().join("message/message_0.db")).unwrap();
+        let table = quote_identifier(&msg_table_name("room@chatroom"));
+        let body_col = quote_identifier(dictionary::msg_body_column());
+        let marker_col = quote_identifier(dictionary::msg_compression_marker_column());
+        let sender_col = quote_identifier(dictionary::msg_sender_column());
+        let packed_col = quote_identifier(dictionary::msg_packed_meta_column());
+        conn.execute_batch(&format!(
+            "CREATE TABLE Name2Id(user_name TEXT PRIMARY KEY);
+             INSERT INTO Name2Id(rowid, user_name) VALUES (1, 'tgid_me'), (2, 'tgid_bob');
+             CREATE TABLE {table} (local_id INTEGER PRIMARY KEY, local_type INTEGER,
+                 sort_seq INTEGER, create_time INTEGER, {body_col} TEXT, {marker_col} INTEGER,
+                 {sender_col} INTEGER, {packed_col} BLOB);"
+        ))
+        .unwrap();
+        let rows: [(i64, i64, &str); 4] = [
+            (1, 2, "tgid_bob:\nhello"),
+            (1, 1, "mine"),
+            (1, 1, "tgid_me:\nprefixed mine"),
+            (10000, 0, "notice"),
+        ];
+        for (i, (local_type, sender, body)) in rows.into_iter().enumerate() {
+            let time = 1000 + i as i64;
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table} (local_type, sort_seq, create_time, {body_col}, \
+                     {marker_col}, {sender_col}, {packed_col}) VALUES (?1, ?2, ?3, ?4, NULL, ?5, x'')"
+                ),
+                params![local_type, time * 1000, time, body, sender],
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn group_messages_carry_sender_ids_and_filter_by_sender() {
+        let dir = create_sender_group_dir();
+        let store = SourceStore::from_plaintext(dir.path())
+            .unwrap()
+            .with_account_username("tgid_me");
+        let read = |sender: Option<&str>, since: Option<i64>| {
+            let options = ReadMessagesOptions {
+                session_query: "room@chatroom",
+                limit: None,
+                offset: 0,
+                search_query: None,
+                since,
+                until: None,
+                order: MessageOrder::Oldest,
+                sender,
+                time_bucket: time::MessageTimeBucket::PerMessage,
+                name_mode: DisplayNameMode::PersonalRemark,
+                jobs: 1,
+            };
+            super::read_messages(&store, &options)
+        };
+
+        let page = read(None, None).unwrap();
+        let shown: Vec<(&str, &str)> = page
+            .messages
+            .iter()
+            .map(|message| (message.sender.as_str(), message.sender_id.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("Bob", "tgid_bob"),
+                ("我", "tgid_me"),
+                ("我", "tgid_me"),
+                ("系统", "")
+            ]
+        );
+
+        let contents = |page: MessagePage| {
+            page.messages
+                .into_iter()
+                .map(|message| message.content)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            contents(read(Some("me"), None).unwrap()),
+            ["mine", "prefixed mine"]
+        );
+        assert_eq!(contents(read(Some("bob"), None).unwrap()), ["hello"]);
+        assert!(read(Some("Nobody"), None).is_err());
+
+        // The local history start ignores the requested range.
+        let late = read(None, Some(1003)).unwrap();
+        assert_eq!(late.history_start, Some(1000));
+        assert_eq!(late.messages.len(), 1);
+
+        let rows = crate::query::query_messages(&crate::query::QueryOptions {
+            store: &store,
+            session: Some("room@chatroom"),
+            contains: &[],
+            not_contains: &[],
+            raw_contains: &[],
+            has: &[],
+            sender: Some("me"),
+            since: None,
+            until: None,
+            limit: None,
+            offset: 0,
+            sort: MessageOrder::Oldest,
+            match_mode: crate::query::QueryMatchMode::All,
+            name_mode: DisplayNameMode::PersonalRemark,
+            jobs: 1,
+        })
+        .unwrap();
+        let shown: Vec<(&str, &str, &str)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.sender.as_str(),
+                    row.sender_id.as_str(),
+                    row.body.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("我", "tgid_me", "mine"),
+                ("我", "tgid_me", "prefixed mine")
+            ]
+        );
     }
 
     #[test]
@@ -2802,6 +3035,7 @@ mod tests {
                 since: None,
                 until,
                 order,
+                sender: None,
                 time_bucket: time::MessageTimeBucket::PerMessage,
                 name_mode: DisplayNameMode::PersonalRemark,
                 jobs: 1,

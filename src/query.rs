@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use crate::db::MessageOrder;
 use crate::source_store::SourceStore;
-use crate::{contact, db, dictionary, media, message, output, parallel};
+use crate::{contact, db, dictionary, media, message, output, parallel, sender};
 
 const MAX_QUERY_KEYWORDS: usize = 16;
 const MAX_QUERY_KEYWORD_CHARS: usize = 256;
@@ -73,6 +73,7 @@ enum MessageField {
     Time,
     Session,
     Sender,
+    SenderId,
     Type,
     Body,
     RawBody,
@@ -93,13 +94,14 @@ impl QueryFields {
                 "time" => MessageField::Time,
                 "session" => MessageField::Session,
                 "sender" => MessageField::Sender,
+                "sender_id" => MessageField::SenderId,
                 "type" | "local_type" => MessageField::Type,
                 "body" | "text" => MessageField::Body,
                 "raw_body" | "raw" => MessageField::RawBody,
                 "timestamp" | "create_time" => MessageField::Timestamp,
                 other => {
                     return Err(format!(
-                        "unknown field '{}'; expected time, session, sender, type, body, raw_body, timestamp",
+                        "unknown field '{}'; expected time, session, sender, sender_id, type, body, raw_body, timestamp",
                         other
                     ));
                 }
@@ -124,6 +126,7 @@ impl MessageField {
             Self::Time => "time",
             Self::Session => "session",
             Self::Sender => "sender",
+            Self::SenderId => "sender_id",
             Self::Type => "type",
             Self::Body => "body",
             Self::RawBody => "raw_body",
@@ -139,6 +142,8 @@ pub(crate) struct QueryOptions<'a> {
     pub not_contains: &'a [String],
     pub raw_contains: &'a [String],
     pub has: &'a [QueryMediaType],
+    /// Only messages from this sender: `me`, an account id, or a shown name.
+    pub sender: Option<&'a str>,
     pub since: Option<i64>,
     pub until: Option<i64>,
     /// None returns every match (MCP); the CLI always passes a page size.
@@ -162,6 +167,8 @@ struct MessageQueryContext {
     table_to_session: HashMap<String, String>,
     table_to_display: HashMap<String, String>,
     sender_display: HashMap<String, String>,
+    sender: Option<sender::SenderFilter>,
+    account_username: Option<String>,
 }
 
 /// How query results are printed; separate from the filters so non-CLI callers
@@ -200,6 +207,8 @@ pub(crate) struct MessageRow {
     /// Session username, or the table name when the session is unknown.
     pub session_id: String,
     pub sender: String,
+    /// Sender account username; empty for system messages.
+    pub sender_id: String,
     pub local_type: i64,
     pub create_time: i64,
     pub body: String,
@@ -268,10 +277,11 @@ fn validate_message_options(options: &QueryOptions<'_>) -> Result<(), String> {
     if options.contains.is_empty()
         && options.raw_contains.is_empty()
         && options.has.is_empty()
+        && options.sender.is_none()
         && options.since.is_none()
     {
         return Err(
-            "refusing an unbounded message query; pass --contains, --raw-contains, --has, or --since"
+            "refusing an unbounded message query; pass --contains, --raw-contains, --has, --sender, or --since"
                 .to_string(),
         );
     }
@@ -334,11 +344,14 @@ fn media_filters_need_post_filtering(options: &QueryOptions<'_>) -> bool {
 
 fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryContext, String> {
     let message_dbs = db::message_databases(options.store);
-    let contacts = if db::has_database(options.store, "contact/contact.db") {
-        let conn = options.store.open("contact/contact.db")?;
-        contact::load_contacts(&conn)?
+    let contact_conn = if db::has_database(options.store, "contact/contact.db") {
+        Some(options.store.open("contact/contact.db")?)
     } else {
-        HashMap::new()
+        None
+    };
+    let contacts = match &contact_conn {
+        Some(conn) => contact::load_contacts(conn)?,
+        None => HashMap::new(),
     };
 
     let mut table_to_session = HashMap::new();
@@ -351,6 +364,7 @@ fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryConte
         sender_display.insert(username.clone(), display);
     }
 
+    let mut session_username = None;
     let selected_table = match options.session {
         Some(session) => {
             let username = db::resolve_username_for_messages(
@@ -367,7 +381,25 @@ fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryConte
             table_to_display
                 .entry(table.clone())
                 .or_insert_with(|| username.clone());
+            session_username = Some(username);
             Some(table)
+        }
+        None => None,
+    };
+    let sender = match options.sender {
+        Some(value) => {
+            let group = match &session_username {
+                Some(username) => sender::load_group_names(contact_conn.as_ref(), username)?,
+                None => sender::GroupNames::default(),
+            };
+            Some(sender::resolve_sender(
+                value,
+                options.store,
+                &message_dbs,
+                &contacts,
+                &group,
+                options.name_mode,
+            )?)
         }
         None => None,
     };
@@ -383,6 +415,8 @@ fn build_message_context(options: &QueryOptions<'_>) -> Result<MessageQueryConte
         table_to_session,
         table_to_display,
         sender_display,
+        sender,
+        account_username: options.store.account_username().map(str::to_string),
     })
 }
 
@@ -400,6 +434,8 @@ struct ShardPlan {
     label: String,
     tables: Vec<TablePlan>,
     name2id: HashMap<i64, String>,
+    /// `Name2Id` rowids of the filtered senders in this shard.
+    sender_rowids: Option<Vec<i64>>,
 }
 
 /// Half-open rowid range `[start, end)`; a missing bound is unbounded, so the
@@ -558,6 +594,23 @@ fn plan_message_shard(
     context: &MessageQueryContext,
 ) -> Result<(ShardPlan, Connection), String> {
     let conn = store.open(&target.label)?;
+    let sender_rowids = match &context.sender {
+        Some(filter) => {
+            let rowids = filter.rowids(&conn, &target.label)?;
+            if rowids.is_empty() {
+                // No message here is from the sender, so plan no tables.
+                let plan = ShardPlan {
+                    label: target.label.clone(),
+                    tables: Vec::new(),
+                    name2id: HashMap::new(),
+                    sender_rowids: Some(rowids),
+                };
+                return Ok((plan, conn));
+            }
+            Some(rowids)
+        }
+        None => None,
+    };
     let tables = match &context.selected_table {
         Some(table) => db::message_table_schema(&conn, table)?
             .map(|schema| (table.clone(), schema))
@@ -606,6 +659,7 @@ fn plan_message_shard(
         label: target.label.clone(),
         tables: planned,
         name2id,
+        sender_rowids,
     };
     Ok((plan, conn))
 }
@@ -753,6 +807,12 @@ fn query_message_table(
         clauses.push("rowid < ?".to_string());
         params.push(Value::Integer(end));
     }
+    if let Some(rowids) = &shard.sender_rowids {
+        clauses.push(
+            sender::sender_rowid_clause(&sender_col, rowids)
+                .expect("shards without the sender plan no tables"),
+        );
+    }
 
     if !options.raw_contains.is_empty() {
         let contains_clause = options
@@ -861,6 +921,8 @@ fn query_message_table(
             .map_err(read_error)?
             .unwrap_or(0);
         let sender_account = name2id.get(&sender_id).map_or("", String::as_str);
+        let is_system =
+            message::MessageType::from(media::local_type_low32(local_type) as i32).is_system();
         rows.push((
             db::read_message_order_key(row, 7).map_err(read_error)?,
             CandidateRow {
@@ -868,6 +930,11 @@ fn query_message_table(
                     session: session.clone(),
                     session_id: session_id.clone(),
                     sender: display_sender(sender_account, context),
+                    sender_id: if is_system {
+                        String::new()
+                    } else {
+                        sender_account.to_string()
+                    },
                     local_type,
                     create_time: row
                         .get::<_, Option<i64>>(1)
@@ -886,6 +953,9 @@ fn query_message_table(
 fn display_sender(sender_account: &str, context: &MessageQueryContext) -> String {
     if sender_account.is_empty() {
         return String::new();
+    }
+    if sender::is_self(sender_account, context.account_username.as_deref()) {
+        return sender::SELF_DISPLAY_NAME.to_string();
     }
     context
         .sender_display
@@ -1030,6 +1100,7 @@ fn message_field_text(row: &MessageRow, field: MessageField) -> String {
         MessageField::Time => crate::time::format_local_timestamp(row.create_time),
         MessageField::Session => row.session.clone(),
         MessageField::Sender => row.sender.clone(),
+        MessageField::SenderId => row.sender_id.clone(),
         MessageField::Type => row.local_type.to_string(),
         MessageField::Body => row.body.clone(),
         MessageField::RawBody => row.raw_body.clone(),
@@ -1141,6 +1212,7 @@ mod tests {
             not_contains,
             raw_contains: &[],
             has: &[],
+            sender: None,
             since: None,
             until: None,
             limit: Some(100),

@@ -136,11 +136,17 @@ tg query --contains "项目" --not "取消" --format json --fields timestamp,ses
 tg query --has voice --session "张三" --limit 20
 tg query --raw-contains "<appmsg" --fields time,session,raw_body --limit 20
 tg query --contains "关键词" --all-time --anonymous
+tg query --session "产品讨论群" --sender "张三" --all-time --format json --fields timestamp,sender,sender_id,body
+tg messages "产品讨论群" --sender me --all-time
 ```
 
-`query` 扫描本地消息分片中由数据库索引约束出的候选行，再匹配解码后的正文，因此比 FTS 覆盖更完整。它不是原始 SQL 接口。`--has` 支持 `voice,image,sticker,file,video`；`--fields` 支持 `time,session,sender,type,body,raw_body,timestamp`。
+`query` 扫描本地消息分片中由数据库索引约束出的候选行，再匹配解码后的正文，因此比 FTS 覆盖更完整。它不是原始 SQL 接口。`--has` 支持 `voice,image,sticker,file,video`；`--fields` 支持 `time,session,sender,sender_id,type,body,raw_body,timestamp`。
 
-`search` 和 `query` 默认查询最近 365 天。全量历史用 `--all-time`；为避免误扫全库，`query --all-time` 仍要求至少提供 `--contains`、`--raw-contains`、`--has` 或 `--since` 之一。
+`--sender`（`query` 和 `messages` 都支持）按发言人筛选：`me` 指本人，也可以传账号 id，或与输出里显示一致的名字（备注、昵称、群昵称，忽略大小写的精确匹配）。多个账号同名时会报错并列出各自的 id。`sender_id` 是稳定的账号 id，同一个人在不同会话、不同显示名下都相同；本人在所有输出里统一显示为“我”。`search` 走上游 FTS，不支持发言人筛选。
+
+`messages --since` 早于该会话本机最早一条记录时，会提示本机历史从何时开始，更早的消息不在本机。
+
+`search` 和 `query` 默认查询最近 365 天。全量历史用 `--all-time`；为避免误扫全库，`query --all-time` 仍要求至少提供 `--contains`、`--raw-contains`、`--has`、`--sender` 或 `--since` 之一。
 
 诊断：
 
@@ -170,7 +176,7 @@ exported/zhangsan/media/
 
 ## MCP 服务
 
-`tg mcp` 把只读命令暴露成 MCP 工具：`list_sessions`、`list_unread`、`read_messages`、`search_messages`、`query_messages`、`list_members`、`diagnose`。`read_messages` 返回按天分组的纯文本记录（`HH:MM 发送者: 内容`），不带逐条 JSON 字段，读整天的群聊也不会把上下文浪费在元数据上。
+`tg mcp` 把只读命令暴露成 MCP 工具：`list_sessions`、`list_unread`、`read_messages`、`search_messages`、`query_messages`、`list_members`、`diagnose`。`read_messages` 返回按天分组的纯文本记录（`HH:MM 发送者: 内容`），不带逐条 JSON 字段，读整天的群聊也不会把上下文浪费在元数据上；头部给出“显示名 = 账号 id”的发言人对照表，以及本机历史的起始时间。`read_messages` 和 `query_messages` 都接受 `sender` 参数，`query_messages` 每条结果带 `sender_id`。
 
 图片显示为 `[img:<id>]`；`get_media` 按 id 返回本机已缓存的图片（默认标准尺寸，`size: "original"` 取原图，视频返回封面），一次最多 10 张。语音不发送音频，转写文本已在消息里。
 

@@ -23,6 +23,7 @@ mod paths;
 mod query;
 mod render;
 mod scanner;
+mod sender;
 mod skill;
 mod source_store;
 mod time;
@@ -222,6 +223,9 @@ enum Commands {
         /// Search within messages
         #[arg(long)]
         search: Option<String>,
+        /// Only messages from this sender: me, an account id, or a name as shown
+        #[arg(long)]
+        sender: Option<String>,
         /// Show messages after this time (ISO 8601 or relative: 5min, 1h, today)
         #[arg(long, conflicts_with = "all_time")]
         since: Option<String>,
@@ -283,6 +287,9 @@ enum Commands {
         /// Require a structured media type: voice, image, sticker, file, or video
         #[arg(long = "has", value_enum)]
         has: Vec<query::QueryMediaType>,
+        /// Only messages from this sender: me, an account id, or a name as shown
+        #[arg(long)]
+        sender: Option<String>,
         /// Show messages after this time (ISO 8601 or relative: 5min, 1h, today)
         #[arg(long, conflicts_with = "all_time")]
         since: Option<String>,
@@ -478,6 +485,7 @@ fn run(command: Commands) -> Result<(), String> {
             limit,
             offset,
             search,
+            sender,
             since,
             all_time,
             tail: _,
@@ -500,6 +508,7 @@ fn run(command: Commands) -> Result<(), String> {
                 since: since_ts,
                 until: None,
                 order: messages_order(head),
+                sender: sender.as_deref(),
                 time_bucket,
                 name_mode: if anonymous {
                     contact::DisplayNameMode::Anonymous
@@ -510,6 +519,15 @@ fn run(command: Commands) -> Result<(), String> {
             };
             let page = db::read_messages(&store, &options).map_err(|e| format!("Error: {e}"))?;
             render_stdout(|out| render::messages(out, &page, &options))?;
+            if let Some(start) = page
+                .history_start
+                .filter(|start| since_ts.is_some_and(|since| since < *start))
+            {
+                print_output(format_args!(
+                    "Note: local history of this chat starts at {}; earlier messages are not stored on this device.",
+                    time::format_local_timestamp(start)
+                ))?;
+            }
             if page.messages.is_empty() {
                 print_output(format_args!(
                     "No messages found for '{}'. Use 'sessions' to list available sessions.",
@@ -560,6 +578,7 @@ fn run(command: Commands) -> Result<(), String> {
             not_contains,
             raw_contains,
             has,
+            sender,
             since,
             all_time,
             until,
@@ -588,6 +607,7 @@ fn run(command: Commands) -> Result<(), String> {
                 not_contains: &not_contains,
                 raw_contains: &raw_contains,
                 has: &has,
+                sender: sender.as_deref(),
                 since: since_ts,
                 until: until_ts,
                 limit: Some(limit),

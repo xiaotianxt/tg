@@ -13,6 +13,9 @@ const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 pub(crate) struct SourceStore {
     databases: BTreeMap<String, SourceEntry>,
     key_recovery: String,
+    /// The signed-in account's username, from the account directory that holds
+    /// `db_storage`; `None` when that directory name does not carry one.
+    account_username: Option<String>,
     /// Per-command copy-on-write clones of live databases, keyed by relative
     /// path; `None` records that this filesystem cannot clone, so reads stay
     /// on the live file. A long read transaction on the live file keeps the
@@ -88,8 +91,17 @@ impl SourceStore {
         Ok(Self {
             databases,
             key_recovery,
+            account_username: root
+                .ancestors()
+                .skip(1)
+                .take(2)
+                .find_map(|dir| crate::media_key::extract_clean_account_id(dir).ok()),
             clones: Mutex::default(),
         })
+    }
+
+    pub(crate) fn account_username(&self) -> Option<&str> {
+        self.account_username.as_deref()
     }
 
     pub(crate) fn databases(&self) -> impl Iterator<Item = &str> {
@@ -260,8 +272,15 @@ impl SourceStore {
         Self {
             databases,
             key_recovery: "tg keys".to_string(),
+            account_username: None,
             clones: Mutex::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_account_username(mut self, username: &str) -> Self {
+        self.account_username = Some(username.to_string());
+        self
     }
 }
 

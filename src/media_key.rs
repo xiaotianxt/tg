@@ -153,7 +153,7 @@ fn derive_aes_key(code: u64, account_id: &str) -> [u8; 16] {
 }
 
 /// Extract the clean account id from the Telegram base path directory name.
-fn extract_clean_account_id(base: &Path) -> Result<String, String> {
+pub(crate) fn extract_clean_account_id(base: &Path) -> Result<String, String> {
     let dir_name = base
         .file_name()
         .and_then(|n| n.to_str())

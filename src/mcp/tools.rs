@@ -23,6 +23,10 @@ const DAY_SECONDS: i64 = 86_400;
 /// page of text.
 const MAX_MEDIA_PER_CALL: usize = 10;
 
+const SENDER_HINT: &str = "Only messages from one sender: `me` for the account owner, an account id \
+     (the ids that list_members and the message tools show), or a name exactly as those tools show it. \
+     A name several accounts share is rejected with their ids.";
+
 pub(crate) struct ToolContext {
     pub db_dir: Option<PathBuf>,
     pub keys: PathBuf,
@@ -153,7 +157,7 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "read_messages",
             "title": "Read a chat",
-            "description": "Read every message of one chat in an optional [since, until) time range. Returns a plain-text transcript in chronological order: a `== YYYY-MM-DD ==` line per local day, then one `HH:MM sender: text` line per message, with indented continuation lines. Non-text messages appear as bracketed placeholders; images show as [img:<id>], which get_media can display. There is no page size: one call returns the whole range. Only if the range exceeds the result size cap is the transcript trimmed and ends with a `[truncated]` line giving the offset to repeat the same call with. order=newest (default) keeps the latest messages when trimming, order=oldest the earliest.",
+            "description": "Read every message of one chat in an optional [since, until) time range. Returns a plain-text transcript in chronological order: a `== YYYY-MM-DD ==` line per local day, then one `HH:MM sender: text` line per message, with indented continuation lines. A senders list after the header maps each shown name to its stable account id; the account owner always appears as 我. The header also says when the chat's readable history starts: nothing earlier is available, so an empty early range means missing history, not silence. Non-text messages appear as bracketed placeholders; images show as [img:<id>], which get_media can display. There is no page size: one call returns the whole range. Only if the range exceeds the result size cap is the transcript trimmed and ends with a `[truncated]` line giving the offset to repeat the same call with. order=newest (default) keeps the latest messages when trimming, order=oldest the earliest.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -162,7 +166,8 @@ pub(crate) fn definitions() -> Value {
                     "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Only to continue a truncated result: pass its next_offset. Counted from the end of the range for order=newest and from the start for order=oldest."},
                     "since": {"type": "string", "description": format!("Inclusive start; {time_hint}")},
                     "until": {"type": "string", "description": format!("Exclusive end; {time_hint}")},
-                    "contains": {"type": "string", "description": "Only messages whose text contains this substring"}
+                    "contains": {"type": "string", "description": "Only messages whose text contains this substring"},
+                    "sender": {"type": "string", "description": SENDER_HINT}
                 },
                 "required": ["session"],
                 "additionalProperties": false
@@ -189,7 +194,7 @@ pub(crate) fn definitions() -> Value {
         json!({
             "name": "query_messages",
             "title": "Filter messages",
-            "description": "Structured message filter across all chats or one chat: keywords to include/exclude, media type, and a time range. Slower than search_messages but exhaustive. Defaults to the recent window unless `since` or `all_time` is given. Returns every match. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset. To read every message of one chat in a period, use read_messages instead.",
+            "description": "Structured message filter across all chats or one chat: keywords to include/exclude, media type, sender, and a time range. Each message carries `sender` (the account owner is 我) and its stable `sender_id`. Slower than search_messages but exhaustive. Defaults to the recent window unless `since` or `all_time` is given. Returns every match. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset. To read every message of one chat in a period, use read_messages instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -198,6 +203,7 @@ pub(crate) fn definitions() -> Value {
                     "not_contains": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
                     "match": {"type": "string", "enum": ["all", "any"], "default": "all"},
                     "has": {"type": "array", "items": {"type": "string", "enum": ["voice", "image", "sticker", "file", "video"]}},
+                    "sender": {"type": "string", "description": SENDER_HINT},
                     "since": {"type": "string", "description": time_hint},
                     "until": {"type": "string", "description": time_hint},
                     "all_time": {"type": "boolean", "default": false},
@@ -314,7 +320,9 @@ fn list_sessions(
 }
 
 fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
-    args.only(&["session", "order", "offset", "since", "until", "contains"])?;
+    args.only(&[
+        "session", "order", "offset", "since", "until", "contains", "sender",
+    ])?;
     let session = args.required_str("session")?;
     let order =
         db::MessageOrder::from_str(args.choice("order", &["newest", "oldest"], "newest")?, true)?;
@@ -322,6 +330,7 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
     let since = ctx.clamp_since(args.time("since")?);
     let until = args.time("until")?;
     let contains = args.str("contains")?;
+    let sender = args.str("sender")?;
     let store = ctx.open_store()?;
     let options = db::ReadMessagesOptions {
         session_query: session,
@@ -331,6 +340,7 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
         since,
         until,
         order,
+        sender,
         time_bucket: time::MessageTimeBucket::PerMessage,
         name_mode: ctx.name_mode(),
         jobs: ctx.jobs,
@@ -347,13 +357,24 @@ fn read_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Strin
             TranscriptMessage {
                 date,
                 block: transcript_block(&minute, &message.sender, &ctx.text(&message.content)),
+                sender: sender_legend_line(&message.sender, &message.sender_id),
             }
         })
         .collect();
-    let header = format!(
-        "Chat: {} (id: {})\n{{count}} messages in time order. Times are local; \
+    let mut header = format!("Chat: {} (id: {})\n", page.display_name, page.username);
+    // The lookback floor also hides when older history begins.
+    let readable_start = page
+        .history_start
+        .map(|start| ctx.lookback_floor().map_or(start, |floor| start.max(floor)));
+    if let Some(start) = readable_start {
+        header.push_str(&format!(
+            "Readable history starts {}; nothing earlier is available.\n",
+            time::format_local_timestamp(start)
+        ));
+    }
+    header.push_str(
+        "{count} messages in time order. Times are local; \
          an indented line continues the message above it.\n",
-        page.display_name, page.username
     );
     let transcript = fit_transcript(
         &header,
@@ -372,6 +393,18 @@ struct TranscriptMessage {
     date: String,
     /// `HH:MM sender: text` plus indented continuation lines, newline-terminated.
     block: String,
+    /// The sender's line in the senders list; empty for system messages.
+    sender: String,
+}
+
+const SENDER_LEGEND_TITLE: &str = "Senders (name = id):\n";
+
+fn sender_legend_line(name: &str, id: &str) -> String {
+    if id.is_empty() {
+        String::new()
+    } else {
+        format!("  {name} = {id}\n")
+    }
 }
 
 /// One message as transcript lines. Continuation lines are indented so they
@@ -425,10 +458,18 @@ fn fit_transcript(
     let mut used = 0;
     let mut kept = 0;
     let mut last_date: Option<&str> = None;
+    let mut senders = std::collections::BTreeSet::new();
     for message in from_origin {
         let mut cost = message.block.len();
         if last_date != Some(message.date.as_str()) {
             cost += day_header(&message.date).len();
+        }
+        let new_sender = !message.sender.is_empty() && !senders.contains(&message.sender);
+        if new_sender {
+            cost += message.sender.len();
+            if senders.is_empty() {
+                cost += SENDER_LEGEND_TITLE.len();
+            }
         }
         // Reserve room for the footer whenever something would be left out.
         let reserve = if kept + 1 < messages.len() {
@@ -442,6 +483,9 @@ fn fit_transcript(
         used += cost;
         kept += 1;
         last_date = Some(&message.date);
+        if new_sender {
+            senders.insert(&message.sender);
+        }
     }
 
     let range = match order {
@@ -449,6 +493,12 @@ fn fit_transcript(
         db::MessageOrder::Oldest => 0..kept,
     };
     let mut text = header.replace("{count}", &kept.to_string());
+    if !senders.is_empty() {
+        text.push_str(SENDER_LEGEND_TITLE);
+        for line in senders {
+            text.push_str(line);
+        }
+    }
     let mut last_date: Option<&str> = None;
     for message in &messages[range] {
         if last_date != Some(message.date.as_str()) {
@@ -518,6 +568,7 @@ fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Stri
         "not_contains",
         "match",
         "has",
+        "sender",
         "since",
         "until",
         "all_time",
@@ -534,6 +585,7 @@ fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Stri
         .iter()
         .map(|value| query::QueryMediaType::from_str(value, true))
         .collect::<Result<Vec<_>, _>>()?;
+    let sender = args.str("sender")?;
     let since = args.time("since")?;
     let since = time::since_or_recent(since, args.bool("all_time")?);
     let until = args.time("until")?;
@@ -550,6 +602,7 @@ fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Stri
         not_contains: &not_contains,
         raw_contains: &[],
         has: &has,
+        sender,
         since: ctx.clamp_since(since),
         until,
         limit: None,
@@ -568,6 +621,7 @@ fn query_messages(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, Stri
                 "time": time_value(row.create_time),
                 "session": {"id": row.session_id, "name": row.session},
                 "sender": row.sender,
+                "sender_id": row.sender_id,
                 "type": message_kind(row.local_type),
                 "text": ctx.text(&row.body),
             })
@@ -1020,6 +1074,11 @@ mod tests {
         TranscriptMessage {
             date: date.to_string(),
             block: transcript_block(minute, sender, text),
+            sender: if sender.is_empty() {
+                String::new()
+            } else {
+                sender_legend_line(sender, &format!("id_{sender}"))
+            },
         }
     }
 
@@ -1039,7 +1098,8 @@ mod tests {
         );
         assert_eq!(
             transcript.text,
-            "3 msgs\n== 2026-11-06 ==\n23:59 张三: 晚安\n\
+            "3 msgs\nSenders (name = id):\n  张三 = id_张三\n  李四 = id_李四\n\
+             == 2026-11-06 ==\n23:59 张三: 晚安\n\
              == 2026-11-07 ==\n08:00 李四: 早\n  第二行\n08:01 [系统消息]\n"
         );
         assert_eq!(transcript.rows, 3);
