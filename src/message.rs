@@ -1032,8 +1032,13 @@ fn decode_quote_content(
     resolve_display_name: &impl Fn(&str) -> String,
 ) -> String {
     let reply = safe_xml_tag(content, "title").unwrap_or_default();
-    let quoted = crate::media::extract_xml_tag(content, "refermsg")
-        .map(|refermsg| decode_refermsg_content(&refermsg, time_bucket, resolve_display_name))
+    // The quoted body stays entity-escaped until its own `<content>` is read:
+    // decoding the whole `<refermsg>` first would expose the quoted message's
+    // own `<type>` and `<content>` tags to the field lookups below.
+    let quoted = crate::media::find_xml_element(content, "refermsg")
+        .map(|element| {
+            decode_refermsg_content(&content[element.body], time_bucket, resolve_display_name)
+        })
         .unwrap_or_default();
 
     match (quoted.is_empty(), reply.is_empty()) {
@@ -1049,10 +1054,21 @@ fn decode_refermsg_content(
     time_bucket: time::MessageTimeBucket,
     resolve_display_name: &impl Fn(&str) -> String,
 ) -> String {
+    // Read the other fields with `<content>` cut out, so a quoted body that
+    // arrives unescaped (CDATA) cannot shadow them.
+    let (ref_content, fields) = match crate::media::find_xml_element(refermsg, "content") {
+        Some(element) => (
+            crate::media::decode_xml_entities(crate::media::strip_cdata(
+                &refermsg[element.body.clone()],
+            )),
+            format!("{}{}", &refermsg[..element.start], &refermsg[element.end..]),
+        ),
+        None => (String::new(), refermsg.to_string()),
+    };
+    let refermsg = fields.as_str();
     let ref_type = crate::media::extract_xml_tag_int(refermsg, "type")
         .map(|n| n as i32)
         .unwrap_or(1);
-    let ref_content = crate::media::extract_xml_tag(refermsg, "content").unwrap_or_default();
     let (content_sender, clean_content) = parse_sender_from_content(&ref_content);
 
     let body = if clean_content.is_empty() {
@@ -1907,6 +1923,24 @@ continues</datadesc></dataitem><dataitem datatype="1" dataid="c"><sourcename>B</
         let d = decode_message(49, xml, "Alice", None, &[], |id| id.to_string());
 
         assert_eq!(d.content, "> Bob: [链接] Example\n 回复链接");
+    }
+
+    // The client writes `<content>` before `<type>`, and the quoted app
+    // message carries its own escaped `<type>`.
+    #[test]
+    fn test_decode_quoted_app_message_with_content_before_type() {
+        let quoted_reply = r#"<msg><appmsg><title>回复内容</title><type>57</type><refermsg><content>&lt;msg&gt;&lt;appmsg appid="" sdkver="0"&gt;&lt;title&gt;被引用的回复&lt;/title&gt;&lt;type&gt;57&lt;/type&gt;&lt;content&gt;&lt;/content&gt;&lt;/appmsg&gt;&lt;/msg&gt;</content><displayname>Bob</displayname><svrid>1</svrid><type>49</type><chatusr>tgid_bob</chatusr></refermsg></appmsg></msg>"#;
+        let d = decode_message(49, quoted_reply, "Alice", None, &[], |id| id.to_string());
+        assert_eq!(d.content, "> Bob: 被引用的回复\n 回复内容");
+
+        let quoted_file = r#"<msg><appmsg><title>收到</title><type>57</type><refermsg><content>&lt;msg&gt;&lt;appmsg&gt;&lt;title&gt;plan.pdf&lt;/title&gt;&lt;type&gt;6&lt;/type&gt;&lt;appattach&gt;&lt;totallen&gt;2048&lt;/totallen&gt;&lt;fileext&gt;pdf&lt;/fileext&gt;&lt;/appattach&gt;&lt;/appmsg&gt;&lt;/msg&gt;</content><displayname>Bob</displayname><type>49</type></refermsg></appmsg></msg>"#;
+        let d = decode_message(49, quoted_file, "Alice", None, &[], |id| id.to_string());
+        assert!(
+            d.content.starts_with("> Bob: [文件] plan.pdf"),
+            "content was: {}",
+            d.content
+        );
+        assert!(!d.content.contains("未知"), "content was: {}", d.content);
     }
 
     #[test]

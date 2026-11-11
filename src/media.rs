@@ -775,7 +775,7 @@ pub(crate) fn strip_cdata(value: &str) -> &str {
 /// creates comes from `&amp;`; a later entity can start there only if the
 /// input continues with that entity's body (`lt;`, ...), which has no `&` and
 /// so passes through the first pass unchanged.
-fn decode_xml_entities(s: &str) -> String {
+pub(crate) fn decode_xml_entities(s: &str) -> String {
     const LATER: [(&str, char); 4] = [("quot;", '"'), ("apos;", '\''), ("lt;", '<'), ("gt;", '>')];
     let mut out = String::with_capacity(s.len());
     let mut copied = 0;
