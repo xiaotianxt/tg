@@ -17,7 +17,7 @@ pub(crate) fn install(target_dir: Option<PathBuf>) -> Result<PathBuf, String> {
         .map_err(|error| format!("Cannot create {}: {error}", target_dir.display()))?;
 
     let skill_path = target_dir.join("SKILL.md");
-    fs::write(&skill_path, render_skill_template(SKILL_TEMPLATE))
+    fs::write(&skill_path, dictionary::render_app_names(SKILL_TEMPLATE))
         .map_err(|error| format!("Cannot write {}: {error}", skill_path.display()))?;
     Ok(skill_path)
 }
@@ -31,25 +31,6 @@ fn default_skill_dir() -> Result<PathBuf, String> {
             .join(".codex"),
     };
     Ok(codex_home.join("skills").join("tg"))
-}
-
-fn render_skill_template(template: &str) -> String {
-    let app_name = dictionary::desktop_app_process();
-    let localized_name = dictionary::desktop_app_localized_name();
-    let lower_app_name = app_name.to_ascii_lowercase();
-
-    let mut rendered = template.to_string();
-    for (from, to) in [
-        ("Telegram聊天", format!("{localized_name}聊天")),
-        ("Telegram群", format!("{localized_name}群")),
-        ("Telegram里", format!("{localized_name}里")),
-    ] {
-        rendered = rendered.replace(from, &to);
-    }
-
-    rendered
-        .replace("Telegram", app_name)
-        .replace("telegram", &lower_app_name)
 }
 
 #[cfg(test)]

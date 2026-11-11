@@ -194,6 +194,18 @@ tg mcp serve
 
 在 ChatGPT 添加自定义 MCP 服务器时，URL 填 `https://mcp.example.com/mcp`，认证选 OAuth。
 
+名称和描述由你在这一步填写，ChatGPT 不从服务器读取；工具按需加载时，模型最先只看到这两项，再决定要不要用这个服务器。名称用你平时对这份数据的叫法（例如“聊天记录”），不要只写 `tg`；描述写清什么时候该用、什么时候不该用，例如：
+
+```text
+Read-only access to my personal chat history, including private and group chats.
+Use it when I ask about past discussions, what someone said, conversations with a
+person, what a group has been talking about, or who is active, even if I don't
+mention chat history. Do not use it for general knowledge or public information.
+Local history may be incomplete.
+```
+
+改了描述或升级 tg 后，在 ChatGPT Plugins 里对该连接点 **Refresh**，再开新对话测试。
+
 - 远程模式默认隐藏你的联系人备注，只返回最近 90 天内的消息，单次结果最多 16 MiB（超出时分页继续）；可在 `~/.tg/mcp/config.json` 的 `remote` 里调整，`max_text_chars` 可选地截断单条长消息，或用 `allow_sessions` / `deny_sessions` 限定会话。图片默认不对远程客户端开放，需要时设置 `"allow_media": true`（同样受会话名单和回看期限约束，回看按缓存月份计算）。
 - `tg mcp status` 查看已连接客户端，`tg mcp revoke --all` 立即吊销全部令牌，`tg mcp audit` 查看调用记录（只记录工具名和参数名，不记录内容或搜索词）。
 - 工具结果会进入远程模型的上下文。只在你信任的客户端里启用远程模式。

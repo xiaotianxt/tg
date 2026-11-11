@@ -37,6 +37,31 @@ pub(crate) fn desktop_app_localized_name() -> &'static str {
     cached_text(&VALUE, &[191, 228, 244, 190, 229, 251])
 }
 
+/// The app's name as people write it, the same on every platform.
+pub(crate) fn app_display_name() -> &'static str {
+    static VALUE: OnceLock<String> = OnceLock::new();
+    cached_text(&VALUE, &[13, 63, 25, 50, 59, 46])
+}
+
+/// Replaces the public cover name in text shown only to the owner's own tools
+/// (the installed skill, MCP metadata) with the real app name, so the source
+/// and public docs keep the cover name.
+pub(crate) fn render_app_names(template: &str) -> String {
+    let app_name = app_display_name();
+    let localized_name = desktop_app_localized_name();
+    let mut rendered = template.to_string();
+    for (from, to) in [
+        ("Telegram聊天", format!("{localized_name}聊天")),
+        ("Telegram群", format!("{localized_name}群")),
+        ("Telegram里", format!("{localized_name}里")),
+    ] {
+        rendered = rendered.replace(from, &to);
+    }
+    rendered
+        .replace("Telegram", app_name)
+        .replace("telegram", &app_name.to_ascii_lowercase())
+}
+
 pub(crate) fn container_id() -> &'static str {
     static VALUE: OnceLock<String> = OnceLock::new();
     cached_text(

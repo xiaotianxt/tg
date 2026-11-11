@@ -14,10 +14,19 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 
-const INSTRUCTIONS: &str = "Read-only access to the owner's local tg chat history. \
-Start with list_sessions or list_unread to get chat ids, then read_messages with an id. \
-Use search_messages for keywords across chats and query_messages for exhaustive filters. \
-Use get_media to view images shown as [img:<id>]. \
+/// Rendered with the real app name before it is sent.
+const INSTRUCTIONS: &str = "Read-only access to the owner's personal Telegram chat history (Telegram聊天记录), \
+private and group chats, read from their own device. \
+Use it whenever an answer depends on what the owner and other people actually said: past discussions, \
+what someone said or why they decided something, a conversation or relationship with a person, \
+what a group has been talking about, who is active, or message counts. \
+The user does not have to mention Telegram, chat history, or this tool. \
+Do not use it for general knowledge, public facts about people, or writing that needs no past conversation. \
+To answer: find a named person or group with list_sessions, then read the chat with read_messages; \
+use search_messages to find a topic across all chats, query_messages for exhaustive or per-sender filters, \
+list_members for a group's members and activity, and get_media to view images shown as [img:<id>]. \
+Base answers on the messages you read and cite them. \
+Local history can start late or have gaps; say so instead of concluding that nobody discussed something. \
 Results contain private message text; quote only what the user asked for.";
 
 /// What a tool call did, for the audit log.
@@ -114,7 +123,7 @@ fn initialize(params: &Value) -> Value {
             "title": "tg chat history",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": INSTRUCTIONS,
+        "instructions": crate::dictionary::render_app_names(INSTRUCTIONS),
     })
 }
 
@@ -260,5 +269,23 @@ mod tests {
             respond(json!({"jsonrpc": "2.0", "id": "a", "method": "tools/list"})).unwrap();
         assert_eq!(response["id"], "a");
         assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 8);
+    }
+
+    // Clients pick the server and its tools by the app name the owner uses;
+    // the source keeps only the cover name.
+    #[test]
+    fn metadata_names_the_real_app_and_never_the_cover_name() {
+        let init = respond(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}
+        }))
+        .unwrap();
+        let tools = respond(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
+        let instructions = init["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains(crate::dictionary::app_display_name()));
+        assert!(instructions.contains(crate::dictionary::desktop_app_localized_name()));
+        for text in [instructions.to_string(), tools.to_string()] {
+            assert!(!text.to_ascii_lowercase().contains("telegram"), "{text}");
+        }
     }
 }
