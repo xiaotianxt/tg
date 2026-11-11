@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "tg"
-version = "2.8.1"
+version = "2.9.0"
 dependencies = [
  "aes",
  "base64",
