@@ -1,23 +1,22 @@
-## MCP tools say when to use them
+## Images load when the MCP server runs as a service
 
-ChatGPT and other MCP clients decide whether to call a tool from its
-description. tg's descriptions said what each tool returns but not which
-questions need it, so questions that never mention chat history ("why did he
-turn the offer down?", "what has the group been discussing?") rarely reached
-tg.
+When launchd or systemd starts `tg mcp serve`, the service gets a minimal PATH
+without the Homebrew prefix. `get_media` then could not find `ffmpeg` and
+failed for `tggf` images with "run ffmpeg for tggf: No such file or directory".
+Exports run from a service lost the voice decoder the same way.
 
-The server instructions and every tool description now start with when to use
-them, cover those indirect questions, name the cases that should not use tg
-(general knowledge, public facts, writing that needs no past conversation), and
-name the chat app the history comes from. The instructions also ask the model to
-cite the messages it read and to say when local history is incomplete.
+tg now looks for ffmpeg and the voice decoder on PATH, then in the Homebrew
+prefix tg was installed into, then in the default Homebrew `bin` directories.
+`TG_FFMPEG` and `TG_VOICE_DECODER` still take precedence. The Homebrew formula
+now installs ffmpeg.
 
-After upgrading, open the connection in ChatGPT Plugins and select **Refresh**
-so ChatGPT reads the new metadata.
+After upgrading, restart the service so it runs the new version.
 
-## Name the ChatGPT connector after your data
+## Failures are easier to tell apart
 
-ChatGPT does not read a connector's name and description from the server; you
-type them when adding it, and the model sees them before any tool. The README
-now suggests a name and a "use it when" description for that step. A connector
-named only `tg` gives the model little reason to pick it.
+- `tg doctor` and the MCP `diagnose` tool show which ffmpeg and voice decoder
+  tg will use, or that one is missing.
+- Errors distinguish ffmpeg not being found, ffmpeg failing to start, and a
+  failed decode.
+- `get_media` reports a tool error when no image could be returned, instead of
+  a normal result that only contains the error text.
