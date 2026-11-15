@@ -713,16 +713,10 @@ fn get_media(ctx: &ToolContext, args: Args<'_>) -> Result<CallOutcome, String> {
     if ids.is_empty() || ids.len() > MAX_MEDIA_PER_CALL {
         return Err(format!("ids must list 1 to {MAX_MEDIA_PER_CALL} media ids"));
     }
-    // Models often copy the whole tag; the id inside it is what counts.
-    let ids: Vec<&str> = ids
+    let ids = ids
         .iter()
-        .map(|id| id.trim().trim_start_matches("[img:").trim_end_matches(']'))
-        .collect();
-    if let Some(bad) = ids.iter().find(|id| !media_fetch::is_media_id(id)) {
-        return Err(format!(
-            "'{bad}' is not a media id; pass the 32-character id from [img:<id>]"
-        ));
-    }
+        .map(|id| media_fetch::parse_media_id(id))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let store = ctx.open_store()?;
     let username = db::resolve_session(&store, session, ctx.jobs)?;

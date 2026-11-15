@@ -196,6 +196,12 @@ impl QueryOutput {
         rows: &[MessageRow],
     ) -> Result<(), String> {
         write_message_rows(out, rows, &self.fields, self.format, self.max_cell_chars)?;
+        // JSON stays a single document for scripts; the hint needs shown bodies.
+        if self.format == QueryOutputFormat::Table
+            && self.fields.fields.contains(&MessageField::Body)
+        {
+            crate::render::media_hint(out, "<chat>", rows.iter().map(|row| row.body.as_str()))?;
+        }
         out.flush()
     }
 }

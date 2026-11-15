@@ -535,22 +535,9 @@ pub fn decrypt_sticker_aes_cbc(data: &[u8], aes_key_hex: &str) -> Option<Vec<u8>
     Some(plaintext.to_vec())
 }
 
-pub fn export_media_file(
-    src: &Path,
-    output_dir: &Path,
-    session_name: &str,
-    msg_type_name: &str,
-    index: usize,
-) -> Result<PathBuf, String> {
+pub fn export_media_file(src: &Path, output_dir: &Path, stem: &str) -> Result<PathBuf, String> {
     let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("bin");
-    let filename = format!(
-        "{}_{}_{:04}.{}",
-        sanitize_filename(session_name),
-        msg_type_name,
-        index,
-        ext
-    );
-    let dest = output_dir.join(&filename);
+    let dest = output_dir.join(format!("{stem}.{ext}"));
 
     fs::create_dir_all(output_dir).map_err(|e| format!("Cannot create media dir: {}", e))?;
     fs::copy(src, &dest).map_err(|e| format!("Cannot copy media file: {}", e))?;

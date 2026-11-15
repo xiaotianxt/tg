@@ -37,7 +37,8 @@ enum MediaExportJob {
         index: usize,
         src: PathBuf,
         category: &'static str,
-        msg_type: i64,
+        /// Output file name without extension.
+        stem: String,
     },
     Sticker {
         index: usize,
@@ -294,20 +295,12 @@ pub fn export_messages(
             MediaExportJob::Cached {
                 index,
                 src,
-                category,
-                msg_type,
+                category: _,
+                stem,
             } => (
                 index,
                 false,
-                export_media_with_decrypt(
-                    &src,
-                    &mdir,
-                    &username,
-                    category,
-                    msg_type,
-                    index,
-                    media_keys.as_ref(),
-                ),
+                export_media_with_decrypt(&src, &mdir, &stem, media_keys.as_ref()),
             ),
             MediaExportJob::Sticker {
                 index,
@@ -419,6 +412,10 @@ fn write_text_exports(
 
 /// Find the cached file for every media message, numbering jobs from 1 in
 /// export order: images, videos, new stickers, then files.
+///
+/// Images and videos are written as `<id>.<ext>`, the id their `[img:<id>]` or
+/// `[视频 … <id>]` placeholder shows, so the transcript leads to the file; a
+/// repeated id is exported once.
 fn plan_media_jobs(
     all_messages: &[ExportMessage],
     telegram_base: &Path,
@@ -432,6 +429,7 @@ fn plan_media_jobs(
         .then(|| MediaIndex::load(telegram_base, username, &["File"], jobs));
 
     let mut media_jobs = Vec::new();
+    let mut seen_ids = HashSet::new();
     let category_map = [("Image", 3), ("Video", 43)];
 
     for (cat_name, local_type) in &category_map {
@@ -448,12 +446,18 @@ fn plan_media_jobs(
                 _ => continue,
             };
 
+            let Some(stem) = id_file_stem(&identifier) else {
+                continue;
+            };
+            if !seen_ids.insert(stem.clone()) {
+                continue;
+            }
             if let Some(src) = media_index.find(cat_name, &identifier) {
                 media_jobs.push(MediaExportJob::Cached {
                     index: media_jobs.len() + 1,
                     src,
                     category: cat_name,
-                    msg_type: m.msg_type,
+                    stem,
                 });
             }
         }
@@ -495,16 +499,33 @@ fn plan_media_jobs(
             .as_ref()
             .and_then(|index| index.find("File", &identifier))
         {
+            let index = media_jobs.len() + 1;
             media_jobs.push(MediaExportJob::Cached {
-                index: media_jobs.len() + 1,
+                index,
                 src,
                 category: "File",
-                msg_type: file_export_type(m.msg_type),
+                stem: format!(
+                    "{}_File_{}_{index:04}",
+                    media::sanitize_filename(username),
+                    file_export_type(m.msg_type)
+                ),
             });
         }
     }
 
     media_jobs
+}
+
+/// The file name stem for a media id, or `None` when the id cannot be a file
+/// name as is. Cache ids are short and file-safe; the CDN-URL fallback id is
+/// not, and those messages show a placeholder that no file can match anyway.
+fn id_file_stem(identifier: &str) -> Option<String> {
+    let safe = identifier.len() <= 128
+        && !identifier.starts_with('.')
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    safe.then(|| identifier.to_string())
 }
 
 fn try_protobuf_identifier(data: &[u8]) -> Option<String> {
@@ -969,10 +990,7 @@ enum CachedMediaExport {
 fn export_media_with_decrypt(
     src: &Path,
     output_dir: &Path,
-    session_name: &str,
-    cat_name: &str,
-    msg_type: i64,
-    index: usize,
+    stem: &str,
     media_keys: Option<&crate::media_key::MediaKeys>,
 ) -> Result<CachedMediaExport, String> {
     let use_decrypt = crate::media_decrypt::file_has_v2_magic(src)?;
@@ -985,15 +1003,7 @@ fn export_media_with_decrypt(
             } else {
                 decrypted.ext
             };
-            let filename = format!(
-                "{}_{}_{}_{:04}.{}",
-                media::sanitize_filename(session_name),
-                cat_name,
-                msg_type,
-                index,
-                ext
-            );
-            let dest = output_dir.join(&filename);
+            let dest = output_dir.join(format!("{stem}.{ext}"));
             std::fs::create_dir_all(output_dir)
                 .map_err(|e| format!("Create dir {}: {}", output_dir.display(), e))?;
             if decrypted.ext == "tggf" {
@@ -1008,14 +1018,7 @@ fn export_media_with_decrypt(
     }
 
     // Plain copy for non-.dat files or when keys are unavailable
-    media::export_media_file(
-        src,
-        output_dir,
-        session_name,
-        &format!("{}_{}", cat_name, msg_type),
-        index,
-    )
-    .map(CachedMediaExport::Written)
+    media::export_media_file(src, output_dir, stem).map(CachedMediaExport::Written)
 }
 
 /// Images per ffmpeg process. Each one keeps a decoder and an encoder alive, so
@@ -1595,6 +1598,16 @@ mod tests {
     }
 
     #[test]
+    fn media_ids_become_file_stems_only_when_file_safe() {
+        let id = "e7c6bdd4fe5f994cd379e443ebc402b6";
+        assert_eq!(id_file_stem(id).as_deref(), Some(id));
+        assert_eq!(id_file_stem("test.jpg").as_deref(), Some("test.jpg"));
+        assert_eq!(id_file_stem("../escape"), None);
+        assert_eq!(id_file_stem("a/b"), None);
+        assert_eq!(id_file_stem(&"3".repeat(129)), None);
+    }
+
+    #[test]
     fn export_media_with_decrypt_decrypts_v2_by_magic() {
         let temp = tempdir().unwrap();
         let output = tempdir().unwrap();
@@ -1602,23 +1615,12 @@ mod tests {
         let keys = fixture_media_keys();
         let jpeg = b"\xff\xd8\xff\xe0fixture-jpeg";
         std::fs::write(&source, v2_media_fixture(jpeg, &keys)).unwrap();
-        let exported = export_media_with_decrypt(
-            &source,
-            output.path(),
-            "session",
-            "Image",
-            3,
-            7,
-            Some(&keys),
-        )
-        .unwrap();
+        let exported =
+            export_media_with_decrypt(&source, output.path(), "image-id", Some(&keys)).unwrap();
         let CachedMediaExport::Written(exported) = exported else {
             panic!("plain JPEG must not need conversion");
         };
-        assert_eq!(
-            exported.extension().and_then(|ext| ext.to_str()),
-            Some("jpg")
-        );
+        assert_eq!(exported, output.path().join("image-id.jpg"));
         assert_eq!(std::fs::read(exported).unwrap(), jpeg);
     }
 }

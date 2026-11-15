@@ -326,6 +326,19 @@ enum Commands {
         #[command(flatten)]
         source: SourceArgs,
     },
+    /// Save cached images from one chat as viewable files and print their paths
+    Media {
+        /// Session username (tgid_xxx) or display name to search
+        session: String,
+        /// Media ids from [img:<id>]; the whole tag is accepted too
+        #[arg(required = true)]
+        ids: Vec<String>,
+        /// Directory for the decrypted files [default: $TMPDIR/tg-media]
+        #[arg(long, value_hint = clap::ValueHint::DirPath)]
+        output: Option<PathBuf>,
+        #[command(flatten)]
+        source: SourceArgs,
+    },
     /// Export a complete chat archive
     Export {
         /// Session username (tgid_xxx) or display name to search
@@ -629,6 +642,58 @@ fn run(command: Commands) -> Result<(), String> {
             render_stdout(|out| query_output.write(out, &rows))?;
             if rows.is_empty() {
                 print_output(format_args!("No rows returned."))?;
+            }
+            Ok(())
+        }
+        Commands::Media {
+            session,
+            ids,
+            output,
+            source,
+        } => {
+            let ids = ids
+                .iter()
+                .map(|id| media_fetch::parse_media_id(id))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Error: {e}"))?;
+            let store = open_source(&source)?;
+            let username = db::resolve_session(&store, &session, source.jobs)
+                .map_err(|e| format!("Error: {e}"))?;
+            let cache = media_fetch::MediaCache::open(&username, None)
+                .map_err(|e| format!("Error: {e}"))?;
+            let dir = output.unwrap_or_else(media_fetch::default_output_dir);
+            let mut unavailable = 0;
+            for &id in &ids {
+                let saved = cache
+                    .load(id, media_fetch::MediaSize::Original)
+                    .and_then(|image| {
+                        media_fetch::write_private(&dir, id, &image).map(|path| (image, path))
+                    });
+                match saved {
+                    Ok((image, path)) => {
+                        print_output(format_args!(
+                            "{id}  {}  {}  {}",
+                            image.variant,
+                            media::format_file_size(image.data.len() as u64),
+                            path.display()
+                        ))?;
+                        if image.variant == "thumbnail" {
+                            print_output(format_args!(
+                                "  only the thumbnail is cached; open the image in Telegram to download it, then retry"
+                            ))?;
+                        }
+                    }
+                    Err(error) => {
+                        print_output(format_args!("{id}  unavailable: {error}"))?;
+                        unavailable += 1;
+                    }
+                }
+            }
+            if unavailable > 0 {
+                return Err(format!(
+                    "Error: {unavailable} of {} media ids could not be saved",
+                    ids.len()
+                ));
             }
             Ok(())
         }
@@ -957,6 +1022,25 @@ mod tests {
             }
             _ => panic!("expected members command"),
         }
+    }
+
+    #[test]
+    fn media_takes_a_session_and_at_least_one_id() {
+        let cli = Cli::parse_from(args(&["tg", "media", "room", "a", "b"]));
+        match cli.command {
+            Commands::Media {
+                session,
+                ids,
+                output,
+                ..
+            } => {
+                assert_eq!(session, "room");
+                assert_eq!(ids, vec!["a", "b"]);
+                assert!(output.is_none());
+            }
+            _ => panic!("expected media command"),
+        }
+        assert!(Cli::try_parse_from(["tg", "media", "room"]).is_err());
     }
 
     #[test]

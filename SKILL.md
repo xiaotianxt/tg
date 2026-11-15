@@ -137,6 +137,24 @@ Query safety rules:
 - Use `--session`, `--since`, and a reasonable `--limit` when results could be large.
 - Table output escapes terminal control characters; use `--format json` for machine parsing.
 
+View images:
+
+Images appear in messages as `[img:<id>]`. To look at one, save it with
+`tg media` and read the printed path as an image; this decrypts only the
+images asked for, so never export a whole chat or decode cached `.dat` files
+by hand to see one image:
+
+```bash
+tg media "产品讨论群" e7c6bdd4fe5f994cd379e443ebc402b6
+tg media "张三" <id> <id>
+```
+
+Each line gives the id, which cached copy was used (`original`, `standard`,
+`thumbnail`, or a video cover), its size, and the path of the decrypted file
+under `$TMPDIR/tg-media` (`--output DIR` to change). `thumbnail` means the full
+image was never downloaded; `unavailable` means nothing is cached for that id.
+Either way, the user has to open the image in Telegram first.
+
 Diagnose:
 
 ```bash
@@ -154,7 +172,7 @@ tg export "产品讨论群" --output exported/group
 
 Each export writes `chat.txt`, `chat.csv`, `chat.json`, and locally available media under `media/`.
 
-Media is exported only as part of the complete chat archive. Locally cached images, videos, stickers, files, and voices go under `media/`; voices prefer WAV and fall back to native `.voice` when decoding is unavailable.
+Locally cached images, videos, stickers, files, and voices go under `media/`. Images and videos are named `<id>.<ext>` after the id in their `[img:<id>]` or video placeholder in `chat.txt`; voices prefer WAV and fall back to native `.voice` when decoding is unavailable.
 
 Time filters support dates, datetimes, and relative values:
 
@@ -177,6 +195,6 @@ Date, datetime, and displayed message times use the current system time zone.
 - Linux attach failure: install GDB, verify ptrace permissions, then run `sudo tg keys --method login --timeout 180`.
 - No chats or messages found: run `sudo tg keys`, then `tg doctor` and `tg sessions --top 50`.
 - Wrong chat matched: use `tg sessions --top 100` and rerun with the exact `tgid_...` or `...@chatroom`.
-- Missing media: open or download it in Telegram first, then retry `tg export CHAT`.
+- Missing media: open or download it in Telegram first, then retry `tg media CHAT <id>` or `tg export CHAT`.
 - Voice export prefers WAV and falls back to native `.voice`; install the Homebrew decoder for playable WAV output.
 - Unknown issue: run `tg doctor` or `tg doctor "联系人或群名"` and follow the result.

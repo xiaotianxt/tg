@@ -124,7 +124,27 @@ pub(crate) fn messages<W: Write>(
 
     out.blank_line()?;
     out.line(format_args!("--- End of messages ---"))?;
+    media_hint(
+        out,
+        &page.username,
+        messages.iter().map(|message| message.content.as_str()),
+    )?;
     out.flush()
+}
+
+/// Tell the reader how to open the images behind `[img:<id>]` placeholders,
+/// once per output and only when some are shown.
+pub(crate) fn media_hint<'a, W: Write>(
+    out: &mut Output<W>,
+    session: &str,
+    mut contents: impl Iterator<Item = &'a str>,
+) -> Result<(), String> {
+    if contents.any(|content| content.contains("[img:")) {
+        out.line(format_args!(
+            "View images: tg media {session} <id>... (ids from [img:<id>])"
+        ))?;
+    }
+    Ok(())
 }
 
 const SEARCH_PREVIEW_CHARS: usize = 100;
@@ -164,6 +184,7 @@ pub(crate) fn search<W: Write>(
     if results.has_more {
         out.line(format_args!("... more older results available"))?;
     }
+    media_hint(out, "<chat>", hits.iter().map(|hit| hit.content.as_str()))?;
     out.flush()
 }
 

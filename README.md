@@ -155,6 +155,17 @@ tg doctor "张三"
 
 诊断会检查源目录、密钥覆盖、SQLCipher、当前 WAL、会话库和 FTS。
 
+## 查看图片
+
+消息里的图片显示为 `[img:<id>]`。`tg media` 只解密指定的图片，并打印可直接打开的文件路径：
+
+```bash
+tg media "产品讨论群" e7c6bdd4fe5f994cd379e443ebc402b6
+tg media "张三" <id> <id> --output ~/Desktop/images
+```
+
+每行给出 id、用到的缓存版本（`original` 原图、`standard` 标准尺寸、`thumbnail` 缩略图或视频封面）、大小和路径。只缓存了缩略图或完全没有缓存时，需要先在 Telegram 中打开该图片。`messages`、`search` 和 `query` 的输出含有图片时，末尾会提示这条命令。
+
 ## 完整导出
 
 ```bash
@@ -170,7 +181,7 @@ exported/zhangsan/chat.json
 exported/zhangsan/media/
 ```
 
-本地可用的图片、视频、表情、文件和语音会写入 `media/`。Telegram 没有缓存或缓存已清理时，只保留消息摘要；tg 不从远端 URL 下载。语音优先写成 WAV，解码器不可用或单条失败时保留 `.voice`。`tggf` 图片和表情转换需要 `ffmpeg`，`brew install` 会一并安装。
+本地可用的图片、视频、表情、文件和语音会写入 `media/`。图片和视频按消息里 `[img:<id>]` / 视频占位符中的 id 命名为 `<id>.<ext>`，可以从 `chat.txt` 直接找到对应文件。Telegram 没有缓存或缓存已清理时，只保留消息摘要；tg 不从远端 URL 下载。语音优先写成 WAV，解码器不可用或单条失败时保留 `.voice`。`tggf` 图片和表情转换需要 `ffmpeg`，`brew install` 会一并安装。
 
 ## MCP 服务
 
@@ -239,7 +250,7 @@ tg 自己只长期保存：
 - `~/.tg/key_material.bin`：账号级 key material，权限 `0600`。
 - 用户显式指定的导出目录。
 
-`sessions`、`unread`、`members`、`doctor`、`messages`、`search` 和 `query` 不创建消息数据库、索引或页缓存。读取期间的 SQLite 临时数据强制放在内存中。`export` 只写用户指定的归档目录。
+`sessions`、`unread`、`members`、`doctor`、`messages`、`search` 和 `query` 不创建消息数据库、索引或页缓存。读取期间的 SQLite 临时数据强制放在内存中。`export` 只写用户指定的归档目录；`media` 只把请求的图片解密写到 `$TMPDIR/tg-media`（或 `--output`），目录权限 0700、文件 0600。
 
 旧版本留下的 `~/.tg/decrypted/` 不再读取，也不会被 tg 自动删除。确认新版工作正常后，可自行清理：
 

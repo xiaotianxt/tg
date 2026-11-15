@@ -7,6 +7,7 @@
 
 use std::cell::OnceCell;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use md5::{Digest, Md5};
@@ -14,6 +15,7 @@ use md5::{Digest, Md5};
 use crate::media;
 use crate::media_decrypt;
 use crate::media_key::{self, MediaKeys};
+use crate::paths;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MediaSize {
@@ -25,6 +27,8 @@ pub(crate) enum MediaSize {
 
 pub(crate) struct CachedImage {
     pub mime: &'static str,
+    /// File extension matching `mime`.
+    pub ext: &'static str,
     pub data: Vec<u8>,
     /// Which cached copy was used, e.g. `standard` or `thumbnail`.
     pub variant: &'static str,
@@ -37,6 +41,45 @@ pub(crate) fn is_media_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The id in a bare id or in the whole `[img:<id>]` tag, which people and
+/// models often copy as is.
+pub(crate) fn parse_media_id(raw: &str) -> Result<&str, String> {
+    let id = raw.trim().trim_start_matches("[img:").trim_end_matches(']');
+    if is_media_id(id) {
+        Ok(id)
+    } else {
+        Err(format!(
+            "'{raw}' is not a media id; pass the 32-character id from [img:<id>]"
+        ))
+    }
+}
+
+/// Where `tg media` writes decrypted copies unless told otherwise. The system
+/// temp directory is per user on macOS and is cleaned up by the OS.
+pub(crate) fn default_output_dir() -> PathBuf {
+    std::env::temp_dir().join("tg-media")
+}
+
+/// Write `image` to `<dir>/<id>.<ext>`, readable only by the owner, replacing
+/// an earlier copy of the same id.
+pub(crate) fn write_private(dir: &Path, id: &str, image: &CachedImage) -> Result<PathBuf, String> {
+    paths::ensure_private_dir(dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let path = dir.join(format!("{id}.{}", image.ext));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(&path)
+        .and_then(|mut file| file.write_all(&image.data))
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    Ok(path)
 }
 
 pub(crate) struct MediaCache {
@@ -96,15 +139,16 @@ impl MediaCache {
         } else {
             raw
         };
-        let mime = match media_decrypt::detect_ext(&data) {
-            "jpg" => "image/jpeg",
-            "png" => "image/png",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
+        let (mime, ext) = match media_decrypt::detect_ext(&data) {
+            "jpg" => ("image/jpeg", "jpg"),
+            "png" => ("image/png", "png"),
+            "gif" => ("image/gif", "gif"),
+            "webp" => ("image/webp", "webp"),
             other => return Err(format!("unsupported image format: {other}")),
         };
         Ok(CachedImage {
             mime,
+            ext,
             data,
             variant,
         })
@@ -187,6 +231,30 @@ mod tests {
         assert!(!is_media_id(&ID.to_uppercase()));
         assert!(!is_media_id("../../../../etc/passwd"));
         assert!(!is_media_id(&ID[..31]));
+    }
+
+    #[test]
+    fn parse_media_id_accepts_the_bare_id_or_the_whole_tag() {
+        assert_eq!(parse_media_id(ID).unwrap(), ID);
+        assert_eq!(parse_media_id(&format!(" [img:{ID}] ")).unwrap(), ID);
+        assert!(parse_media_id("[img:../../etc/passwd]").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_names_the_file_by_id_and_hides_it_from_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, cache) = cache_with(&["msg/attach/{chat}/2026-11/Img/{id}.dat"]);
+        let image = cache.load(ID, MediaSize::Original).unwrap();
+        let dir = temp.path().join("out");
+        let path = write_private(&dir, ID, &image).unwrap();
+        assert_eq!(path, dir.join(format!("{ID}.jpg")));
+        assert_eq!(fs::read(&path).unwrap(), image.data);
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        // A second save of the same id replaces the copy instead of failing.
+        write_private(&dir, ID, &image).unwrap();
     }
 
     #[test]
