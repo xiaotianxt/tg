@@ -30,6 +30,9 @@ const MAX_FAILURES: usize = 5;
 
 const CHATGPT_STABLE_REDIRECT: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
 const CHATGPT_REDIRECT_PREFIX: &str = "https://chatgpt.com/connector/oauth/";
+/// Gemini issues a per-user, per-server callback under this Google-owned host;
+/// its path shape is undocumented, so any plain path is accepted.
+const GEMINI_REDIRECT_PREFIX: &str = "https://oauth-redirect.googleusercontent.com/";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Owner {
@@ -279,13 +282,26 @@ impl<'a> AuthServer<'a> {
         {
             return true;
         }
-        uri.strip_prefix(CHATGPT_REDIRECT_PREFIX)
+        let chatgpt = uri
+            .strip_prefix(CHATGPT_REDIRECT_PREFIX)
             .is_some_and(|segment| {
                 !segment.is_empty()
                     && segment
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-            })
+            });
+        // No query, fragment, percent-escapes, or dot segments, so the exact-match
+        // check at /oauth/authorize compares the same path the browser will visit.
+        let gemini = uri
+            .strip_prefix(GEMINI_REDIRECT_PREFIX)
+            .is_some_and(|path| {
+                !path.is_empty()
+                    && !path.split('/').any(|seg| seg == "." || seg == "..")
+                    && path.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/')
+                    })
+            });
+        chatgpt || gemini
     }
 
     /// RFC 7591 dynamic client registration, limited to allowlisted redirects.
@@ -959,6 +975,11 @@ mod tests {
             "https://chatgpt.com/connector/oauth/a/b",
             "https://chatgpt.com/connector/oauth/",
             "http://chatgpt.com/connector_platform_oauth_redirect",
+            "https://oauth-redirect.googleusercontent.com/",
+            "https://oauth-redirect.googleusercontent.com.evil.example/cb",
+            "https://oauth-redirect.googleusercontent.com/a/../cb",
+            "https://oauth-redirect.googleusercontent.com/cb?x=1",
+            "http://oauth-redirect.googleusercontent.com/cb",
         ] {
             let (status, body) =
                 json_of(server.register(json!({"redirect_uris": [bad]}).to_string().as_bytes()));
@@ -975,6 +996,10 @@ mod tests {
         ));
         assert_eq!(status, 201);
         assert!(body["client_secret"].as_str().unwrap().starts_with("tgs_"));
+        let gemini = "https://oauth-redirect.googleusercontent.com/r/12345/mcp.example.com";
+        let (status, _) =
+            json_of(server.register(json!({"redirect_uris": [gemini]}).to_string().as_bytes()));
+        assert_eq!(status, 201);
     }
 
     #[test]
