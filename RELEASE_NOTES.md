@@ -1,13 +1,18 @@
-## Connect the Gemini app to `tg mcp serve`
+## Gemini app connector now works
 
-Adding tg as a custom MCP connector in the Gemini app failed with "the server
-rejected Google's redirect URL", and Gemini then asked for an OAuth client ID
-and secret, which tg does not issue.
+2.10.1 allowed only one of the three Google callback hosts that the Gemini app
+registers at once, so adding tg as a custom connector still failed with "the
+server rejected Google's redirect URL". `tg mcp serve` now also accepts
+`oauth-redirect-sandbox` and `oauth-redirect-test` under
+`googleusercontent.com`.
 
-The remote server now accepts Gemini's callback under
-`https://oauth-redirect.googleusercontent.com/` alongside ChatGPT's. Enter the
-connector URL printed by `tg mcp status` and approve with your owner
-passphrase; leave the client ID and secret empty.
+Enter the connector URL printed by `tg mcp status`, leave the client ID and
+secret empty, and approve with your owner passphrase.
 
-Redirects with a query string, percent escapes, or `..` path segments are
-still rejected. Restart `tg mcp serve` after upgrading.
+## Rejected registrations are logged
+
+When a client registers with a redirect URI that is not allowed, the server
+log now records the URIs it sent. Add one with
+`tg mcp init --redirect-uri <uri>` if you trust that client.
+
+Restart `tg mcp serve` after upgrading.
