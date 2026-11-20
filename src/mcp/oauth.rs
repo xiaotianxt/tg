@@ -30,9 +30,14 @@ const MAX_FAILURES: usize = 5;
 
 const CHATGPT_STABLE_REDIRECT: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
 const CHATGPT_REDIRECT_PREFIX: &str = "https://chatgpt.com/connector/oauth/";
-/// Gemini issues a per-user, per-server callback under this Google-owned host;
-/// its path shape is undocumented, so any plain path is accepted.
-const GEMINI_REDIRECT_PREFIX: &str = "https://oauth-redirect.googleusercontent.com/";
+/// Gemini issues a per-user, per-server callback under these Google-owned hosts and
+/// registers all of them at once; the path shape is undocumented, so any plain path
+/// is accepted.
+const GEMINI_REDIRECT_PREFIXES: [&str; 3] = [
+    "https://oauth-redirect.googleusercontent.com/",
+    "https://oauth-redirect-sandbox.googleusercontent.com/",
+    "https://oauth-redirect-test.googleusercontent.com/",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Owner {
@@ -292,8 +297,9 @@ impl<'a> AuthServer<'a> {
             });
         // No query, fragment, percent-escapes, or dot segments, so the exact-match
         // check at /oauth/authorize compares the same path the browser will visit.
-        let gemini = uri
-            .strip_prefix(GEMINI_REDIRECT_PREFIX)
+        let gemini = GEMINI_REDIRECT_PREFIXES
+            .iter()
+            .find_map(|prefix| uri.strip_prefix(prefix))
             .is_some_and(|path| {
                 !path.is_empty()
                     && !path.split('/').any(|seg| seg == "." || seg == "..")
@@ -321,6 +327,9 @@ impl<'a> AuthServer<'a> {
             })
             .unwrap_or_default();
         if redirect_uris.is_empty() || !redirect_uris.iter().all(|uri| self.redirect_allowed(uri)) {
+            // Redirect URIs are public callback addresses; logging them is what lets
+            // the owner allowlist a new client with `tg mcp init --redirect-uri`.
+            log::warn!("rejected client registration; redirect_uris: {redirect_uris:?}");
             return oauth_error(400, "invalid_redirect_uri", "redirect_uris are not allowed");
         }
         let auth_method = request
@@ -977,6 +986,7 @@ mod tests {
             "http://chatgpt.com/connector_platform_oauth_redirect",
             "https://oauth-redirect.googleusercontent.com/",
             "https://oauth-redirect.googleusercontent.com.evil.example/cb",
+            "https://oauth-redirect-evil.googleusercontent.com/cb",
             "https://oauth-redirect.googleusercontent.com/a/../cb",
             "https://oauth-redirect.googleusercontent.com/cb?x=1",
             "http://oauth-redirect.googleusercontent.com/cb",
@@ -996,9 +1006,17 @@ mod tests {
         ));
         assert_eq!(status, 201);
         assert!(body["client_secret"].as_str().unwrap().starts_with("tgs_"));
-        let gemini = "https://oauth-redirect.googleusercontent.com/r/12345/mcp.example.com";
+        // The set the Gemini app actually registers.
+        let gemini: Vec<String> = ["", "-sandbox", "-test"]
+            .iter()
+            .flat_map(|env| {
+                ["r", "a"].map(|kind| {
+                    format!("https://oauth-redirect{env}.googleusercontent.com/{kind}/user_bound_custom-mcp-6a7ca2")
+                })
+            })
+            .collect();
         let (status, _) =
-            json_of(server.register(json!({"redirect_uris": [gemini]}).to_string().as_bytes()));
+            json_of(server.register(json!({"redirect_uris": gemini}).to_string().as_bytes()));
         assert_eq!(status, 201);
     }
 

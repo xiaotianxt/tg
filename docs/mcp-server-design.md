@@ -341,7 +341,7 @@ Redirect allowlist, defaulting to:
 ```text
 https://chatgpt.com/connector_platform_oauth_redirect
 https://chatgpt.com/connector/oauth/*        (single path segment)
-https://oauth-redirect.googleusercontent.com/**  (Gemini app; plain path, no query)
+https://oauth-redirect{,-sandbox,-test}.googleusercontent.com/**  (Gemini app; plain path, no query)
 ```
 
 The config can add other clients' redirect URIs, such as Claude's remote
