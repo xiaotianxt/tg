@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "Invalid since: Cannot parse time expression 'banana'. Use ISO 8601 (e.g. '2024-01-01T00:00:00') or relative (e.g. '5min', '1h', '7d', '1y', 'today').",
+      "type": "text"
+    }
+  ],
+  "isError": true
+}

@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "session is required",
+      "type": "text"
+    }
+  ],
+  "isError": true
+}

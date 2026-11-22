@@ -1,0 +1,70 @@
+{
+  "content": [
+    {
+      "text": "<structuredContent>",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "checks": [
+      {
+        "check": "ffmpeg",
+        "detail": "/opt/e2e/bin/ffmpeg",
+        "status": "ok"
+      },
+      {
+        "check": "voice decoder",
+        "detail": "/opt/e2e/bin/voice-decoder",
+        "status": "ok"
+      },
+      {
+        "check": "keys",
+        "detail": "8 keys in <KEYS>",
+        "status": "ok"
+      },
+      {
+        "check": "source db dir",
+        "detail": "<DB_DIR>",
+        "status": "ok"
+      },
+      {
+        "check": "source numbered message dbs",
+        "detail": "2",
+        "status": null
+      },
+      {
+        "check": "message key coverage",
+        "detail": "2/2 numbered dbs",
+        "status": null
+      },
+      {
+        "check": "live message WAL files",
+        "detail": "0",
+        "status": null
+      },
+      {
+        "check": "direct source",
+        "detail": null,
+        "status": "ok"
+      },
+      {
+        "check": "session db",
+        "detail": null,
+        "status": "ok"
+      },
+      {
+        "check": "message FTS",
+        "detail": null,
+        "status": "ok"
+      }
+    ],
+    "session": {
+      "databases": 2,
+      "id": "tgid_alice",
+      "message_rows": 19,
+      "name": "爱丽丝",
+      "outcome": "resolved"
+    }
+  }
+}

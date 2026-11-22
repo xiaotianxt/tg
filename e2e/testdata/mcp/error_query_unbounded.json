@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "refusing to return every message of every chat; pass --session, --contains, --raw-contains, --has, --sender, or --since",
+      "type": "text"
+    }
+  ],
+  "isError": true
+}

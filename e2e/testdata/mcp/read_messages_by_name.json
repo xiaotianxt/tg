@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "Chat: 爱丽丝 (id: tgid_alice)\nReadable history starts 2024-06-01 09:00:00; nothing earlier is available.\n3 messages in time order. Times are local; an indented line continues the message above it.\nSenders (name = id):\n  我 = gh_e2e_owner\n  爱丽丝 = tgid_alice\n== 2024-06-02 ==\n10:00 爱丽丝: 第二天的消息 from shard one\n10:00 我: 收到 see you\n11:30 爱丽丝: 最后一条 latest message\n",
+      "type": "text"
+    }
+  ],
+  "isError": false
+}

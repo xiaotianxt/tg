@@ -1,0 +1,12 @@
+{
+  "content": [
+    {
+      "text": "{\"hits\":[]}",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "hits": []
+  }
+}

@@ -1,41 +1,32 @@
-.PHONY: all fmt clippy test check build install install-local clean
+.PHONY: all build check e2e linux-check remote-check install install-local
+
+TG ?= $(CURDIR)/target/tg
 
 all: check
-	$(MAKE) build
-
-fmt:
-	cargo fmt --all -- --check
-
-clippy:
-	cargo clippy --all-targets --all-features -- -D warnings
-
-test:
-	cargo test --all-features
-
-check:
-	cargo fmt --all -- --check
-	cargo clippy --all-targets --all-features -- -D warnings
-	cargo test --all-features
 
 build:
-	cargo build --release
+	go build -trimpath -o "$(TG)" ./cmd/tg
+
+# Unit tests plus the black-box contracts in e2e/ against the built binary.
+check: build
+	test -z "$$(gofmt -l cmd internal e2e)"
+	go vet ./...
+	TG_BIN="$(TG)" go test -count=1 ./...
+
+e2e: build
+	TG_BIN="$(TG)" go test -count=1 ./e2e/...
+
+# Linux cgo build in the release container image (needs docker).
+linux-check:
+	scripts/linux-check.sh
+
+# Run check on the build host (default: ssh mini) instead of this machine.
+remote-check:
+	scripts/remote.sh make check
 
 install: build
-	sudo cp target/release/tg /usr/local/bin/
-	@echo ""
-	@echo "安装完成！现在可以直接使用以下命令："
-	@echo "  sudo tg keys      # 提取密钥"
-	@echo "  tg sessions       # 查看会话"
+	sudo cp "$(TG)" /usr/local/bin/tg
 
 install-local: build
 	mkdir -p ~/.local/bin
-	cp target/release/tg ~/.local/bin/
-	@echo ""
-	@echo "已安装到 ~/.local/bin，请确保该目录在 PATH 中。"
-	@echo "  sudo tg keys      # 提取密钥"
-	@echo "  tg sessions       # 查看会话"
-
-clean:
-	cargo clean
-	sudo rm -f /usr/local/bin/tg 2>/dev/null || true
-	rm -f ~/.local/bin/tg 2>/dev/null || true
+	cp "$(TG)" ~/.local/bin/tg

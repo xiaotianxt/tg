@@ -1,0 +1,14 @@
+{
+  "content": [
+    {
+      "text": "fedcba9876543210fedcba9876543210 (thumbnail, 100B)",
+      "type": "text"
+    },
+    {
+      "data": "iVBORw0KGgpwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcA==",
+      "mimeType": "image/png",
+      "type": "image"
+    }
+  ],
+  "isError": false
+}

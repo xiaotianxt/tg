@@ -1,0 +1,31 @@
+{
+  "content": [
+    {
+      "text": "<structuredContent>",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "sessions": [
+      {
+        "id": "tgid_alicia",
+        "last_active": {
+          "local": "2024-03-01 09:00:00",
+          "unix": 1709283600
+        },
+        "name": "Alicia",
+        "unread": 0
+      },
+      {
+        "id": "tgid_alice",
+        "last_active": {
+          "local": "2024-06-02 11:30:00",
+          "unix": 1717327800
+        },
+        "name": "爱丽丝",
+        "unread": 2
+      }
+    ]
+  }
+}

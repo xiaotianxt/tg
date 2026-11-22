@@ -1,0 +1,7 @@
+exit: 0
+tg doctor
+
+ffmpeg: OK (/opt/e2e/bin/ffmpeg)
+voice decoder: OK (/opt/e2e/bin/voice-decoder)
+keys: OK (8 keys in <KEYS>)
+source db dir: MISSING (/nonexistent/e2e/db_storage)

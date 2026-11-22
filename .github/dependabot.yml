@@ -1,6 +1,6 @@
 version: 2
 updates:
-  - package-ecosystem: cargo
+  - package-ecosystem: gomod
     directory: "/"
     schedule:
       interval: weekly
@@ -10,7 +10,7 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - dependencies
-      - rust
+      - go
 
   - package-ecosystem: github-actions
     directory: "/"

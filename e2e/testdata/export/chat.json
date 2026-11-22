@@ -1,0 +1,154 @@
+[
+  {
+    "time": "2024-06-01 09:00:00",
+    "timestamp": 1717232400,
+    "sender": "爱丽丝",
+    "type": 1,
+    "type_name": "文本",
+    "content": "早上好，今天吃饭了吗？"
+  },
+  {
+    "time": "2024-06-01 09:00:30",
+    "timestamp": 1717232430,
+    "sender": "<OWNER_ROW>",
+    "type": 1,
+    "type_name": "文本",
+    "content": "还没有，一起去吃饭吧"
+  },
+  {
+    "time": "2024-06-01 09:01:10",
+    "timestamp": 1717232470,
+    "sender": "爱丽丝",
+    "type": 3,
+    "type_name": "图片",
+    "content": "[img:0123456789abcdef0123456789abcdef]"
+  },
+  {
+    "time": "2024-06-01 09:05:00",
+    "timestamp": 1717232700,
+    "sender": "爱丽丝",
+    "type": 34,
+    "type_name": "语音",
+    "content": "[语音] 这是语音转文字"
+  },
+  {
+    "time": "2024-06-01 09:06:00",
+    "timestamp": 1717232760,
+    "sender": "<OWNER_ROW>",
+    "type": 25769803825,
+    "type_name": "链接/文件/小程序",
+    "content": "[文件] report.pdf (2KB)"
+  },
+  {
+    "time": "2024-06-01 09:10:00",
+    "timestamp": 1717233000,
+    "sender": "爱丽丝",
+    "type": 49,
+    "type_name": "链接/文件/小程序",
+    "content": "[链接] Rust 2024 edition - release notes \n  https://example.com/rust-2024"
+  },
+  {
+    "time": "2024-06-01 09:12:00",
+    "timestamp": 1717233120,
+    "sender": "爱丽丝",
+    "type": 48,
+    "type_name": "位置",
+    "content": "[位置] 外滩"
+  },
+  {
+    "time": "2024-06-01 09:15:00",
+    "timestamp": 1717233300,
+    "sender": "<OWNER_ROW>",
+    "type": 244813135921,
+    "type_name": "链接/文件/小程序",
+    "content": "> 爱丽丝: 早上好，今天吃饭了吗？\n 好的，明天见"
+  },
+  {
+    "time": "2024-06-01 09:20:00",
+    "timestamp": 1717233600,
+    "sender": "系统",
+    "type": 10000,
+    "type_name": "系统提示",
+    "content": "你已添加了Alice Zhang，现在可以开始聊天了。"
+  },
+  {
+    "time": "2024-06-01 09:21:00",
+    "timestamp": 1717233660,
+    "sender": "爱丽丝",
+    "type": 47,
+    "type_name": "表情",
+    "content": "[sticker:aabbccddeeff00112233445566778899]"
+  },
+  {
+    "time": "2024-06-01 09:30:00",
+    "timestamp": 1717234200,
+    "sender": "爱丽丝",
+    "type": 1,
+    "type_name": "文本",
+    "content": "这条消息是压缩存储的 compressed zstd"
+  },
+  {
+    "time": "2024-06-01 09:31:00",
+    "timestamp": 1717234260,
+    "sender": "<OWNER_ROW>",
+    "type": 1,
+    "type_name": "文本",
+    "content": "zlib compressed reply"
+  },
+  {
+    "time": "2024-06-01 09:40:00",
+    "timestamp": 1717234800,
+    "sender": "爱丽丝",
+    "type": 81604378673,
+    "type_name": "链接/文件/小程序",
+    "content": "[聊天记录] 群聊的聊天记录 (2条)\n        [2024-05-30 10:00]\n        Bob: hi there\n        [2024-05-30 10:01]\n        Carol: hello back"
+  },
+  {
+    "time": "2024-06-01 09:45:00",
+    "timestamp": 1717235100,
+    "sender": "爱丽丝",
+    "type": 43,
+    "type_name": "视频",
+    "content": "[视频 320x240 aaaabbbbccccddddeeeeffff00001111]"
+  },
+  {
+    "time": "2024-06-01 09:50:00",
+    "timestamp": 1717235400,
+    "sender": "系统",
+    "type": 10002,
+    "type_name": "撤回消息",
+    "content": "[撤回] \"Alice Zhang\" 撤回了一条消息"
+  },
+  {
+    "time": "2024-06-01 09:55:00",
+    "timestamp": 1717235700,
+    "sender": "爱丽丝",
+    "type": 1,
+    "type_name": "文本",
+    "content": "line one\nline two\twith tab"
+  },
+  {
+    "time": "2024-06-02 10:00:00",
+    "timestamp": 1717322400,
+    "sender": "爱丽丝",
+    "type": 1,
+    "type_name": "文本",
+    "content": "第二天的消息 from shard one"
+  },
+  {
+    "time": "2024-06-02 10:00:20",
+    "timestamp": 1717322420,
+    "sender": "<OWNER_ROW>",
+    "type": 1,
+    "type_name": "文本",
+    "content": "收到 see you"
+  },
+  {
+    "time": "2024-06-02 11:30:00",
+    "timestamp": 1717327800,
+    "sender": "爱丽丝",
+    "type": 1,
+    "type_name": "文本",
+    "content": "最后一条 latest message"
+  }
+]

@@ -1,0 +1,15 @@
+exit: 0
+Group: 项目群 (team@chatroom)
+Current members: 6
+Local sender history: 2024-05-01 10:00 to 2024-06-04 12:05
+
+Rank Last Spoke           Messages   Role    Display Name           Username
+----------------------------------------------------------------------------------------------------------------------------------
+1    never recorded       0                  Eve                    tgid_eve
+2    2024-05-01 10:00     1                  Dave                   tgid_dave
+3    2024-06-04 12:00     1          owner   爱丽丝                    tgid_alice
+4    2024-06-04 12:01     1                  Owner                  gh_e2e_owner
+5    2024-06-04 12:02     1                  卡罗                     tgid_carol
+6    2024-06-04 12:05     2                  Bob                    tgid_bob
+
+Listed: 6 current members

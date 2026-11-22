@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "Images are disabled for remote clients. The owner can enable them with remote.allow_media in the tg MCP config.",
+      "type": "text"
+    }
+  ],
+  "isError": true
+}

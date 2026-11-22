@@ -1,0 +1,37 @@
+{
+  "content": [
+    {
+      "text": "<structuredContent>",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "hits": [
+      {
+        "session": {
+          "id": "tgid_bob",
+          "name": "Bob"
+        },
+        "text": "bob message 03",
+        "time": {
+          "local": "2024-06-03 08:01:00",
+          "unix": 1717401660
+        },
+        "type": "text"
+      },
+      {
+        "session": {
+          "id": "tgid_bob",
+          "name": "Bob"
+        },
+        "text": "bob message 02",
+        "time": {
+          "local": "2024-06-03 08:00:30",
+          "unix": 1717401630
+        },
+        "type": "text"
+      }
+    ]
+  }
+}

@@ -19,7 +19,7 @@ tg --version
 
 Homebrew 支持 macOS Apple Silicon、Linux x86_64 和 Linux arm64。
 
-源码安装需要 Rust、C 编译器、make、Perl 和 pkg-config；SQLCipher 与 OpenSSL 会静态编入二进制，不需要系统 SQLite/SQLCipher/OpenSSL 动态库。
+源码安装需要 Go、C 编译器（cgo）和 make；Linux 还需要 OpenSSL 开发包（如 `libssl-dev`）。SQLCipher 随源码编入二进制，Linux 静态链接 libcrypto，macOS 使用系统 CommonCrypto，不需要系统 SQLite/SQLCipher/OpenSSL 动态库。
 
 ```bash
 git clone https://github.com/xiaotianxt/tg.git
@@ -326,11 +326,13 @@ make build
 
 核心模块：
 
-- `src/source_store.rs`：发现源数据库、应用 SQLCipher key、建立只读快照。
-- `src/database_keys.rs`：key 文件、salt、第一页 HMAC 验证。
-- `src/db.rs` / `src/query.rs`：会话、消息、FTS 和结构化查询。
-- `src/scanner.rs`：缓存派生或平台登录捕获。
-- `src/export.rs` / `src/media*.rs`：聊天和媒体归档。
+- `internal/store` / `internal/sqlcipher`：发现源数据库、应用 SQLCipher key、建立只读快照。
+- `internal/keys`：key 文件、salt、第一页 HMAC 验证、key 派生。
+- `internal/msgdb` / `internal/history` / `internal/query`：消息读取、会话、FTS 和结构化查询。
+- `internal/capture`：缓存派生或平台登录捕获。
+- `internal/export` / `internal/media` / `internal/voice`：聊天和媒体归档。
+
+包结构、依赖方向和测试策略见 [docs/go-architecture.md](docs/go-architecture.md)。
 
 面向 AI/自动化助手的能力说明见 [SKILL.md](SKILL.md)。
 

@@ -1,0 +1,55 @@
+{
+  "content": [
+    {
+      "text": "<structuredContent>",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "messages": [
+      {
+        "sender": "卡罗",
+        "sender_id": "tgid_carol",
+        "session": {
+          "id": "team@chatroom",
+          "name": "项目群"
+        },
+        "text": "[img:fedcba9876543210fedcba9876543210]",
+        "time": {
+          "local": "2024-06-04 12:02:00",
+          "unix": 1717502520
+        },
+        "type": "image"
+      },
+      {
+        "sender": "爱丽丝",
+        "sender_id": "tgid_alice",
+        "session": {
+          "id": "tgid_alice",
+          "name": "爱丽丝"
+        },
+        "text": "[视频 320x240 aaaabbbbccccddddeeeeffff00001111]",
+        "time": {
+          "local": "2024-06-01 09:45:00",
+          "unix": 1717235100
+        },
+        "type": "video"
+      },
+      {
+        "sender": "爱丽丝",
+        "sender_id": "tgid_alice",
+        "session": {
+          "id": "tgid_alice",
+          "name": "爱丽丝"
+        },
+        "text": "[img:0123456789abcdef0123456789abcdef]",
+        "time": {
+          "local": "2024-06-01 09:01:10",
+          "unix": 1717232470
+        },
+        "type": "image"
+      }
+    ]
+  }
+}

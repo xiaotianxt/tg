@@ -1,0 +1,22 @@
+{
+  "content": [
+    {
+      "text": "<structuredContent>",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "sessions": [
+      {
+        "id": "gh_news",
+        "last_active": {
+          "local": "2024-05-20 08:00:00",
+          "unix": 1716192000
+        },
+        "name": "News Feed",
+        "unread": 1
+      }
+    ]
+  }
+}

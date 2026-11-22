@@ -1,0 +1,9 @@
+exit: 0
+  Media #1: tgid_alice_Voice_34_0001_4.voice
+  Media #2: tgid_alice_Voice_34_0002_99.amr
+Exported 2 media files
+Exported 19 messages for 爱丽丝 (tgid_alice)
+Exported to:
+  [txt] <OUT>/chat.txt
+  [csv] <OUT>/chat.csv
+  [json] <OUT>/chat.json

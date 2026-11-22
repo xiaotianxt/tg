@@ -17,7 +17,7 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/release.sh [options]
 
-Create a tg release, bumping Cargo.toml when needed, wait for GitHub
+Create a tg release, bumping the version in cmd/tg/version.go when needed, wait for GitHub
 Actions to publish macOS and Linux artifacts, update the Homebrew tap,
 and verify brew.
 
@@ -25,7 +25,7 @@ Options:
   --bump LEVEL         Bump level when current version is already tagged on
                        another commit.
                        One of: patch, minor, major. Default: patch.
-  --version VERSION    Release this exact version, updating Cargo files first.
+  --version VERSION    Release this exact version, updating cmd/tg/version.go first.
   --skip-checks        Do not run local checks before tagging.
   --skip-tests         Alias for --skip-checks.
   --skip-tap           Do not update the Homebrew tap formula.
@@ -54,17 +54,10 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
-package_version() {
-  python3 - <<'PY'
-from pathlib import Path
-import re
+VERSION_FILE="cmd/tg/version.go"
 
-text = Path("Cargo.toml").read_text()
-match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
-if not match:
-    raise SystemExit("Cargo.toml version not found")
-print(match.group(1))
-PY
+package_version() {
+  sed -n 's/^const version = "\([0-9][0-9.]*\)"$/\1/p' "$VERSION_FILE"
 }
 
 local_tag_commit() {
@@ -95,15 +88,24 @@ tag_commit() {
   printf '%s' "$sha"
 }
 
-cargo_release_version() {
+# set_version bumps cmd/tg/version.go to an exact version, or by a level,
+# and commits it.
+set_version() {
   local level_or_version="$1"
-
-  cargo release "$level_or_version" \
-    --execute \
-    --no-confirm \
-    --no-publish \
-    --no-tag \
-    --no-push
+  local current next
+  current="$(package_version)"
+  IFS=. read -r major minor patch <<<"$current"
+  case "$level_or_version" in
+    patch) next="${major}.${minor}.$((patch + 1))" ;;
+    minor) next="${major}.$((minor + 1)).0" ;;
+    major) next="$((major + 1)).0.0" ;;
+    *) next="$level_or_version" ;;
+  esac
+  sed -i.bak "s/^const version = \"${current}\"$/const version = \"${next}\"/" "$VERSION_FILE"
+  rm -f "${VERSION_FILE}.bak"
+  [[ "$(package_version)" == "$next" ]] || die "could not update ${VERSION_FILE}"
+  git add "$VERSION_FILE"
+  git commit -m "chore: bump tg version to ${next}"
 }
 
 release_asset_sha() {
@@ -175,8 +177,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-need_cmd cargo
-need_cmd cargo-release
+need_cmd go
 need_cmd git
 need_cmd gh
 need_cmd python3
@@ -219,26 +220,26 @@ if [[ "$HEAD_SHA" != "$ORIGIN_MAIN_SHA" ]]; then
 fi
 
 CURRENT_VERSION="$(package_version)"
-[[ -n "$CURRENT_VERSION" ]] || die "Cargo.toml version not found"
+[[ -n "$CURRENT_VERSION" ]] || die "version not found in ${VERSION_FILE}"
 CURRENT_TAG="v${CURRENT_VERSION}"
 CURRENT_TAG_SHA="$(tag_commit "$CURRENT_TAG")"
 
 if [[ -n "$VERSION_OVERRIDE" && "$VERSION_OVERRIDE" != "$CURRENT_VERSION" ]]; then
   TAG_SHA="$(tag_commit "v${VERSION_OVERRIDE}")"
   [[ -z "$TAG_SHA" ]] || die "tag v${VERSION_OVERRIDE} already exists at ${TAG_SHA}; choose a different version"
-  log "bumping Cargo version ${CURRENT_VERSION} -> ${VERSION_OVERRIDE} with cargo-release"
-  cargo_release_version "$VERSION_OVERRIDE"
+  log "bumping version ${CURRENT_VERSION} -> ${VERSION_OVERRIDE}"
+  set_version "$VERSION_OVERRIDE"
 elif [[ -n "$CURRENT_TAG_SHA" && "$CURRENT_TAG_SHA" != "$HEAD_SHA" ]]; then
-  log "current version ${CURRENT_VERSION} is already tagged; bumping ${BUMP_KIND} with cargo-release"
-  cargo_release_version "$BUMP_KIND"
+  log "current version ${CURRENT_VERSION} is already tagged; bumping ${BUMP_KIND}"
+  set_version "$BUMP_KIND"
 else
-  log "using Cargo version ${CURRENT_VERSION}"
+  log "using version ${CURRENT_VERSION}"
 fi
 
-[[ -z "$(git status --porcelain -- Cargo.toml Cargo.lock)" ]] || die "cargo-release left uncommitted Cargo version changes"
+[[ -z "$(git status --porcelain -- "$VERSION_FILE")" ]] || die "uncommitted version changes in ${VERSION_FILE}"
 
 VERSION="$(package_version)"
-[[ -n "$VERSION" ]] || die "Cargo.toml version not found"
+[[ -n "$VERSION" ]] || die "version not found in ${VERSION_FILE}"
 TAG="v${VERSION}"
 TAG_SHA="$(tag_commit "$TAG")"
 HEAD_SHA="$(git rev-parse HEAD)"

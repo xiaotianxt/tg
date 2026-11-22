@@ -1,0 +1,321 @@
+{
+  "tools": [
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Use this first when the user names a person, group, or chat, or asks about a conversation or relationship with someone, in their Telegram history: it turns the name into the chat `id` that the other tools take as `session`. Lists every direct and group chat, most recently active first. Returns each chat's stable `id`, which other tools accept as `session`. Only if the list exceeds the result size cap is it trimmed, with `truncated: true` and `next_offset`.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "offset": {
+            "default": 0,
+            "description": "Only to continue a truncated result: pass its next_offset.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "query": {
+            "description": "Optional name filter (fuzzy match on names and ids)",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "list_sessions",
+      "title": "List chats"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Use this when the user asks what is new, unread, or waiting for a reply. Lists every chat that has unread messages, with unread counts. Only if the list exceeds the result size cap is it trimmed, with `truncated: true` and `next_offset`.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "offset": {
+            "default": 0,
+            "description": "Only to continue a truncated result: pass its next_offset.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "query": {
+            "description": "Optional name filter",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "list_unread",
+      "title": "List unread chats"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Use this to see what was actually said in one chat: summarize what a group has been discussing, recall a conversation with someone, or read the context around a search hit. Reads every message of one chat in an optional [since, until) time range. Returns a plain-text transcript in chronological order: a `== YYYY-MM-DD ==` line per local day, then one `HH:MM sender: text` line per message, with indented continuation lines. A senders list after the header maps each shown name to its stable account id; the account owner always appears as 我. The header also says when the chat's readable history starts: nothing earlier is available, so an empty early range means missing history, not silence. Non-text messages appear as bracketed placeholders; images show as [img:<id>], which get_media can display. There is no page size: one call returns the whole range. Only if the range exceeds the result size cap is the transcript trimmed and ends with a `[truncated]` line giving the offset to repeat the same call with. order=newest (default) keeps the latest messages when trimming, order=oldest the earliest.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "contains": {
+            "description": "Only messages whose text contains this substring",
+            "type": "string"
+          },
+          "offset": {
+            "default": 0,
+            "description": "Only to continue a truncated result: pass its next_offset. Counted from the end of the range for order=newest and from the start for order=oldest.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "order": {
+            "default": "newest",
+            "enum": [
+              "newest",
+              "oldest"
+            ],
+            "type": "string"
+          },
+          "sender": {
+            "description": "Only messages from one sender: `me` for the account owner, an account id (the ids that list_members and the message tools show), or a name exactly as those tools show it. A name several accounts share is rejected with their ids.",
+            "type": "string"
+          },
+          "session": {
+            "description": "Chat id from list_sessions (preferred) or a display name",
+            "type": "string"
+          },
+          "since": {
+            "description": "Inclusive start; ISO 8601 date/time or relative (30min, 2h, 7d, today, yesterday)",
+            "type": "string"
+          },
+          "until": {
+            "description": "Exclusive end; ISO 8601 date/time or relative (30min, 2h, 7d, today, yesterday)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session"
+        ],
+        "type": "object"
+      },
+      "name": "read_messages",
+      "title": "Read a chat"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Use this when answering needs what people previously said or discussed about a topic, across private and group Telegram chats, including indirect questions that never mention Telegram or chat history (why someone decided something, who talked about a subject, what was said about a plan). Fast keyword search on the client's own index, over the full history unless `since` is given; it can miss some card and notice text, so use query_messages when completeness matters. Returns every match, newest first. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "offset": {
+            "default": 0,
+            "description": "Only to continue a truncated result: pass its next_offset.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "query": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "since": {
+            "description": "ISO 8601 date/time or relative (30min, 2h, 7d, today, yesterday)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "search_messages",
+      "title": "Search messages"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Use this for exhaustive or precise lookups: everything one person said (`sender`), messages with a media type, keyword combinations with exclusions, or counting messages in a period. Structured message filter across all chats or one chat: keywords to include/exclude, media type, sender, and a time range. Each message carries `sender` (the account owner is 我) and its stable `sender_id`. Slower than search_messages but exhaustive. Covers the full history unless `since` is given; with no session, give at least one filter or `since`. Returns every match. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset. To read every message of one chat in a period, use read_messages instead.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "contains": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "type": "array"
+          },
+          "has": {
+            "items": {
+              "enum": [
+                "voice",
+                "image",
+                "sticker",
+                "file",
+                "video"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "match": {
+            "default": "all",
+            "enum": [
+              "all",
+              "any"
+            ],
+            "type": "string"
+          },
+          "not_contains": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "type": "array"
+          },
+          "offset": {
+            "default": 0,
+            "description": "Only to continue a truncated result: pass its next_offset.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "order": {
+            "default": "newest",
+            "enum": [
+              "newest",
+              "oldest"
+            ],
+            "type": "string"
+          },
+          "sender": {
+            "description": "Only messages from one sender: `me` for the account owner, an account id (the ids that list_members and the message tools show), or a name exactly as those tools show it. A name several accounts share is rejected with their ids.",
+            "type": "string"
+          },
+          "session": {
+            "description": "Optional chat id or display name",
+            "type": "string"
+          },
+          "since": {
+            "description": "ISO 8601 date/time or relative (30min, 2h, 7d, today, yesterday)",
+            "type": "string"
+          },
+          "until": {
+            "description": "ISO 8601 date/time or relative (30min, 2h, 7d, today, yesterday)",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "query_messages",
+      "title": "Filter messages"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Use this for questions about who is in a group or how active its members are: who speaks most, who has gone quiet, or which members are your contacts. Lists a group's current members with each one's id, message count, and last message time, or only members who are your local contacts (friends_only).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "friends_only": {
+            "default": false,
+            "type": "boolean"
+          },
+          "inactive_since": {
+            "description": "Only members with no recorded messages since this time; ISO 8601 date/time or relative (30min, 2h, 7d, today, yesterday)",
+            "type": "string"
+          },
+          "session": {
+            "description": "Group id or display name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session"
+        ],
+        "type": "object"
+      },
+      "name": "list_members",
+      "title": "List group members"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Use this when an image in a transcript matters to the answer. Views images from one chat. Pass the 32-character ids that read_messages and the other message tools show as [img:<id>] (images) or as the name in [视频 WxH <id>] (video cover). Returns each image the local client has cached, up to 10 per call; an id that was never downloaded reports so instead. size=preview (default) returns the client's standard copy, size=original the full-resolution copy when one was downloaded. Each image costs about as much context as a page of text, so fetch only the ones the task needs.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10,
+            "minItems": 1,
+            "type": "array"
+          },
+          "session": {
+            "description": "Chat id or display name the images were sent in",
+            "type": "string"
+          },
+          "size": {
+            "default": "preview",
+            "enum": [
+              "preview",
+              "original"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "session",
+          "ids"
+        ],
+        "type": "object"
+      },
+      "name": "get_media",
+      "title": "View cached images"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Check whether tg can read the local history, optionally for one chat. Use when another tool fails.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "session": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "diagnose",
+      "title": "Diagnose tg"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "'../x' is not a media id; pass the 32-character id from [img:<id>]",
+      "type": "text"
+    }
+  ],
+  "isError": true
+}

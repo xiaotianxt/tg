@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "No chat matched 'tgid_bob'. Use list_sessions to find chat ids.",
+      "type": "text"
+    }
+  ],
+  "isError": true
+}

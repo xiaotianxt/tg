@@ -1,0 +1,4 @@
+# Vendored upstream source and byte-exact golden outputs keep their whitespace.
+internal/sqlcipher/sqlite3.c -whitespace
+internal/sqlcipher/sqlite3.h -whitespace
+e2e/testdata/** -whitespace

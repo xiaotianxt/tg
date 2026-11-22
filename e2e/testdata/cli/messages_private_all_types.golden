@@ -1,0 +1,50 @@
+exit: 0
+Chat with: 爱丽丝 (tgid_alice)
+Showing latest 19 messages
+
+[2024-06-01 09:00]
+爱丽丝: 早上好，今天吃饭了吗？
+我: 还没有，一起去吃饭吧
+[2024-06-01 09:01]
+爱丽丝: [img:0123456789abcdef0123456789abcdef]
+[2024-06-01 09:05]
+爱丽丝: [voice:4:7s] 这是语音转文字
+[2024-06-01 09:06]
+我: [文件] report.pdf (2KB)
+[2024-06-01 09:10]
+爱丽丝: [链接] Rust 2024 edition - release notes 
+  https://example.com/rust-2024
+[2024-06-01 09:12]
+爱丽丝: [位置] 外滩
+[2024-06-01 09:15]
+我: > 爱丽丝: 早上好，今天吃饭了吗？
+ 好的，明天见
+[2024-06-01 09:20]
+系统: 你已添加了Alice Zhang，现在可以开始聊天了。
+[2024-06-01 09:21]
+爱丽丝: [sticker:aabbccddeeff00112233445566778899]
+[2024-06-01 09:30]
+爱丽丝: 这条消息是压缩存储的 compressed zstd
+[2024-06-01 09:31]
+我: zlib compressed reply
+[2024-06-01 09:40]
+爱丽丝: [聊天记录] 群聊的聊天记录 (2条)
+        [2024-05-30 10:00]
+        Bob: hi there
+        [2024-05-30 10:01]
+        Carol: hello back
+[2024-06-01 09:45]
+爱丽丝: [视频 320x240 aaaabbbbccccddddeeeeffff00001111]
+[2024-06-01 09:50]
+系统: [撤回] "Alice Zhang" 撤回了一条消息
+[2024-06-01 09:55]
+爱丽丝: line one
+line two	with tab
+[2024-06-02 10:00]
+爱丽丝: 第二天的消息 from shard one
+我: 收到 see you
+[2024-06-02 11:30]
+爱丽丝: 最后一条 latest message
+
+--- End of messages ---
+View images: tg media tgid_alice <id>... (ids from [img:<id>])

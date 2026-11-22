@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "Chat: 项目群 (id: team@chatroom)\nReadable history starts 2024-05-01 10:00:00; nothing earlier is available.\n7 messages in time order. Times are local; an indented line continues the message above it.\nSenders (name = id):\n  Bob = tgid_bob\n  Dave = tgid_dave\n  卡罗 = tgid_carol\n  我 = gh_e2e_owner\n  爱丽丝 = tgid_alice\n== 2024-05-01 ==\n10:00 Dave: old message from dave\n== 2024-06-04 ==\n12:00 爱丽丝: 大家好 welcome\n12:00 Bob: hi all\n12:01 我: 我是群主\n12:02 卡罗: [img:fedcba9876543210fedcba9876543210]\n12:03 系统: Bob邀请Carol加入了群聊\n12:05 Bob: 明天开会 meeting tomorrow\n",
+      "type": "text"
+    }
+  ],
+  "isError": false
+}

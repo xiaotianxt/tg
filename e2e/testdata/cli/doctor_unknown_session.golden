@@ -1,0 +1,18 @@
+exit: 0
+tg doctor
+
+ffmpeg: OK (/opt/e2e/bin/ffmpeg)
+voice decoder: OK (/opt/e2e/bin/voice-decoder)
+keys: OK (8 keys in <KEYS>)
+source db dir: OK (<DB_DIR>)
+source numbered message dbs: 2
+message key coverage: 2/2 numbered dbs
+live message WAL files: 0
+direct source: OK
+session db: OK
+message FTS: OK
+
+session query: nobody-at-all
+resolved session: nobody-at-all (nobody-at-all)
+message table: Msg_5e2deb790b1a0508282210ea3ad10669
+message rows: 0 across 0 database(s)

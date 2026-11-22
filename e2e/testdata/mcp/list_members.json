@@ -1,0 +1,85 @@
+{
+  "content": [
+    {
+      "text": "<structuredContent>",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "group": {
+      "id": "team@chatroom",
+      "name": "项目群"
+    },
+    "history": {
+      "end": {
+        "local": "2024-06-04 12:05:00",
+        "unix": 1717502700
+      },
+      "start": {
+        "local": "2024-05-01 10:00:00",
+        "unix": 1714557600
+      }
+    },
+    "members": [
+      {
+        "id": "tgid_eve",
+        "last_spoke": null,
+        "message_count": 0,
+        "name": "Eve",
+        "owner": false
+      },
+      {
+        "id": "tgid_dave",
+        "last_spoke": {
+          "local": "2024-05-01 10:00:00",
+          "unix": 1714557600
+        },
+        "message_count": 1,
+        "name": "Dave",
+        "owner": false
+      },
+      {
+        "id": "tgid_alice",
+        "last_spoke": {
+          "local": "2024-06-04 12:00:00",
+          "unix": 1717502400
+        },
+        "message_count": 1,
+        "name": "爱丽丝",
+        "owner": true
+      },
+      {
+        "id": "gh_e2e_owner",
+        "last_spoke": {
+          "local": "2024-06-04 12:01:00",
+          "unix": 1717502460
+        },
+        "message_count": 1,
+        "name": "Owner",
+        "owner": false
+      },
+      {
+        "id": "tgid_carol",
+        "last_spoke": {
+          "local": "2024-06-04 12:02:00",
+          "unix": 1717502520
+        },
+        "message_count": 1,
+        "name": "卡罗",
+        "owner": false
+      },
+      {
+        "id": "tgid_bob",
+        "last_spoke": {
+          "local": "2024-06-04 12:05:00",
+          "unix": 1717502700
+        },
+        "message_count": 2,
+        "name": "Bob",
+        "owner": false
+      }
+    ],
+    "total_members": 6
+  }
+}

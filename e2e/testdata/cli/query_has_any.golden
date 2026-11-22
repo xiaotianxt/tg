@@ -1,0 +1,8 @@
+exit: 0
+type	body
+43	[视频 320x240 aaaabbbbccccddddeeeeffff00001111]
+47	[sticker:aabbccddeeff00112233445566778899]
+25769803825	[文件] report.pdf (2KB)
+34	[voice:4:7s] 这是语音转文字
+3	[img:0123456789abcdef0123456789abcdef]
+View images: tg media <chat> <id>... (ids from [img:<id>])

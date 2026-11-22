@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "query is required",
+      "type": "text"
+    }
+  ],
+  "isError": true
+}

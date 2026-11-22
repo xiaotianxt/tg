@@ -1,0 +1,41 @@
+{
+  "content": [
+    {
+      "text": "<structuredContent>",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "messages": [
+      {
+        "sender": "我",
+        "sender_id": "gh_e2e_owner",
+        "session": {
+          "id": "tgid_alice",
+          "name": "爱丽丝"
+        },
+        "text": "还没有，一起去吃饭吧",
+        "time": {
+          "local": "2024-06-01 09:00:30",
+          "unix": 1717232430
+        },
+        "type": "text"
+      },
+      {
+        "sender": "爱丽丝",
+        "sender_id": "tgid_alice",
+        "session": {
+          "id": "tgid_alice",
+          "name": "爱丽丝"
+        },
+        "text": "早上好，今天吃饭了吗？",
+        "time": {
+          "local": "2024-06-01 09:00:00",
+          "unix": 1717232400
+        },
+        "type": "text"
+      }
+    ]
+  }
+}

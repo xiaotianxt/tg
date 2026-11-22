@@ -1,7 +1,10 @@
 # Direct Source Store Design
 
-Status: approved for implementation. Independent CLI/interface, end-to-end,
-and Rust/security/release reviewers returned `PASS` on 2026-08-02.
+Status: implemented. Independent CLI/interface, end-to-end, and
+security/release reviewers returned `PASS` on 2026-08-02 for the Rust 2.x
+implementation; tg 3.0 carries the same contract to Go (`internal/store` and
+`internal/sqlcipher`, see [`go-architecture.md`](go-architecture.md)). Module
+names below are the Go packages.
 
 ## Decision
 
@@ -27,7 +30,7 @@ snapshots.
 
 ## Non-goals
 
-- A public Rust library interface.
+- A public Go library interface.
 - A generic database repository, VFS, connection pool, or storage abstraction.
 - A cross-database atomic snapshot. SQLite can provide a snapshot per database,
   but not one transaction spanning independent files.
@@ -39,8 +42,8 @@ snapshots.
 
 ### High-level `History` facade
 
-An interface such as `History::sessions`, `History::messages`, and
-`History::export` would hide the most details from `main.rs`, but it would either
+An interface such as `History.Sessions`, `History.Messages`, and
+`History.Export` would hide the most details from `cmd/tg`, but it would either
 move the existing domain implementations into one god module or merely forward
 to them. It is broader than the storage problem and fails the deletion test.
 
@@ -48,46 +51,40 @@ to them. It is broader than the storage problem and fails the deletion test.
 
 An interface based on `ReadScope`, `DatabaseRole`, and callbacks would prevent
 callers from seeing database names, but those names and schemas are already
-domain knowledge in `db.rs`, `query.rs`, and `export.rs`. Scope policy and query
+domain knowledge in `history`, `query`, and `export`. Scope policy and query
 parallelism would be duplicated in the storage layer.
 
 ### Custom decrypting VFS
 
 A custom VFS could promise stricter control over filesystem writes, but it would
 need to reproduce SQLite pager, WAL-index, locking, recovery, and SQLCipher HMAC
-behavior. That unsafe implementation is unnecessary because SQLCipher already
+behavior. That implementation is unnecessary because SQLCipher already
 implements the required mechanism.
 
 ## Module and interface
 
-The seam lives in `src/source_store.rs`:
+The seam lives in `internal/store`:
 
-```rust
-pub(crate) struct SourceStore {
-    // source root, exact relative-path catalog, and zeroizing keys
+```go
+type Store struct {
+    // source root, exact relative-path catalog, and decoded keys
 }
 
-impl SourceStore {
-    pub(crate) fn discover(
-        db_dir: Option<&Path>,
-        keys_path: &Path,
-    ) -> Result<Self, String>;
+func Discover(dbDir, keysPath string) (*Store, error)
 
-    pub(crate) fn databases(&self) -> impl Iterator<Item = &str>;
-
-    pub(crate) fn open(&self, relative_path: &str)
-        -> Result<rusqlite::Connection, String>;
-}
+func (s *Store) Databases() []string
+func (s *Store) Open(rel string) (*sqlcipher.Conn, error)
+func (s *Store) OpenOptional(rel string) (*sqlcipher.Conn, error)
+func (s *Store) Close() error // removes this command's snapshot clones
 ```
 
-This is the whole external interface. There is no trait because there is one
-implementation. There is no connection wrapper because SQLite open flags and
-`query_only` enforce the safety property, while a wrapper would only forward the
-large `rusqlite::Connection` interface.
+There is no interface type because there is one implementation.
+`internal/sqlcipher.Conn` is the minimal cgo binding (prepare, bind, step,
+column reads); SQLite open flags and `query_only` enforce the safety property.
 
 ### Interface contract
 
-`discover`:
+`Discover`:
 
 - uses `db_dir` when supplied, otherwise performs the current local source
   auto-detection shared with `tg keys`;
@@ -96,16 +93,16 @@ large `rusqlite::Connection` interface.
 - reads `all_keys.json` once, requires a regular key file with no group/other
   permission bits, accepts only exact relative-path key matches, and rejects
   malformed 32-byte keys;
-- keeps decoded keys in zeroizing fixed-size buffers and never includes them in
-  logs or errors;
+- keeps decoded keys in fixed-size arrays and never includes them in logs or
+  errors;
 - does not open every database, derive keys, run PBKDF2, or write any file.
 
-`databases` exposes only catalogued relative names such as
+`Databases` exposes only catalogued relative names such as
 `message/message_0.db`. It never exposes an absolute source path or key. Callers
 retain their existing schema-aware selection rules. A caller that needs to use a
 name across scoped worker threads copies that short relative name.
 
-`open` accepts a name only when it exists in the frozen catalog. It returns a
+`Open` accepts a name only when it exists in the frozen catalog. It returns a
 new, independently keyed read-only connection whose snapshot is pinned before
 returning. The snapshot lasts until that active read transaction ends. Current
 reader modules must not issue `BEGIN`, `COMMIT`, `END`, or `ROLLBACK`; the
@@ -116,48 +113,40 @@ connections to the same database: it scans each FTS content table on its own
 connection, so each table is read from one snapshot but different tables may
 come from slightly different instants, as with message shards.
 
-The module returns contextual `String` errors, matching the rest of this
-crate. No caller needs to branch on storage error variants after refresh and
+The package returns contextual errors. No caller needs to branch on storage error variants after refresh and
 fallback behavior is removed. Errors identify only the relative database and
 operation; they never contain key material.
 
 ## Connection sequence
 
-`SourceStore::open` performs this sequence in one narrow implementation:
+`Store.Open` performs this sequence in one narrow implementation:
 
 1. Look up the exact catalog entry; arbitrary paths and `..` are not joined.
 2. Read the 16-byte page salt from that source database rather than trusting a
    duplicated JSON value.
-3. Open the real path with `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX`.
-   Do not use a URI and never set `immutable=1`.
-4. Build a zeroizing 99-byte SQLCipher keyspec:
+3. Open the real path with `SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX`.
+   Do not pass a URI and never set `immutable=1`.
+4. Build a 99-byte SQLCipher keyspec:
    `x'` + 64 key hex bytes + 32 salt hex bytes + `'`.
-5. Call the bundled `rusqlite::ffi::sqlite3_key` in the module's only new
-   `unsafe` block. Passing the raw 48 bytes directly is forbidden because
-   SQLCipher would interpret them as a passphrase and run PBKDF2 again.
+5. Call the vendored `sqlite3_key` through cgo, then clear the keyspec
+   buffer. Passing the raw 48 bytes directly is forbidden because SQLCipher
+   would interpret them as a passphrase and run PBKDF2 again.
 6. Set `cipher_compatibility = 4`, `query_only = ON`, and
    `temp_store = MEMORY` before reading database pages.
-7. Verify `Connection::is_readonly(MAIN_DB)`.
-8. Execute `BEGIN` and read `sqlite_schema`. This both validates the key/cipher
+7. Execute `BEGIN` and read `sqlite_schema`. This both validates the key/cipher
    format and pins that database's SQLite snapshot for the active transaction.
-   On macOS the first open of a database per command runs steps 3–8 on the
+   On macOS the first open of a database per command runs steps 3–7 on the
    live file, clones it while pinned, and then runs them on the clone (see the
    WAL contract below).
-9. Return the connection with that read transaction active. Existing reader
-   modules may prepare and run queries but must not execute transaction-control
-   SQL. Dropping the connection ends the transaction and erases the Rust-owned
-   key buffers on their normal lifetimes.
+8. Return the connection with that read transaction active. Reader packages
+   may prepare and run queries but must not execute transaction-control SQL.
+   Closing the connection ends the transaction.
 
-The `unsafe` block must have a local `SAFETY` proof covering the live SQLite
-handle, keyspec pointer and length, return-code handling, and buffer lifetime.
-The implementation uses the generated `ffi::sqlite3_key` declaration and does
-not redeclare the C symbol.
-
-Key-bearing JSON input, decoded keys, temporary JSON strings, and keyspecs are
-zeroized on their normal Rust lifetimes. Internal key types do not implement
-`Debug`, `Display`, or `Serialize`. This is best-effort process-memory hygiene;
-it does not claim to erase allocator copies, core dumps, or SQLCipher's internal
-key schedule before the connection closes.
+Read-only mode comes from the open flag and `query_only`; a test proves write
+SQL is rejected. Keyspecs and derived keys are cleared after use. This is
+best-effort process-memory hygiene: Go's garbage collector may leave copies,
+and it does not claim to erase core dumps or SQLCipher's internal key schedule
+before the connection closes.
 
 Do not add retries or a busy timeout without a reproduced failure. A SQLite
 busy, recovery, I/O, missing-key, or invalid-key/cipher error is returned with
@@ -165,20 +154,12 @@ an actionable instruction to run `tg keys` where appropriate.
 
 ## SQLCipher dependency
 
-Implementation changes the already-upgraded dependency to:
-
-```toml
-rusqlite = {
-    version = "0.40.1",
-    default-features = false,
-    features = ["bundled-sqlcipher-vendored-openssl"],
-}
-```
-
-`libsqlite3-sys 0.38.1` bundles SQLCipher 4.14.0 and enables FTS5. Vendored
-OpenSSL gives all three release targets one SQLite/SQLCipher/crypto provider and
-prevents Linux artifacts from depending on the runner's `libcrypto.so` ABI.
-The accepted costs are a slower build and a larger single executable.
+`internal/sqlcipher` compiles the vendored SQLCipher 4.14.0 amalgamation
+(SQLite 3.51.3) with cgo, with FTS5 enabled and extension loading omitted. The
+crypto provider is the system CommonCrypto on macOS and OpenSSL's libcrypto,
+linked statically, on Linux, so no artifact depends on an external
+sqlite/sqlcipher/crypto/ssl shared library or on the runner's `libcrypto.so`
+ABI.
 
 This does not make Linux artifacts fully static: they retain the platform libc
 dependency. Linux releases target glibc 2.35 or newer, are built and smoked in
@@ -187,8 +168,8 @@ symbol. They are also smoked on the current Ubuntu runner. The support claim is
 explicitly “no external sqlite/sqlcipher/crypto/ssl dependency,” not “runs on
 every Linux distribution.”
 
-The release archive must include the project license plus SQLCipher and OpenSSL
-notices. It must not claim FIPS compliance.
+The release archive must include the project license plus SQLCipher, OpenSSL,
+Go, and Go module notices. It must not claim FIPS compliance.
 
 ## WAL and filesystem contract
 
@@ -210,7 +191,7 @@ every later connection to the database in the command read the clone. The pin
 keeps checkpoints from backfilling past the snapshot or restarting the WAL, so
 the two files, cloned at two instants, replay to one committed state. A clone
 is copy-on-write and stays encrypted; the directory is removed when the
-command's `SourceStore` drops. Where `clonefile` is unsupported (Linux, a
+command's `Store` closes. Where `clonefile` is unsupported (Linux, a
 non-APFS volume, or a source on another volume than the temporary directory)
 reads stay on the live file: a full copy would hold the live read for the
 copy's duration and write the whole database on every command.
@@ -232,44 +213,45 @@ is not part of this design.
 
 ## Ownership of behavior
 
-`SourceStore` owns only source discovery, cataloguing, key handling, SQLCipher
-initialization, read-only enforcement, and per-database snapshots.
+`internal/store` owns only source discovery, cataloguing, key decoding,
+SQLCipher initialization, read-only enforcement, and per-database snapshots.
 
-Existing modules continue to own:
+Other packages continue to own:
 
-- `db.rs`: session resolution, session/message reads, current group-member
-  activity, FTS table queries, global merge and display behavior;
-- `query.rs`: parameterized filters, limits, post-filtering, fields, sorting and
+- `history`, `resolve`, `contacts`, `msgdb`: session resolution,
+  session/message reads, current group-member activity, FTS table queries,
+  global merge;
+- `query`: parameterized filters, limits, post-filtering, fields, sorting and
   output formats;
-- `export.rs`: archive formats, media lookup, decoding and requested output;
-- `fts.rs`: compatible tokenizer registration and ideograph behavior;
-- `parallel.rs`: bounded worker scheduling;
-- `database_keys.rs` and `scanner.rs`: account-material capture, PBKDF2 key
-  derivation, verification, and the small `all_keys.json` file.
+- `export`: archive formats, media lookup, decoding and requested output;
+- `sqlcipher`: compatible tokenizer registration;
+- `par`: bounded worker scheduling;
+- `keys` and `capture`: account-material capture, PBKDF2 key derivation,
+  verification, and the small `all_keys.json` file.
 
 Two low-level mechanisms are deliberately shared instead of duplicated:
 
-- `paths.rs` finds `db_storage` below an explicit home directory; normal reads
+- `paths` finds `db_storage` below an explicit home directory; normal reads
   pass `$HOME`, while the privileged key-capture path passes the invoking user's
   resolved home;
-- `database_keys.rs` owns the serialized key types, source `.db` file record,
-  key-file loading/coverage inspection, deterministic file collection, page-1
-  reading, and first-page key verification. `scanner`, `doctor`, and
-  `SourceStore::discover` reuse those functions.
+- `keys` owns the key-file format, source `.db` file records, key-file
+  loading/coverage inspection, deterministic file collection, page-1 reading,
+  and first-page key verification. `capture`, `doctor`, and `store.Discover`
+  reuse those functions.
 
-`SourceStore` still owns the frozen per-command catalog and all keyed connection
+`store` still owns the frozen per-command catalog and all keyed connection
 behavior. These shared helpers are mechanisms needed by the independently
 existing `keys` command, not a second storage adapter.
 
 FTS tokenizer registration remains in the search implementation. The storage
 module must not infer query policy from a filename.
 
-`doctor` is intentionally not an ordinary `SourceStore` caller when setup is
-broken. It reports each prerequisite independently through the shared
-`paths.rs` source lookup and `database_keys.rs` catalog/key-coverage helpers,
-then exercises `SourceStore::discover/open` only when those prerequisites are
-available. This preserves multi-fault diagnostics without adding an inspection
-interface or parsing `SourceStore` error strings.
+`doctor` is intentionally not an ordinary `store` caller when setup is
+broken. It reports each prerequisite independently through the shared `paths`
+source lookup and `keys` catalog/key-coverage helpers, then exercises
+`store.Discover`/`Open` only when those prerequisites are available. This
+preserves multi-fault diagnostics without adding an inspection interface or
+parsing `store` error strings.
 
 ## Completeness and optional data
 
@@ -310,7 +292,7 @@ When source/key overrides are active, the error prints the corresponding
 The direct-reader release is a breaking storage cleanup:
 
 - delete `decrypt` and `refresh` commands;
-- delete `--decrypted-dir` and `paths::default_decrypted_dir`;
+- delete `--decrypted-dir` and the default decrypted directory;
 - add `--db-dir` and `--keys` source overrides to data-reading commands while
   preserving automatic source discovery and the default key path;
 - add matching `--db-dir` and `--output` options to `tg keys`, so every custom
@@ -320,15 +302,10 @@ The direct-reader release is a breaking storage cleanup:
 - rewrite `doctor` around source discovery, key coverage, SQLCipher, FTS, and
   WAL readability.
 
-After all commands migrate and pass differential tests, delete:
-
-- `src/cache.rs`;
-- all of `src/decrypt.rs`, after moving its small source-file/page-1/key
-  verification mechanisms into `database_keys.rs`;
-- `src/sqlite.rs::open_immutable`;
-- `find_decrypted_*`, refresh retry/warning branches, and decrypted-cache tests;
-- stale documentation for `.tg_index.db`, refresh/decrypt scopes, and retired
-  media commands.
+After all commands migrated and passed differential tests, the 2.x release
+deleted the decrypted cache, the immutable plaintext open, refresh retry and
+warning branches, decrypted-cache tests, and stale documentation for
+`.tg_index.db`, refresh/decrypt scopes, and retired media commands.
 
 Do not keep the old read path behind a feature flag or compatibility fallback.
 
@@ -345,7 +322,7 @@ are never guessed or deleted.
    keeps its old snapshot, and a new reader sees the next commit.
 3. Prove encrypted FTS5 plus the existing compatible tokenizer performs the
    current ideograph search.
-4. Implement only the three-method `SourceStore` interface.
+4. Implement only the small `store` interface.
 5. Migrate one vertical slice at a time: sessions/unread, messages/query,
    search, export, then doctor. Compare normalized old/new output against a
    fixed real source snapshot after every slice.
@@ -379,11 +356,12 @@ new approved design.
 | Disk | no `~/.tg/decrypted`, `*.tg-pages`, or new tg-owned DB after all reads |
 | macOS artifact | `otool -L` has no sqlite/sqlcipher/crypto/ssl dylib |
 | Linux artifacts | native x86_64/arm64 Ubuntu 22.04 build and smoke; no GLIBC symbol newer than 2.35; `ldd`/`readelf` has no sqlite/sqlcipher/crypto/ssl dependency |
-| Provider | one `libsqlite3-sys`; SQLCipher version nonempty; FTS5 enabled |
-| Release | archive contains project, SQLCipher, and OpenSSL license notices |
+| Provider | one vendored SQLCipher amalgamation; SQLCipher version nonempty; FTS5 enabled |
+| Release | archive contains project, SQLCipher, OpenSSL, Go, and Go module license notices |
 
-All current unit tests, rustfmt, Clippy with `-D warnings`, release builds, CLI
-help, and Homebrew smoke tests remain mandatory.
+`make check` (gofmt, `go vet`, unit tests, and the `e2e/` contract suite
+against the built binary), release builds, CLI help, and Homebrew smoke tests
+remain mandatory.
 
 ## Performance and disk acceptance
 
@@ -422,7 +400,5 @@ The implementation measurements and reproducible checks are recorded in
   <https://www.sqlite.org/wal.html>
 - SQLite WAL-index and SHM behavior:
   <https://sqlite.org/walformat.html>
-- rusqlite feature and build behavior:
-  <https://docs.rs/crate/rusqlite/latest/features>
 - SQLCipher Community license:
   <https://www.zetetic.net/sqlcipher/license/>

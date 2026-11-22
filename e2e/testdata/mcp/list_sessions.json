@@ -1,0 +1,76 @@
+{
+  "content": [
+    {
+      "text": "<structuredContent>",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "sessions": [
+      {
+        "id": "team@chatroom",
+        "last_active": {
+          "local": "2024-06-04 12:05:00",
+          "unix": 1717502700
+        },
+        "name": "项目群",
+        "unread": 5
+      },
+      {
+        "id": "tgid_bob",
+        "last_active": {
+          "local": "2024-06-03 08:27:00",
+          "unix": 1717403220
+        },
+        "name": "Bob",
+        "unread": 0
+      },
+      {
+        "id": "tgid_alice",
+        "last_active": {
+          "local": "2024-06-02 11:30:00",
+          "unix": 1717327800
+        },
+        "name": "爱丽丝",
+        "unread": 2
+      },
+      {
+        "id": "gh_news",
+        "last_active": {
+          "local": "2024-05-20 08:00:00",
+          "unix": 1716192000
+        },
+        "name": "News Feed",
+        "unread": 1
+      },
+      {
+        "id": "quiet@chatroom",
+        "last_active": {
+          "local": "2024-04-01 09:00:00",
+          "unix": 1711962000
+        },
+        "name": "Quiet Room",
+        "unread": 0
+      },
+      {
+        "id": "tgid_alicia",
+        "last_active": {
+          "local": "2024-03-01 09:00:00",
+          "unix": 1709283600
+        },
+        "name": "Alicia",
+        "unread": 0
+      },
+      {
+        "id": "tgid_unknown",
+        "last_active": {
+          "local": "2024-02-01 09:00:00",
+          "unix": 1706778000
+        },
+        "name": "tgid_unknown",
+        "unread": 3
+      }
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+exit: 0
+timestamp	type	raw_body	body
+1717234260	1	zlib compressed reply	zlib compressed reply
+1717234200	1	这条消息是压缩存储的 compressed zstd	这条消息是压缩存储的 compressed zstd

@@ -1,0 +1,11 @@
+exit: 0
+tg doctor
+
+ffmpeg: OK (/opt/e2e/bin/ffmpeg)
+voice decoder: OK (/opt/e2e/bin/voice-decoder)
+keys: MISSING (/nonexistent/e2e/keys.json)
+source db dir: OK (<DB_DIR>)
+source numbered message dbs: 2
+message key coverage: unknown
+live message WAL files: 0
+direct source: ERROR (Database keys are missing at /nonexistent/e2e/keys.json; run: tg keys --db-dir '<DB_DIR>' --output '/nonexistent/e2e/keys.json')

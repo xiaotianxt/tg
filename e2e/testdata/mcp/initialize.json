@@ -1,0 +1,14 @@
+{
+  "capabilities": {
+    "tools": {
+      "listChanged": false
+    }
+  },
+  "instructions": "Read-only access to the owner's personal Telegram chat history (Telegram聊天记录), private and group chats, read from their own device. Use it whenever an answer depends on what the owner and other people actually said: past discussions, what someone said or why they decided something, a conversation or relationship with a person, what a group has been talking about, who is active, or message counts. The user does not have to mention Telegram, chat history, or this tool. Do not use it for general knowledge, public facts about people, or writing that needs no past conversation. To answer: find a named person or group with list_sessions, then read the chat with read_messages; use search_messages to find a topic across all chats, query_messages for exhaustive or per-sender filters, list_members for a group's members and activity, and get_media to view images shown as [img:<id>]. Base answers on the messages you read and cite them. Local history can start late or have gaps; say so instead of concluding that nobody discussed something. Results contain private message text; quote only what the user asked for.",
+  "protocolVersion": "2025-06-18",
+  "serverInfo": {
+    "name": "tg",
+    "title": "tg chat history",
+    "version": "<VERSION>"
+  }
+}

@@ -1,0 +1,5 @@
+exit: 0
+time	session	sender	body
+2024-06-03 08:00:30	Bob	我	bob message 02
+2024-06-03 08:01:00	Bob	Bob	bob message 03
+2024-06-03 08:01:30	Bob	我	bob message 04

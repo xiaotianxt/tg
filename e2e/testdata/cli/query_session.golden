@@ -1,0 +1,6 @@
+exit: 0
+time	session	sender	body
+2024-06-02 11:30:00	爱丽丝	爱丽丝	最后一条 latest message
+2024-06-02 10:00:20	爱丽丝	我	收到 see you
+2024-06-02 10:00:00	爱丽丝	爱丽丝	第二天的消息 from shard one
+2024-06-01 09:55:00	爱丽丝	爱丽丝	line one\nline two\twith tab

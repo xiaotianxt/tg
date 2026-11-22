@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "Unknown argument: bogus",
+      "type": "text"
+    }
+  ],
+  "isError": true
+}

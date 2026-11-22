@@ -1,0 +1,41 @@
+{
+  "content": [
+    {
+      "text": "<structuredContent>",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "messages": [
+      {
+        "sender": "爱丽丝",
+        "sender_id": "tgid_alice",
+        "session": {
+          "id": "team@chatroom",
+          "name": "项目群"
+        },
+        "text": "大家好 welcome",
+        "time": {
+          "local": "2024-06-04 12:00:00",
+          "unix": 1717502400
+        },
+        "type": "text"
+      },
+      {
+        "sender": "Bob",
+        "sender_id": "tgid_bob",
+        "session": {
+          "id": "team@chatroom",
+          "name": "项目群"
+        },
+        "text": "明天开会 meeting tomorrow",
+        "time": {
+          "local": "2024-06-04 12:05:00",
+          "unix": 1717502700
+        },
+        "type": "text"
+      }
+    ]
+  }
+}

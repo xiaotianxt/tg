@@ -1,18 +1,38 @@
-## Gemini app connector now works
+## tg is now written in Go
 
-2.10.1 allowed only one of the three Google callback hosts that the Gemini app
-registers at once, so adding tg as a custom connector still failed with "the
-server rejected Google's redirect URL". `tg mcp serve` now also accepts
-`oauth-redirect-sandbox` and `oauth-redirect-test` under
-`googleusercontent.com`.
+3.0 replaces the Rust implementation with Go. The binary name, commands,
+flags, `~/.tg` files, MCP tools and endpoints stay the same; upgrade with
+`brew upgrade tg` and restart `tg mcp serve` if you run it.
 
-Enter the connector URL printed by `tg mcp status`, leave the client ID and
-secret empty, and approve with your owner passphrase.
+## Fixes that change output
 
-## Rejected registrations are logged
+- Voice messages show their real length. Current messages used to read as
+  `1s` and older ones showed milliseconds labelled as seconds.
+- A private message that starts with a link such as `https://…` keeps its
+  text; it was split into sender `https` and text `//…`.
+- `query` and `export` name the sender the same way `messages` does: your own
+  messages show as `我`, the other side of a private chat by name, and system
+  messages as `系统`.
+- A chat without a contact entry is shown by its username everywhere, never
+  by an internal table name.
+- Names containing terminal control or text-direction characters are shown
+  escaped as `\u{..}`, so a contact name can no longer recolor or reorder a
+  terminal line. Emoji display as before.
+- `query --until` is exclusive, like `messages` and the MCP tools.
+- `query --format json` writes keys in `--fields` order, and an empty result
+  prints nothing on stdout (the note goes to stderr).
+- `export` saves cached images with their real extension instead of `.dat`,
+  and skips (with a warning) encrypted media it cannot decrypt instead of
+  copying ciphertext.
+- Errors print once as `error: <message>`.
 
-When a client registers with a redirect URI that is not allowed, the server
-log now records the URIs it sent. Add one with
-`tg mcp init --redirect-uri <uri>` if you trust that client.
+## MCP
 
-Restart `tg mcp serve` after upgrading.
+- The HTTP endpoint rejects requests whose `Origin` names another site.
+- In remote mode, `list_sessions` and `diagnose` hide contact remarks like the
+  other tools, and `list_members` honours the lookback window.
+
+## Building from source
+
+Building needs Go, a C compiler and make (plus the OpenSSL development
+package on Linux) instead of Rust.

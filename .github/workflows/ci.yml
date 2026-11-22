@@ -14,35 +14,24 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
-
 jobs:
-  # Lint is platform-independent, so it runs once instead of on every target.
+  # Formatting is platform-independent, so it runs once.
   lint:
-    name: fmt + clippy
+    name: gofmt
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v7
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
+          go-version-file: go.mod
       - name: Format
-        run: cargo fmt --all -- --check
+        run: test -z "$(gofmt -l cmd internal e2e)"
 
-      - name: Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-
-  build:
-    name: build (${{ matrix.target }})
+  test:
+    name: test (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -56,42 +45,35 @@ jobs:
           - target: linux-arm64
             runner: ubuntu-24.04-arm
             uname: aarch64
-
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v7
         with:
-          key: ${{ matrix.target }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          go-version-file: go.mod
 
       - name: Install Linux packages
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            perl \
-            pkg-config
+          sudo apt-get install -y --no-install-recommends build-essential libssl-dev
 
       - name: Verify runner architecture
         run: test "$(uname -m)" = "${{ matrix.uname }}"
 
-      - name: Test
-        run: cargo test --locked --all-features
+      - name: Vet
+        run: go vet ./...
 
-      # Release is required here: the bundled-database check below asserts on
-      # the artifact that actually ships.
       - name: Build
-        run: cargo build --locked --release --bin tg
+        run: go build -trimpath -o target/tg ./cmd/tg
 
-      - name: Verify CLI
-        run: ./target/release/tg --help
+      - name: Test
+        run: TG_BIN="$PWD/target/tg" go test -count=1 ./...
 
       - name: Verify bundled database provider
         run: |
+          ./target/tg --help >/dev/null
           if [[ "${{ runner.os }}" == "Linux" ]]; then
-            ! ldd target/release/tg | grep -E 'lib(sqlite3|sqlcipher|crypto|ssl)'
+            ! ldd target/tg | grep -E 'lib(sqlite3|sqlcipher|crypto|ssl)'
           else
-            ! otool -L target/release/tg | grep -E 'lib(sqlite3|sqlcipher|crypto|ssl)'
+            ! otool -L target/tg | grep -E 'lib(sqlite3|sqlcipher|crypto|ssl)'
           fi

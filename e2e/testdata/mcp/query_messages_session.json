@@ -1,0 +1,69 @@
+{
+  "content": [
+    {
+      "text": "<structuredContent>",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "messages": [
+      {
+        "sender": "Bob",
+        "sender_id": "tgid_bob",
+        "session": {
+          "id": "team@chatroom",
+          "name": "项目群"
+        },
+        "text": "明天开会 meeting tomorrow",
+        "time": {
+          "local": "2024-06-04 12:05:00",
+          "unix": 1717502700
+        },
+        "type": "text"
+      },
+      {
+        "sender": "卡罗",
+        "sender_id": "tgid_carol",
+        "session": {
+          "id": "team@chatroom",
+          "name": "项目群"
+        },
+        "text": "[img:fedcba9876543210fedcba9876543210]",
+        "time": {
+          "local": "2024-06-04 12:02:00",
+          "unix": 1717502520
+        },
+        "type": "image"
+      },
+      {
+        "sender": "爱丽丝",
+        "sender_id": "tgid_alice",
+        "session": {
+          "id": "team@chatroom",
+          "name": "项目群"
+        },
+        "text": "大家好 welcome",
+        "time": {
+          "local": "2024-06-04 12:00:00",
+          "unix": 1717502400
+        },
+        "type": "text"
+      },
+      {
+        "sender": "Dave",
+        "sender_id": "tgid_dave",
+        "session": {
+          "id": "team@chatroom",
+          "name": "项目群"
+        },
+        "text": "old message from dave",
+        "time": {
+          "local": "2024-05-01 10:00:00",
+          "unix": 1714557600
+        },
+        "type": "text"
+      }
+    ]
+  }
+}

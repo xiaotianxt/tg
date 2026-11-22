@@ -1,6 +1,6 @@
 # MCP Server Design
 
-Status: implemented in `src/mcp/` (phases 1–3 and 5). Differences from the
+Status: implemented in `internal/mcp/` (phases 1–3 and 5). Differences from the
 text below:
 
 - Tools return `structuredContent` plus the same JSON as text, without an
@@ -101,65 +101,32 @@ ChatGPT web ──HTTPS──> mcp.example.com (VPS reverse proxy, TLS)
                                      └─ /mcp              (JSON-RPC, bearer token)
                                             │
                                             ▼
-                                     tool registry ──> db.rs / query.rs / doctor.rs
+                                     tool registry ──> history / query / doctor
                                             │
                                             ▼
-                                     SourceStore (read-only SQLCipher)
+                                     store (read-only SQLCipher)
 
 Claude Desktop ──spawn──> tg mcp stdio ──> same tool registry
 ```
 
 Module layout:
 
-| File | Responsibility |
+| Package | Responsibility |
 |---|---|
-| `src/mcp/mod.rs` | `tg mcp` subcommand wiring, config loading |
-| `src/mcp/protocol.rs` | JSON-RPC 2.0 framing, `initialize`, `tools/list`, `tools/call`, `ping`, version negotiation |
-| `src/mcp/tools.rs` | Tool definitions, input validation, calls into domain modules, output caps |
-| `src/mcp/stdio.rs` | Newline-delimited JSON over stdin/stdout |
-| `src/mcp/http.rs` | Streamable HTTP transport, Origin/Host checks, routing |
-| `src/mcp/oauth.rs` | Authorization server, token store, passphrase verification |
-| `src/mcp/policy.rs` | Session allow/deny lists, lookback window, audit log |
+| `cmd/tg/mcp.go` | `tg mcp` subcommand wiring, stdio loop |
+| `internal/mcp/rpc` | JSON-RPC 2.0 classification, `initialize`, `tools/list`, `tools/call`, `ping`, version negotiation (stateless) |
+| `internal/mcp/tools` | Tool definitions, argument validation, remote policy (allow/deny lists, lookback, name mode), output caps |
+| `internal/mcp/httpx` | Streamable HTTP transport, Host/Origin/size/auth checks, routing, audit log |
+| `internal/mcp/oauth` | Authorization server: grants, consents, codes and tokens as explicit states with pure transitions |
+| `internal/mcp/config` | Config, owner passphrase and OAuth state files |
 
 ## Prerequisite: separate data from rendering
 
-Today most domain functions print as they go. `db::read_messages` and
-`db::search_messages` return a count, `list_members` and `doctor::run` return
-`()`, and only `query` has a JSON writer. MCP needs the rows themselves.
-
-Before any MCP code, change each function to return a typed, `Serialize` result
-and move printing into `main.rs` (or a `render` module):
-
-```rust
-pub(crate) struct SessionSummary {
-    pub id: String,            // the stable session username
-    pub display_name: String,
-    pub kind: SessionKind,     // direct, group, official
-    pub unread_count: i64,
-    pub last_active: i64,      // unix seconds
-}
-
-pub(crate) struct MessageRecord {
-    pub session_id: String,
-    pub local_id: i64,
-    pub time: i64,
-    pub sender_id: Option<String>,
-    pub sender_name: String,
-    pub kind: MessageKind,     // text, image, voice, file, video, sticker, link, system, other
-    pub text: String,          // parsed body, never the raw XML
-}
-
-pub(crate) struct MessagePage {
-    pub session: SessionSummary,
-    pub messages: Vec<MessageRecord>,
-    pub next_offset: Option<usize>,
-}
-```
-
-Equivalent types cover search hits, members, and doctor checks. The CLI renders
-these types and must produce byte-identical output to today; existing CLI tests
-are the regression check. This step is worth doing even without MCP, because it
-gives every command a consistent `--format json`.
+The 2.x code printed from inside domain functions; MCP needed the rows
+themselves. The domain packages now return typed results
+(`history.SessionList`, `history.MessagePage`, search hits, member reports,
+`doctor` reports) and `internal/render` turns them into CLI text, so the CLI
+and the MCP tools read the same values.
 
 ## Session identity
 
@@ -246,9 +213,8 @@ result instead of sent.
   Echo the client's version if supported, otherwise answer with the newest one.
   Re-check the current spec revision before implementation.
 - `serverInfo.name` is `tg`; tool descriptions use only neutral wording.
-- Handwritten on `serde_json`, which is already a dependency. The official
-  `rmcp` crate would bring in tokio and an HTTP framework, which is heavy for a
-  synchronous tool that serves one person.
+- Handwritten on `encoding/json` (see Dependencies for why not the official
+  SDK).
 
 ### stdio transport
 
@@ -284,9 +250,10 @@ it needs no auth, and policy limits apply only when `--remote-policy` is given.
 - **The HTTP mode always requires auth.** A "no auth on private addresses" mode
   would be unsafe here, because the gateway turns every public request into a
   request from a trusted tailnet peer. Local unauthenticated use goes through stdio instead.
-- HTTP library: `tiny_http` (synchronous, small, no TLS needed because the proxy
-  terminates TLS and the proxy-to-machine hop is WireGuard). Requests are handled on one worker thread with a bounded
-  queue; tg's own `jobs` setting already parallelizes the heavy reads.
+- HTTP library: Go's `net/http` (no TLS needed because the proxy terminates
+  TLS and the proxy-to-machine hop is WireGuard). MCP requests run one at a
+  time under a mutex; tg's own `jobs` setting already parallelizes the heavy
+  reads.
 
 ## Auth: a single-user authorization server inside tg
 
@@ -525,13 +492,13 @@ shows a manual plist instead.
 
 Each phase lands on its own and is usable.
 
-1. **Structured results.** Return `Serialize` types from `db.rs`, `query.rs`,
-   and `doctor.rs`; the CLI renders them. Check: existing CLI tests pass with
+1. **Structured results.** Return typed results from the history, query, and
+   doctor code; the CLI renders them. Check: existing CLI tests pass with
    unchanged output, plus unit tests for the new types.
 2. **stdio MCP.** Protocol, tool registry, session identity rules, caps. Check:
    protocol tests with scripted JSON-RPC exchanges over a fixture database, and
    a manual run in MCP Inspector and Claude Desktop.
-3. **HTTP transport and OAuth.** `tiny_http`, the endpoints above, token store,
+3. **HTTP transport and OAuth.** `net/http`, the endpoints above, token store,
    passphrase, rate limits. Check: tests for PKCE, redirect allowlist, code
    reuse, refresh rotation and reuse detection, audience checks, and `401`
    discovery; then MCP Inspector against the loopback port.
@@ -543,15 +510,13 @@ Each phase lands on its own and is usable.
 5. **Policy and audit.** Allow/deny lists, lookback clamp, anonymous default,
    audit log, `status`/`revoke`/`audit`.
 
-## New dependencies
+## Dependencies
 
-| Crate | Why | Alternatives rejected |
-|---|---|---|
-| `tiny_http` | Synchronous HTTP server on a private address | `axum`/`hyper` need tokio |
-| `getrandom` | Token and salt generation | Already a transitive dependency; make it direct |
-| `base64` | base64url for tokens and PKCE | Hand-rolled encoding |
-
-No TLS crate, no HTTP client, no JWT library.
+None beyond the standard library: `net/http`, `crypto/rand` for tokens and
+salts, and `encoding/base64` for base64url tokens and PKCE. No TLS library,
+no HTTP client, no JWT library. The JSON-RPC layer is hand-written because the
+official Go SDK negotiates protocol versions differently and changes the HTTP
+check order and error texts that clients already rely on.
 
 ## Open questions
 

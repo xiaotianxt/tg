@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "Chat: Bob (id: tgid_bob)\nReadable history starts 2024-06-03 08:00:00; nothing earlier is available.\n4 messages in time order. Times are local; an indented line continues the message above it.\nSenders (name = id):\n  Bob = tgid_bob\n  我 = gh_e2e_owner\n== 2024-06-03 ==\n08:20 Bob: bob message 41\n08:20 我: bob message 42\n08:21 Bob: bob message 43\n08:21 我: bob message 44\n",
+      "type": "text"
+    }
+  ],
+  "isError": false
+}

@@ -1,0 +1,18 @@
+{
+  "content": [
+    {
+      "text": "0123456789abcdef0123456789abcdef (standard, 100B)",
+      "type": "text"
+    },
+    {
+      "data": "/9j/4Gpqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqampqag==",
+      "mimeType": "image/jpeg",
+      "type": "image"
+    },
+    {
+      "text": "ffffffffffffffffffffffffffffffff: not in the local cache (never downloaded, or cleared)",
+      "type": "text"
+    }
+  ],
+  "isError": false
+}

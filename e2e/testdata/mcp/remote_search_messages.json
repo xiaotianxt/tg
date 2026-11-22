@@ -1,0 +1,25 @@
+{
+  "content": [
+    {
+      "text": "<structuredContent>",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "hits": [
+      {
+        "session": {
+          "id": "tgid_alice",
+          "name": "Alice Zhang"
+        },
+        "text": "最后一条 lat…[truncated]",
+        "time": {
+          "local": "2024-06-02 11:30:00",
+          "unix": 1717327800
+        },
+        "type": "text"
+      }
+    ]
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "content": [
+    {
+      "text": "<structuredContent>",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "cached_members": 6,
+    "friends": [
+      {
+        "id": "tgid_bob",
+        "name": "Bob"
+      },
+      {
+        "id": "tgid_alice",
+        "name": "爱丽丝"
+      }
+    ],
+    "group": {
+      "id": "team@chatroom",
+      "name": "项目群"
+    }
+  }
+}
