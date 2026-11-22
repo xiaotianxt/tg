@@ -73,7 +73,10 @@ func TestExport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	golden(t, "export/chat.txt", maskOwnerSenders(string(txt)))
+	if header := realAppNames("Telegram 聊天记录: "); !strings.HasPrefix(string(txt), header) {
+		t.Errorf("chat.txt does not start with %q", header)
+	}
+	golden(t, "export/chat.txt", coverAppNames(maskOwnerSenders(string(txt))))
 	csv, err := os.ReadFile(filepath.Join(out, "chat.csv"))
 	if err != nil {
 		t.Fatal(err)

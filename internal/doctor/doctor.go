@@ -76,10 +76,10 @@ func (r *report) status(label string, s render.CheckStatus, detail string) {
 func (r *report) fact(label, detail string) { r.status(label, render.NoStatus, detail) }
 
 func (r *report) process() {
-	const label = "Telegram process"
+	label := dict.AppDisplayName + " process"
 	out, err := exec.Command("pgrep", "-x", dict.DesktopAppProcess()).Output()
 	if err != nil {
-		r.status(label, render.StatusMissing, "Telegram is not running.")
+		r.status(label, render.StatusMissing, dict.AppDisplayName+" is not running.")
 		return
 	}
 	line, _, _ := strings.Cut(string(out), "\n")

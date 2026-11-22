@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/xiaotianxt/tg/internal/dict"
 )
 
 // writeArchive writes chat.txt, chat.csv and chat.json into dir.
@@ -54,7 +56,7 @@ func writeFile(path string, write func(io.Writer) error) error {
 // `[time] sender: content` line per message. msgs is not empty.
 func writeTXT(w io.Writer, username, displayName string, msgs []message) error {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Telegram 聊天记录: %s (%s)\n", displayName, username)
+	fmt.Fprintf(&b, "%s 聊天记录: %s (%s)\n", dict.AppDisplayName, displayName, username)
 	fmt.Fprintf(&b, "总消息数: %d\n", len(msgs))
 	fmt.Fprintf(&b, "时间范围: %s ~ %s\n", msgs[0].Time, msgs[len(msgs)-1].Time)
 	b.WriteString(strings.Repeat("=", 60) + "\n\n")

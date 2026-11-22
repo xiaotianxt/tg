@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/xiaotianxt/tg/internal/decode"
+	"github.com/xiaotianxt/tg/internal/dict"
 	"github.com/xiaotianxt/tg/internal/env"
 	"github.com/xiaotianxt/tg/internal/logx"
 	"github.com/xiaotianxt/tg/internal/media"
@@ -252,7 +253,7 @@ func fileExportType(localType int64) int {
 // pictures in one batched JPEG stage, and warns about what was not saved.
 func exportMedia(e env.Env, src mediaSources, jobs []mediaJob, dir, username string, jobCount int) []MediaOutcome {
 	if !src.ok {
-		logx.Warnf("Telegram data directory not found, cached image/video/file export skipped")
+		logx.Warnf("%s data directory not found, cached image/video/file export skipped", dict.AppDisplayName)
 		return nil
 	}
 	if len(jobs) == 0 {

@@ -52,7 +52,12 @@ above it.
 - **Text decoding is byte-compatible.** The XML and protobuf readers copy the
   Rust string-scanning behaviour; do not swap in `encoding/xml`, which
   changes output on malformed input.
-- **Naming.** Public code uses `tg` / `telegram` / neutral words. The native
+- **Naming.** Public code uses `tg` / `telegram` / neutral words. Text tg
+  writes at runtime (help, errors, warnings, doctor, export headers, MCP
+  metadata, the installed skill) names the real app through `internal/dict`
+  (`AppDisplayName` or `RenderAppNames`), never the cover name; tests turn it
+  back into the cover name before comparing with checked-in files. Message
+  content is never rewritten. The native
   voice codec is "native voice"; its four-letter name is assembled from
   pieces in `internal/dict`, never written literally.
 

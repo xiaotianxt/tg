@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/xiaotianxt/tg/internal/decode"
+	"github.com/xiaotianxt/tg/internal/dict"
 	"github.com/xiaotianxt/tg/internal/env"
 	"github.com/xiaotianxt/tg/internal/media"
 	"github.com/xiaotianxt/tg/internal/resolve"
@@ -56,7 +57,7 @@ func runMedia(e env.Env, src *sourceFlags, session string, rawIDs []string, outp
 		}
 		fmt.Fprintf(w, "%s  %s  %s  %s\n", id, img.Variant, decode.FormatFileSize(uint64(len(img.Data))), path)
 		if img.Variant == "thumbnail" {
-			fmt.Fprintln(w, "  only the thumbnail is cached; open the image in Telegram to download it, then retry")
+			fmt.Fprintln(w, dict.RenderAppNames("  only the thumbnail is cached; open the image in Telegram to download it, then retry"))
 		}
 	}
 	if err := w.Flush(); err != nil {

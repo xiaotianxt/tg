@@ -24,7 +24,7 @@ func loginCapture(ctx context.Context, e env.Env, _ string, timeout int) (*keys.
 	if err := validateSudoCredentials(ctx, timeout); err != nil {
 		return nil, err
 	}
-	pid, err := telegramPID()
+	pid, err := clientPID()
 	if err != nil {
 		return nil, fmt.Errorf("Cannot find desktop process: %w", err)
 	}
@@ -45,10 +45,10 @@ func loginCapture(ctx context.Context, e env.Env, _ string, timeout int) (*keys.
 	})
 }
 
-func telegramPID() (int, error) {
+func clientPID() (int, error) {
 	out, err := exec.Command("pgrep", "-x", dict.DesktopAppProcess()).Output()
 	if err != nil {
-		return 0, fmt.Errorf("Telegram is not running.")
+		return 0, fmt.Errorf("%s is not running.", dict.AppDisplayName)
 	}
 	line := strings.TrimSpace(firstLine(string(out)))
 	pid, err := strconv.Atoi(line)

@@ -9,6 +9,7 @@ import (
 
 	"github.com/xiaotianxt/tg/internal/capture"
 	"github.com/xiaotianxt/tg/internal/contacts"
+	"github.com/xiaotianxt/tg/internal/dict"
 	"github.com/xiaotianxt/tg/internal/env"
 	"github.com/xiaotianxt/tg/internal/history"
 	"github.com/xiaotianxt/tg/internal/mcp"
@@ -83,7 +84,7 @@ func messagesLimit(limit uint, limitSet, sinceSet, allTime bool) (int, bool) {
 func newRoot(e env.Env) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "tg",
-		Short:         "Read Telegram messages from local databases",
+		Short:         dict.RenderAppNames("Read Telegram messages from local databases"),
 		Version:       version,
 		SilenceErrors: true,
 		SilenceUsage:  true,
