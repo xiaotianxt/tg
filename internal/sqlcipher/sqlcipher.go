@@ -93,6 +93,17 @@ const (
 	CodeCorrupt = 11
 )
 
+// SQLite marks itself initialized before it runs SQLCipher's setup
+// (SQLITE_EXTRA_INIT), so a thread whose first open overlaps another
+// thread's initialization can key a connection before SQLCipher is ready and
+// fail with "sqlcipher not initialized". Initializing here, before any
+// goroutine can open a database, closes that window.
+func init() {
+	if rc := C.sqlite3_initialize(); rc != codeOK {
+		panic(fmt.Sprintf("sqlcipher: sqlite3_initialize failed (SQLite code %d)", rc))
+	}
+}
+
 // IsCode reports whether err is a SQLite error with the given primary code.
 func IsCode(err error, code int) bool {
 	var e *Error

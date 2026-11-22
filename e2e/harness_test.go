@@ -210,6 +210,9 @@ func goldenRun(t *testing.T, name string, r Result, extra ...string) {
 	t.Helper()
 	got := fmt.Sprintf("exit: %d\n%s", r.Code, normalize(r.Stdout, extra...))
 	golden(t, filepath.Join("cli", name+".golden"), got)
+	if t.Failed() && r.Stderr != "" {
+		t.Logf("stderr:\n%s", r.Stderr)
+	}
 }
 
 var ansi = regexp.MustCompile("\x1b\\[[0-9;]*m")
