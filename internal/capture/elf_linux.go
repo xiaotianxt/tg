@@ -7,8 +7,6 @@ import (
 	"debug/elf"
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
 )
 
 // The account key material passes through the cipher configuration helper,
@@ -125,41 +123,32 @@ func findHook(binaryPath string) (hookLocation, error) {
 	}, nil
 }
 
-// runtimeAddress maps a hook's file offset to its load address in the running
-// process, using the executable mapping for the exact inode and path in the
-// process maps.
-func runtimeAddress(identity *processIdentity, hookFileOffset uint64) (uint64, error) {
-	mapsPath := fmt.Sprintf("/proc/%d/maps", identity.pid)
-	maps, err := os.ReadFile(mapsPath)
+// fileOffsetForVA converts a hook's virtual address to the file offset a
+// uprobe registers against, using the ELF loadable segments. The kernel
+// matches a uprobe by file offset within the mapped inode, so the conversion
+// goes through the program headers (PT_LOAD) rather than section headers.
+func fileOffsetForVA(binaryPath string, va uint64) (uint64, error) {
+	image, err := os.ReadFile(binaryPath)
 	if err != nil {
-		return 0, fmt.Errorf("Cannot read %s: %w", mapsPath, err)
+		return 0, fmt.Errorf("Cannot read desktop client binary: %w", err)
 	}
-	for _, line := range strings.Split(string(maps), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 6 || !strings.Contains(fields[1], "x") {
-			continue
-		}
-		startText, endText, ok := strings.Cut(fields[0], "-")
-		if !ok {
-			continue
-		}
-		start, err1 := strconv.ParseUint(startText, 16, 64)
-		end, err2 := strconv.ParseUint(endText, 16, 64)
-		mappingOffset, err3 := strconv.ParseUint(fields[2], 16, 64)
-		inode, err4 := strconv.ParseUint(fields[4], 10, 64)
-		if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
-			continue
-		}
-		if inode != identity.executableInode || fields[5] != identity.executablePath {
-			continue
-		}
-		mappingSize := end - start
-		if hookFileOffset < mappingOffset || hookFileOffset >= mappingOffset+mappingSize {
-			continue
-		}
-		return start + (hookFileOffset - mappingOffset), nil
+	f, err := elf.NewFile(bytes.NewReader(image))
+	if err != nil {
+		return 0, fmt.Errorf("Cannot parse desktop client ELF: %w", err)
 	}
-	return 0, fmt.Errorf("Cannot map capture hook into desktop client process %d", identity.pid)
+	defer f.Close()
+	var segments []loadSegment
+	for _, p := range f.Progs {
+		if p.Type != elf.PT_LOAD {
+			continue
+		}
+		segments = append(segments, loadSegment{
+			vaddr:  p.Vaddr,
+			offset: p.Off,
+			filesz: p.Filesz,
+		})
+	}
+	return fileOffsetFromSegments(segments, va)
 }
 
 func sectionBytes(f *elf.File, name string) (*sectionData, error) {

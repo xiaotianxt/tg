@@ -25,7 +25,7 @@ above it.
 | `internal/msgdb` | message table naming (`Msg_` + md5), schema probe, Name2Id, shard iteration, **the single raw-row reader** used by history, query and export |
 | `internal/voice` | native voice payload sniffing and the decoder protocol |
 | `internal/media` | media base discovery, export media index, per-id image cache, kvcomm media keys, V2 decrypt, sticker decrypt, ffmpeg conversion |
-| `internal/capture` | the `keys` flow as an explicit state machine; `lldb` (macOS), `gdb` + ELF hook locator + process identity (Linux) |
+| `internal/capture` | the `keys` flow as an explicit state machine; `lldb` (macOS), kernel uprobe + ELF hook locator + process identity (Linux) |
 | `internal/keys` | all_keys.json read/write (atomic, 0600), page-1 HMAC check, PBKDF2 derivation grouped by salt, key_material.bin |
 | `internal/decode` | **pure**: message types, byte-level XML scanning, protobuf wire reader, packed_info, decompression, `Decode(Raw, Ctx)`, media classification |
 | `internal/tgtime` | pure time parsing (`Parse(s, now, loc)`), buckets, local formatting |
@@ -61,6 +61,33 @@ above it.
   voice codec is "native voice"; its four-letter name is assembled from
   pieces in `internal/dict`, never written literally.
 
+## Linux key capture
+
+`keys --method login` on Linux captures the account key material with a kernel
+uprobe instead of attaching a debugger to the client. The ELF hook locator
+finds the account-material function's virtual address; the program headers
+convert it to a file offset, and a uprobe is registered against that offset in
+the client executable (`internal/capture/uprobe_linux.go`).
+
+The probe is defined through tracefs `uprobe_events` with memory-dereference
+fetch args: the 32-byte buffer is read as four `x64` words from the argument-1
+pointer register (`%si` / `%x1`) and the length from the argument-2 register
+(`%dx` / `%x2`). The dereference runs in kernel context at the hit, so the
+bytes are copied while they are still live; sampling only the pointer register
+and reading `/proc/pid/mem` afterwards would race the client freeing the
+buffer. Four fixed-width words parse out of `trace_pipe` more reliably than one
+array fetch arg, whose text form varies between kernels.
+
+This path needs no new runtime dependency — no bpftrace, no eBPF loader. It
+requires root (CAP_SYS_ADMIN) and a mounted tracefs with `CONFIG_UPROBE_EVENTS`
+(`/sys/kernel/tracing` or `/sys/kernel/debug/tracing`); a missing mount or
+permission gives a diagnostic naming the mount command. Capture runs in a
+dedicated trace instance scoped to the client process set (`set_event_pid` +
+`event-fork`) and filtered to the material length, and the flow is an explicit
+state machine (`captureState`) whose cleanup removes the event, the probe
+definition and the instance on every exit — success, timeout, Ctrl-C or error —
+so no uprobe is ever left registered. macOS is unchanged (`lldb_darwin.go`).
+
 ## Tests
 
 - `e2e/`: black-box contracts against a built binary with encrypted fixture
@@ -68,7 +95,8 @@ above it.
 - Go unit tests only for pure functions with many edge cases: time parsing,
   decode (message types, XML, protobuf, decompression), media decrypt and key
   vectors, KDF vectors, OAuth redirect validation and PKCE, session scoring,
-  query field/argument validation, escaping, ELF instruction decoding.
+  query field/argument validation, escaping, ELF instruction decoding,
+  uprobe file-offset conversion and trace-line parsing.
 - No unit tests that rebuild fixture databases per package, assert call
   order, or compare a parallel path with a serial one.
 - Build and test on the mini (`scripts/remote.sh make check`).

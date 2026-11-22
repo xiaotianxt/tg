@@ -60,12 +60,15 @@ sudo tg keys --method login --timeout 180
 
 命令等待期间，在 Telegram 中退出账号并重新登录。需要 Apple Command Line Tools；若缺少 `lldb`，运行 `xcode-select --install`。若系统提示 Developer Tools 权限，请允许当前终端应用。
 
-Linux 使用同一个接口，内部通过 GDB 捕获：
+Linux 使用同一个接口，内部通过内核 uprobe 捕获（无需安装调试器）：
 
 ```bash
-sudo apt install gdb
 sudo tg keys --method login --timeout 180
 ```
+
+需要 root（CAP_SYS_ADMIN）以及已挂载、启用 `CONFIG_UPROBE_EVENTS` 的 tracefs
+（`/sys/kernel/tracing` 或 `/sys/kernel/debug/tracing`）。若未挂载，先运行
+`sudo mount -t tracefs tracefs /sys/kernel/tracing`。
 
 以后直接运行下面的快速路径。它会复用权限为 `0600` 的 `~/.tg/key_material.bin`，验证已有 key，只为新 salt 派生密钥：
 
