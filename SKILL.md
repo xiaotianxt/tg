@@ -44,12 +44,16 @@ sudo tg keys --method login --timeout 180
 
 If Telegram is installed somewhere else, use that `.app` path instead.
 
-On Linux, install GDB and start the same cross-platform login capture:
+On Linux, start the same cross-platform login capture (a kernel uprobe is used,
+so no debugger needs installing):
 
 ```bash
-sudo apt install gdb
 sudo tg keys --method login --timeout 180
 ```
+
+This needs root (CAP_SYS_ADMIN) and a mounted tracefs with
+`CONFIG_UPROBE_EVENTS` (`/sys/kernel/tracing` or `/sys/kernel/debug/tracing`).
+If it is not mounted, run `sudo mount -t tracefs tracefs /sys/kernel/tracing`.
 
 While `login` is waiting, log out of the account in Telegram and log back in once. Then verify the direct reader:
 
@@ -195,7 +199,7 @@ Date, datetime, and displayed message times use the current system time zone.
 
 - `Telegram is not running`: open and log in to the desktop Telegram client, then run `sudo tg keys`.
 - macOS `task_for_pid failed`: quit Telegram, sign it as above, reopen it, then run `sudo tg keys --method login --timeout 180` and log out/in once while it waits.
-- Linux attach failure: install GDB, verify ptrace permissions, then run `sudo tg keys --method login --timeout 180`.
+- Linux capture failure: ensure tracefs is mounted (`sudo mount -t tracefs tracefs /sys/kernel/tracing`) and the kernel has `CONFIG_UPROBE_EVENTS`, then run `sudo tg keys --method login --timeout 180` and log out/in once while it waits.
 - No chats or messages found: run `sudo tg keys`, then `tg doctor` and `tg sessions --top 50`.
 - Wrong chat matched: use `tg sessions --top 100` and rerun with the exact `tgid_...` or `...@chatroom`.
 - Missing media: open or download it in Telegram first, then retry `tg media CHAT <id>` or `tg export CHAT`.

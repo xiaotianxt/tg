@@ -5,7 +5,6 @@ package capture
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/xiaotianxt/tg/internal/dict"
 	"github.com/xiaotianxt/tg/internal/env"
@@ -13,9 +12,10 @@ import (
 )
 
 // loginCapture (Linux) pins the client process identity, locates the
-// account-material hook in its executable, maps the hook into the running
-// process, then drives a trusted gdb to read the material at the hook during
-// a re-login.
+// account-material hook in its executable, converts the hook address to a file
+// offset, and registers a kernel uprobe that copies the material at the hook
+// during a re-login. Unlike the previous gdb flow it never attaches a debugger
+// to the client; the probe reads the buffer in kernel context at the hit.
 func loginCapture(ctx context.Context, _ env.Env, _ string, timeout int) (*keys.Material, error) {
 	identity, err := findInvokingUserMainProcess(dict.DesktopAppProcess())
 	if err != nil {
@@ -28,26 +28,28 @@ func loginCapture(ctx context.Context, _ env.Env, _ string, timeout int) (*keys.
 	if err := identity.verify(); err != nil {
 		return nil, err
 	}
-	runtimeAddr, err := runtimeAddress(identity, hook.fileOffset)
+	fileOffset, err := fileOffsetForVA(identity.procExePath(), hook.virtualAddress)
 	if err != nil {
 		return nil, err
 	}
-	gdbPath, err := findGDB()
-	if err != nil {
-		return nil, err
-	}
-	workDir, err := os.MkdirTemp("/tmp", "tg-gdb-material-")
-	if err != nil {
-		return nil, fmt.Errorf("Cannot create gdb capture directory: %w", err)
-	}
-	defer os.RemoveAll(workDir)
-	return gdbCapture(ctx, gdbRequest{
+	return uprobeCapture(ctx, uprobeRequest{
 		identity:        identity,
-		gdbPath:         gdbPath,
-		workDir:         workDir,
-		runtimeAddress:  runtimeAddr,
-		codeFingerprint: hook.codeFingerprint,
+		fileOffset:      fileOffset,
 		architecture:    hook.architecture,
+		codeFingerprint: hook.codeFingerprint,
 		timeout:         timeout,
 	})
+}
+
+// uprobeRequest carries everything a single uprobe capture needs.
+type uprobeRequest struct {
+	identity        *processIdentity
+	fileOffset      uint64
+	architecture    captureArch
+	codeFingerprint [hookFingerprintLen]byte
+	timeout         int
+}
+
+func (r uprobeRequest) describe() string {
+	return fmt.Sprintf("pid %d offset %#x", r.identity.pid, r.fileOffset)
 }
