@@ -148,13 +148,21 @@ func (r *report) source(e env.Env, requested string, kf keys.KeyFile, haveKeys b
 		r.status("source catalog", render.StatusError, err.Error())
 		return root
 	}
+	// shards are every database a message read may open: chat shards and
+	// official-account shards.
 	var shards []store.SourceDatabase
+	chat, official := 0, 0
 	for _, f := range files {
-		if n, ok := store.ShardNumber(f.RelPath); ok && n >= 0 {
+		if _, ok := store.ChatShard.Number(f.RelPath); ok {
 			shards = append(shards, f)
+			chat++
+		} else if _, ok := store.OfficialShard.Number(f.RelPath); ok {
+			shards = append(shards, f)
+			official++
 		}
 	}
-	r.fact("source numbered message dbs", strconv.Itoa(len(shards)))
+	r.fact("source numbered message dbs", strconv.Itoa(chat))
+	r.fact("source official-account dbs", strconv.Itoa(official))
 	coverage := "unknown"
 	if haveKeys {
 		covered := 0
@@ -163,7 +171,7 @@ func (r *report) source(e env.Env, requested string, kf keys.KeyFile, haveKeys b
 				covered++
 			}
 		}
-		coverage = fmt.Sprintf("%d/%d numbered dbs", covered, len(shards))
+		coverage = fmt.Sprintf("%d/%d message dbs", covered, len(shards))
 	}
 	r.fact("message key coverage", coverage)
 	hot := 0

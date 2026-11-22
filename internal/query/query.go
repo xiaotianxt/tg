@@ -69,8 +69,12 @@ func ParseMedia(s string) (Media, error) {
 type Options struct {
 	// Session is a session id or display name; "" searches every chat.
 	Session string
+	// Official also scans official-account shards when no Session is
+	// given; a selected session is read wherever its table lives.
+	Official bool
 	// Contains and Not match the decoded body (substring); RawContains the
-	// stored body (SQL LIKE). Match combines Contains and RawContains.
+	// raw (decompressed) body like SQL LIKE. Match combines Contains and
+	// RawContains.
 	Contains, Not, RawContains []string
 	// Has keeps messages carrying any of these media types.
 	Has []Media

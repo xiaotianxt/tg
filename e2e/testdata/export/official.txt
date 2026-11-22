@@ -1,0 +1,20 @@
+Telegram 聊天记录: News Feed (gh_news)
+总消息数: 5
+时间范围: 2024-05-19 08:00:00 ~ 2024-05-20 08:00:00
+============================================================
+
+[2024-05-19 08:00:00] News Feed: [文章] News Feed
+  · 今日要闻
+    https://example.com/news/1
+  · 第二篇
+    https://example.com/news/2
+[2024-05-19 12:00:00] News Feed: [文章] News Feed
+  · 午间快讯 - 只有一篇时显示摘要
+    https://example.com/news/3
+[2024-05-19 15:00:00] News Feed: [通知] 支付成功
+  付款金额：￥30.00
+  商户名称：示例便利店
+  零钱
+[2024-05-19 18:00:00] News Feed: [链接] 压缩推送 
+  https://example.com/news/4
+[2024-05-20 08:00:00] News Feed: biz shard secret

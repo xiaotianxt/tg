@@ -6,7 +6,8 @@ voice decoder: OK (/opt/e2e/bin/voice-decoder)
 keys: OK (8 keys in <KEYS>)
 source db dir: OK (<DB_DIR>)
 source numbered message dbs: 2
-message key coverage: 2/2 numbered dbs
+source official-account dbs: 1
+message key coverage: 3/3 message dbs
 live message WAL files: 0
 direct source: OK
 session db: OK

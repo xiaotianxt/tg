@@ -134,11 +134,14 @@ tg query --contains "项目" --contains "上线" --match-mode all --since today 
 tg query --contains "项目" --not "取消" --format json --fields timestamp,session,body --anonymous
 tg query --has voice --session "张三" --limit 20
 tg query --raw-contains "<appmsg" --fields time,session,raw_body --limit 20
+tg query --official --contains "¥" --since 30d --fields time,session,body
 tg query --session "产品讨论群" --sender "张三" --format json --fields timestamp,sender,sender_id,body
 tg messages "产品讨论群" --sender me --all-time
 ```
 
-`query` 扫描本地消息分片中由数据库索引约束出的候选行，再匹配解码后的正文，因此比 FTS 覆盖更完整。它不是原始 SQL 接口。`--has` 支持 `voice,image,sticker,file,video`；`--fields` 支持 `time,session,sender,sender_id,type,body,raw_body,timestamp`。
+`query` 扫描本地消息分片中由数据库索引约束出的候选行，再匹配解码后的正文，因此比 FTS 覆盖更完整。它不是原始 SQL 接口。`--raw-contains` 匹配解压后的原始正文（与 `raw_body` 字段一致，ASCII 不区分大小写）。
+
+公众号和服务号（订阅号文章推送、支付凭证等服务通知）的消息存在单独的分片里，上游 FTS 不收录，所以 `search` 搜不到。`messages`、`export` 和 `query --session` 可以像普通会话一样读取某个公众号；不指定会话的 `query` 默认只查聊天记录，加 `--official` 才会同时查公众号消息。`--has` 支持 `voice,image,sticker,file,video`；`--fields` 支持 `time,session,sender,sender_id,type,body,raw_body,timestamp`。
 
 `--sender`（`query` 和 `messages` 都支持）按发言人筛选：`me` 指本人，也可以传账号 id，或与输出里显示一致的名字（备注、昵称、群昵称，忽略大小写的精确匹配）。多个账号同名时会报错并列出各自的 id。`sender_id` 是稳定的账号 id，同一个人在不同会话、不同显示名下都相同；本人在所有输出里统一显示为“我”。`search` 走上游 FTS，不支持发言人筛选。
 

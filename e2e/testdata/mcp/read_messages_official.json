@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "Chat: News Feed (id: gh_news)\nReadable history starts 2024-05-19 08:00:00; nothing earlier is available.\n5 messages in time order. Times are local; an indented line continues the message above it.\nSenders (name = id):\n  News Feed = gh_news\n== 2024-05-19 ==\n08:00 News Feed: [文章] News Feed\n    · 今日要闻\n      https://example.com/news/1\n    · 第二篇\n      https://example.com/news/2\n12:00 News Feed: [文章] News Feed\n    · 午间快讯 - 只有一篇时显示摘要\n      https://example.com/news/3\n15:00 News Feed: [通知] 支付成功\n    付款金额：￥30.00\n    商户名称：示例便利店\n    零钱\n18:00 News Feed: [链接] 压缩推送 \n    https://example.com/news/4\n== 2024-05-20 ==\n08:00 News Feed: biz shard secret\n",
+      "type": "text"
+    }
+  ],
+  "isError": false
+}

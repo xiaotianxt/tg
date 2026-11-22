@@ -456,7 +456,9 @@ func insertMessages(d *db, ids map[string]int, session string, messages []msg) {
 const (
 	appType = 49
 	// App messages carry their subtype in the high 32 bits.
-	fileAppType = 6<<32 | appType
+	fileAppType     = 6<<32 | appType
+	linkAppType     = 5<<32 | appType
+	transferAppType = 2000<<32 | appType
 )
 
 func aliceDayOne() []msg {
@@ -535,10 +537,27 @@ func fillShard0(d *db) {
 
 func fillShard1(d *db) {
 	// A different Name2Id order than shard 0: sender ids are per shard.
-	ids := createShard(d, []string{team, bob, ownerID, alice, carol, dave})
+	ids := createShard(d, []string{team, bob, ownerID, alice, carol, dave, alicia})
 	insertMessages(d, ids, alice, aliceDayTwo())
 	insertMessages(d, ids, bob, bobChat())
 	insertMessages(d, ids, team, teamRecent())
+	insertMessages(d, ids, alicia, aliciaTransfer())
+}
+
+// aliciaTransfer is one transfer's life: she sends it (paysubtype 8, the
+// current format, with a memo), the owner accepts it (3).
+func aliciaTransfer() []msg {
+	transfer := func(subtype, memo string) string {
+		return `<msg><appmsg appid="" sdkver=""><title><![CDATA[转账]]></title>` +
+			`<des><![CDATA[收到转账12.50元。请在手机上查看]]></des><type>2000</type>` +
+			`<wcpayinfo><paysubtype>` + subtype + `</paysubtype><feedesc><![CDATA[￥12.50]]></feedesc>` +
+			`<transferid><![CDATA[e2e-transfer-1]]></transferid><pay_memo><![CDATA[` + memo + `]]></pay_memo>` +
+			`</wcpayinfo></appmsg></msg>`
+	}
+	return []msg{
+		{1, transferAppType, ts("2024-03-01 08:58:00"), alicia, transfer("8", "午饭"), nil, nil},
+		{2, transferAppType, ts("2024-03-01 09:00:00"), ownerID, transfer("3", ""), nil, nil},
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -614,11 +633,49 @@ func fillResources(d *db) {
 		message_local_id INTEGER, message_svr_id INTEGER, message_origin_source INTEGER, packed_info BLOB)`)
 }
 
-// The official-account shard is not a numbered message shard; nothing in it
-// may show up in message reads or queries.
+// The official-account shard holds article pushes (one with two articles,
+// one with a single article), a service notice, a compressed push whose raw
+// body carries a tag the decoded text does not, and a plain text row. Unscoped queries skip it
+// unless asked; reading the account itself finds every row.
 func fillBiz(d *db) {
 	ids := createShard(d, []string{news})
+	item := func(title, url, digest string) string {
+		return `<item><itemshowtype>0</itemshowtype><title><![CDATA[` + title + `]]></title>` +
+			`<url><![CDATA[` + url + `]]></url><shorturl></shorturl><pub_time>1716076800</pub_time>` +
+			`<digest><![CDATA[` + digest + `]]></digest><del_flag>0</del_flag>` +
+			`<sources><source><name><![CDATA[News Feed]]></name></source></sources></item>`
+	}
+	push := func(items ...string) string {
+		return `<msg><appmsg appid="" sdkver="0"><title><![CDATA[今日要闻]]></title><type>5</type>` +
+			`<url><![CDATA[https://example.com/news/1]]></url><mmreader>` +
+			fmt.Sprintf(`<category type="20" count="%d"><name><![CDATA[News Feed]]></name>`, len(items)) +
+			strings.Join(items, "") + `</category><publisher><username><![CDATA[gh_news]]></username>` +
+			`<nickname><![CDATA[News Feed]]></nickname></publisher></mmreader></appmsg>` +
+			`<fromusername><![CDATA[gh_news]]></fromusername></msg>`
+	}
 	insertMessages(d, ids, news, []msg{
-		{1, 1, ts("2024-05-20 08:00:00"), news, "biz shard secret", nil, nil},
+		{1, linkAppType, ts("2024-05-19 08:00:00"), news, push(
+			item("今日要闻", "https://example.com/news/1", "第一篇摘要"),
+			item("第二篇", "https://example.com/news/2", "第二篇摘要"),
+		), nil, nil},
+		{2, linkAppType, ts("2024-05-19 12:00:00"), news, push(
+			item("午间快讯", "https://example.com/news/3", "只有一篇时显示摘要"),
+		), nil, nil},
+		{3, linkAppType, ts("2024-05-19 18:00:00"), news,
+			zstdRaw(`<msg><appmsg><title>压缩推送</title><type>5</type><url>https://example.com/news/4</url><rawmark/></appmsg></msg>`), 4, nil},
+		{4, 1, ts("2024-05-20 08:00:00"), news, "biz shard secret", nil, nil},
+		// A service notice: its lines sit under template_detail; a hidden
+		// key shows only its value.
+		{5, linkAppType, ts("2024-05-19 15:00:00"), news,
+			`<msg><appmsg appid="" sdkver="0"><title><![CDATA[支付成功]]></title><type>5</type>` +
+				`<url><![CDATA[https://example.com/pay/1]]></url><mmreader>` +
+				`<category type="0" count="1"><name><![CDATA[News Feed]]></name><item><title><![CDATA[支付成功]]></title>` +
+				`<url><![CDATA[https://example.com/pay/1]]></url><pub_time>1716102000</pub_time></item></category>` +
+				`<publisher><username><![CDATA[gh_news]]></username><nickname><![CDATA[News Feed]]></nickname></publisher>` +
+				`<template_header><title><![CDATA[支付成功]]></title></template_header><template_detail><line_content>` +
+				`<topline><key><word><![CDATA[付款金额]]></word></key><value><word><![CDATA[￥30.00]]></word></value></topline>` +
+				`<lines><line><key><word><![CDATA[商户名称：]]></word></key><value><word><![CDATA[示例便利店]]></word></value></line>` +
+				`<line><key><word><![CDATA[支付方式]]></word><hide>1</hide></key><value><word><![CDATA[零钱]]></word></value></line></lines>` +
+				`</line_content></template_detail></mmreader></appmsg></msg>`, nil, nil},
 	})
 }

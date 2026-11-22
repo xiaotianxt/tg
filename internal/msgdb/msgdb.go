@@ -1,7 +1,8 @@
-// Package msgdb reads the numbered message shards: table naming, schema
-// probes, Name2Id, shard iteration, and the single raw-row reader that
-// messages, query and export build on. It returns raw rows; names and
-// decoding belong to contacts, resolve and decode.
+// Package msgdb reads the message shards (chat and official-account; see
+// store.ShardKind): table naming, schema probes, Name2Id, shard iteration,
+// and the single raw-row reader that messages, query and export build on.
+// It returns raw rows; names and decoding belong to contacts, resolve and
+// decode.
 package msgdb
 
 import (
@@ -167,7 +168,7 @@ func placeholders(n int) string {
 // ShardJobs is the worker count for per-shard reads.
 func ShardJobs(jobs int) int { return par.Jobs(jobs, par.SourceDBAutoCap) }
 
-// EachShard opens every message shard on up to ShardJobs(jobs) goroutines,
+// EachShard opens every chat shard on up to ShardJobs(jobs) goroutines,
 // calls f with its own connection, and returns results in shard order. The
 // first error in shard order wins, as a sequential read would report it.
 func EachShard[T any](st *store.Store, jobs int, f func(label string, conn *sqlcipher.Conn) (T, error)) ([]T, error) {

@@ -36,3 +36,29 @@ func TestOrderKeyNullFirstThenRowID(t *testing.T) {
 		t.Errorf("newest order: %+v", rows)
 	}
 }
+
+// likeMatch must agree with SQL LIKE on uncompressed rows: substring,
+// ASCII case-insensitive, wildcards literal, all or any term.
+func TestLikeMatchFollowsSQLLike(t *testing.T) {
+	cases := []struct {
+		body     string
+		terms    []string
+		matchAny bool
+		want     bool
+	}{
+		{"<msg><WCPayInfo>", []string{"wcpayinfo"}, false, true},
+		{"<msg><wcpayinfo>", []string{"WCPAYINFO"}, false, true},
+		{"收款 ÄB", []string{"äb"}, false, false}, // non-ASCII letters keep their case
+		{"收款 ÄB", []string{"收款"}, false, true},
+		{"100%", []string{"0%"}, false, true},
+		{"100", []string{"1%0"}, false, false}, // % is literal
+		{"alpha beta", []string{"alpha", "gamma"}, false, false},
+		{"alpha beta", []string{"alpha", "gamma"}, true, true},
+		{"alpha beta", []string{"delta", "gamma"}, true, false},
+	}
+	for _, c := range cases {
+		if got := likeMatch(c.body, c.terms, c.matchAny); got != c.want {
+			t.Errorf("likeMatch(%q, %q, any=%v) = %v, want %v", c.body, c.terms, c.matchAny, got, c.want)
+		}
+	}
+}

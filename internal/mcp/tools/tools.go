@@ -346,12 +346,15 @@ type queryResult struct {
 }
 
 func (t *tools) queryMessages(a args) (rpc.Result, error) {
-	if err := a.only("session", "contains", "not_contains", "match", "has", "sender", "since", "until", "all_time", "order", "offset"); err != nil {
+	if err := a.only("session", "include_official", "contains", "not_contains", "match", "has", "sender", "since", "until", "all_time", "order", "offset"); err != nil {
 		return rpc.Result{}, err
 	}
 	o := query.Options{Mode: t.policy.nameMode(), Jobs: t.Jobs, Loc: t.Env.Loc}
 	var err error
 	if o.Session, err = a.str("session"); err != nil {
+		return rpc.Result{}, err
+	}
+	if o.Official, err = a.bool("include_official"); err != nil {
 		return rpc.Result{}, err
 	}
 	if o.Contains, err = a.strList("contains"); err != nil {

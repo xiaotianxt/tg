@@ -121,25 +121,19 @@ func (s *Store) Databases() []string {
 	return out
 }
 
-// MessageShards lists message/message_N.db in numeric order.
-func (s *Store) MessageShards() []string {
-	var out []string
-	for rel := range s.databases {
-		if n, ok := ShardNumber(rel); ok && n >= 0 {
-			out = append(out, rel)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		a, _ := ShardNumber(out[i])
-		b, _ := ShardNumber(out[j])
-		return a < b
-	})
-	return out
-}
+// ShardKind is a family of numbered message databases. Every kind uses the
+// same Msg_<md5(username)> tables, and a session's table lives in one kind
+// only: chats in ChatShard, official accounts in OfficialShard.
+type ShardKind string
 
-// ShardNumber parses N from message/message_N.db.
-func ShardNumber(rel string) (int, bool) {
-	name, ok := strings.CutPrefix(filepath.ToSlash(rel), "message/message_")
+const (
+	ChatShard     ShardKind = "message/message_"
+	OfficialShard ShardKind = "message/biz_message_"
+)
+
+// Number parses N from <kind>N.db.
+func (k ShardKind) Number(rel string) (int, bool) {
+	name, ok := strings.CutPrefix(filepath.ToSlash(rel), string(k))
 	if !ok {
 		return 0, false
 	}
@@ -156,6 +150,34 @@ func ShardNumber(rel string) (int, bool) {
 	}
 	return n, true
 }
+
+// Shards lists the cataloged databases of the given kinds, kind by kind in
+// argument order, each in numeric order.
+func (s *Store) Shards(kinds ...ShardKind) []string {
+	var out []string
+	for _, k := range kinds {
+		start := len(out)
+		for rel := range s.databases {
+			if _, ok := k.Number(rel); ok {
+				out = append(out, rel)
+			}
+		}
+		part := out[start:]
+		sort.Slice(part, func(i, j int) bool {
+			a, _ := k.Number(part[i])
+			b, _ := k.Number(part[j])
+			return a < b
+		})
+	}
+	return out
+}
+
+// MessageShards lists the chat shards, message/message_N.db.
+func (s *Store) MessageShards() []string { return s.Shards(ChatShard) }
+
+// SessionShards lists every database that can hold a session's message
+// table: chat shards, then official-account shards.
+func (s *Store) SessionShards() []string { return s.Shards(ChatShard, OfficialShard) }
 
 // Open returns a read-only connection to rel inside a read transaction, so
 // every query on it sees one snapshot.

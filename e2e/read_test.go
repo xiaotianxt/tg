@@ -123,7 +123,10 @@ func TestMessages(t *testing.T) {
 		{name: "messages_bucket_year", args: []string{"messages", "team@chatroom", "--time-bucket", "1y"}},
 		{name: "messages_bucket_minute_alias", args: []string{"messages", "tgid_bob", "--time-bucket", "1min", "--limit", "4"}},
 		{name: "messages_no_contact", args: []string{"messages", "tgid_unknown"}},
-		{name: "messages_empty_session", args: []string{"messages", "gh_news"}},
+		// An official account's messages live in the official-account shard.
+		{name: "messages_official", args: []string{"messages", "gh_news"}},
+		{name: "messages_transfer", args: []string{"messages", "tgid_alicia"}},
+		{name: "messages_empty_session", args: []string{"messages", "quiet@chatroom"}},
 		{name: "messages_unknown_session", args: []string{"messages", "nobody-at-all"}},
 	})
 }
@@ -179,8 +182,15 @@ func TestQuery(t *testing.T) {
 		{name: "query_fields_raw", args: []string{"query", "--session", "tgid_alice", "--contains", "compressed", "--fields", "timestamp,type,raw_body,body"}},
 		{name: "query_max_cell_chars", args: []string{"query", "--contains", "bob message 5", "--max-cell-chars", "6", "--fields", "body"}},
 		{name: "query_anonymous", args: []string{"query", "--session", "team@chatroom", "--contains", "welcome", "--anonymous"}},
-		// Account-feed shards are not chat history.
+		// Unscoped queries skip official-account shards unless asked; naming
+		// the account reads it.
 		{name: "query_excludes_feed_shard", args: []string{"query", "--contains", "biz shard secret"}},
+		{name: "query_official", args: []string{"query", "--official", "--contains", "biz shard secret", "--fields", "session,sender,body"}},
+		{name: "query_official_session", args: []string{"query", "--session", "gh_news", "--fields", "type,body"}},
+		// Raw keywords match compressed bodies after decompression, with SQL
+		// LIKE's ASCII case folding.
+		{name: "query_raw_contains_compressed", args: []string{"query", "--official", "--raw-contains", "RAWMARK", "--fields", "session,type,body"}},
+		{name: "query_transfer", args: []string{"query", "--contains", "[转账]", "--fields", "session,sender,type,body"}},
 		{name: "query_no_rows", args: []string{"query", "--contains", "zzz-nothing"}},
 		{name: "query_refuses_everything", args: []string{"query"},
 			stderrHas: []string{"refusing to return every message"}},

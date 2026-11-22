@@ -187,7 +187,7 @@ func ProbeSession(st *store.Store, query string, o resolve.Options) (SessionProb
 		n     int64
 		found bool
 	}
-	per, err := msgdb.EachShard(st, o.Jobs, func(label string, conn *sqlcipher.Conn) (count, error) {
+	per, err := msgdb.EachDB(st, st.SessionShards(), o.Jobs, func(label string, conn *sqlcipher.Conn) (count, error) {
 		ok, err := conn.TableExists(table)
 		if err != nil || !ok {
 			return count{}, err

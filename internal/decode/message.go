@@ -511,9 +511,12 @@ func decodeLinkContent(content string, packed []byte, ctx Ctx) string {
 		return decodePatContent(content)
 	}
 
-	subType, _ := ExtractXMLTagInt(content, "type")
+	subType := appMessageType(content)
 	switch subType {
 	case 5:
+		if push, ok := decodeOfficialPush(content); ok {
+			return push
+		}
 		if info, ok := ParseLinkInfo(content); ok {
 			return displayLinkInfo(info)
 		}
@@ -548,13 +551,33 @@ func decodeLinkContent(content string, packed []byte, ctx Ctx) string {
 		}
 		return decodeAppCardFallback(subType, "卡片", content)
 	case 2000:
+		if transfer, ok := decodeTransfer(content); ok {
+			return transfer
+		}
 		return decodeAppCardFallback(subType, "转账", content)
 	case 2001:
+		if packet, ok := decodeRedPacket(content); ok {
+			return packet
+		}
 		return decodeAppCardFallback(subType, "红包", content)
 	case 51:
 		return decodeShortVideoOrLegacyReference(content)
 	}
 	return decodeAppCardFallback(subType, "卡片", content)
+}
+
+// appMessageType is the first `<type>` as a number, 0 when absent. Some
+// clients wrap it in CDATA, as they do every other appmsg field.
+func appMessageType(content string) int64 {
+	v, ok := ExtractXMLTag(content, "type")
+	if !ok {
+		return 0
+	}
+	n, err := strconv.ParseInt(StripCDATA(v), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func decodePatContent(content string) string {

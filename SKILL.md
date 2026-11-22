@@ -27,6 +27,8 @@ For summary requests, choose display names by the target. If the user clearly na
 `~/.tg/all_keys.json` and `~/.tg/key_material.bin` are sensitive local state. Read commands open Telegram's encrypted databases directly and never create a decrypted database cache.
 For exhaustive keyword lookup over locally cached messages, prefer `tg query --contains "..."`; `tg search` is the faster upstream-FTS path and does not cover every message type or nested card body.
 
+Official accounts (subscription articles, and service notices such as payment receipts) live outside chat history and outside `search`. Read one with `tg messages <account>`; include them in an unscoped lookup with `tg query --official ...` (for example payment receipts: `tg query --official --contains "¥" --since 30d`).
+
 ## First Setup
 
 For a fresh setup, ask the user to open and log in to the desktop Telegram client first.
@@ -119,6 +121,7 @@ tg query --session "产品讨论群" --contains "关键词" --fields time,sender
 tg query --contains "项目" --contains "上线" --match-mode all --since today --anonymous
 tg query --contains "项目" --not "已取消" --format json --fields timestamp,session,body --anonymous
 tg query --session "产品讨论群" --sender "张三" --format json --fields timestamp,sender,sender_id,body
+tg query --official --contains "¥" --since 30d --fields time,session,body
 tg messages "产品讨论群" --sender me --all-time
 ```
 

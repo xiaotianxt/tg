@@ -257,9 +257,13 @@ parsing `store` error strings.
 
 - `sessions` and `unread` require `session/session.db`; contact data is optional
   and missing contacts continue to render raw identifiers.
-- `messages` and `query` require every catalogued numbered message shard to open
-  and query successfully. A present shard failure aborts the command instead of
-  returning partial results.
+- `messages`, `export` and `query` require every catalogued message shard they
+  read to open and query successfully. A present shard failure aborts the
+  command instead of returning partial results. Reading one session opens the
+  numbered chat shards and the official-account shards
+  (`message/biz_message_N.db`), since its table lives in one of them; an
+  unscoped `query` reads chat shards only unless `--official` adds the
+  official-account shards.
 - `members` requires a complete current-member relation from
   `contact/contact.db` and every numbered message shard. It fails instead of
   presenting historical senders as a complete current roster.

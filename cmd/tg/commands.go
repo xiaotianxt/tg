@@ -342,7 +342,7 @@ func searchCmd(e env.Env) *cobra.Command {
 func queryCmd(e env.Env) *cobra.Command {
 	var session, sender, since, until, fields string
 	var contains, notContains, rawContains []string
-	var allTime, anonymous bool
+	var allTime, anonymous, official bool
 	var limit, offset, maxCell uint
 	has := &enumListValue{allowed: []string{"voice", "image", "sticker", "file", "video"}}
 	order := newEnum("newest", "newest", "oldest")
@@ -356,6 +356,7 @@ func queryCmd(e env.Env) *cobra.Command {
 	src := addSource(cmd, e)
 	f := cmd.Flags()
 	f.StringVar(&session, "session", "", "Optional session username (tgid_xxx) or display name to search within")
+	f.BoolVar(&official, "official", false, "Also search official-account messages (articles and service notices such as payment receipts) when no --session is given")
 	f.StringArrayVar(&contains, "contains", nil, "Keyword that must appear in message text; repeat for multiple keywords")
 	f.StringArrayVar(&notContains, "not", nil, "Keyword that must not appear in message text; repeat for multiple keywords")
 	f.StringArrayVar(&rawContains, "raw-contains", nil, "Keyword that must appear in the raw database message body; repeat for multiple keywords")
@@ -381,7 +382,7 @@ func queryCmd(e env.Env) *cobra.Command {
 			session: session, sender: sender, since: since, until: until, fields: fields,
 			contains: contains, not: notContains, rawContains: rawContains, has: has.values,
 			limit: limit, offset: offset, order: order.value, match: match.value, format: format.value,
-			maxCellChars: maxCell, anonymous: anonymous,
+			maxCellChars: maxCell, anonymous: anonymous, official: official,
 		})
 	})
 	return cmd

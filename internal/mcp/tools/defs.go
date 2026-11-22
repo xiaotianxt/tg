@@ -84,7 +84,7 @@ var definitions = []definition{
 	},
 	{
 		name: "search_messages", title: "Search messages",
-		description: dict.RenderAppNames("Use this when answering needs what people previously said or discussed about a topic, across private and group Telegram chats, including indirect questions that never mention Telegram or chat history (why someone decided something, who talked about a subject, what was said about a plan). Fast keyword search on the client's own index, over the full history unless `since` is given; it can miss some card and notice text, so use query_messages when completeness matters. Returns every match, newest first. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset."),
+		description: dict.RenderAppNames("Use this when answering needs what people previously said or discussed about a topic, across private and group Telegram chats, including indirect questions that never mention Telegram or chat history (why someone decided something, who talked about a subject, what was said about a plan). Fast keyword search on the client's own index, over the full history unless `since` is given; it can miss some card and notice text and never covers official accounts (articles, payment receipts), so use query_messages (with include_official for official accounts) when completeness matters. Returns every match, newest first. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset."),
 		properties: map[string]any{
 			"query":  map[string]any{"type": "string", "minLength": 1},
 			"since":  str(timeHint),
@@ -94,9 +94,11 @@ var definitions = []definition{
 	},
 	{
 		name: "query_messages", title: "Filter messages",
-		description: "Use this for exhaustive or precise lookups: everything one person said (`sender`), messages with a media type, keyword combinations with exclusions, or counting messages in a period. Structured message filter across all chats or one chat: keywords to include/exclude, media type, sender, and a time range. Each message carries `sender` (the account owner is 我) and its stable `sender_id`. Slower than search_messages but exhaustive. Covers the full history unless `since` is given; with no session, give at least one filter or `since`. Returns every match. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset. To read every message of one chat in a period, use read_messages instead.",
+		description: "Use this for exhaustive or precise lookups: everything one person said (`sender`), messages with a media type, keyword combinations with exclusions, or counting messages in a period. Structured message filter across all chats or one chat: keywords to include/exclude, media type, sender, and a time range. Official-account messages (subscription articles, and service notices such as payment receipts) are searched only with include_official or when session names that account. Each message carries `sender` (the account owner is 我) and its stable `sender_id`. Slower than search_messages but exhaustive. Covers the full history unless `since` is given; with no session, give at least one filter or `since`. Returns every match. Only if the matches exceed the result size cap is the result trimmed, with `truncated: true` and `next_offset`; then repeat the same call with offset=next_offset. To read every message of one chat in a period, use read_messages instead.",
 		properties: map[string]any{
-			"session":      str("Optional chat id or display name"),
+			"session": str("Optional chat id or display name"),
+			"include_official": map[string]any{"type": "boolean", "default": false,
+				"description": "With no session, also search official-account messages: subscription articles and service notices such as payment receipts"},
 			"contains":     strArray(16),
 			"not_contains": strArray(16),
 			"match":        enum("all", "all", "any"),

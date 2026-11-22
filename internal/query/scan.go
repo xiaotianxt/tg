@@ -29,6 +29,9 @@ func Run(st *store.Store, o Options) ([]Row, error) {
 	}
 	window, _ := o.window()
 	shards := st.MessageShards()
+	if o.Official || o.Session != "" {
+		shards = st.SessionShards()
+	}
 	if len(shards) == 0 {
 		return nil, errors.New("No message databases found in the source directory.")
 	}

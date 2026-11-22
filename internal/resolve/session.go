@@ -212,7 +212,7 @@ func latestActivity(st *store.Store, cands []scoredContact, jobs int) (map[strin
 	for _, c := range cands {
 		byTable[msgdb.TableName(c.contact.Username)] = c.contact.Username
 	}
-	per, err := msgdb.EachShard(st, jobs, func(label string, conn *sqlcipher.Conn) (map[string]int64, error) {
+	per, err := msgdb.EachDB(st, st.SessionShards(), jobs, func(label string, conn *sqlcipher.Conn) (map[string]int64, error) {
 		tables, err := msgdb.ListTables(conn)
 		if err != nil {
 			return nil, err

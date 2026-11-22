@@ -15,7 +15,7 @@ type queryFlags struct {
 	contains, not, rawContains, has       []string
 	limit, offset, maxCellChars           uint
 	order, match, format                  string
-	anonymous                             bool
+	anonymous, official                   bool
 }
 
 func runQuery(e env.Env, src *sourceFlags, f queryFlags) error {
@@ -39,7 +39,7 @@ func runQuery(e env.Env, src *sourceFlags, f queryFlags) error {
 		return err
 	}
 	o := query.Options{
-		Session: f.session, Contains: f.contains, Not: f.not, RawContains: f.rawContains,
+		Session: f.session, Official: f.official, Contains: f.contains, Not: f.not, RawContains: f.rawContains,
 		Sender: f.sender, Since: since, Until: until,
 		Limit: int(f.limit), Limited: true, Offset: int(f.offset),
 		Mode: nameMode(f.anonymous), Jobs: int(src.jobs), Loc: e.Loc,

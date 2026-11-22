@@ -34,8 +34,13 @@
         "status": null
       },
       {
+        "check": "source official-account dbs",
+        "detail": "1",
+        "status": null
+      },
+      {
         "check": "message key coverage",
-        "detail": "2/2 numbered dbs",
+        "detail": "3/3 message dbs",
         "status": null
       },
       {

@@ -11,6 +11,7 @@ import (
 	"github.com/xiaotianxt/tg/internal/decode"
 	"github.com/xiaotianxt/tg/internal/sqlcipher"
 	"github.com/xiaotianxt/tg/internal/store"
+	"github.com/xiaotianxt/tg/internal/strsearch"
 )
 
 // Order is which end of a message range comes first. Paging counts from
@@ -108,9 +109,11 @@ type ScanOptions struct {
 	// shard). An empty list matches nothing.
 	FilterSenders bool
 	SenderRowIDs  []int64
-	// BodyLike are raw substrings matched against the stored body with
-	// LIKE (wildcards escaped); all must match, or any with BodyLikeAny.
-	// Compressed bodies are matched as stored.
+	// BodyLike are raw substrings matched, like SQL LIKE (ASCII
+	// case-insensitive, wildcards literal), against the body as Row.Body
+	// holds it; all must match, or any with BodyLikeAny. Uncompressed rows are
+	// filtered in SQL; compressed rows can only be matched after
+	// decompression, so SQL keeps them and ScanTable filters them.
 	BodyLike    []string
 	BodyLikeAny bool
 	// Where are extra conditions, ANDed.
@@ -178,14 +181,19 @@ func ScanTable(conn *sqlcipher.Conn, label string, t Table, name2id map[int64]st
 		if o.BodyLikeAny {
 			joiner = " OR "
 		}
-		add("("+strings.Join(parts, joiner)+")", a...)
+		add("("+MarkerCol+" = "+strconv.Itoa(compressedMarker)+" OR "+strings.Join(parts, joiner)+")", a...)
 	}
 	for _, c := range o.Where {
 		add("("+c.SQL+")", c.Args...)
 	}
+	// Compressed rows are filtered after SQL, so with BodyLike the limit
+	// counts rows that passed that filter instead of being pushed down.
 	order := ""
 	if o.Limit > 0 {
-		order = " ORDER BY " + orderCol + " " + o.Order.sql() + " LIMIT " + strconv.Itoa(o.Limit)
+		order = " ORDER BY " + orderCol + " " + o.Order.sql()
+		if len(o.BodyLike) == 0 {
+			order += " LIMIT " + strconv.Itoa(o.Limit)
+		}
 	}
 	sql := "SELECT " + localID + ", local_type, create_time, " + BodyCol + ", " + MarkerCol + ", " +
 		SenderCol + ", " + packed + ", " + orderCol + ", rowid FROM " + QuoteIdent(t.Name) +
@@ -200,7 +208,11 @@ func ScanTable(conn *sqlcipher.Conn, label string, t Table, name2id map[int64]st
 		return fmt.Errorf("Query messages from %s: %w", label, err)
 	}
 	var vals [rowColumns]sqlcipher.Value
+	yielded := 0
 	for {
+		if o.Limit > 0 && yielded == o.Limit {
+			return nil
+		}
 		ok, err := st.Step()
 		if err != nil {
 			return fmt.Errorf("Read messages from %s: %w", label, err)
@@ -208,20 +220,25 @@ func ScanTable(conn *sqlcipher.Conn, label string, t Table, name2id map[int64]st
 		if !ok {
 			return nil
 		}
-		row, err := readRow(st, &vals, name2id)
+		row, compressed, err := readRow(st, &vals, name2id)
 		if err != nil {
 			return fmt.Errorf("Read messages from %s: %w", label, err)
+		}
+		if compressed && len(o.BodyLike) > 0 && !likeMatch(row.Body, o.BodyLike, o.BodyLikeAny) {
+			continue
 		}
 		if err := yield(row); err != nil {
 			return err
 		}
+		yielded++
 	}
 }
 
 // rowColumns is the column count of ScanTable's SELECT.
 const rowColumns = 9
 
-func readRow(st *sqlcipher.Stmt, vals *[rowColumns]sqlcipher.Value, name2id map[int64]string) (Row, error) {
+// readRow also reports whether the body was stored compressed.
+func readRow(st *sqlcipher.Stmt, vals *[rowColumns]sqlcipher.Value, name2id map[int64]string) (Row, bool, error) {
 	st.Row(vals[:])
 	optInt := func(i int) (int64, bool, error) {
 		switch v := &vals[i]; v.Type() {
@@ -237,25 +254,26 @@ func readRow(st *sqlcipher.Stmt, vals *[rowColumns]sqlcipher.Value, name2id map[
 	var err error
 	var ok bool
 	if r.LocalID, r.HasLocalID, err = optInt(0); err != nil {
-		return r, err
+		return r, false, err
 	}
 	if r.LocalType, ok, err = optInt(1); err != nil {
-		return r, err
+		return r, false, err
 	} else if !ok {
 		r.LocalType = -1
 	}
 	if r.CreateTime, _, err = optInt(2); err != nil {
-		return r, err
+		return r, false, err
 	}
 	marker, hasMarker, err := optInt(4)
 	if err != nil {
-		return r, err
+		return r, false, err
 	}
-	if r.Body, err = readBody(&vals[3], hasMarker && marker == compressedMarker); err != nil {
-		return r, err
+	compressed := hasMarker && marker == compressedMarker
+	if r.Body, err = readBody(&vals[3], compressed); err != nil {
+		return r, false, err
 	}
 	if r.SenderRowID, _, err = optInt(5); err != nil {
-		return r, err
+		return r, false, err
 	}
 	r.Sender = name2id[r.SenderRowID]
 	if vals[6].Type() != sqlcipher.TypeNull {
@@ -265,11 +283,40 @@ func readRow(st *sqlcipher.Stmt, vals *[rowColumns]sqlcipher.Value, name2id map[
 		}
 	}
 	if r.Key.Seq, r.Key.HasSeq, err = optInt(7); err != nil {
-		return r, err
+		return r, false, err
 	}
 	r.Key.RowID = vals[8].Int64()
 	r.RowID = r.Key.RowID
-	return r, nil
+	return r, compressed, nil
+}
+
+// likeMatch applies BodyLike terms to a decompressed body the way SQL LIKE
+// with escaped wildcards matches them: substring, ASCII case-insensitive.
+func likeMatch(body string, terms []string, matchAny bool) bool {
+	lower := asciiLower(body)
+	for _, t := range terms {
+		if strsearch.Contains(lower, asciiLower(t)) == matchAny {
+			return matchAny
+		}
+	}
+	return !matchAny
+}
+
+// asciiLower lowers ASCII letters only, as SQLite's LIKE folds case; other
+// bytes, including UTF-8 sequences, are kept.
+func asciiLower(s string) string {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; 'A' <= c && c <= 'Z' {
+			b := []byte(s)
+			for j := i; j < len(b); j++ {
+				if 'A' <= b[j] && b[j] <= 'Z' {
+					b[j] += 'a' - 'A'
+				}
+			}
+			return string(b)
+		}
+	}
+	return s
 }
 
 // readBody reads the body column. A compressed body must be stored as bytes
@@ -345,7 +392,8 @@ type SessionRows struct {
 	HasHistory   bool
 }
 
-// ReadSession reads one session's table in every shard. With a Limit, each
+// ReadSession reads one session's table in every chat and official-account
+// shard (it lives in one of them). With a Limit, each
 // shard returns up to Limit rows from the chosen end, so a caller paging
 // with an offset passes offset+limit.
 func ReadSession(st *store.Store, username string, jobs int, o SessionOptions) (SessionRows, error) {
@@ -355,7 +403,7 @@ func ReadSession(st *store.Store, username string, jobs int, o SessionOptions) (
 		start    int64
 		hasStart bool
 	}
-	per, err := EachShard(st, jobs, func(label string, conn *sqlcipher.Conn) (shardRows, error) {
+	per, err := EachDB(st, st.SessionShards(), jobs, func(label string, conn *sqlcipher.Conn) (shardRows, error) {
 		var out shardRows
 		schema, ok, err := TableSchema(conn, table)
 		if err != nil || !ok {

@@ -22,7 +22,7 @@ above it.
 | `internal/history` | sessions/unread, read messages, FTS search, members/friends, chat probe; returns typed results, never text |
 | `internal/resolve` | session resolution (exact id, fuzzy name scoring), sender filter, self detection |
 | `internal/contacts` | contact rows, display-name modes, group rosters and nicknames (ext_buffer), friend evidence |
-| `internal/msgdb` | message table naming (`Msg_` + md5), schema probe, Name2Id, shard iteration, **the single raw-row reader** used by history, query and export |
+| `internal/msgdb` | message table naming (`Msg_` + md5), schema probe, Name2Id, shard iteration (chat shards `message_N.db`, official-account shards `biz_message_N.db`), **the single raw-row reader** used by history, query and export |
 | `internal/voice` | native voice payload sniffing and the decoder protocol |
 | `internal/media` | media base discovery, export media index, per-id image cache, kvcomm media keys, V2 decrypt, sticker decrypt, ffmpeg conversion |
 | `internal/capture` | the `keys` flow as an explicit state machine; `lldb` (macOS), `gdb` + ELF hook locator + process identity (Linux) |
@@ -40,6 +40,10 @@ above it.
   `loc` as arguments. Masked names live only in `internal/dict`.
 - **One reader.** Every command that reads messages goes through
   `msgdb` raw rows, then `contacts`/`resolve` for names, then `decode`.
+  A session's table lives in exactly one shard kind (`store.ShardKind`):
+  reading one session opens chat and official-account shards; whole-store
+  scans (unscoped `query`, members, sender lookup) use chat shards, and
+  `query` adds official-account shards only on request.
   Sender inference (1:1 partner, the account owner shown as 我) is the same
   for messages, query, export and MCP.
 - **Explicit states.** Multi-step flows (keys capture, snapshot clones,
@@ -112,6 +116,22 @@ Each was a Rust inconsistency or bug found while writing the contracts.
   extension instead of `.dat`.
 - A message type whose low 32 bits are 2^31 or more reads as `未知(<n>)` with
   the same signed value in every command (Rust's `query` showed `未知(-1)`).
+- Official-account messages (`biz_message_N.db`: subscription article
+  pushes and service notices such as payment receipts) are readable:
+  `messages`, `export`, MCP `read_messages` and `query --session` read an
+  official account like any chat; unscoped `query` includes them with
+  `--official` (MCP `include_official`). Rust never opened these shards.
+- `query --raw-contains` matches the decompressed body, the same text the
+  `raw_body` field shows. Rust ran SQL `LIKE` on stored bytes, so it never
+  matched a compressed message (nearly every app message).
+- `doctor` reports official-account shards and counts them in key
+  coverage.
+- App messages get their own display where Rust used the generic card:
+  article pushes list each article's title and link (`[文章]`), service
+  notices list their template lines (`[通知]`), transfers show amount,
+  status and memo (`[转账] ¥12.50 已收款`), red packets show their greeting.
+  The app subtype is read even when the client wraps it in CDATA, which
+  Rust missed, so those red packets read as `[卡片]` with raw CDATA.
 - Voice durations come from the body's millisecond length
   (`voicelength="<ms>"`, or legacy `<sender>:<ms>:<flag>`), rounded to the
   nearest second. Rust took the first digit run of the body, so current

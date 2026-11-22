@@ -215,7 +215,7 @@ func TestExportErrors(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	out := filepath.Join(e.Tmp, "archive")
-	e.run(t, fixtureArgs("export", "gh_news", "--output", out)...).mustFail(t, 1, "No messages found for 'gh_news'")
+	e.run(t, fixtureArgs("export", "quiet@chatroom", "--output", out)...).mustFail(t, 1, "No messages found for 'quiet@chatroom'")
 	if _, err := os.Stat(out); err == nil {
 		t.Error("a failed export created its output directory")
 	}
@@ -239,4 +239,18 @@ func assertDirNames(t *testing.T, dir string, want ...string) {
 	if !slices.Equal(got, want) {
 		t.Errorf("%s holds %q, want %q", dir, got, want)
 	}
+}
+
+// An official account exports like a chat: its rows come from the
+// official-account shard.
+func TestExportOfficialAccount(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	out := filepath.Join(e.Tmp, "archive")
+	e.run(t, fixtureArgs("export", "gh_news", "--output", out)...).mustSucceed(t)
+	txt, err := os.ReadFile(filepath.Join(out, "chat.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	golden(t, "export/official.txt", coverAppNames(string(txt)))
 }
